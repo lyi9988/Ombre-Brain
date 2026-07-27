@@ -23,6 +23,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from bucket_manager import BucketManager
+from canonical_continuation import CanonicalContinuationAdapter, ContinuationBatch
 from dehydrator import Dehydrator
 from dream_engine import DreamEngine
 from embedding_engine import EmbeddingEngine
@@ -822,6 +823,28 @@ class GatewayService:
         self.pending_tool_reasoning: dict[str, dict[tuple[str, ...], dict[str, Any]]] = {}
 
         self.http_client = http_client or httpx.AsyncClient(timeout=60.0)
+        canonical_cfg = (
+            self.gateway_cfg.get("canonical_continuation", {})
+            if isinstance(self.gateway_cfg.get("canonical_continuation", {}), dict)
+            else {}
+        )
+        self.canonical_target_session_id = str(
+            canonical_cfg.get("session_id") or "jiajia"
+        ).strip()
+        self.canonical_target_profile_id = str(
+            canonical_cfg.get("profile_id") or "jiajia-main"
+        ).strip()
+        self.canonical_adapter = CanonicalContinuationAdapter(
+            enabled=self._bool_config_value(canonical_cfg.get("enabled"), False),
+            base_url=str(canonical_cfg.get("base_url") or ""),
+            token=os.environ.get("OMBRE_CANONICAL_BRIDGE_TOKEN", ""),
+            device_id=str(canonical_cfg.get("device_id") or "ombre-gateway-operit"),
+            conversation_id=str(canonical_cfg.get("conversation_id") or "conv-jiajia-main"),
+            channel_id=str(canonical_cfg.get("channel_id") or "operit"),
+            state_db_path=os.path.join(config["buckets_dir"], "gateway_state.db"),
+            http_client=self.http_client,
+            max_events=max(1, min(200, int(canonical_cfg.get("max_events", 40)))),
+        )
 
     async def close(self) -> None:
         if self.http_client and not getattr(self.http_client, "is_closed", False):
@@ -875,6 +898,19 @@ class GatewayService:
                 "upstream_base_url": self.upstream_base_url
                 or (self.upstreams[0]["base_url"] if len(self.upstreams) == 1 else ""),
                 "upstream_default_model": self.upstream_default_model,
+                "canonical_continuation": {
+                    "enabled": self.canonical_adapter.enabled,
+                    "target_session_id": self.canonical_target_session_id,
+                    "target_profile_id": self.canonical_target_profile_id,
+                    "conversation_id": self.canonical_adapter.conversation_id,
+                    "channel_id": self.canonical_adapter.channel_id,
+                    "max_events": self.canonical_adapter.max_events,
+                    "cursor": self.canonical_adapter.cursor() if self.canonical_adapter.enabled else 0,
+                    "outbox_pending": (
+                        self.canonical_adapter.outbox_size() if self.canonical_adapter.enabled else 0
+                    ),
+                    "instruction_injected": False,
+                },
                 "upstream_models": self.upstream_models,
                 "cooldown_hours": self.cooldown_hours,
                 "skip_recent_rounds": self.skip_recent_rounds,
@@ -1821,6 +1857,105 @@ class GatewayService:
             logger.exception("Gateway health check failed: %s", exc)
             return JSONResponse({"status": "error", "detail": str(exc)}, status_code=500)
 
+    def _canonical_continuation_active(self, session_id: str) -> bool:
+        profile_id = str(getattr(self.persona_engine, "profile_id", "") or "").strip()
+        return bool(
+            self.canonical_adapter.enabled
+            and session_id == self.canonical_target_session_id
+            and profile_id == self.canonical_target_profile_id
+        )
+
+    def _canonical_request_id(self, request: Request, payload: dict, session_id: str) -> str:
+        explicit = str(
+            request.headers.get("X-Request-ID")
+            or request.headers.get("X-Client-Request-ID")
+            or ""
+        ).strip()
+        if explicit and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}", explicit):
+            return explicit
+        canonical = json.dumps(
+            {
+                "session_id": session_id,
+                "model": str(payload.get("model") or ""),
+                "messages": payload.get("messages") or [],
+            },
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+    async def _prepare_canonical_turn(
+        self, request: Request, payload: dict, session_id: str, current_user_text: str,
+    ) -> tuple[dict, dict[str, Any]]:
+        state: dict[str, Any] = {"enabled": False, "status": "not_target"}
+        if not self._canonical_continuation_active(session_id):
+            return payload, state
+        state = {"enabled": True, "status": "preparing"}
+        request_id = self._canonical_request_id(request, payload, session_id)
+        user_source_event_id = f"operit:{request_id}:user"
+        state.update({
+            "request_id": request_id,
+            "user_source_event_id": user_source_event_id,
+            "through_seq": self.canonical_adapter.cursor(),
+            "event_count": 0,
+        })
+        try:
+            flush = await self.canonical_adapter.flush_outbox()
+            state["outbox_pending"] = int(flush.get("pending") or 0)
+        except Exception as exc:
+            state["outbox_status"] = "flush_failed"
+            state["outbox_error_type"] = type(exc).__name__
+        try:
+            batch = await self.canonical_adapter.pull()
+            state["through_seq"] = batch.through_seq
+            state["event_count"] = len(batch.events)
+            messages = payload.get("messages")
+            if isinstance(messages, list):
+                payload = deepcopy(payload)
+                payload["messages"] = self.canonical_adapter.merge_messages(messages, batch)
+            state["status"] = "injected" if batch.events else "no_delta"
+        except Exception as exc:
+            state["status"] = "pull_failed"
+            state["pull_error_type"] = type(exc).__name__
+        user_text = str(current_user_text or "").strip()
+        if user_text:
+            result = await self.canonical_adapter.ingest_or_queue(
+                source_event_id=user_source_event_id, role="user", content=user_text,
+            )
+            state["user_write_status"] = "queued" if result.get("queued") else (
+                "created" if result.get("created") else "duplicate"
+            )
+        else:
+            state["user_write_status"] = "skipped_no_current_user"
+        return payload, state
+
+    async def _finalize_canonical_turn(
+        self, state: dict[str, Any] | None, assistant_message: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(state, dict) or not state.get("enabled"):
+            return
+        if not self._assistant_message_has_output(assistant_message):
+            state["assistant_write_status"] = "skipped_no_output"
+            return
+        assistant_text = self._coerce_message_text(assistant_message.get("content")).strip()
+        if not assistant_text:
+            state["assistant_write_status"] = "skipped_non_text_output"
+            return
+        request_id = str(state.get("request_id") or "")
+        if not request_id:
+            state["assistant_write_status"] = "skipped_no_request_id"
+            return
+        result = await self.canonical_adapter.ingest_or_queue(
+            source_event_id=f"operit:{request_id}:assistant",
+            role="assistant", content=assistant_text,
+            correlation_id=str(state.get("user_source_event_id") or ""),
+        )
+        state["assistant_write_status"] = "queued" if result.get("queued") else (
+            "created" if result.get("created") else "duplicate"
+        )
+        through_seq = max(0, int(state.get("through_seq") or 0))
+        if state.get("status") != "pull_failed":
+            state["committed_cursor"] = self.canonical_adapter.commit_cursor(through_seq)
+
     async def handle_chat(self, request: Request) -> Response:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
@@ -1857,6 +1992,10 @@ class GatewayService:
                 request.headers.get("X-Ombre-Include-Favorite-Memory")
             )
             persona_user_message = self._extract_last_user_query(payload.get("messages", []))
+            canonical_current_user = self._extract_current_turn_user_query(payload.get("messages", []))
+            payload, canonical_state = await self._prepare_canonical_turn(
+                request, payload, session_id, canonical_current_user,
+            )
             forward_payload, recalled_ids, injection_debug = await self.prepare_payload(
                 payload,
                 session_id,
@@ -1868,6 +2007,8 @@ class GatewayService:
                     else "compact"
                 ),
             )
+            if isinstance(injection_debug, dict):
+                injection_debug["canonical_continuation"] = canonical_state
         except ValueError as exc:
             return JSONResponse(
                 {"error": {"message": str(exc), "type": "invalid_request_error"}},
@@ -1998,6 +2139,10 @@ class GatewayService:
                 request.headers.get("X-Ombre-Include-Favorite-Memory")
             )
             persona_user_message = self._extract_last_user_query(openai_payload.get("messages", []))
+            canonical_current_user = self._extract_current_turn_user_query(openai_payload.get("messages", []))
+            openai_payload, canonical_state = await self._prepare_canonical_turn(
+                request, openai_payload, session_id, canonical_current_user,
+            )
             forward_payload, recalled_ids, injection_debug = await self.prepare_payload(
                 openai_payload,
                 session_id,
@@ -2009,6 +2154,8 @@ class GatewayService:
                     else "compact"
                 ),
             )
+            if isinstance(injection_debug, dict):
+                injection_debug["canonical_continuation"] = canonical_state
         except ValueError as exc:
             return self._anthropic_error(str(exc), status_code=400)
         except RuntimeError as exc:
@@ -3687,6 +3834,20 @@ class GatewayService:
                 route,
             )
             return
+        canonical_state = (
+            injection_debug.get("canonical_continuation")
+            if isinstance(injection_debug, dict) else None
+        )
+        try:
+            await self._finalize_canonical_turn(canonical_state, assistant_message)
+        except Exception as exc:
+            logger.warning(
+                "Gateway canonical finalize failed | session=%s route=%s error_type=%s",
+                session_id, route, type(exc).__name__,
+            )
+            if isinstance(canonical_state, dict):
+                canonical_state["assistant_write_status"] = "finalize_failed"
+                canonical_state["assistant_error_type"] = type(exc).__name__
         round_id = self.state_store.record_success(session_id, recalled_ids)
         if injection_debug and injection_debug.get("recent_context_injected"):
             try:
@@ -6871,6 +7032,18 @@ class GatewayService:
         return "\n".join(lines), ids
 
     def _get_persona_state_for_context_mode(self, session_id: str) -> dict[str, Any]:
+        # Phase C: route to self_model read if enabled
+        sm_cfg = self.config.get("self_model", {}) if isinstance(self.config.get("self_model"), dict) else {}
+        if sm_cfg.get("read_enabled") and sm_cfg.get("profile_id", "jiajia-main") == getattr(self.persona_engine, "profile_id", ""):
+            sm_getter = getattr(self.persona_engine, "get_self_model_state", None)
+            if callable(sm_getter):
+                try:
+                    state = sm_getter(session_id)
+                    if isinstance(state, dict) and state:
+                        return state
+                except Exception as exc:
+                    logger.warning("Gateway self_model read failed, fallback | session=%s error=%s", session_id, exc)
+        # Original path
         getter = getattr(self.persona_engine, "get_current_state", None)
         if not callable(getter):
             return {}

@@ -533,6 +533,69 @@ class PersonaStateEngine:
         session_state = self._apply_session_decay(session_id, session_state, now)
         return self._snapshot(global_state, session_state, self.fallback_guidance)
 
+    def get_self_model_state(self, session_id: str) -> dict:
+        """Read persona projection from self_model tables (Phase C read-only).
+
+        Falls back to old tables if self_model has no data for this session.
+        Does NOT read pending_review or legacy_imported narrative.
+        """
+        conn = self._connect()
+        try:
+            # Try self_model_state first
+            sm_row = conn.execute(
+                """SELECT valence, arousal, tenderness, possessiveness, longing,
+                          security, protective_drive, mood_label, residue, inner_thought
+                   FROM self_model_state WHERE profile_id=? AND session_id=?""",
+                (self.profile_id, session_id),
+            ).fetchone()
+            if sm_row is None:
+                conn.close()
+                return self.get_current_state(session_id)  # fallback
+
+            # Read evolving_self for OCEAN + relationship
+            es_row = conn.execute(
+                """SELECT ocean_current, relationship_dynamics
+                   FROM self_model_evolving_self WHERE profile_id=?""",
+                (self.profile_id,),
+            ).fetchone()
+            conn.close()
+
+            import json as _json
+            ocean = _json.loads(es_row[0]) if es_row and es_row[0] else {}
+            rel = _json.loads(es_row[1]) if es_row and es_row[1] else {}
+
+            session_state = {
+                "valence": sm_row[0] or self.default_affect["valence"],
+                "arousal": sm_row[1] or self.default_affect["arousal"],
+                "tenderness": sm_row[2] or self.default_affect.get("tenderness", 0.0),
+                "possessiveness": sm_row[3] or self.default_affect.get("possessiveness", 0.0),
+                "longing": sm_row[4] or self.default_affect.get("longing", 0.0),
+                "security": sm_row[5] or self.default_affect.get("security", 0.5),
+                "protective_drive": sm_row[6] or self.default_affect.get("protective_drive", 0.0),
+                "mood_label": sm_row[7] or "warm_neutral",
+                "residue": sm_row[8] or "",
+                "inner_thought": sm_row[9] or "",
+                "session_defensiveness": rel.get("defensiveness", 0.0),
+            }
+            global_state = {
+                "openness": ocean.get("O", 0.5),
+                "conscientiousness": ocean.get("C", 0.5),
+                "extraversion": ocean.get("E", 0.5),
+                "agreeableness": ocean.get("A", 0.5),
+                "neuroticism": ocean.get("N", 0.5),
+                "affinity": rel.get("affinity", 0.5),
+                "dominance": rel.get("dominance", 0.5),
+                "defensiveness": rel.get("defensiveness", 0.0),
+                "trust": rel.get("trust", 0.5),
+            }
+            return self._snapshot(global_state, session_state, self.fallback_guidance)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return self.get_current_state(session_id)  # fallback on any error
+
     def get_dashboard_payload(
         self,
         session_id: str | None = None,
@@ -824,32 +887,24 @@ class PersonaStateEngine:
         return decayed
 
     def _apply_global_delta(self, state: dict, evaluation: dict, now: datetime) -> dict:
+        """Freeze automatic long-term global writes during ordinary chat.
+
+        Keep session short-state + persona_events as evidence.
+        Long-term personality/relationship changes must go through a future
+        explicit Self Model commit path, not per-turn auto deltas.
+        """
         updated = dict(state)
-        for key, delta in evaluation["personality_delta"].items():
-            updated[key] = self._clamp_float(float(updated.get(key, self.default_personality[key])) + delta)
-        for key, delta in evaluation["relationship_delta"].items():
-            updated[key] = self._clamp_float(float(updated.get(key, self.default_relationship[key])) + delta)
+        # Intentionally do NOT apply evaluation personality/relationship deltas.
         updated["updated_at"] = self._format_time(now)
 
         conn = self._connect()
         conn.execute(
             """
             UPDATE persona_global_state
-            SET openness = ?, conscientiousness = ?, extraversion = ?, agreeableness = ?,
-                neuroticism = ?, affinity = ?, dominance = ?, defensiveness = ?, trust = ?,
-                updated_at = ?
+            SET updated_at = ?
             WHERE profile_id = ?
             """,
             (
-                updated["openness"],
-                updated["conscientiousness"],
-                updated["extraversion"],
-                updated["agreeableness"],
-                updated["neuroticism"],
-                updated["affinity"],
-                updated["dominance"],
-                updated["defensiveness"],
-                updated["trust"],
                 updated["updated_at"],
                 self.profile_id,
             ),
@@ -1423,3 +1478,211 @@ class PersonaStateEngine:
             "non_thinking": "disabled",
         }
         return aliases.get(normalized, "")
+
+
+# ===============================================================
+# Self Model Commit Protocol (Phase D)
+# Propose -> Validate -> Decide -> Commit
+# ===============================================================
+
+import json as _sm_json
+
+_SM_MAX_OCEAN_DELTA = 0.15
+_SM_MAX_REL_DELTA = 0.15
+_SM_MAX_OPINIONS_PER_COMMIT = 3
+
+
+def _sm_propose_observation(self, session_id, content, source="ordinary_chat"):
+    """Auto-record observation. No human decision needed."""
+    conn = self._connect()
+    cur = conn.execute(
+        "INSERT INTO self_model_narrative"
+        " (profile_id, event_type, layer, content, source, confidence, status, created_at)"
+        " VALUES (?, 'observation', 'self_state', ?, ?, NULL, 'accepted',"
+        " strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        (self.profile_id, content, source),
+    )
+    row_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO self_model_audit (profile_id, action, layer, diff, actor, created_at)"
+        " VALUES (?, 'propose', 'self_state', ?, 'system',"
+        " strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        (self.profile_id, _sm_json.dumps({"narrative_id": row_id, "type": "observation"})),
+    )
+    conn.commit()
+    conn.close()
+    return row_id
+
+
+def _sm_propose_evolving(self, content, source="ordinary_chat",
+                         evidence_ids=None, confidence=None):
+    """Create proposal for Evolving Self. Status=pending, requires decide()."""
+    conn = self._connect()
+    cur = conn.execute(
+        "INSERT INTO self_model_narrative"
+        " (profile_id, event_type, layer, content, source, confidence, status, created_at)"
+        " VALUES (?, 'proposal', 'evolving_self', ?, ?, ?, 'pending',"
+        " strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        (self.profile_id, content, source, confidence),
+    )
+    row_id = cur.lastrowid
+    actor = "aizizhu_proposal" if source == "aizizhu_proposal" else "system"
+    conn.execute(
+        "INSERT INTO self_model_audit (profile_id, action, layer, diff, actor, created_at)"
+        " VALUES (?, 'propose', 'evolving_self', ?, ?,"
+        " strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        (self.profile_id,
+         _sm_json.dumps({"narrative_id": row_id, "evidence_ids": evidence_ids or []}),
+         actor),
+    )
+    conn.commit()
+    conn.close()
+    return row_id
+
+
+def _sm_propose_identity_core(self, content, actor="human"):
+    """Identity Core: ALWAYS rejected unless actor=human."""
+    if actor != "human":
+        return {"error": "identity_core_locked",
+                "message": "Identity Core changes require human actor"}
+    conn = self._connect()
+    cur = conn.execute(
+        "INSERT INTO self_model_narrative"
+        " (profile_id, event_type, layer, content, source, confidence, status, created_at)"
+        " VALUES (?, 'proposal', 'identity_core', ?, 'human_decision', NULL, 'pending',"
+        " strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        (self.profile_id, content),
+    )
+    row_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO self_model_audit (profile_id, action, layer, diff, actor, created_at)"
+        " VALUES (?, 'propose', 'identity_core', ?, 'human',"
+        " strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        (self.profile_id, _sm_json.dumps({"narrative_id": row_id})),
+    )
+    conn.commit()
+    conn.close()
+    return {"proposal_id": row_id, "status": "pending", "requires_human_decide": True}
+
+
+def _sm_validate(self, proposal_id):
+    """Programmatic validation: schema, amplitude, version conflict."""
+    conn = self._connect()
+    row = conn.execute(
+        "SELECT layer, content, status FROM self_model_narrative WHERE id=? AND profile_id=?",
+        (proposal_id, self.profile_id),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"valid": False, "errors": ["proposal_not_found"]}
+    layer, content, status = row
+    errors = []
+    if status != "pending":
+        errors.append("status_is_%s_not_pending" % status)
+    if layer == "identity_core":
+        errors.append("identity_core_requires_human_decide")
+    if content:
+        try:
+            diff = _sm_json.loads(content)
+            if isinstance(diff, dict):
+                for k in ("O", "C", "E", "A", "N"):
+                    if k in diff and abs(float(diff[k])) > _SM_MAX_OCEAN_DELTA:
+                        errors.append("ocean_%s_delta_exceeds_%.2f" % (k, _SM_MAX_OCEAN_DELTA))
+                for k in ("affinity", "dominance", "defensiveness", "trust"):
+                    if k in diff and abs(float(diff[k])) > _SM_MAX_REL_DELTA:
+                        errors.append("rel_%s_delta_exceeds_%.2f" % (k, _SM_MAX_REL_DELTA))
+                if "opinions" in diff and isinstance(diff["opinions"], list):
+                    if len(diff["opinions"]) > _SM_MAX_OPINIONS_PER_COMMIT:
+                        errors.append("too_many_opinions_max_%d" % _SM_MAX_OPINIONS_PER_COMMIT)
+        except (ValueError, TypeError):
+            pass
+    return {"valid": len(errors) == 0, "errors": errors}
+
+
+def _sm_decide(self, proposal_id, decision, actor="human", justification=""):
+    """Human decision entry. accept or reject. Commits only if mode allows."""
+    if decision not in ("accept", "reject"):
+        return {"error": "invalid_decision"}
+    conn = self._connect()
+    row = conn.execute(
+        "SELECT layer, content, status FROM self_model_narrative WHERE id=? AND profile_id=?",
+        (proposal_id, self.profile_id),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return {"error": "proposal_not_found"}
+    layer, content, status = row
+    if status != "pending":
+        conn.close()
+        return {"error": "proposal_already_%s" % status}
+    if layer == "identity_core" and actor != "human":
+        conn.close()
+        return {"error": "identity_core_requires_human"}
+
+    new_status = "accepted" if decision == "accept" else "rejected"
+    conn.execute(
+        "UPDATE self_model_narrative SET status=?, decided_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+        (new_status, proposal_id),
+    )
+
+    committed = False
+    if decision == "accept" and layer == "evolving_self":
+        sm_cfg = getattr(self, "_sm_config", {})
+        commit_mode = sm_cfg.get("evolve_commit_mode", "manual_only")
+        if commit_mode == "auto_low_risk":
+            validation = _sm_validate(self, proposal_id)
+            if validation["valid"]:
+                try:
+                    diff = _sm_json.loads(content) if content else {}
+                    es_row = conn.execute(
+                        "SELECT ocean_current, relationship_dynamics, revision"
+                        " FROM self_model_evolving_self WHERE profile_id=?",
+                        (self.profile_id,),
+                    ).fetchone()
+                    if es_row and isinstance(diff, dict):
+                        ocean = _sm_json.loads(es_row[0] or "{}")
+                        rel = _sm_json.loads(es_row[1] or "{}")
+                        rev = es_row[2] or 1
+                        for k in ("O", "C", "E", "A", "N"):
+                            if k in diff:
+                                ocean[k] = round(ocean.get(k, 0.5) + float(diff[k]), 4)
+                        for k in ("affinity", "dominance", "defensiveness", "trust"):
+                            if k in diff:
+                                rel[k] = round(rel.get(k, 0.5) + float(diff[k]), 4)
+                        conn.execute(
+                            "UPDATE self_model_evolving_self"
+                            " SET ocean_current=?, relationship_dynamics=?, revision=?,"
+                            " last_commit_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),"
+                            " updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+                            " WHERE profile_id=?",
+                            (_sm_json.dumps(ocean), _sm_json.dumps(rel), rev + 1, self.profile_id),
+                        )
+                        conn.execute(
+                            "UPDATE self_model_narrative SET revision_before=?, revision_after=? WHERE id=?",
+                            (rev, rev + 1, proposal_id),
+                        )
+                        committed = True
+                except Exception:
+                    pass
+
+    audit_action = "commit" if committed else "validate"
+    conn.execute(
+        "INSERT INTO self_model_audit (profile_id, action, layer, diff, actor, created_at)"
+        " VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        (self.profile_id, audit_action, layer,
+         _sm_json.dumps({"proposal_id": proposal_id, "decision": decision,
+                         "committed": committed, "justification": justification[:200]}),
+         actor),
+    )
+    conn.commit()
+    conn.close()
+    return {"proposal_id": proposal_id, "decision": decision,
+            "committed": committed, "layer": layer}
+
+
+# Bind to PersonaEngine
+PersonaStateEngine.sm_propose_observation = _sm_propose_observation
+PersonaStateEngine.sm_propose_evolving = _sm_propose_evolving
+PersonaStateEngine.sm_propose_identity_core = _sm_propose_identity_core
+PersonaStateEngine.sm_validate = _sm_validate
+PersonaStateEngine.sm_decide = _sm_decide

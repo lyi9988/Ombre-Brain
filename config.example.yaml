@@ -299,6 +299,19 @@ gateway:
   host: "0.0.0.0"
   port: 8010
   default_session_id: "main"      # used only by compatible routes when the header is omitted
+  # Optional Canonical cross-channel continuation. Disabled by default.
+  # Token is read only from OMBRE_CANONICAL_BRIDGE_TOKEN.
+  # Missing messages are inserted as real user/assistant roles; no system prompt is added.
+  canonical_continuation:
+    enabled: false
+    base_url: "http://10.0.0.2:18010"
+    device_id: "ombre-gateway-operit"
+    conversation_id: "conv-jiajia-main"
+    channel_id: "operit"
+    session_id: "jiajia"
+    profile_id: "jiajia-main"
+    max_events: 40
+    instruction: ""  # reserved; current implementation never injects this
   upstream_base_url: "https://api.openai.com/v1"
   upstream_default_model: "gpt-4.1-mini"
   upstream_models:
