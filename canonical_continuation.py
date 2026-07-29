@@ -63,21 +63,29 @@ class CanonicalContinuationAdapter:
                 last_error TEXT NOT NULL DEFAULT "", created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"""
             )
 
-    def cursor_or_none(self) -> int | None:
+    def _channel(self, channel_id: str | None = None) -> str:
+        """Resolve the effective channel; defaults to the configured one."""
+        value = str(channel_id or "").strip()
+        return value or self.channel_id
+
+    def own_event_prefix(self, channel_id: str | None = None) -> str:
+        return self._channel(channel_id) + ":"
+
+    def cursor_or_none(self, channel_id: str | None = None) -> int | None:
         if not self.enabled:
             return 0
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT last_seq FROM canonical_channel_cursors WHERE conversation_id=? AND channel_id=?",
-                (self.conversation_id, self.channel_id),
+                (self.conversation_id, self._channel(channel_id)),
             ).fetchone()
         return int(row["last_seq"]) if row else None
 
-    def cursor(self) -> int:
-        value = self.cursor_or_none()
+    def cursor(self, channel_id: str | None = None) -> int:
+        value = self.cursor_or_none(channel_id)
         return int(value or 0)
 
-    def commit_cursor(self, seq: int) -> int:
+    def commit_cursor(self, seq: int, channel_id: str | None = None) -> int:
         if not self.enabled:
             return 0
         value = max(0, int(seq))
@@ -88,9 +96,9 @@ class CanonicalContinuationAdapter:
                 ON CONFLICT(conversation_id,channel_id) DO UPDATE SET
                 last_seq=excluded.last_seq,updated_at=CURRENT_TIMESTAMP
                 WHERE excluded.last_seq>canonical_channel_cursors.last_seq""",
-                (self.conversation_id, self.channel_id, value),
+                (self.conversation_id, self._channel(channel_id), value),
             )
-        return self.cursor()
+        return self.cursor(channel_id)
 
     def _headers(self):
         return {
@@ -112,15 +120,15 @@ class CanonicalContinuationAdapter:
             raise RuntimeError("canonical bridge must be no-generation")
         return body
 
-    async def pull(self) -> ContinuationBatch:
-        current_value = self.cursor_or_none()
+    async def pull(self, channel_id: str | None = None) -> ContinuationBatch:
+        current_value = self.cursor_or_none(channel_id)
         current = int(current_value or 0)
         if not self.enabled:
             return ContinuationBatch((), current)
         if current_value is None:
             state = await self.verify()
             baseline = max(0, int(state.get("max_seq") or 0))
-            self.commit_cursor(baseline)
+            self.commit_cursor(baseline, channel_id)
             return ContinuationBatch((), baseline)
         response = await self.http_client.get(
             self.base_url + "/bridge/v1/events",
@@ -132,13 +140,17 @@ class CanonicalContinuationAdapter:
         if body.get("conversation_id") != self.conversation_id:
             raise RuntimeError("canonical event conversation mismatch")
         through_seq = max(current, int(body.get("next_after_seq") or current))
+        own_prefix = self.own_event_prefix(channel_id)
         selected = []
         for event in body.get("items") or []:
             if event.get("event_type") != "message":
                 continue
             if event.get("role") not in {"user", "assistant"}:
                 continue
-            if event.get("source") == "ombre-gateway":
+            # Own-echo guard. Every channel now writes through the same bridge, so
+            # source is "ombre-gateway" for all of them; identify our own writes by
+            # the channel prefix we stamp onto source_event_id instead.
+            if str(event.get("source_event_id") or "").startswith(own_prefix):
                 continue
             content = str(event.get("content") or "").strip()
             if not content:

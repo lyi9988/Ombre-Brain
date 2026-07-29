@@ -14,16 +14,18 @@ class FakeAdapter:
         self.committed = []
         self.pull_calls = 0
         self.flush_calls = 0
+        self.pull_channels = []
 
-    def cursor(self):
+    def cursor(self, channel_id=None):
         return 10
 
     async def flush_outbox(self):
         self.flush_calls += 1
         return {"delivered": 0, "pending": 0}
 
-    async def pull(self):
+    async def pull(self, channel_id=None):
         self.pull_calls += 1
+        self.pull_channels.append(channel_id)
         return ContinuationBatch((
             {"seq": 11, "role": "user", "content": "那我下午去。", "source_event_id": "app:11"},
             {"seq": 12, "role": "assistant", "content": "别盯着针。", "source_event_id": "app:12"},
@@ -37,8 +39,8 @@ class FakeAdapter:
         self.ingested.append(values)
         return {"created": True}
 
-    def commit_cursor(self, seq):
-        self.committed.append(seq)
+    def commit_cursor(self, seq, channel_id=None):
+        self.committed.append((seq, channel_id) if channel_id else seq)
         return seq
 
 
@@ -61,6 +63,7 @@ def service(profile="jiajia-main"):
     item.persona_engine = SimpleNamespace(profile_id=profile)
     item.canonical_target_session_id = "jiajia"
     item.canonical_target_profile_id = "jiajia-main"
+    item.canonical_session_channels = {"jiajia": "operit", "main": "reality"}
     item.canonical_adapter = FakeAdapter()
     return item
 
@@ -115,13 +118,14 @@ def test_successful_assistant_is_ingested_then_cursor_commits():
         state = {
             "enabled": True, "status": "injected", "request_id": "req-123",
             "user_source_event_id": "operit:req-123:user", "through_seq": 12,
+            "channel_id": "operit",
         }
         await item._finalize_canonical_turn(state, {"role": "assistant", "content": "通常就一下。"})
         assert item.canonical_adapter.ingested == [{
             "source_event_id": "operit:req-123:assistant", "role": "assistant",
             "content": "通常就一下。", "correlation_id": "operit:req-123:user",
         }]
-        assert item.canonical_adapter.committed == [12]
+        assert item.canonical_adapter.committed == [(12, "operit")]
         assert state["assistant_write_status"] == "created"
     asyncio.run(scenario())
 
@@ -134,4 +138,36 @@ def test_no_assistant_output_does_not_commit_cursor():
         assert item.canonical_adapter.ingested == []
         assert item.canonical_adapter.committed == []
         assert state["assistant_write_status"] == "skipped_no_output"
+    asyncio.run(scenario())
+
+
+def test_second_channel_uses_its_own_prefix_and_cursor():
+    """A client that falls back to default_session_id ("main") must still take part,
+    writing under its own channel prefix so the other channel can read it back."""
+    async def scenario():
+        item = service()
+        payload = {"messages": [{"role": "user", "content": "在网页这边说的"}]}
+        prepared, state = await item._prepare_canonical_turn(
+            request({"X-Request-ID": "req-9"}), payload, "main", "在网页这边说的",
+        )
+        assert state["enabled"] is True
+        assert state["channel_id"] == "reality"
+        assert item.canonical_adapter.pull_channels == ["reality"]
+        assert item.canonical_adapter.ingested == [{
+            "source_event_id": "reality:req-9:user", "role": "user",
+            "content": "在网页这边说的",
+        }]
+        await item._finalize_canonical_turn(state, {"role": "assistant", "content": "嗯。"})
+        assert item.canonical_adapter.ingested[-1]["source_event_id"] == "reality:req-9:assistant"
+        assert item.canonical_adapter.committed == [(12, "reality")]
+    asyncio.run(scenario())
+
+
+def test_unmapped_session_is_still_not_target():
+    async def scenario():
+        item = service()
+        payload = {"messages": [{"role": "user", "content": "hello"}]}
+        prepared, state = await item._prepare_canonical_turn(request(), payload, "stranger", "hello")
+        assert state == {"enabled": False, "status": "not_target"}
+        assert item.canonical_adapter.pull_calls == 0
     asyncio.run(scenario())

@@ -834,6 +834,21 @@ class GatewayService:
         self.canonical_target_profile_id = str(
             canonical_cfg.get("profile_id") or "jiajia-main"
         ).strip()
+        # session_id -> channel_id. Each channel keeps its own read cursor over the
+        # one shared ledger, so a client that never sends X-Ombre-Session-Id (and
+        # therefore falls back to default_session_id) can still take part.
+        primary_channel = str(canonical_cfg.get("channel_id") or "operit").strip()
+        self.canonical_session_channels: dict[str, str] = {}
+        raw_session_channels = canonical_cfg.get("session_channels")
+        if isinstance(raw_session_channels, dict):
+            for raw_session, raw_channel in raw_session_channels.items():
+                session_key = str(raw_session or "").strip()
+                channel_value = str(raw_channel or "").strip()
+                if session_key and channel_value:
+                    self.canonical_session_channels[session_key] = channel_value
+        self.canonical_session_channels.setdefault(
+            self.canonical_target_session_id, primary_channel
+        )
         self.canonical_adapter = CanonicalContinuationAdapter(
             enabled=self._bool_config_value(canonical_cfg.get("enabled"), False),
             base_url=str(canonical_cfg.get("base_url") or ""),
@@ -906,6 +921,11 @@ class GatewayService:
                     "channel_id": self.canonical_adapter.channel_id,
                     "max_events": self.canonical_adapter.max_events,
                     "cursor": self.canonical_adapter.cursor() if self.canonical_adapter.enabled else 0,
+                    "session_channels": dict(self.canonical_session_channels),
+                    "channel_cursors": {
+                        channel: self.canonical_adapter.cursor(channel)
+                        for channel in sorted(set(self.canonical_session_channels.values()))
+                    } if self.canonical_adapter.enabled else {},
                     "outbox_pending": (
                         self.canonical_adapter.outbox_size() if self.canonical_adapter.enabled else 0
                     ),
@@ -1857,11 +1877,14 @@ class GatewayService:
             logger.exception("Gateway health check failed: %s", exc)
             return JSONResponse({"status": "error", "detail": str(exc)}, status_code=500)
 
+    def _canonical_channel_for_session(self, session_id: str) -> str:
+        return self.canonical_session_channels.get(str(session_id or "").strip(), "")
+
     def _canonical_continuation_active(self, session_id: str) -> bool:
         profile_id = str(getattr(self.persona_engine, "profile_id", "") or "").strip()
         return bool(
             self.canonical_adapter.enabled
-            and session_id == self.canonical_target_session_id
+            and self._canonical_channel_for_session(session_id)
             and profile_id == self.canonical_target_profile_id
         )
 
@@ -1890,12 +1913,14 @@ class GatewayService:
         if not self._canonical_continuation_active(session_id):
             return payload, state
         state = {"enabled": True, "status": "preparing"}
+        channel_id = self._canonical_channel_for_session(session_id)
         request_id = self._canonical_request_id(request, payload, session_id)
-        user_source_event_id = f"operit:{request_id}:user"
+        user_source_event_id = f"{channel_id}:{request_id}:user"
         state.update({
+            "channel_id": channel_id,
             "request_id": request_id,
             "user_source_event_id": user_source_event_id,
-            "through_seq": self.canonical_adapter.cursor(),
+            "through_seq": self.canonical_adapter.cursor(channel_id),
             "event_count": 0,
         })
         try:
@@ -1905,7 +1930,7 @@ class GatewayService:
             state["outbox_status"] = "flush_failed"
             state["outbox_error_type"] = type(exc).__name__
         try:
-            batch = await self.canonical_adapter.pull()
+            batch = await self.canonical_adapter.pull(channel_id)
             state["through_seq"] = batch.through_seq
             state["event_count"] = len(batch.events)
             messages = payload.get("messages")
@@ -1944,8 +1969,12 @@ class GatewayService:
         if not request_id:
             state["assistant_write_status"] = "skipped_no_request_id"
             return
+        channel_id = str(state.get("channel_id") or "").strip()
+        if not channel_id:
+            state["assistant_write_status"] = "skipped_no_channel"
+            return
         result = await self.canonical_adapter.ingest_or_queue(
-            source_event_id=f"operit:{request_id}:assistant",
+            source_event_id=f"{channel_id}:{request_id}:assistant",
             role="assistant", content=assistant_text,
             correlation_id=str(state.get("user_source_event_id") or ""),
         )
@@ -1954,7 +1983,9 @@ class GatewayService:
         )
         through_seq = max(0, int(state.get("through_seq") or 0))
         if state.get("status") != "pull_failed":
-            state["committed_cursor"] = self.canonical_adapter.commit_cursor(through_seq)
+            state["committed_cursor"] = self.canonical_adapter.commit_cursor(
+                through_seq, channel_id
+            )
 
     async def handle_chat(self, request: Request) -> Response:
         auth_result = self._authorize(request.headers.get("Authorization", ""))

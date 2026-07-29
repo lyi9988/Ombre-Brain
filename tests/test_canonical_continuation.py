@@ -27,7 +27,8 @@ def test_pull_filters_non_natural_and_own_events_then_merges_before_current_user
                     {"seq": 4, "event_type": "turn.started", "role": "system"},
                     {"seq": 5, "event_type": "message", "role": "user", "content": "那我下午去。", "source": "app"},
                     {"seq": 6, "event_type": "message", "role": "assistant", "content": "别盯着针。", "source": "conversation-service"},
-                    {"seq": 7, "event_type": "message", "role": "assistant", "content": "own", "source": "ombre-gateway"},
+                    {"seq": 7, "event_type": "message", "role": "assistant", "content": "own",
+                     "source": "ombre-gateway", "source_event_id": "operit:r9:assistant"},
                     {"seq": 8, "event_type": "message", "role": "tool", "content": "secret", "source": "app"},
                 ],
             })
@@ -109,4 +110,43 @@ def test_failed_ingest_is_queued_and_later_flushed(tmp_path):
         status = await healthy.flush_outbox()
         assert status == {"delivered": 1, "pending": 0}
         await healthy.http_client.aclose()
+    asyncio.run(scenario())
+
+
+def test_pull_keeps_events_written_by_other_channels_through_same_bridge(tmp_path):
+    """Every channel writes via the same bridge, so `source` is "ombre-gateway" for
+    all of them. Only our own channel prefix may be filtered, otherwise cross-channel
+    continuation silently degrades to an empty batch."""
+    async def scenario():
+        async def handler(request):
+            return httpx.Response(200, json={
+                "conversation_id": "conv-jiajia-main", "next_after_seq": 12,
+                "items": [
+                    {"seq": 11, "event_type": "message", "role": "user", "content": "Reality 那边说的",
+                     "source": "ombre-gateway", "source_event_id": "reality:r1:user"},
+                    {"seq": 12, "event_type": "message", "role": "assistant", "content": "Operit 自己说的",
+                     "source": "ombre-gateway", "source_event_id": "operit:r1:assistant"},
+                ],
+            })
+        item = adapter(tmp_path, handler, channel_id="operit")
+        item.commit_cursor(10)
+        batch = await item.pull()
+        assert [(event["role"], event["content"]) for event in batch.events] == [
+            ("user", "Reality 那边说的"),
+        ]
+        await item.http_client.aclose()
+    asyncio.run(scenario())
+
+
+def test_cursors_are_isolated_per_channel(tmp_path):
+    """Each channel tracks its own read position in the shared ledger; a single
+    shared cursor would let one channel consume events the other never sees."""
+    async def scenario():
+        item = adapter(tmp_path, lambda request: httpx.Response(200))
+        assert item.commit_cursor(40, "operit") == 40
+        assert item.commit_cursor(7, "reality") == 7
+        assert item.cursor("operit") == 40
+        assert item.cursor("reality") == 7
+        assert item.cursor() == 40  # default channel is the configured one
+        await item.http_client.aclose()
     asyncio.run(scenario())
