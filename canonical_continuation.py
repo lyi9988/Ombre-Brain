@@ -206,6 +206,8 @@ class CanonicalContinuationAdapter:
                 (max(1, min(100, int(limit))),),
             ).fetchall()
         delivered = 0
+        failed = 0
+        max_failures = 3
         for row in rows:
             try:
                 await self.ingest(
@@ -218,7 +220,13 @@ class CanonicalContinuationAdapter:
                         "UPDATE canonical_outbox SET attempts=attempts+1,last_error=? WHERE source_event_id=?",
                         (type(exc).__name__, row["source_event_id"]),
                     )
-                break
+                # Skip this row and keep draining. A single undeliverable event
+                # (oversized summary, malformed content) used to break here and
+                # stall every later event behind it indefinitely.
+                failed += 1
+                if failed >= max_failures:
+                    break
+                continue
             with self._connect() as conn:
                 conn.execute("DELETE FROM canonical_outbox WHERE source_event_id=?", (row["source_event_id"],))
             delivered += 1
@@ -246,5 +254,10 @@ class CanonicalContinuationAdapter:
         response = await self.http_client.post(
             self.base_url + "/bridge/v1/events", json=body, headers=self._headers()
         )
+        # 409 means the bridge already holds this source_event_id. That is the
+        # idempotency guarantee doing its job, not a delivery failure -- treat it
+        # as success so the outbox can retire the row instead of retrying forever.
+        if response.status_code == 409:
+            return {"created": False, "duplicate": True}
         response.raise_for_status()
         return response.json()

@@ -150,3 +150,42 @@ def test_cursors_are_isolated_per_channel(tmp_path):
         assert item.cursor() == 40  # default channel is the configured one
         await item.http_client.aclose()
     asyncio.run(scenario())
+
+
+def test_ingest_treats_409_duplicate_as_success(tmp_path):
+    """409 is the bridge's idempotency guard, not a delivery failure.
+
+    Treating it as an error made already-delivered outbox rows retry forever.
+    """
+    async def scenario():
+        async def handler(request):
+            return httpx.Response(409, json={"error": "duplicate_event"})
+        item = adapter(tmp_path, handler)
+        result = await item.ingest(
+            source_event_id="operit:r3:user", role="user", content="hi",
+        )
+        assert result["duplicate"] is True
+        assert result["created"] is False
+        await item.http_client.aclose()
+    asyncio.run(scenario())
+
+
+def test_flush_outbox_skips_poisoned_row_and_keeps_draining(tmp_path):
+    """One undeliverable event must not stall every event queued behind it."""
+    async def scenario():
+        async def handler(request):
+            body = __import__("json").loads(request.content)
+            if body["source_event_id"] == "operit:bad:user":
+                return httpx.Response(500, json={"error": "boom"})
+            return httpx.Response(200, json={"created": True})
+        item = adapter(tmp_path, handler)
+        item.queue_outbox(source_event_id="operit:bad:user", role="user", content="poison")
+        item.queue_outbox(source_event_id="operit:good1:user", role="user", content="behind it")
+        item.queue_outbox(source_event_id="operit:good2:user", role="user", content="also behind")
+        assert item.outbox_size() == 3
+        result = await item.flush_outbox()
+        # The two healthy rows drain despite the poisoned one being first.
+        assert result["delivered"] == 2
+        assert result["pending"] == 1
+        await item.http_client.aclose()
+    asyncio.run(scenario())

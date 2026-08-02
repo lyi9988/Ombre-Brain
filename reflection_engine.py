@@ -3009,6 +3009,14 @@ class ReflectionEngine:
             same_date = str(item.get("date") or "") == str(existing.get("date") or "")
             if same_date and new_topics and (new_topics & self._daily_chat_memory_topic_keys(existing)):
                 return True
+            # Same source turns/events = literally the same conversation, no
+            # matter which day the extractor happened to pick it up on. This is
+            # the reliable cross-day signal; wording drifts, turn ids do not.
+            if new_sources:
+                existing_sources = (set(existing.get("source_event_ids") or [])
+                                    or set(existing.get("source_turn_ids") or []))
+                if existing_sources and new_sources & existing_sources:
+                    return True
             title_overlap = self._daily_chat_memory_token_overlap(
                 new_title_tokens,
                 self._daily_chat_memory_similarity_tokens(str(existing.get("title") or "")),
@@ -3232,6 +3240,17 @@ class ReflectionEngine:
             if event_id is not None
         ]
         normalized = []
+        # Compare against everything already proposed, including items 润润 已经
+        # 否决过的. Without this the dedup only ever saw the current run's batch,
+        # so identical content resurfaced day after day and past rejections were
+        # silently ignored.
+        # Stored records wrap the real payload: {"id","date","status","candidate":{...}}.
+        # The comparator needs the inner candidate dicts, not the wrappers.
+        history = [
+            record.get("candidate") or record
+            for record in (self._load_daily_chat_memory_payload().get("items") or [])
+            if isinstance(record, dict)
+        ]
         for candidate in candidates or []:
             if candidate.get("should_write") is False:
                 continue
@@ -3287,7 +3306,7 @@ class ReflectionEngine:
                 "source_event_ids": source_event_ids,
                 "reason": str(candidate.get("reason") or "").strip()[:160],
             })
-            if self._daily_chat_memory_duplicate_candidate(item, normalized):
+            if self._daily_chat_memory_duplicate_candidate(item, normalized + history):
                 continue
             normalized.append(item)
             if len(normalized) >= int(max_candidates or self.daily_chat_memory_max_per_day or 1):

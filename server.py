@@ -12879,41 +12879,33 @@ async def api_config_update(request):
             return save_config
 
         try:
-            save_config = {}
-            if os.path.exists(config_path):
-                with open(config_path, "r", encoding="utf-8") as f:
-                    save_config = yaml.safe_load(f) or {}
-            save_config = _apply_dashboard_config(save_config)
-
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(save_config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-            updated.append("persisted_to_yaml")
+            # Dashboard writes ONLY the runtime overlay, never config.yaml.
+            #
+            # config.yaml is hand-maintained and full of comments explaining why
+            # each value is what it is. Round-tripping it through yaml.safe_load
+            # + yaml.dump silently destroys every comment (PyYAML does not retain
+            # them), so a single Dashboard save used to wipe the whole file's
+            # documentation. The runtime overlay is merged last and wins over
+            # config.yaml anyway, so persisting there has identical effect on
+            # behaviour while leaving the hand-written file untouched.
+            runtime_config = {}
             if os.path.exists(runtime_config_path):
-                runtime_config = {}
                 with open(runtime_config_path, "r", encoding="utf-8") as f:
                     runtime_config = yaml.safe_load(f) or {}
-                runtime_config = _apply_dashboard_config(runtime_config)
-                os.makedirs(os.path.dirname(runtime_config_path), exist_ok=True)
-                with open(runtime_config_path, "w", encoding="utf-8") as f:
-                    yaml.dump(runtime_config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-                updated.append("runtime_yaml_synced")
+            runtime_config = _apply_dashboard_config(runtime_config)
+            os.makedirs(os.path.dirname(runtime_config_path), exist_ok=True)
+            with open(runtime_config_path, "w", encoding="utf-8") as f:
+                yaml.dump(runtime_config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            updated.append("persisted_to_runtime_yaml")
+            updated.append("config_yaml_left_untouched")
         except Exception as e:
-            try:
-                runtime_config = {}
-                if os.path.exists(runtime_config_path):
-                    with open(runtime_config_path, "r", encoding="utf-8") as f:
-                        runtime_config = yaml.safe_load(f) or {}
-                runtime_config = _apply_dashboard_config(runtime_config)
-                os.makedirs(os.path.dirname(runtime_config_path), exist_ok=True)
-                with open(runtime_config_path, "w", encoding="utf-8") as f:
-                    yaml.dump(runtime_config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-                updated.append("persisted_to_runtime_yaml")
-                updated.append(f"config_yaml_unwritable:{type(e).__name__}")
-            except Exception as fallback_e:
-                return JSONResponse(
-                    {"error": f"persist failed: {e}; runtime persist failed: {fallback_e}", "updated": updated},
-                    status_code=500,
-                )
+            # The old fallback re-tried the runtime overlay here, which is now the
+            # primary (and only) write target -- retrying it would just repeat the
+            # same failure. Report instead of silently double-writing.
+            return JSONResponse(
+                {"error": f"runtime persist failed: {e}", "updated": updated},
+                status_code=500,
+            )
 
     if body.get("persist_env", False):
         if "OMBRE_API_KEY" not in env_updates:

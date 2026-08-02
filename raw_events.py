@@ -38,6 +38,11 @@ CLIENT_CONTEXT_BLOCK_TITLES = {
     "最近通知",
     "相关记忆",
     "屏幕文本",
+    # Rolling windows: these blocks carry PRIOR days' entries forward, so letting
+    # them into the archive means the same text is re-ingested every single day
+    # and the daily extractor keeps re-proposing it as "new" memory.
+    "今日浏览",
+    "我自己今天看的",
 }
 
 
