@@ -1,9 +1,11 @@
+import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
+import weakref
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any
@@ -104,6 +106,12 @@ class PersonaStateEngine:
         self.persona_cfg = config.get("persona", {})
         self.enabled = bool(self.persona_cfg.get("enabled", True))
         self.profile_id = self.persona_cfg.get("profile_id", "haven_xiaoyu")
+        self.canonical_session_id = str(
+            self.persona_cfg.get("canonical_session_id") or ""
+        ).strip()
+        self._exchange_locks: weakref.WeakValueDictionary[
+            tuple[str, str], asyncio.Lock
+        ] = weakref.WeakValueDictionary()
         self.mode = self.persona_cfg.get("mode", "llm")
         self.base_url = self.persona_cfg.get("base_url", "https://api.deepseek.com/v1")
         self.model = self.persona_cfg.get("model", "deepseek-chat")
@@ -330,11 +338,16 @@ class PersonaStateEngine:
     def _post_reply_evaluation_prompt(self) -> str:
         return render_identity_template(POST_REPLY_EVALUATION_PROMPT_TEMPLATE, self.identity)
 
+    def _affect_session_id(self, session_id: str) -> str:
+        """Map channel sessions to one identity-wide short affect state when configured."""
+        return self.canonical_session_id or str(session_id or "").strip() or "main"
+
     async def build_pre_reply_guidance(self, session_id: str, latest_user_message: str = "") -> dict:
         now = self._now()
+        affect_session_id = self._affect_session_id(session_id)
         global_state = self._ensure_global_state(now)
-        session_state = self._ensure_session_state(session_id, now)
-        session_state = self._apply_session_decay(session_id, session_state, now)
+        session_state = self._ensure_session_state(affect_session_id, now)
+        session_state = self._apply_session_decay(affect_session_id, session_state, now)
         return self._snapshot(global_state, session_state, self.fallback_guidance)
 
     async def update_from_user_message(self, session_id: str, user_message: str) -> dict:
@@ -349,10 +362,37 @@ class PersonaStateEngine:
         tool_summary: str = "",
         recent_conversation_turns: list[dict] | None = None,
     ) -> dict:
+        source_session_id = str(session_id or "").strip() or "main"
+        affect_session_id = self._affect_session_id(source_session_id)
+        lock_key = (self.profile_id, affect_session_id)
+        lock = self._exchange_locks.get(lock_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._exchange_locks[lock_key] = lock
+        async with lock:
+            return await self._update_from_exchange_locked(
+                session_id=session_id,
+                user_message=user_message,
+                assistant_response=assistant_response,
+                recalled_memory_ids=recalled_memory_ids,
+                tool_summary=tool_summary,
+                recent_conversation_turns=recent_conversation_turns,
+            )
+
+    async def _update_from_exchange_locked(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_response: str,
+        recalled_memory_ids: list[str] | None = None,
+        tool_summary: str = "",
+        recent_conversation_turns: list[dict] | None = None,
+    ) -> dict:
         now = self._now()
+        affect_session_id = self._affect_session_id(session_id)
         global_state = self._ensure_global_state(now)
-        session_state = self._ensure_session_state(session_id, now)
-        session_state = self._apply_session_decay(session_id, session_state, now)
+        session_state = self._ensure_session_state(affect_session_id, now)
+        session_state = self._apply_session_decay(affect_session_id, session_state, now)
 
         cleaned_user_message = self._clean_client_status_lines(user_message)
 
@@ -391,8 +431,14 @@ class PersonaStateEngine:
             return self._snapshot(global_state, session_state, self.fallback_guidance)
 
         global_state = self._apply_global_delta(global_state, evaluation, now)
-        session_state = self._apply_session_delta(session_id, session_state, evaluation, now)
-        self._mark_exchange_processed(session_id, exchange_hash)
+        session_state = self._apply_session_delta(
+            affect_session_id,
+            session_state,
+            evaluation,
+            now,
+            processed_session_id=session_id,
+            exchange_hash=exchange_hash,
+        )
         if self._should_record_event(session_id, evaluation, now):
             self._record_event(
                 session_id=session_id,
@@ -528,9 +574,10 @@ class PersonaStateEngine:
 
     def get_current_state(self, session_id: str) -> dict:
         now = self._now()
+        affect_session_id = self._affect_session_id(session_id)
         global_state = self._ensure_global_state(now)
-        session_state = self._ensure_session_state(session_id, now)
-        session_state = self._apply_session_decay(session_id, session_state, now)
+        session_state = self._ensure_session_state(affect_session_id, now)
+        session_state = self._apply_session_decay(affect_session_id, session_state, now)
         return self._snapshot(global_state, session_state, self.fallback_guidance)
 
     def get_self_model_state(self, session_id: str) -> dict:
@@ -539,6 +586,7 @@ class PersonaStateEngine:
         Falls back to old tables if self_model has no data for this session.
         Does NOT read pending_review or legacy_imported narrative.
         """
+        affect_session_id = self._affect_session_id(session_id)
         conn = self._connect()
         try:
             # Try self_model_state first
@@ -546,7 +594,7 @@ class PersonaStateEngine:
                 """SELECT valence, arousal, tenderness, possessiveness, longing,
                           security, protective_drive, mood_label, residue, inner_thought
                    FROM self_model_state WHERE profile_id=? AND session_id=?""",
-                (self.profile_id, session_id),
+                (self.profile_id, affect_session_id),
             ).fetchone()
             if sm_row is None:
                 conn.close()
@@ -610,9 +658,10 @@ class PersonaStateEngine:
             or (sessions[0]["session_id"] if sessions else "")
             or "dashboard-preview"
         )
+        affect_session_id = self._affect_session_id(active_session_id)
         if session_id or sessions:
-            session_state = self._ensure_session_state(active_session_id, now)
-            session_state = self._apply_session_decay(active_session_id, session_state, now)
+            session_state = self._ensure_session_state(affect_session_id, now)
+            session_state = self._apply_session_decay(affect_session_id, session_state, now)
             sessions = self._list_sessions(sessions_limit)
         else:
             session_state = {
@@ -913,7 +962,15 @@ class PersonaStateEngine:
         conn.close()
         return updated
 
-    def _apply_session_delta(self, session_id: str, state: dict, evaluation: dict, now: datetime) -> dict:
+    def _apply_session_delta(
+        self,
+        session_id: str,
+        state: dict,
+        evaluation: dict,
+        now: datetime,
+        processed_session_id: str | None = None,
+        exchange_hash: str | None = None,
+    ) -> dict:
         updated = dict(state)
         affect_delta = evaluation["affect_delta"]
         relationship_delta = evaluation["relationship_delta"]
@@ -929,11 +986,31 @@ class PersonaStateEngine:
         updated["residue"] = evaluation.get("residue") or updated.get("residue", "")
         updated["inner_thought"] = evaluation.get("inner_thought") or updated.get("inner_thought", "")
         updated["updated_at"] = self._format_time(now)
-        self._save_session_state(session_id, updated)
+        conn = self._connect()
+        try:
+            self._write_session_state(conn, session_id, updated)
+            if processed_session_id and exchange_hash:
+                self._insert_exchange_processed(conn, processed_session_id, exchange_hash)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
         return updated
 
     def _save_session_state(self, session_id: str, state: dict) -> None:
         conn = self._connect()
+        self._write_session_state(conn, session_id, state)
+        conn.commit()
+        conn.close()
+
+    def _write_session_state(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        state: dict,
+    ) -> None:
         conn.execute(
             """
             UPDATE persona_session_state
@@ -959,8 +1036,6 @@ class PersonaStateEngine:
                 session_id,
             ),
         )
-        conn.commit()
-        conn.close()
 
     def _record_event(
         self,
@@ -1142,13 +1217,50 @@ class PersonaStateEngine:
     def format_state_block(self, state: dict) -> str:
         affect = state.get("affect", {})
         relationship = state.get("relationship", {})
-        return "\n".join(
-            [
-                "Long-term State Summary",
-                f"最近基调：{self._long_term_state_summary(affect, relationship)}",
-                "使用方式：只在语气上轻轻参考，不替你做判断。不要提到你的状态。",
-            ]
-        )
+        lines = [
+            "Current Private Affect",
+            f"当前短态：{self._current_affect_summary(affect, relationship)}",
+        ]
+        residue = self._clip_private_state_text(affect.get("residue"), 90)
+        if residue:
+            lines.append(f"上一轮余韵：{residue}")
+        lines.append("只让短态轻轻影响语气、主动性和亲近方式；不要复述数值，不要提到隐藏状态。")
+        return "\n".join(lines)
+
+    def _current_affect_summary(self, affect: dict, relationship: dict) -> str:
+        valence = self._clamp_float(affect.get("valence", 0.5))
+        arousal = self._clamp_float(affect.get("arousal", 0.3))
+        if valence >= 0.68:
+            baseline = "心绪偏明亮"
+        elif valence <= 0.40:
+            baseline = "心绪有些低沉"
+        else:
+            baseline = "心绪平稳"
+        if arousal >= 0.62:
+            baseline += "、情绪张力较高"
+        elif arousal <= 0.24:
+            baseline += "、很安静"
+
+        signals: list[str] = []
+        if self._clamp_float(affect.get("tenderness", 0.0)) >= 0.72:
+            signals.append("温柔感明显")
+        if self._clamp_float(affect.get("longing", 0.0)) >= 0.45:
+            signals.append("有想念")
+        if self._clamp_float(affect.get("protective_drive", 0.0)) >= 0.62:
+            signals.append("保护欲更强")
+        if self._clamp_float(affect.get("security", 0.5)) <= 0.45:
+            signals.append("安全感偏低")
+        if self._clamp_float(affect.get("possessiveness", 0.0)) >= 0.45:
+            signals.append("有一点占有欲")
+        if self._clamp_float(relationship.get("defensiveness", 0.0)) >= 0.35:
+            signals.append("有一点防备")
+        if signals:
+            baseline += "，" + self._join_chinese_phrases(signals[:3])
+        return baseline + "。"
+
+    @staticmethod
+    def _clip_private_state_text(value: Any, limit: int) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
 
     def _long_term_state_summary(self, affect: dict, relationship: dict) -> str:
         affinity = self._clamp_float(relationship.get("affinity", 0.5))
@@ -1253,6 +1365,16 @@ class PersonaStateEngine:
 
     def _mark_exchange_processed(self, session_id: str, exchange_hash: str) -> None:
         conn = self._connect()
+        self._insert_exchange_processed(conn, session_id, exchange_hash)
+        conn.commit()
+        conn.close()
+
+    def _insert_exchange_processed(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        exchange_hash: str,
+    ) -> None:
         conn.execute(
             """
             INSERT OR IGNORE INTO persona_exchange_log
@@ -1261,8 +1383,6 @@ class PersonaStateEngine:
             """,
             (self.profile_id, session_id, exchange_hash, self._format_time(self._now())),
         )
-        conn.commit()
-        conn.close()
 
     def _should_record_event(self, session_id: str, evaluation: dict, now: datetime) -> bool:
         if not self.event_recording_enabled:

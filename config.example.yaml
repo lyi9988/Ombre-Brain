@@ -428,7 +428,7 @@ gateway:
   favorite_memory_max_cards: 1
   related_memory_budget: 220
   core_memory_interval_rounds: 0
-  current_inner_state_interval_rounds: 0
+  current_inner_state_interval_rounds: 1  # inject the latest short affect every turn
   relationship_weather_interval_rounds: 0
   favorite_memory_interval_rounds: 0
   word_map_hint_enabled: false       # true lets derived Word Map add weak recall candidates; still gated by RecallPolicy
@@ -590,6 +590,7 @@ memory_relevance:
 persona:
   enabled: true
   profile_id: "main_profile"
+  canonical_session_id: ""  # one identity-wide affect session for cross-channel continuity
   mode: "llm"
   base_url: "https://api.deepseek.com/v1"
   model: "deepseek-chat"

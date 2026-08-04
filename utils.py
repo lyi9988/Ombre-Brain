@@ -313,7 +313,7 @@ def load_config(config_path: str = None) -> dict:
             "active_reminders_enabled": True,
             "active_reminder_inject_limit": 2,
             "core_memory_interval_rounds": 0,
-            "current_inner_state_interval_rounds": 15,
+            "current_inner_state_interval_rounds": 1,
             "relationship_weather_interval_rounds": 0,
             "favorite_memory_interval_rounds": 0,
             "semantic_weight": 0.45,
@@ -333,6 +333,7 @@ def load_config(config_path: str = None) -> dict:
         "persona": {
             "enabled": True,
             "profile_id": "haven_xiaoyu",
+            "canonical_session_id": "",
             "mode": "llm",
             "base_url": "https://api.deepseek.com/v1",
             "model": "deepseek-chat",
