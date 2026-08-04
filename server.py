@@ -7971,6 +7971,30 @@ async def list_buckets_light(
         return {"error": str(e), "buckets": []}
 
 
+@mcp.tool()
+async def persona_projection(session_id: str = "") -> dict:
+    """Owner-safe current affect/drive projection; excludes private narrative and Self Model."""
+    try:
+        canonical = str(getattr(persona_engine, "canonical_session_id", "") or "").strip()
+        effective_session = canonical or str(session_id or "").strip() or "main"
+        state = persona_engine.get_current_state(effective_session)
+        updated_at = ""
+        dashboard = persona_engine.get_dashboard_payload(
+            session_id=effective_session, events_limit=1, sessions_limit=20
+        )
+        for item in dashboard.get("sessions", []):
+            if str(item.get("session_id") or "") == effective_session:
+                updated_at = str(item.get("updated_at") or "")
+                break
+        from persona_projection import safe_persona_projection
+        return safe_persona_projection(
+            state, updated_at, profile_id=str(getattr(persona_engine, "profile_id", ""))
+        )
+    except Exception:
+        logger.exception("Owner-safe persona projection failed")
+        return {"error": "projection_unavailable"}
+
+
 # =============================================================
 # Tool 1.6: comment_bucket — add a ring/comment to a memory
 # 工具 1.6：comment_bucket — 给记忆追加年轮
