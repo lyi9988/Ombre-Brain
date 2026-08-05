@@ -653,16 +653,21 @@ class PersonaStateEngine:
         now = self._now()
         global_state = self._ensure_global_state(now)
         sessions = self._list_sessions(sessions_limit)
-        active_session_id = (
-            session_id
-            or (sessions[0]["session_id"] if sessions else "")
+        canonical_session_id = str(self.canonical_session_id or "").strip()
+        active_session_id = canonical_session_id or (
+            session_id or (sessions[0]["session_id"] if sessions else "")
             or "dashboard-preview"
         )
         affect_session_id = self._affect_session_id(active_session_id)
-        if session_id or sessions:
+        if canonical_session_id or session_id or sessions:
             session_state = self._ensure_session_state(affect_session_id, now)
             session_state = self._apply_session_decay(affect_session_id, session_state, now)
             sessions = self._list_sessions(sessions_limit)
+            if canonical_session_id:
+                sessions = [
+                    item for item in sessions
+                    if item.get("session_id") == canonical_session_id
+                ]
         else:
             session_state = {
                 "profile_id": self.profile_id,
@@ -675,7 +680,9 @@ class PersonaStateEngine:
                 "inner_thought": self.default_affect.get("inner_thought", ""),
                 "updated_at": self._format_time(now),
             }
-        events = self._list_events(events_limit, active_session_id)
+        events = self._list_events(
+            events_limit, None if canonical_session_id else active_session_id
+        )
         guidance = (
             events[0].get("reply_guidance")
             if events and events[0].get("reply_guidance")

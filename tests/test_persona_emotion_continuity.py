@@ -184,6 +184,18 @@ class PersonaEmotionContinuityTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("温柔感明显", block)
         self.assertNotIn("0.", block)
 
+    def test_dashboard_only_exposes_canonical_persona_state(self):
+        self.engine._ensure_session_state("aizizhu-app", self.engine._now())
+        self.engine._ensure_session_state("main", self.engine._now())
+
+        payload = self.engine.get_dashboard_payload(session_id="aizizhu-app")
+
+        self.assertEqual(payload["active_session_id"], "jiajia-main")
+        self.assertEqual(
+            [item["session_id"] for item in payload["sessions"]],
+            ["jiajia-main"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
