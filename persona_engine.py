@@ -644,6 +644,35 @@ class PersonaStateEngine:
                 pass
             return self.get_current_state(session_id)  # fallback on any error
 
+    def get_pending_proposal_counts(self) -> dict:
+        """Read-only pending Self Model proposal counts, grouped by layer.
+
+        Profile-constrained COUNT/GROUP BY on ``self_model_narrative``.
+        Never reads proposal content, never writes the database, never
+        exposes the profile id. Degrades to zero counts when the table is
+        absent (e.g. a fresh local DB).
+        """
+        try:
+            conn = self._connect()
+        except Exception:
+            return {"total": 0, "by_layer": {}}
+        try:
+            rows = conn.execute(
+                "SELECT layer, COUNT(*) FROM self_model_narrative "
+                "WHERE profile_id=? AND event_type='proposal' AND status='pending' "
+                "GROUP BY layer",
+                (self.profile_id,),
+            ).fetchall()
+        except Exception:
+            return {"total": 0, "by_layer": {}}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        by_layer = {str(row[0]): int(row[1]) for row in rows}
+        return {"total": sum(by_layer.values()), "by_layer": by_layer}
+
     def get_dashboard_payload(
         self,
         session_id: str | None = None,

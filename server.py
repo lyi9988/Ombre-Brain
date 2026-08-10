@@ -9363,6 +9363,46 @@ async def portrait_state() -> dict:
     return await _portrait_state_payload()
 
 
+@mcp.tool()
+async def owner_portrait_snapshot() -> dict:
+    """Owner-only read snapshot of the daily portrait (Portrait Viewer v0).
+
+    只读裁剪后的画像视图，供主人在 Reality 查看真实 stable/mid-term/
+    recent/staging/history 正文与元数据。绝不调用 portrait_maintain、edit、
+    lock、rollback，绝不写 state，绝不暴露 state_path/bucket/session/
+    profile ID、token、URL 或 pending proposal 正文。
+    """
+    try:
+        from owner_portrait import build_owner_portrait_snapshot
+        state = portrait_engine.load_state()
+        anchor = await _owner_self_anchor_payload()
+        pending = persona_engine.get_pending_proposal_counts()
+        return build_owner_portrait_snapshot(
+            state,
+            enabled=bool(getattr(portrait_engine, "enabled", True)),
+            auto_enabled=bool(getattr(portrait_engine, "auto_enabled", True)),
+            auto_initial_enabled=bool(getattr(portrait_engine, "auto_initial_enabled", False)),
+            daily_enabled=bool(getattr(portrait_engine, "daily_enabled", True)),
+            self_anchor=anchor,
+            pending=pending,
+        )
+    except Exception:
+        logger.exception("Owner portrait snapshot failed")
+        return {"error": "portrait_unavailable"}
+
+
+async def _owner_self_anchor_payload() -> dict:
+    """Self-anchor text for the owner view; strips bucket id/name/path."""
+    payload = await _self_anchor_entry_payload()
+    if not payload:
+        return {}
+    return {
+        "text": str(payload.get("text") or ""),
+        "updated_at": str(payload.get("updated_at") or ""),
+        "configured": bool(payload.get("configured")),
+    }
+
+
 # =============================================================
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
