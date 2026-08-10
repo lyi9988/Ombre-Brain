@@ -1916,12 +1916,24 @@ class GatewayService:
         channel_id = self._canonical_channel_for_session(session_id)
         request_id = self._canonical_request_id(request, payload, session_id)
         user_source_event_id = f"{channel_id}:{request_id}:user"
+        origin_source_event_ids = list(dict.fromkeys(
+            value
+            for value in (
+                str(request.headers.get("X-Ombre-Canonical-Source-Event-Id") or "").strip(),
+                str(request.headers.get("X-Ombre-Canonical-Assistant-Source-Event-Id") or "").strip(),
+            )
+            if value
+        ))
         state.update({
             "channel_id": channel_id,
             "request_id": request_id,
             "user_source_event_id": user_source_event_id,
             "through_seq": self.canonical_adapter.cursor(channel_id),
             "event_count": 0,
+            # Aizizhu already owns the canonical user/assistant events for turns
+            # carrying origin IDs. Keep pull/merge and all prompt injection, but
+            # do not mirror the same logical turn back into its event ledger.
+            "mirror_write_enabled": not bool(origin_source_event_ids),
         })
         try:
             flush = await self.canonical_adapter.flush_outbox()
@@ -1942,7 +1954,9 @@ class GatewayService:
             state["status"] = "pull_failed"
             state["pull_error_type"] = type(exc).__name__
         user_text = str(current_user_text or "").strip()
-        if user_text:
+        if not state["mirror_write_enabled"]:
+            state["user_write_status"] = "skipped_origin_owned"
+        elif user_text:
             result = await self.canonical_adapter.ingest_or_queue(
                 source_event_id=user_source_event_id, role="user", content=user_text,
             )
@@ -1957,6 +1971,14 @@ class GatewayService:
         self, state: dict[str, Any] | None, assistant_message: dict[str, Any] | None,
     ) -> None:
         if not isinstance(state, dict) or not state.get("enabled"):
+            return
+        if not state.get("mirror_write_enabled", True):
+            state["assistant_write_status"] = "skipped_origin_owned"
+            through_seq = max(0, int(state.get("through_seq") or 0))
+            if state.get("status") != "pull_failed":
+                state["committed_cursor"] = self.canonical_adapter.commit_cursor(
+                    through_seq, str(state.get("channel_id") or "").strip()
+                )
             return
         if not self._assistant_message_has_output(assistant_message):
             state["assistant_write_status"] = "skipped_no_output"
