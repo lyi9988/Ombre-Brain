@@ -173,6 +173,19 @@ class DarkroomStore:
             locked = self._locked_payload_unlocked(entry)
             if locked:
                 return locked
+            prior_release = self._prior_release_unlocked(entry["id"])
+            if prior_release:
+                # Idempotent repeat-release guard: never append a second
+                # release record or bump released_count again.
+                # 重复释放保护：不追加第二条释放记录，也不重复计数。
+                return {
+                    "status": "already_released",
+                    "entry_id": entry["id"],
+                    "room_id": self._entry_room_id(entry),
+                    "revision": entry.get("revision", 1),
+                    "created_at": entry.get("created_at", ""),
+                    "released_at": str(prior_release.get("created_at") or ""),
+                }
             release = {
                 "id": f"rel_{secrets.token_hex(6)}",
                 "entry_id": entry["id"],
@@ -466,6 +479,26 @@ class DarkroomStore:
         for entry in self._iter_entries_unlocked(visibility="active"):
             if entry.get("id") == target and not entry.get("room_id"):
                 return entry
+        return None
+
+    def _prior_release_unlocked(self, entry_id: str) -> dict | None:
+        """Return the first release record for an entry, or None.
+
+        Read-only lookup over the append-only release log. Never writes.
+        """
+        if not self.release_log_path.exists():
+            return None
+        with self.release_log_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(data, dict) and data.get("entry_id") == entry_id:
+                    return data
         return None
 
     def _iter_entries_unlocked(self, *, visibility: str | None = None):

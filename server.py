@@ -8353,6 +8353,32 @@ async def hold(
 # Tool 2.5: darkroom — Private unfinished reflection
 # 工具 2.5：darkroom — 暗房，存放未显影的内在反思
 # =============================================================
+_DARKROOM_LATEST_IDS = {"", "latest"}
+
+
+def _darkroom_error(code: str, message: str, **extra) -> dict:
+    """Stable whitelisted error envelope for darkroom MCP tools.
+
+    Never carries tokens, file paths, state_dir, bucket/session/profile ids,
+    prompts or hidden reasoning. Codes: no_active_room / room_not_found /
+    invalid_state / already_released / permission_denied / internal_error.
+    """
+    payload = {"status": "error", "error_code": code, "error": message}
+    payload.update(extra)
+    return payload
+
+
+def _darkroom_is_latest(entry_id: str) -> bool:
+    return str(entry_id or "latest").strip() in _DARKROOM_LATEST_IDS
+
+
+def _darkroom_has_active_room() -> bool:
+    try:
+        return int(darkroom_store.status().get("count") or 0) > 0
+    except Exception:
+        return False
+
+
 @mcp.tool()
 async def darkroom_enter(
     note: str,
@@ -8377,7 +8403,7 @@ async def darkroom_enter(
             new_room=new_room,
         )
     except ValueError as exc:
-        return {"status": "error", "error": str(exc)}
+        return _darkroom_error("invalid_state", str(exc))
 
 
 @mcp.tool()
@@ -8386,7 +8412,7 @@ async def darkroom_rooms(limit: int = 20, visibility: str = "active") -> dict:
     try:
         return darkroom_store.rooms(limit=limit, visibility=visibility)
     except ValueError as exc:
-        return {"status": "error", "error": str(exc)}
+        return _darkroom_error("invalid_state", str(exc))
 
 
 @mcp.tool()
@@ -8395,20 +8421,42 @@ async def darkroom_view(entry_id: str = "latest") -> dict:
     try:
         return darkroom_store.view(entry_id=entry_id)
     except KeyError:
-        return {"status": "error", "error": "entry not found"}
+        if _darkroom_is_latest(entry_id) and not _darkroom_has_active_room():
+            return _darkroom_error("no_active_room", "没有活动暗房房间")
+        return _darkroom_error("room_not_found", "暗房条目不存在")
 
 
+@mcp.tool()
 async def darkroom_status() -> dict:
     """查看暗房门口状态。不返回任何暗房正文。"""
-    return darkroom_store.status()
-
-
-async def darkroom_release(entry_id: str = "latest", reason: str = "") -> dict:
-    """把一条暗房内容显影并带出来。这个工具会公开返回正文,只在明确想让内容可见时调用。"""
     try:
-        return darkroom_store.release(entry_id=entry_id, reason=reason)
+        return darkroom_store.status()
+    except Exception as exc:
+        logger.warning("darkroom status failed / 暗房状态失败: %s", exc)
+        return _darkroom_error("internal_error", "暗房状态不可用")
+
+
+@mcp.tool()
+async def darkroom_release(entry_id: str = "latest", reason: str = "") -> dict:
+    """把一条暗房内容显影并带出来。重复释放安全返回 already_released；锁定期内返回 permission_denied。"""
+    try:
+        result = darkroom_store.release(entry_id=entry_id, reason=reason)
     except KeyError:
-        return {"status": "error", "error": "entry not found"}
+        if _darkroom_is_latest(entry_id) and not _darkroom_has_active_room():
+            return _darkroom_error("no_active_room", "没有活动暗房房间")
+        return _darkroom_error("room_not_found", "暗房条目不存在")
+    except Exception as exc:
+        logger.warning("darkroom release failed / 暗房释放失败: %s", exc)
+        return _darkroom_error("internal_error", "暗房释放内部错误")
+    if result.get("status") == "locked":
+        return _darkroom_error(
+            "permission_denied",
+            "暗房条目锁定中，未到解锁时间",
+            entry_id=result.get("entry_id", ""),
+            room_id=result.get("room_id", ""),
+            unlock_at=result.get("unlock_at", ""),
+        )
+    return result
 
 
 # =============================================================
