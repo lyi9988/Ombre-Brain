@@ -1845,18 +1845,42 @@ class ReflectionEngine:
     ) -> list[dict]:
         materials: list[dict] = []
         for candidate in daily_chat_memory_candidates or []:
+            if not self._daily_chat_memory_candidate_is_material(candidate):
+                continue
             material = self._daily_chat_memory_material(candidate)
             if material and (not key or material.get("date") == key):
                 materials.append(material)
         for item in self._load_daily_chat_memory_pending():
             if str(item.get("date") or "") != key:
                 continue
-            if str(item.get("status") or "pending") not in {"pending", "confirmed"}:
+            item_status = str(item.get("status") or "pending").strip().lower()
+            candidate = item.get("candidate") if isinstance(item.get("candidate"), dict) else {}
+            if not self._daily_chat_memory_candidate_is_material(candidate, status=item_status):
                 continue
-            material = self._daily_chat_memory_material(item.get("candidate") or {})
+            material = self._daily_chat_memory_material(candidate)
             if material:
                 materials.append(material)
         return self._dedupe_daily_chat_memory_materials(materials)
+
+    @staticmethod
+    def _daily_chat_memory_candidate_is_material(
+        candidate: dict,
+        *,
+        status: str | None = None,
+    ) -> bool:
+        """Allow only adopted candidate projections into reflection/activity paths."""
+        if not isinstance(candidate, dict):
+            return False
+        mode = str(candidate.get("mode") or "").strip().lower()
+        candidate_status = str(
+            status if status is not None else candidate.get("status") or ""
+        ).strip().lower()
+        if mode == "review":
+            return candidate_status == "confirmed"
+        if mode == "auto":
+            return candidate_status == "applied"
+        # Backward-compatible confirmed records from the original JSON flow.
+        return candidate_status in {"confirmed", "applied"}
 
     @staticmethod
     def _dedupe_daily_chat_memory_materials(materials: list[dict]) -> list[dict]:
@@ -2434,6 +2458,10 @@ class ReflectionEngine:
             }
 
         if effective_mode == "review":
+            candidates = [
+                {**candidate, "mode": "review", "status": "pending"}
+                for candidate in candidates
+            ]
             pending = self._store_daily_chat_memory_pending(candidates, force=force)
             cursor_updated = (
                 self._update_daily_chat_memory_raw_cursor(profile_id, max_seen_raw_event_id, key)
@@ -2458,6 +2486,24 @@ class ReflectionEngine:
             bucket_mgr,
             embedding_engine=embedding_engine,
         )
+        result_by_id = {
+            str(result.get("id") or ""): result
+            for result in (write_result.get("results") or [])
+            if isinstance(result, dict)
+        }
+        candidates = [
+            {
+                **candidate,
+                "mode": "auto",
+                "status": (
+                    "applied"
+                    if result_by_id.get(str(candidate.get("id") or ""), {}).get("status")
+                    in {"created", "exists"}
+                    else "apply_failed"
+                ),
+            }
+            for candidate in candidates
+        ]
         cursor_updated = (
             self._update_daily_chat_memory_raw_cursor(profile_id, max_seen_raw_event_id, key)
             if turn_source == "raw_events"
@@ -2592,6 +2638,7 @@ class ReflectionEngine:
                 dict(item.get("candidate") or {}),
                 safe_edits.get(item_id),
             )
+            candidate.update({"mode": "review", "status": "pending"})
             item["candidate"] = candidate
             changed = True
             write_result = await self._write_daily_chat_memory_candidates(
@@ -2602,6 +2649,7 @@ class ReflectionEngine:
             candidate_result = (write_result.get("results") or [{}])[0]
             if candidate_result.get("status") in {"created", "exists"}:
                 item["status"] = "confirmed"
+                item["candidate"]["status"] = "confirmed"
                 item["confirmed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 item["bucket_id"] = candidate_result.get("id") or item_id
                 created += 1 if candidate_result.get("status") == "created" else 0
