@@ -672,10 +672,14 @@ reflection:
   daily_chat_memory_max_per_day: 10 # cap for selected long-term memory candidates
   daily_chat_memory_min_confidence: 0.68 # auto-write threshold
   daily_chat_memory_review_max_per_day: 10 # review mode can surface more candidates without auto-writing them
-  daily_chat_memory_review_min_confidence: 0.55 # lower review threshold; auto still uses daily_chat_memory_min_confidence
-  daily_chat_memory_summary_enabled: true       # first compress chat windows, then extract memory candidates
+  daily_chat_memory_review_min_confidence: 0.55 # review stays recall-friendly; owner filters. Strict confidence is auto-only (daily_chat_memory_min_confidence)
+  daily_chat_memory_summary_enabled: true       # first compress chat windows (locate windows only), then extract candidates from original turns
   daily_chat_memory_summary_window_turns: 14    # overlapping context window so boundaries do not split causality
   daily_chat_memory_summary_stride_turns: 7     # start a new summary window every N turns
+  daily_chat_memory_extraction_turns: 40        # bounded original turns replayed into the final candidate stage (no summary-of-summary)
+  daily_chat_memory_heuristic_confidence: 0.70  # fixed confidence for durable-signal heuristic candidates (per-turn matching)
+  daily_chat_memory_confirm_rate_limit_per_minute: 30 # owner approve/reject sliding-window rate limit (per process)
+  daily_chat_memory_requests_path: ""           # optional; defaults to <state_dir>/daily_chat_memory_requests.json (request_id idempotency ledger)
   daily_chat_memory_api_key_env: "" # optional; leave empty to use the dehydration model
   daily_chat_memory_base_url: ""    # optional; set with api_key_env/model only for a separate daily-chat model
   daily_chat_memory_timeout_seconds: 180

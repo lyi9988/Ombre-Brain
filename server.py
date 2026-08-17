@@ -11535,13 +11535,27 @@ async def api_daily_chat_memory_confirm(request):
     ids = body.get("candidate_ids", [])
     if not isinstance(ids, list) or not ids:
         return JSONResponse({"error": "candidate_ids must be a non-empty list"}, status_code=400)
+    allowed_reasons = {"too_generic", "not_important", "wrong", "duplicate", "other"}
+    reason = str(body.get("reason") or "").strip().lower()
+    if reason and reason not in allowed_reasons:
+        return JSONResponse({"error": f"reason must be one of: {sorted(allowed_reasons)}"}, status_code=400)
     result = await reflection_engine.confirm_daily_chat_memory(
         [str(item or "") for item in ids],
         bucket_mgr,
         embedding_engine=embedding_engine,
         action=action,
         edits=body.get("edits") if isinstance(body.get("edits"), dict) else None,
+        request_id=str(body.get("request_id") or "").strip() or None,
+        reject_reason=reason or None,
+        reject_note=str(body.get("reason_note") or "").strip() or None,
     )
+    if result.get("status") == "rate_limited":
+        return JSONResponse(result, status_code=429)
+    invalid_sources = [
+        item for item in (result.get("results") or []) if item.get("status") == "invalid_source"
+    ]
+    if invalid_sources and not any(item.get("status") in {"created", "exists", "rejected"} for item in (result.get("results") or [])):
+        return JSONResponse(result, status_code=409)
     return JSONResponse(result)
 
 

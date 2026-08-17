@@ -2745,9 +2745,118 @@
     flex-wrap: wrap;
     gap: 8px;
     margin-top: 2px;
+    align-items: center;
+  }
+  .chat-memory-card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .chat-memory-card-head strong {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .chat-memory-select {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+  }
+  .chat-memory-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    margin-bottom: 12px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: rgba(255,255,255,0.20);
+    font-size: 12px;
+    color: var(--text-light);
+  }
+  .chat-memory-batch-select {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .chat-memory-batch-count {
+    font-weight: 600;
+  }
+  .chat-memory-reject-reason {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--text-light);
+    font-size: 11px;
+  }
+  .chat-memory-reject-reason select,
+  .chat-memory-reject-note input,
+  .chat-memory-reject-note-inline {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: rgba(255,255,255,0.42);
+    color: var(--text);
+    font: inherit;
+    line-height: 1.4;
+    padding: 5px 8px;
+    min-width: 0;
+  }
+  .chat-memory-reject-note {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--text-light);
+    font-size: 11px;
+  }
+  .chat-memory-reject-note input {
+    width: 150px;
+  }
+  .chat-memory-reject-note-inline {
+    width: 140px;
+  }
+  .chat-memory-card-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+    gap: 12px;
+  }
+  .chat-memory-column {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .chat-memory-column-title {
+    color: var(--text-light);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .chat-memory-excerpt {
+    overflow-wrap: anywhere;
+    border-left: 2px solid var(--border);
+    padding-left: 8px;
+    color: var(--text);
+  }
+  .chat-memory-excerpt.chat-memory-legacy {
+    color: var(--text-light);
+    font-style: italic;
+  }
+  .chat-memory-card-source {
+    overflow-wrap: anywhere;
+  }
+  .chat-memory-stale {
+    border: 1px solid #c0392b55;
+    border-radius: 8px;
+    padding: 7px 9px;
+    font-size: 12px;
+    color: #a93226;
+    background: rgba(192, 57, 43, 0.07);
   }
 
   @media (max-width: 768px) {
+    .chat-memory-card-grid {
+      grid-template-columns: 1fr;
+    }
     .chat-memory-edit-grid {
       grid-template-columns: 1fr;
     }
@@ -3258,7 +3367,7 @@
     <div class="reflection-toolbar">
       <div class="reflection-title">
         <h2>记忆候选</h2>
-        <p>每天本地零点后从原文保险箱里挑长期记忆；Review 模式下候选需主人确认后才作为正式 daily_chat_memory，Auto 模式继续自动采用。</p>
+        <p>每天本地零点后从原文保险箱里挑长期记忆；Review 模式下候选需主人确认后才作为正式 daily_chat_memory，Auto 模式继续自动采用。每条候选按「原文摘录 / 建议记忆 / 来源 / 状态」展示；历史候选若缺少原文摘录会如实标注「历史候选无原文摘录」。打开或刷新本页不会改变任何候选状态。</p>
       </div>
     </div>
     <div class="bucket-bulk-message" id="daily-chat-memory-message"></div>
@@ -8806,7 +8915,7 @@ function loadDashboardModule(path) {
   document.body.appendChild(script);
 }
 
-loadDashboardModule('/dashboard-assets/chat-memory.js?v=20260706-chat-memory-edit');
+loadDashboardModule('/dashboard-assets/chat-memory.js?v=20260818-review-v2');
 </script>
 </body>
 </html>
