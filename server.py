@@ -11515,6 +11515,28 @@ async def api_daily_chat_memory_pending(request):
     return JSONResponse({"status": "ok", "items": items})
 
 
+@mcp.custom_route("/api/daily-chat-memory/source-preview", methods=["GET"])
+async def api_daily_chat_memory_source_preview(request):
+    """Owner-only read of the complete sanitized source text behind a candidate."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    candidate_id = str(request.query_params.get("candidate_id") or "").strip()
+    if not candidate_id:
+        return JSONResponse({"error": "candidate_id is required"}, status_code=400)
+    profile_id = str(getattr(persona_engine, "profile_id", "") or "default")
+    result = await reflection_engine.daily_chat_memory_source_preview(
+        candidate_id,
+        raw_event_store=raw_event_store,
+        conversation_turn_store=gateway_state_store,
+        profile_id=profile_id,
+    )
+    if result.get("status") == "missing":
+        return JSONResponse({"error": "candidate not found"}, status_code=404)
+    return JSONResponse(result)
+
+
 @mcp.custom_route("/api/daily-chat-memory/confirm", methods=["POST"])
 async def api_daily_chat_memory_confirm(request):
     """Confirm or reject pending daily chat memory candidates."""

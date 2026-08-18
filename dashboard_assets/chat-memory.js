@@ -25,6 +25,11 @@
     return Boolean(display.confirm_blocked);
   }
 
+  function hasSourcePreview(item) {
+    var display = item && item.display ? item.display : {};
+    return Boolean(display.has_source_preview);
+  }
+
   async function loadDailyChatMemoryPending() {
     var target = document.getElementById('daily-chat-memory-pending');
     if (!target) return;
@@ -41,10 +46,8 @@
   }
 
   function renderDailyChatMemoryPending(items) {
+    if (!items.length) return '<div class="loading">暂无待确认候选。</div>';
     var toolbar = renderDailyChatMemoryToolbar(items);
-    if (!items.length) {
-      return '<div class="loading">暂无待确认候选。</div>';
-    }
     var cards = items.map(renderDailyChatMemoryCard).join('');
     return toolbar + '<div class="chat-memory-list" id="daily-chat-memory-cards">' + cards + '</div>';
   }
@@ -78,8 +81,9 @@
     var id = item.id || '';
     var legacy = legacyNoOriginal(item);
     var blocked = confirmBlocked(item);
-    var excerpt = String(candidate.original_excerpt || '').trim() || (legacy ? '历史候选无原文摘录' : '（无摘录）');
-    var proposed = String(candidate.proposed_memory || candidate.content || '').trim();
+    var hasSource = hasSourcePreview(item);
+    var excerpt = String(candidate.original_excerpt || '').trim() || (legacy ? '历史候选无原文摘录' : '（无来源片段）');
+    var proposed = String(candidate.proposed_memory || candidate.content || '').trim() || '（缺少建议记忆）';
     var sourceParts = [];
     if (candidate.source_event_ids && candidate.source_event_ids.length) {
       sourceParts.push('事件 ' + candidate.source_event_ids.slice(0, 12).join(', '));
@@ -93,9 +97,12 @@
       ? '<div class="chat-memory-stale">来源无法核对（' + esc(String(item.stale_reason || 'candidate_source_invalid')) + '），不可写入，请拒绝。</div>'
       : '';
     var blockedNote = blocked && !item.stale
-      ? '<div class="chat-memory-stale">' + esc(String(item.display && item.display.confirm_blocked_reason || '来源无法核对，不可写入，请拒绝。')) + '</div>'
+      ? '<div class="chat-memory-stale">' + esc(String(item.display && item.display.confirm_blocked_reason || '候选无法核对，不可写入，请拒绝。')) + '</div>'
       : '';
-    var confirmDisabled = blocked ? ' disabled title="来源无法核对，不可写入"' : '';
+    var confirmDisabled = blocked ? ' disabled title="候选无法核对，不可写入"' : '';
+    var sourcePreviewButton = hasSource
+      ? '<button type="button" class="chat-memory-source-btn" onclick="toggleDailyChatMemorySource(this, \'' + jsString(id) + '\')">查看完整原文</button>'
+      : '';
     return '' +
       '<div class="chat-memory-card" data-candidate-id="' + escAttr(id) + '">' +
         '<div class="chat-memory-card-head">' +
@@ -105,16 +112,16 @@
           '<strong>' + esc(candidate.title || id) + '</strong>' +
         '</div>' +
         '<div class="chat-memory-card-grid">' +
-          '<div class="chat-memory-column">' +
-            '<div class="chat-memory-column-title">原文摘录</div>' +
-            '<div class="chat-memory-excerpt' + (legacy ? ' chat-memory-legacy' : '') + '">' + esc(excerpt) + '</div>' +
-          '</div>' +
-          '<div class="chat-memory-column">' +
+          '<div class="chat-memory-column chat-memory-column-primary">' +
             '<div class="chat-memory-column-title">建议记忆</div>' +
             '<div class="chat-memory-card-body">' + esc(proposed) + '</div>' +
           '</div>' +
           '<div class="chat-memory-column">' +
-            '<div class="chat-memory-column-title">来源</div>' +
+            '<div class="chat-memory-column-title">来源片段</div>' +
+            '<details class="chat-memory-excerpt-details"' + (legacy ? ' open' : '') + '>' +
+              '<summary>' + (legacy ? '历史候选无原文摘录' : '展开来源片段') + '</summary>' +
+              '<div class="chat-memory-excerpt' + (legacy ? ' chat-memory-legacy' : '') + '">' + esc(excerpt) + '</div>' +
+            '</details>' +
             '<div class="chat-memory-card-source">' + esc(sourceText) + '</div>' +
             '<div class="chat-memory-card-meta">' +
               esc((candidate.kind || candidate.candidate_type || 'memory') + ' · ' + (item.date || '') + ' · confidence ' + (candidate.confidence || '')) +
@@ -122,12 +129,15 @@
             '</div>' +
           '</div>' +
         '</div>' +
+        '<div class="chat-memory-source-panel" hidden>' +
+          '<div class="chat-memory-source-loading">读取完整原文...</div>' +
+        '</div>' +
         staleNote + blockedNote +
         '<div class="chat-memory-edit-panel" hidden>' +
           '<label class="chat-memory-edit-field">标题' +
             '<input type="text" data-field="title" value="' + escAttr(candidate.title || id) + '" />' +
           '</label>' +
-          '<label class="chat-memory-edit-field">正文（写入记忆桶的内容）' +
+          '<label class="chat-memory-edit-field">正文（建议记忆，写入记忆桶的内容）' +
             '<textarea data-field="content" rows="4">' + esc(proposed) + '</textarea>' +
           '</label>' +
           '<div class="chat-memory-edit-grid">' +
@@ -150,6 +160,7 @@
         '</div>' +
         '<div class="chat-memory-card-actions">' +
           '<button type="button" onclick="toggleDailyChatMemoryEdit(this)">编辑</button>' +
+          sourcePreviewButton +
           '<button type="button"' + confirmDisabled + ' onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'confirm\')">写入</button>' +
           '<label class="chat-memory-reject-reason">拒绝原因' +
             '<select id="reject-reason-' + escAttr(id) + '">' +
@@ -164,6 +175,47 @@
           '<button type="button" class="danger" onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'reject\')">拒绝</button>' +
         '</div>' +
       '</div>';
+  }
+
+  function renderDailyChatMemorySourcePanel(data) {
+    var blocks = [];
+    (data.turns || []).forEach(function (turn) {
+      if (turn.user_text) blocks.push('<div class="chat-memory-source-block"><span class="chat-memory-source-role">我</span>' + esc(turn.user_text) + '</div>');
+      if (turn.assistant_text) blocks.push('<div class="chat-memory-source-block"><span class="chat-memory-source-role">润润</span>' + esc(turn.assistant_text) + '</div>');
+    });
+    (data.events || []).forEach(function (event) {
+      if (event.text) {
+        var roleLabel = event.role === 'user' ? '我' : '润润';
+        blocks.push('<div class="chat-memory-source-block"><span class="chat-memory-source-role">' + esc(roleLabel) + '</span>' + esc(event.text) + '</div>');
+      }
+    });
+    if (!blocks.length) {
+      return '<div class="chat-memory-source-empty">未找到可展开的完整原文（来源事件可能已被清理或撤回）。</div>';
+    }
+    return blocks.join('');
+  }
+
+  async function toggleDailyChatMemorySource(button, id) {
+    var card = button && button.closest ? button.closest('.chat-memory-card') : null;
+    var panel = card && card.querySelector ? card.querySelector('.chat-memory-source-panel') : null;
+    if (!panel) return;
+    if (!panel.hidden) {
+      panel.hidden = true;
+      button.textContent = '查看完整原文';
+      return;
+    }
+    panel.hidden = false;
+    panel.innerHTML = '<div class="chat-memory-source-loading">读取完整原文...</div>';
+    button.textContent = '收起原文';
+    try {
+      var res = await authFetch(dailyChatMemoryApiBase() + '/api/daily-chat-memory/source-preview?candidate_id=' + encodeURIComponent(id));
+      if (!res) return;
+      var data = await res.json();
+      if (!res.ok) throw new Error(data.error || '读取失败');
+      panel.innerHTML = renderDailyChatMemorySourcePanel(data);
+    } catch (e) {
+      panel.innerHTML = '<div class="chat-memory-source-empty">读取失败: ' + esc(e.message) + '</div>';
+    }
   }
 
   function listText(value) {
@@ -230,7 +282,6 @@
     if (!res.ok && !data) throw new Error('操作失败 (HTTP ' + res.status + ')');
     if (!res.ok) {
       data = data || {};
-      if (res.status === 409 && data.status === 'ok') return data;
       throw new Error(data.error || data.reason || '操作失败 (HTTP ' + res.status + ')');
     }
     return data;
@@ -270,7 +321,7 @@
       }
       var invalid = (data.results || []).filter(function (r) { return r.status === 'invalid_source'; });
       if (invalid.length) {
-        setDailyChatMemoryMessage('部分候选来源无法核对，未写入；请拒绝这些候选。', 'error');
+        setDailyChatMemoryMessage('候选来源无法核对，未写入；请拒绝这些候选。', 'error');
         loadDailyChatMemoryPending();
         return;
       }
@@ -339,6 +390,7 @@
   window.toggleDailyChatMemoryEdit = toggleDailyChatMemoryEdit;
   window.toggleDailyChatMemorySelectAll = toggleDailyChatMemorySelectAll;
   window.refreshDailyChatMemorySelection = refreshDailyChatMemorySelection;
+  window.toggleDailyChatMemorySource = toggleDailyChatMemorySource;
   window.initDailyChatMemoryTab = initDailyChatMemoryTab;
 
   if (typeof getActiveTab === 'function' && getActiveTab() === 'chat-memory') {

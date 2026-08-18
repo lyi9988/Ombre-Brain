@@ -2852,6 +2852,59 @@
     color: #a93226;
     background: rgba(192, 57, 43, 0.07);
   }
+  .chat-memory-column-primary {
+    background: rgba(255,255,255,0.14);
+    border-radius: 10px;
+    padding: 8px 10px;
+  }
+  .chat-memory-excerpt-details {
+    font-size: 12px;
+    color: var(--text-light);
+  }
+  .chat-memory-excerpt-details summary {
+    cursor: pointer;
+    user-select: none;
+  }
+  .chat-memory-excerpt {
+    margin-top: 4px;
+  }
+  .chat-memory-source-panel {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    background: rgba(255,255,255,0.18);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 260px;
+    overflow-y: auto;
+  }
+  .chat-memory-source-panel[hidden] {
+    display: none;
+  }
+  .chat-memory-source-loading,
+  .chat-memory-source-empty {
+    color: var(--text-light);
+    font-size: 12px;
+  }
+  .chat-memory-source-block {
+    font-size: 12px;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+  }
+  .chat-memory-source-role {
+    display: inline-block;
+    font-weight: 600;
+    color: var(--text);
+    margin-right: 6px;
+    font-size: 11px;
+    background: rgba(0,0,0,0.06);
+    border-radius: 5px;
+    padding: 1px 6px;
+  }
+  .chat-memory-source-btn {
+    font-size: 12px;
+  }
 
   @media (max-width: 768px) {
     .chat-memory-card-grid {
@@ -3367,7 +3420,7 @@
     <div class="reflection-toolbar">
       <div class="reflection-title">
         <h2>记忆候选</h2>
-        <p>每天本地零点后从原文保险箱里挑长期记忆；Review 模式下候选需主人确认后才作为正式 daily_chat_memory，Auto 模式继续自动采用。每条候选按「原文摘录 / 建议记忆 / 来源 / 状态」展示；历史候选若缺少原文摘录会如实标注「历史候选无原文摘录」。打开或刷新本页不会改变任何候选状态。</p>
+        <p>每天本地零点后从原文保险箱里挑长期记忆；Review 模式下候选需主人确认后才作为正式 daily_chat_memory，Auto 模式继续自动采用。卡片主体是「建议记忆」（脱水和整理后的长期记忆建议），来源片段按完整句子折叠展示，「查看完整原文」按来源事件展开；内部控制标记与内部素材不会被展示。打开或刷新本页不会改变任何候选状态。</p>
       </div>
     </div>
     <div class="bucket-bulk-message" id="daily-chat-memory-message"></div>
@@ -8915,7 +8968,7 @@ function loadDashboardModule(path) {
   document.body.appendChild(script);
 }
 
-loadDashboardModule('/dashboard-assets/chat-memory.js?v=20260818-review-v2');
+loadDashboardModule('/dashboard-assets/chat-memory.js?v=20260818-review-v3');
 </script>
 </body>
 </html>

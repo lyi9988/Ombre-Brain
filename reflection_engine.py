@@ -210,8 +210,9 @@ DAILY_CHAT_MEMORY_PROMPT_TEMPLATE = """你是 {ai_name}。现在是凌晨，你�
 输入包含两层材料，两层都会提供：
 - window_summaries：按连续窗口压缩的对话摘要，只用来定位“可能值得写”的候选窗口，不是最终依据。
 - conversation_turns：原始对话片段（可能按窗口命中做了裁剪），是最终选择与来源核对必须回到的原文。
+原始对话里可能夹带 <silent mood=… as=… reason=…></silent> 等内部控制标记、[语音:…] 等媒体转写，以及“近期素材/今天的聊天”这类内部材料转储；这些都不是主人可见内容，一律忽略，不得作为候选依据，也不要复制进任何字段。
 user_text 永远是 {user_display_name} 的原话，里面的“我”指 {user_display_name}；assistant_text 永远是 {ai_name} 的回复，里面的“我”指 {ai_name}。请最多挑选 {max_candidates} 条候选，宁可返回空，也不要把聊天流水写进记忆。
-先通读 window_summaries 定位候选窗口，然后回到 conversation_turns 原文逐字核对：候选是否真实存在、来源轮次是否准确、original_excerpt 是否逐字摘自原文。不要只根据摘要写“摘要的摘要”，也不要凭单轮、单句或一个称呼下判断。
+先通读 window_summaries 定位候选窗口，然后回到 conversation_turns 原文逐字核对：候选是否真实存在、来源轮次是否准确、建议记忆能否被原文支持。不要只根据摘要写“摘要的摘要”，也不要凭单轮、单句或一个称呼下判断。
 目标不是把一天压成一条日报，而是把当天分散出现的高价值信号拆成多条可确认候选。
 
 优先看这些信号：
@@ -236,6 +237,7 @@ user_text 永远是 {user_display_name} 的原话，里面的“我”指 {user_
 - 禁止把暗号、沟通方式、我们的项目、睡眠这类细分标签写进 kind。
 - 禁止把 key_event、stable_preference、boundary、project_state 这类 kind 写进 domain。
 - project_state 只允许写“已确认的稳定决定、长期项目状态、主人偏好或明确承诺”；普通排错过程、临时测试、一次修复动作、没有后续的状态不写。
+- key_event / boundary / stable_preference / signal 必须由 {user_display_name} 明确表达的内容支撑；{ai_name} 单纯的安慰、寒暄、情绪回复不能成为这些类型。{ai_name} 的内容只有包含明确长期承诺、关系约定或稳定行为边界时，才可作为 commitment / relationship_anchor / boundary 的来源。
 
 输出纯 JSON：
 {
@@ -244,8 +246,7 @@ user_text 永远是 {user_display_name} 的原话，里面的“我”指 {user_
       "should_write": true,
       "kind": "key_event",
       "title": "短标题",
-      "content": "可直接写入长期记忆的一小段正文",
-      "original_excerpt": "从 conversation_turns 原话里逐字摘录的真实片段",
+      "content": "脱水和整理后的长期记忆建议（1-3 句，独立于原文）",
       "domain": "general",
       "tags": ["key_event"],
       "importance": 5,
@@ -266,12 +267,13 @@ user_text 永远是 {user_display_name} 的原话，里面的“我”指 {user_
 - 不要写日报，不要总结整天，不要复制原文流水，不要把“我问了什么/我测试了什么/模型有没有召回”当成记忆。
 - 不写普通聊天、临时测试、召回探针、问答试探、调情闲聊、模型失误、工具注入、系统上下文。
 - 不写单句照顾提醒、晚安、吃药、睡觉、别熬夜、催睡或 ntfy 玩笑；除非当天明确升级成稳定规则或长期承诺。
+- 不写安慰、哄睡、抱抱、心疼等即时情绪回复；这些是当天关系天气，不是长期记忆。
 - 不把“可能是/似乎/果然没触发”这类未确认猜测写成记忆；项目假设只有在包含明确项目名、已验证结论和下一步时才可写。
 - 不把原文句子换个壳当候选；如果说不出未来需要怎么承接、为什么重要，就丢弃。
 - 不写代码块、伪代码、查询规则、缓存规则、prompt 片段或内部实现片段；如果候选正文里出现 ```、query_cache、recent_raw_context、if query contains、bypass query 这类内容，直接丢弃。
-- original_excerpt 必须是从 conversation_turns 里逐字摘录的真实原文片段（30 到 180 字），不得改写、翻译或由 summary 转述；摘不出来就留空并丢弃该候选。它只用于主人核对，不是记忆正文。
+- 本阶段不需要输出 original_excerpt；来源片段会由系统按完整句子自动提取。你只需要给出精确的 source_event_ids / source_turn_ids。
 - source_event_ids / source_turn_ids 必须精确指向该候选实际依据的原文轮次/事件，只从 conversation_turns 里真实出现的 id 中选；拿不准就留空并丢弃该候选，禁止回退到全天所有 id。
-- content 必须只写一个可未来召回的点，通常 60 到 260 字；可以用 1 到 3 句写清背景、已确认结论、后续要注意什么。它应该像手动 hold 的正文，而不是聊天记录转述。
+- content 是“建议记忆”：必须是与原文不同的脱水和整理，通常 60 到 260 字、1 到 3 句；写清背景、已确认结论、后续要注意什么。它应该像手动 hold 的正文，而不是聊天记录转述，更不是把原文原句照抄。
 - content 不要以日期或来源壳开头；不要写 "x月x日，有一条可召回的边界"、"2026-xx-xx 的聊天里确认了..."、"这是一条长期记忆"。
 - 必须消解代词：user_text 里的“我”要改写成 {user_display_name} 或“她”；assistant_text 里的“我”才可指 {ai_name}。不要让来源原话里的“我”在记忆里变成 {ai_name}。
 - title 必须是具体短标题，8 到 24 字，不要用“自动记忆”“每日记忆”“2026-xx-xx 自动记忆”。
@@ -2641,15 +2643,128 @@ class ReflectionEngine:
             has_excerpt = bool(str(candidate.get("original_excerpt") or "").strip())
             verified = str(candidate.get("source_verification") or "").strip() == "verified"
             has_source = bool(candidate.get("source_turn_ids") or candidate.get("source_event_ids"))
-            blocked = not (verified and has_source)
+            excerpt = str(candidate.get("original_excerpt") or "")
+            proposed = str(candidate.get("proposed_memory") or candidate.get("content") or "")
+            has_proposed = bool(proposed.strip())
+            # Health gates: legacy/unverifiable, unclean excerpt (internal control
+            # markers leaked from a pre-fix run), or missing proposed memory.
+            blocked_reasons: list[str] = []
+            if not (verified and has_source):
+                blocked_reasons.append("missing_source_verification")
+            if "<" in excerpt or ">" in excerpt or re.search(r'\b(?:as|reason|mood|action|source|role|mode|tags|metadata|id|session|event_hash|client)="[^"]*"', excerpt):
+                blocked_reasons.append("candidate_excerpt_unclean")
+            if not has_proposed:
+                blocked_reasons.append("missing_proposed_memory")
             display["legacy_no_original"] = not has_excerpt
-            display["confirm_blocked"] = blocked
+            display["confirm_blocked"] = bool(blocked_reasons)
+            display["blocked_reasons"] = blocked_reasons
+            display["has_source_preview"] = has_source
             display["confirm_blocked_reason"] = (
-                "历史候选缺少原文摘录/来源校验，无法核对原文，请拒绝。"
-                if blocked
+                "候选来源无法核对或原文含内部控制标记，无法批准，请拒绝。"
+                if blocked_reasons
                 else ""
             )
         return {**item, "display": display}
+
+    async def daily_chat_memory_source_preview(
+        self,
+        candidate_id: str,
+        *,
+        raw_event_store=None,
+        conversation_turn_store=None,
+        profile_id: str = "default",
+    ) -> dict:
+        """Owner-only read of the complete sanitized source text behind a candidate.
+
+        The full original is never stored in the candidate record; it stays pointed
+        at by source_event_ids / source_turn_ids and is fetched here for the
+        Dashboard "查看完整原文" expander. All returned text goes through the
+        unified owner-visible sanitizer (no <silent>, no internal markers)."""
+        rid = str(candidate_id or "").strip()
+        if not rid:
+            return {"status": "missing"}
+        item = next(
+            (
+                candidate_item
+                for candidate_item in self._load_daily_chat_memory_pending()
+                if str(candidate_item.get("id") or "") == rid
+            ),
+            None,
+        )
+        if not item:
+            return {"status": "missing"}
+        candidate = item.get("candidate") if isinstance(item.get("candidate"), dict) else {}
+        event_ids = [int(v) for v in (candidate.get("source_event_ids") or []) if str(v).isdigit()]
+        turn_ids = [int(v) for v in (candidate.get("source_turn_ids") or []) if str(v).isdigit()]
+        date_key = str(candidate.get("date") or item.get("date") or "")
+        events: list[dict] = []
+        turns: list[dict] = []
+        if event_ids and raw_event_store:
+            rows: list[dict] = []
+            try:
+                if date_key:
+                    start, end = self._period_window("daily", self._daily_chat_memory_target(date_key))
+                    rows = raw_event_store.list_events_between(
+                        start_at=start,
+                        end_at=end,
+                        limit=10000,
+                    )
+            except Exception as exc:
+                logger.warning("Daily chat memory source preview event read failed: %s", exc)
+            wanted = set(event_ids)
+            for event in rows or []:
+                try:
+                    event_id = int(event.get("id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if event_id in wanted:
+                    events.append(
+                        {
+                            "id": event_id,
+                            "role": str(event.get("role") or ""),
+                            "text": self._daily_chat_memory_owner_text(str(event.get("text") or "")),
+                        }
+                    )
+            events.sort(key=lambda entry: entry["id"])
+        if turn_ids and conversation_turn_store:
+            rows = []
+            try:
+                if date_key:
+                    start, end = self._period_window("daily", self._daily_chat_memory_target(date_key))
+                    rows = conversation_turn_store.list_conversation_turns_between(
+                        profile_id=str(profile_id or "default"),
+                        start_at=start,
+                        end_at=end,
+                        limit=10000,
+                    )
+            except Exception as exc:
+                logger.warning("Daily chat memory source preview turn read failed: %s", exc)
+            wanted = set(turn_ids)
+            for turn in rows or []:
+                try:
+                    turn_id = int(turn.get("id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if turn_id in wanted:
+                    turns.append(
+                        {
+                            "id": turn_id,
+                            "session_id": str(turn.get("session_id") or ""),
+                            "user_text": self._daily_chat_memory_owner_text(str(turn.get("user_text") or "")),
+                            "assistant_text": self._daily_chat_memory_owner_text(
+                                str(turn.get("assistant_text") or "")
+                            ),
+                        }
+                    )
+            turns.sort(key=lambda entry: entry["id"])
+        return {
+            "status": "ok",
+            "candidate_id": rid,
+            "events": events,
+            "turns": turns,
+            "missing_event_ids": sorted(set(event_ids) - {entry["id"] for entry in events}),
+            "missing_turn_ids": sorted(set(turn_ids) - {entry["id"] for entry in turns}),
+        }
 
     async def confirm_daily_chat_memory(
         self,
@@ -2788,8 +2903,8 @@ class ReflectionEngine:
         reason = str(value or "").strip().lower()
         return reason if reason in DAILY_CHAT_MEMORY_REJECT_REASONS else "other"
 
-    @staticmethod
-    def _daily_chat_memory_candidate_source_ok(candidate: dict) -> bool:
+    @classmethod
+    def _daily_chat_memory_candidate_source_ok(cls, candidate: dict) -> bool:
         if not isinstance(candidate, dict):
             return False
         if str(candidate.get("source_verification") or "").strip() != "verified":
@@ -2797,6 +2912,11 @@ class ReflectionEngine:
         if not (candidate.get("source_turn_ids") or candidate.get("source_event_ids")):
             return False
         if not str(candidate.get("source_hash") or "").strip():
+            return False
+        excerpt = str(candidate.get("original_excerpt") or "")
+        if "<" in excerpt or ">" in excerpt or cls._CONTROL_ATTR_RE.search(excerpt):
+            # Malformed pre-fix candidates (internal control markers in the
+            # excerpt) must not be silently approved.
             return False
         return True
 
@@ -3043,17 +3163,23 @@ class ReflectionEngine:
             has_event_ids = bool(raw_event_ids)
             if not has_turn_id and not has_event_ids:
                 continue
-            user_text = str(turn.get("user_text") or "").strip()
-            assistant_text = str(turn.get("assistant_text") or "").strip()
-            texts = [text for text in (user_text, assistant_text) if text]
-            if not texts:
+            if self._daily_chat_memory_turn_is_internal_dump(turn):
                 continue
-            full_text = " ".join(texts)
-            # Per turn keep the dominant signal only (most matched keywords), so a
-            # single mixed turn does not collapse into near-identical candidates.
+            user_text = self._daily_chat_memory_owner_text(str(turn.get("user_text") or ""))
+            assistant_text = self._daily_chat_memory_owner_text(str(turn.get("assistant_text") or ""))
+            if not user_text and not assistant_text:
+                continue
+            # V3: user statements are the primary signal source; assistant content
+            # is only eligible for explicit long-term commitment / relationship /
+            # stable boundary patterns (ordinary comfort replies never trigger).
+            full_text = " ".join(text for text in (user_text, assistant_text) if text)
             matched_by_kind: dict[str, list[str]] = {}
             for kind, keywords in keyword_map:
-                matched = [kw for kw in keywords if kw in full_text]
+                if kind in {"commitment", "relationship_anchor"}:
+                    candidates_pool = full_text
+                else:
+                    candidates_pool = user_text
+                matched = [kw for kw in keywords if kw in candidates_pool]
                 if not matched:
                     continue
                 if kind == "project_state":
@@ -3069,8 +3195,9 @@ class ReflectionEngine:
                 key=lambda kind: (len(matched_by_kind[kind]), -kind_priority.index(kind)),
             )
             matched_keyword = matched_by_kind[best_kind][0]
-            excerpt = self._heuristic_excerpt_from_text(full_text, matched_keyword)
-            content = self._daily_chat_memory_content(best_kind, key, excerpt)
+            excerpt = self._daily_chat_memory_heuristic_excerpt(full_text, matched_keyword)
+            core_sentence = self._daily_chat_memory_heuristic_core_sentence(full_text, matched_keyword) or excerpt
+            content = self._daily_chat_memory_content(best_kind, key, core_sentence)
             if self._daily_chat_memory_noise(content):
                 continue
             if self._daily_chat_memory_low_value_social_noise(content, best_kind):
@@ -3083,6 +3210,7 @@ class ReflectionEngine:
                 "title": self._daily_chat_memory_title(content, best_kind, key),
                 "content": content,
                 "original_excerpt": excerpt,
+                "generation_source": "heuristic",
                 "domain": self._auto_memory_domain(best_kind, content, [self._kind_tag(best_kind)]),
                 "tags": [self._kind_tag(best_kind)],
                 "importance": 5,
@@ -3100,16 +3228,29 @@ class ReflectionEngine:
                 return candidates
         return candidates
 
-    @staticmethod
-    def _heuristic_excerpt_from_text(text: str, matched_keyword: str) -> str:
-        """Return a real verbatim snippet of the turn text around the matched keyword."""
-        index = text.find(matched_keyword)
-        if index < 0:
-            return text[:180]
-        start = max(0, index - 24)
-        end = min(len(text), index + len(matched_keyword) + 56)
-        snippet = text[start:end]
-        return snippet.strip()[:180]
+    @classmethod
+    def _daily_chat_memory_heuristic_excerpt(cls, text: str, matched_keyword: str, *, max_sentences: int = 3) -> str:
+        """Complete-sentence source fragment starting at the sentence containing
+        the matched keyword. Never slices at arbitrary character offsets."""
+        sentences = cls._daily_chat_memory_sentences(text)
+        if not sentences:
+            return ""
+        start = next((index for index, sentence in enumerate(sentences) if matched_keyword in sentence), 0)
+        picked = [sentences[start]]
+        for sentence in sentences[start + 1 :]:
+            if len(picked) >= max_sentences:
+                break
+            picked.append(sentence)
+        return " ".join(picked).strip()
+
+    @classmethod
+    def _daily_chat_memory_heuristic_core_sentence(cls, text: str, matched_keyword: str) -> str:
+        """The single sentence carrying the matched signal, used as the dehydrated
+        proposed-memory core for heuristic candidates."""
+        for sentence in cls._daily_chat_memory_sentences(text):
+            if matched_keyword in sentence:
+                return sentence
+        return ""
 
     def _daily_chat_memory_content(self, kind: str, key: str, excerpt: str) -> str:
         user_display_name = self.identity["user_display_name"]
@@ -3672,17 +3813,41 @@ class ReflectionEngine:
             )
             if not source_turns:
                 continue
-            raw_excerpt = str(candidate.get("original_excerpt") or "").strip()
-            if raw_excerpt:
-                if not self._daily_chat_memory_excerpt_verified(raw_excerpt, source_turns):
-                    # Model-supplied excerpt does not match any referenced turn text.
-                    continue
-                original_excerpt = self._trim_daily_chat_memory_excerpt(raw_excerpt)
-            else:
-                original_excerpt = self._daily_chat_memory_excerpt_for_content(candidate, source_turns)
-                if not original_excerpt:
-                    continue
-            source_hash = self._daily_chat_memory_source_hash_for_turns(source_turns)
+            # V3: only clean, owner-visible source turns may support a candidate.
+            # Internal material dumps (e.g. "近期素材" [app/bridge] payloads) and
+            # turns with no remaining clean text after sanitization are excluded.
+            source_turns = [
+                turn
+                for turn in source_turns
+                if not self._daily_chat_memory_turn_is_internal_dump(turn)
+            ]
+            clean_turns = [
+                turn
+                for turn in source_turns
+                if self._daily_chat_memory_turn_has_clean_text(turn)
+            ]
+            if not clean_turns:
+                # No complete, clean source available: drop, never guess/fill.
+                continue
+            # The stored excerpt is always system-derived from bound turns with
+            # complete-sentence boundaries and the unified owner-visible
+            # sanitizer. A model-supplied original_excerpt is never stored as-is
+            # (it was the source of mid-tag / mid-sentence slices).
+            original_excerpt = self._daily_chat_memory_excerpt_for_turns(candidate, clean_turns)
+            if not original_excerpt:
+                continue
+            generation_source = str(candidate.get("generation_source") or "model").strip().lower() or "model"
+            if generation_source == "model" and self._daily_chat_memory_proposed_echoes_excerpt(
+                content,
+                original_excerpt,
+            ):
+                # The model just echoed the original as the proposed memory.
+                continue
+            if not self._daily_chat_memory_source_supports_kind(kind, clean_turns):
+                # candidate_type must be supported by the source; ordinary comfort
+                # replies must not become boundary/key_event/stable_preference.
+                continue
+            source_hash = self._daily_chat_memory_source_hash_for_turns(clean_turns)
             item = self._daily_chat_memory_enrich_candidate_terms({
                 "id": self._daily_chat_memory_candidate_id(key, kind, content),
                 "date": key,
@@ -3692,6 +3857,7 @@ class ReflectionEngine:
                 "content": content,
                 "proposed_memory": content,
                 "original_excerpt": original_excerpt,
+                "generation_source": generation_source,
                 "source_hash": source_hash,
                 "source_verification": "verified",
                 "tags": candidate_tags,
@@ -3781,28 +3947,199 @@ class ReflectionEngine:
         matched.sort(key=lambda item: (str(item.get("created_at") or ""), int(item.get("id") or 0)))
         return matched
 
-    @staticmethod
-    def _daily_chat_memory_text_pool(turns: list[dict]) -> str:
-        return re.sub(
-            r"\s+",
-            " ",
-            " ".join(
-                text
-                for turn in (turns or [])
-                for text in (str(turn.get("user_text") or ""), str(turn.get("assistant_text") or ""))
-            ),
-        ).strip()
+    # ------------------------------------------------------------------
+    # V3 owner-visible source helpers: sanitizer, sentence boundaries,
+    # internal-dump detection, complete-sentence excerpt selection.
+    # ------------------------------------------------------------------
+    _SILENT_BLOCK_RE = re.compile(r"<silent\b[^>]*>.*?</silent>", re.DOTALL | re.IGNORECASE)
+    _TAG_RE = re.compile(r"<[^>]+>")
+    _CONTROL_ATTR_RE = re.compile(
+        r'\b(?:as|reason|mood|action|role|source|mode|tags|metadata|id|session|event_hash|client)="[^"]*"',
+        re.IGNORECASE,
+    )
+    _MEDIA_ARTIFACT_RE = re.compile(r"\[(?:语音|图片|文件|贴纸|表情)[^\]]*\]")
+    _SENTENCE_END_RE = re.compile(r"(?<=[。！？!?…；;])")
+    _DUMP_MARKERS = ("近期素材", "[app/bridge]", "今天的聊天:", "今天的聊天：", "[telegram]")
+    _COMFORT_MARKERS = (
+        "别难过", "别伤心", "抱抱", "没事的", "没关系", "辛苦了", "别担心",
+        "我在呢", "会一直陪着", "守着你", "别哭", "乖", "摸摸头", "放心",
+    )
+    _DURABLE_ASSISTANT_MARKERS = (
+        "承诺", "约定", "答应", "会一直", "永远", "记住", "关系", "正式在一起",
+        "以后默认", "不会改", "保持", "边界", "不要再",
+    )
 
     @classmethod
-    def _daily_chat_memory_excerpt_verified(cls, excerpt: str, turns: list[dict]) -> bool:
-        normalized_excerpt = re.sub(r"\s+", " ", str(excerpt or "")).strip()
-        if not normalized_excerpt:
-            return False
-        return normalized_excerpt in cls._daily_chat_memory_text_pool(turns)
+    def _daily_chat_memory_owner_text(cls, text: str) -> str:
+        """Unified owner-visible sanitizer.
 
-    def _trim_daily_chat_memory_excerpt(self, excerpt: str) -> str:
-        text = re.sub(r"\s+", " ", str(excerpt or "")).strip()
-        return text[:240]
+        Removes <silent ...>...</silent> blocks (hidden commentary), any other
+        angle-bracket control tags, internal attribute fragments (as= / reason= /
+        mood= / action= ...), and media render artifacts ([语音:...] ...). The
+        result is exactly what the owner sees in the chat.
+        """
+        cleaned = str(text or "")
+        cleaned = cls._SILENT_BLOCK_RE.sub(" ", cleaned)
+        cleaned = cls._TAG_RE.sub(" ", cleaned)
+        cleaned = cls._CONTROL_ATTR_RE.sub(" ", cleaned)
+        cleaned = cls._MEDIA_ARTIFACT_RE.sub(" ", cleaned)
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    @classmethod
+    def _daily_chat_memory_sentences(cls, text: str) -> list[str]:
+        """Split sanitized text into complete sentences (Chinese/English/line ends)."""
+        cleaned = cls._daily_chat_memory_owner_text(text)
+        if not cleaned:
+            return []
+        sentences: list[str] = []
+        for chunk in cls._SENTENCE_END_RE.split(cleaned):
+            for line in chunk.splitlines():
+                sentence = " ".join(line.split()).strip()
+                if sentence:
+                    sentences.append(sentence)
+        return sentences
+
+    @classmethod
+    def _daily_chat_memory_turn_is_internal_dump(cls, turn: dict) -> bool:
+        """Internal material-dump turns (e.g. "近期素材：今天的聊天 [app/bridge]")
+        are not real owner-visible conversation and must never be a source."""
+        for key in ("user_text", "assistant_text"):
+            raw = str(turn.get(key) or "")
+            if any(marker in raw for marker in cls._DUMP_MARKERS):
+                return True
+        return False
+
+    @classmethod
+    def _daily_chat_memory_turn_has_clean_text(cls, turn: dict) -> bool:
+        for key in ("user_text", "assistant_text"):
+            if cls._daily_chat_memory_owner_text(str(turn.get(key) or "")):
+                return True
+        return False
+
+    def _daily_chat_memory_excerpt_for_turns(
+        self,
+        candidate: dict,
+        turns: list[dict],
+        *,
+        max_sentences: int = 3,
+        max_chars: int = 240,
+    ) -> str:
+        """Select 1-3 complete, clean sentences that best support the proposed
+        memory. Never slices at arbitrary character offsets; every excerpt starts
+        and ends at a sentence boundary."""
+        if not turns:
+            return ""
+        probe = re.sub(r"\s+", " ", str(candidate.get("content") or "")).strip()
+        probe_tokens: set[str] = set()
+        for block in re.findall(r"[\u4e00-\u9fff]{2,16}", probe):
+            for size in (2, 3, 4):
+                for index in range(0, max(0, len(block) - size + 1)):
+                    probe_tokens.add(block[index : index + size])
+        probe_tokens = sorted(probe_tokens, key=len, reverse=True)
+        sentences_by_turn: list[list[str]] = []
+        all_sentences: list[str] = []
+        for turn in turns:
+            turn_sentences: list[str] = []
+            for key in ("user_text", "assistant_text"):
+                for sentence in self._daily_chat_memory_sentences(str(turn.get(key) or "")):
+                    if sentence not in all_sentences:
+                        all_sentences.append(sentence)
+                        turn_sentences.append(sentence)
+            sentences_by_turn.append(turn_sentences)
+
+        def pick_from(start_index: int) -> str:
+            picked: list[str] = []
+            total_chars = 0
+            for index in range(start_index, len(all_sentences)):
+                if len(picked) >= max_sentences:
+                    break
+                sentence = all_sentences[index]
+                if not sentence:
+                    continue
+                if picked and probe_tokens:
+                    # Only extend with sentences that also support the proposed
+                    # memory; stop at the first unrelated sentence so the fragment
+                    # stays focused on the supporting evidence.
+                    support = sum(1 for token in probe_tokens if token in sentence)
+                    if support == 0:
+                        break
+                picked.append(sentence)
+                total_chars += len(sentence)
+                if total_chars >= max_chars:
+                    break
+            if not picked:
+                return ""
+            joined = " ".join(picked).strip()
+            # Chinese sentences must not carry a space after the end punctuation.
+            return re.sub(r"([。！？!?…；;])\s+", r"\1", joined)
+
+        # Prefer sentences overlapping the proposed memory; otherwise fall back to
+        # the first complete clean sentences of the bound turns.
+        if probe_tokens:
+            best: tuple[int, int] = (-1, 0)
+            for index, sentence in enumerate(all_sentences):
+                score = sum(1 for token in probe_tokens if token in sentence)
+                if score > best[1]:
+                    best = (index, score)
+            if best[1] > 0:
+                return pick_from(best[0])
+        return pick_from(0)
+
+    @staticmethod
+    def _daily_chat_memory_proposed_echoes_excerpt(proposed: str, excerpt: str) -> bool:
+        """Model candidates whose proposed_memory is just the original echoed back
+        are invalid. Heuristic candidates are templated and exempt by design."""
+        proposed_text = re.sub(r"\s+", " ", str(proposed or "")).strip()
+        excerpt_text = re.sub(r"\s+", " ", str(excerpt or "")).strip()
+        if not proposed_text or not excerpt_text:
+            return False
+        if proposed_text == excerpt_text:
+            return True
+        if proposed_text in excerpt_text or excerpt_text in proposed_text:
+            longer = max(len(proposed_text), len(excerpt_text))
+            shorter = min(len(proposed_text), len(excerpt_text))
+            if longer and shorter / longer >= 0.6:
+                return True
+        proposed_tokens = ReflectionEngine._daily_chat_memory_similarity_tokens(proposed_text)
+        excerpt_tokens = ReflectionEngine._daily_chat_memory_similarity_tokens(excerpt_text)
+        if not proposed_tokens or not excerpt_tokens:
+            return False
+        overlap = len(proposed_tokens & excerpt_tokens) / max(1, min(len(proposed_tokens), len(excerpt_tokens)))
+        return overlap >= 0.95 and abs(len(proposed_tokens) - len(excerpt_tokens)) <= 2
+
+    @classmethod
+    def _daily_chat_memory_source_supports_kind(cls, kind: str, turns: list[dict]) -> bool:
+        """candidate_type must be supported by the source. Ordinary comfort replies
+        must not become boundary/key_event/stable_preference; assistant content is
+        eligible only for explicit long-term commitment/relationship/boundary."""
+        user_texts = [
+            cls._daily_chat_memory_owner_text(str(turn.get("user_text") or ""))
+            for turn in (turns or [])
+        ]
+        assistant_texts = [
+            cls._daily_chat_memory_owner_text(str(turn.get("assistant_text") or ""))
+            for turn in (turns or [])
+        ]
+        has_user_statement = any(text for text in user_texts)
+        assistant_pool = " ".join(text for text in assistant_texts if text)
+        user_pool = " ".join(text for text in user_texts if text)
+        user_needed_kinds = {"key_event", "boundary", "stable_preference", "signal"}
+        if kind in user_needed_kinds and not has_user_statement:
+            return False
+        if any(marker in assistant_pool for marker in cls._COMFORT_MARKERS):
+            if kind in user_needed_kinds and not has_user_statement:
+                return False
+            if not has_user_statement and kind in {"project_state"}:
+                return False
+        if not has_user_statement and kind in {"commitment", "relationship_anchor"}:
+            if not any(marker in assistant_pool for marker in cls._DURABLE_ASSISTANT_MARKERS):
+                return False
+        if kind == "project_state" and not has_user_statement:
+            durable = any(marker in assistant_pool for marker in cls._DURABLE_ASSISTANT_MARKERS)
+            project = any(marker in assistant_pool for marker in ("部署", "迁移", "镜像", "正式", "上线", "保持"))
+            if not (durable and project):
+                return False
+        return True
 
     @classmethod
     def _daily_chat_memory_source_hash_for_turns(cls, turns: list[dict]) -> str:
@@ -3820,34 +4157,8 @@ class ReflectionEngine:
         candidate: dict,
         turns: list[dict],
     ) -> str:
-        """Derive a verbatim excerpt from a bound source turn when the model did
-        not supply one. Source provenance comes from the bound source ids (not from
-        literal word overlap); the excerpt is display-only, so an anchor match is
-        preferred but the first bound turn's real text is an honest fallback."""
-        if not turns:
-            return ""
-        probe = re.sub(r"\s+", " ", str(candidate.get("content") or "")).strip()
-        probe_tokens = set(re.findall(r"[\u4e00-\u9fff]{2,6}", probe))
-        for turn in turns:
-            for text in (str(turn.get("user_text") or ""), str(turn.get("assistant_text") or "")):
-                compact = re.sub(r"\s+", " ", text).strip()
-                if not compact:
-                    continue
-                if probe_tokens:
-                    for token in probe_tokens:
-                        index = compact.find(token)
-                        if index >= 0:
-                            start = max(0, index - 20)
-                            end = min(len(compact), index + len(token) + 50)
-                            return compact[start:end].strip()[:180]
-        # No literal anchor found: still return real original text of the bound
-        # turn so the owner sees a genuine excerpt (provenance is from source ids).
-        for turn in turns:
-            for text in (str(turn.get("user_text") or ""), str(turn.get("assistant_text") or "")):
-                compact = re.sub(r"\s+", " ", text).strip()
-                if len(compact) >= 10:
-                    return compact[:180].strip()
-        return ""
+        """Backward-compatible alias for the V3 complete-sentence selector."""
+        return self._daily_chat_memory_excerpt_for_turns(candidate, turns)
 
     def _apply_daily_chat_memory_candidate_edit(self, candidate: dict, edit: Any) -> dict:
         if not isinstance(edit, dict):
