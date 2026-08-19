@@ -267,7 +267,7 @@ def test_internal_dump_source_turn_dropped(tmp_path):
         ),
     )
     result = run_review(engine, turns)
-    assert result["status"] == "skipped"
+    assert result["status"] == "zero_candidates"
     assert result["reason"] == "no_candidates"
 
 
@@ -303,12 +303,13 @@ def test_proposed_memory_missing_invalid(tmp_path):
         ),
     )
     result = run_review(engine, turns)
-    assert result["status"] == "skipped"
+    assert result["status"] == "zero_candidates"
     assert result["reason"] == "no_candidates"
 
 
-def test_model_echo_proposed_memory_dropped(tmp_path):
-    """模型把原句原样当作建议记忆 → 候选无效。"""
+def test_model_echo_kept_with_needs_owner_edit(tmp_path):
+    """V4：模型把原句原样当建议记忆 → 候选保留并标记 needs_owner_edit，
+    未编辑前不能 approve（不再静默丢弃）。"""
     engine = ReflectionEngine(make_config(tmp_path, mode="review"))
     turns = [
         {
@@ -336,7 +337,17 @@ def test_model_echo_proposed_memory_dropped(tmp_path):
         ),
     )
     result = run_review(engine, turns)
-    assert result["status"] == "skipped"
+    assert result["status"] == "pending"
+    candidate = result["candidates"][0]
+    assert "needs_owner_edit" in candidate["soft_flags"]
+    assert "excerpt_overlap" in candidate["soft_flags"]
+    # 未编辑 → approve 拦截
+    buckets = FakeBuckets()
+    blocked = asyncio.run(
+        engine.confirm_daily_chat_memory([candidate["id"]], buckets, action="confirm", request_id="rq-echo-v3")
+    )
+    assert blocked["results"][0]["status"] == "needs_owner_edit"
+    assert buckets.created == []
 
 
 def test_proposed_memory_independent_readable(tmp_path):
@@ -409,7 +420,7 @@ def test_assistant_comfort_not_boundary_or_key_event(tmp_path):
             ),
         )
         result = run_review(engine, turns)
-        assert result["status"] == "skipped", f"kind={kind} must be dropped"
+        assert result["status"] == "zero_candidates", f"kind={kind} must be dropped"
 
 
 def test_assistant_commitment_with_durable_marker_eligible(tmp_path):
@@ -473,7 +484,7 @@ def test_assistant_boundary_without_owner_statement_dropped(tmp_path):
         ),
     )
     result = run_review(engine, turns)
-    assert result["status"] == "skipped"
+    assert result["status"] == "zero_candidates"
 
 
 # ---------------------------------------------------------------------------

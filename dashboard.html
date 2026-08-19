@@ -2905,6 +2905,94 @@
   .chat-memory-source-btn {
     font-size: 12px;
   }
+  .chat-memory-flags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-left: auto;
+    justify-content: flex-end;
+  }
+  .chat-memory-flag {
+    display: inline-block;
+    font-size: 10px;
+    line-height: 1.3;
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid #b9770e55;
+    background: rgba(217, 164, 34, 0.12);
+    color: #7d5a00;
+    cursor: help;
+    white-space: nowrap;
+  }
+  .chat-memory-edit-needed {
+    border: 1px solid #b9770e55;
+    border-radius: 8px;
+    padding: 7px 9px;
+    font-size: 12px;
+    color: #7d5a00;
+    background: rgba(217, 164, 34, 0.10);
+  }
+  .chat-memory-card-edit-needed {
+    border-color: #b9770e88;
+  }
+  .chat-memory-source-more {
+    display: inline-block;
+    margin-left: 6px;
+    font-size: 11px;
+  }
+  .chat-memory-source-chunk {
+    margin-top: 4px;
+  }
+  .chat-memory-runs {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-bottom: 14px;
+    background: rgba(255,255,255,0.18);
+    font-size: 12px;
+    color: var(--text-light);
+  }
+  .chat-memory-runs-title {
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 6px;
+  }
+  .chat-memory-runs-cursor {
+    font-size: 11px;
+    margin-bottom: 6px;
+  }
+  .chat-memory-run-item {
+    border-top: 1px solid var(--border);
+    padding: 7px 0;
+  }
+  .chat-memory-run-head {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .chat-memory-run-meta {
+    font-size: 11px;
+    overflow-wrap: anywhere;
+  }
+  .chat-memory-run-empty {
+    color: var(--text-light);
+    font-size: 12px;
+    padding: 6px 0;
+  }
+  .chat-memory-runs-actions {
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .chat-memory-rerun-btn {
+    font-size: 12px;
+  }
+  .chat-memory-runs-hint {
+    font-size: 11px;
+    color: var(--text-light);
+  }
 
   @media (max-width: 768px) {
     .chat-memory-card-grid {
@@ -3424,6 +3512,7 @@
       </div>
     </div>
     <div class="bucket-bulk-message" id="daily-chat-memory-message"></div>
+    <div id="daily-chat-memory-runs"></div>
     <div class="reflection-board chat-memory-board">
       <section class="reflection-card">
         <div class="reflection-card-head">
@@ -8968,7 +9057,7 @@ function loadDashboardModule(path) {
   document.body.appendChild(script);
 }
 
-loadDashboardModule('/dashboard-assets/chat-memory.js?v=20260818-review-v3');
+loadDashboardModule('/dashboard-assets/chat-memory.js?v=20260818-review-v4');
 </script>
 </body>
 </html>

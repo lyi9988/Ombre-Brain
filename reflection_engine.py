@@ -230,6 +230,7 @@ user_text 永远是 {user_display_name} 的原话，里面的“我”指 {user_
 - commitment：承诺、未完成约定
 - project_state：仍会影响未来执行的稳定项目决定或长期项目状态
 - relationship_anchor：关系连续性锚点
+- self_insight：{user_display_name} 明确表达的、以后理解他/她有帮助的自我认识
 
 字段边界：
 - kind 只能是 key_event / stable_preference / boundary / signal / commitment / project_state / relationship_anchor 之一；kind 表示“为什么值得写入、属于哪类记忆”。
@@ -569,6 +570,29 @@ class ReflectionEngine:
             1,
             min(200, int(cfg.get("daily_chat_memory_extraction_turns", 40))),
         )
+        # V4 full-day windowed extraction: every valid window of the day is
+        # actually checked (beginning / middle / end), bounded by per-window and
+        # per-run cost controls. Summaries only assist location, never replace a
+        # window check.
+        self.daily_chat_memory_window_turns = max(
+            4,
+            min(100, int(cfg.get("daily_chat_memory_window_turns", 24))),
+        )
+        self.daily_chat_memory_window_stride_turns = max(
+            1,
+            min(
+                self.daily_chat_memory_window_turns,
+                int(cfg.get("daily_chat_memory_window_stride_turns", 12)),
+            ),
+        )
+        self.daily_chat_memory_max_windows_per_run = max(
+            1,
+            min(60, int(cfg.get("daily_chat_memory_max_windows_per_run", 10))),
+        )
+        self.daily_chat_memory_window_max_input_chars = max(
+            2000,
+            min(60000, int(cfg.get("daily_chat_memory_window_max_input_chars", 12000))),
+        )
         # Owner confirm/reject sliding-window rate limit (per process).
         self.daily_chat_memory_confirm_rate_limit_per_minute = max(
             1,
@@ -578,7 +602,15 @@ class ReflectionEngine:
         self.daily_chat_memory_heuristic_confidence = self._clamp(
             cfg.get("daily_chat_memory_heuristic_confidence", 0.70)
         )
+        self.daily_chat_memory_run_audit_path = str(
+            cfg.get("daily_chat_memory_run_audit_path")
+            or os.path.join(
+                os.path.dirname(self.daily_chat_memory_pending_path),
+                "daily_chat_memory_run_audit.json",
+            )
+        )
         self._confirm_rate_window: list[float] = []
+        self._daily_chat_memory_run_lock: bool = False
 
         self.client = None
         if self.enabled and self.api_key and self.base_url:
@@ -2377,6 +2409,50 @@ class ReflectionEngine:
         force: bool = False,
         now: datetime | None = None,
     ) -> dict:
+        """Run daily chat memory with a per-process concurrency lock.
+
+        The lock guarantees a manual dashboard "补扫" cannot overlap a scheduled
+        run (request_id + concurrency lock semantics)."""
+        effective_mode = self._normalize_daily_chat_memory_mode(mode or self.daily_chat_memory_mode)
+        if effective_mode == "off" or self.daily_chat_memory_max_per_day <= 0:
+            return {"status": "disabled", "reason": "daily_chat_memory_off", "mode": effective_mode}
+        if not conversation_turn_store:
+            return {"status": "skipped", "reason": "no_conversation_turn_store", "mode": effective_mode}
+        if not self._daily_chat_memory_run_lock_acquire():
+            return {
+                "status": "locked",
+                "reason": "daily_chat_memory_run_in_progress",
+                "date": (now or datetime.now(timezone.utc)).astimezone(self.tz).date().isoformat(),
+                "mode": effective_mode,
+            }
+        try:
+            return await self._run_daily_chat_memory_impl(
+                bucket_mgr,
+                conversation_turn_store=conversation_turn_store,
+                raw_event_store=raw_event_store,
+                persona_engine=persona_engine,
+                embedding_engine=embedding_engine,
+                key=key,
+                mode=mode,
+                force=force,
+                now=now,
+            )
+        finally:
+            self._daily_chat_memory_run_lock_release()
+
+    async def _run_daily_chat_memory_impl(
+        self,
+        bucket_mgr,
+        *,
+        conversation_turn_store=None,
+        raw_event_store=None,
+        persona_engine=None,
+        embedding_engine=None,
+        key: str = "",
+        mode: str = "",
+        force: bool = False,
+        now: datetime | None = None,
+    ) -> dict:
         effective_mode = self._normalize_daily_chat_memory_mode(mode or self.daily_chat_memory_mode)
         if effective_mode == "off" or self.daily_chat_memory_max_per_day <= 0:
             return {"status": "disabled", "reason": "daily_chat_memory_off", "mode": effective_mode}
@@ -2464,28 +2540,104 @@ class ReflectionEngine:
             turns,
             self_context=self_context,
         )
-        raw_candidates = await self._extract_daily_chat_memory_candidates(
+        run_id = hashlib.sha1(
+            f"daily_chat_memory|{key}|{raw_event_cursor_id}|{datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+            .encode("utf-8")
+        ).hexdigest()[:12]
+        audit: dict = {
+            "run_id": run_id,
+            "date": key,
+            "source_start_seq": raw_event_cursor_id,
+            "source_end_seq": max_seen_raw_event_id or raw_event_cursor_id,
+            "eligible_turn_count": len(turns),
+            "window_count": 0,
+            "skipped_noise_window_count": 0,
+            "model_call_count": 0,
+            "model_candidate_count": 0,
+            "hard_rejects": {},
+            "soft_flags": {},
+            "merged_duplicates": 0,
+            "pending_count": 0,
+            "auto_applied_count": 0,
+            "status": "failed",
+            "error_category": "",
+            "prompt_version": "daily_chat_memory_v4",
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "completed_at": "",
+        }
+        raw_candidates, extraction_meta = await self._extract_daily_chat_memory_candidates(
             key,
             turns,
             self_context=self_context,
             window_summaries=window_summaries,
             max_candidates=max_candidates,
+            audit=audit,
         )
+        audit["model_candidate_count"] = len(raw_candidates)
         candidates = self._normalize_daily_chat_memory_candidates(
             key,
             raw_candidates,
             turns,
             max_candidates=max_candidates,
             min_confidence=min_confidence,
+            mode=effective_mode,
+            audit=audit,
         )
-        if not candidates:
+        # V4 watermark semantics: a run advances only the range it actually
+        # scanned to completion. zero_candidates still advances (windows were
+        # checked); partial stops at the last successfully processed window; the
+        # failed range is re-scanned on retry (idempotent, no double pending).
+        partial = bool(extraction_meta.get("partial"))
+        cursor_target = (
+            max_seen_raw_event_id
+            if not partial
+            else max(extraction_meta.get("last_processed_event_id") or 0, raw_event_cursor_id)
+        )
+        if not candidates and partial:
+            audit["status"] = "partial"
+            audit["error_category"] = "window_extraction_failed"
+            audit["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._store_daily_chat_memory_run_audit(audit)
             return {
-                "status": "skipped",
+                "status": "partial",
+                "reason": "window_extraction_failed",
+                "date": key,
+                "mode": effective_mode,
+                "turns": len(turns),
+                "source_start_seq": raw_event_cursor_id,
+                "source_end_seq": audit["source_end_seq"],
+                "processed_until_seq": cursor_target,
+                "cursor_updated": False,
+                "run_id": run_id,
+                "error_category": "window_extraction_failed",
+            }
+        if not candidates:
+            # All windows scanned, none produced: zero_candidates (allowed), and
+            # the processed watermark advances to the actual scanned end.
+            cursor_updated = (
+                self._update_daily_chat_memory_raw_cursor(profile_id, cursor_target, key)
+                if turn_source == "raw_events" and cursor_target > raw_event_cursor_id
+                else False
+            )
+            audit["status"] = "zero_candidates"
+            audit["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._store_daily_chat_memory_run_audit(audit)
+            return {
+                "status": "zero_candidates",
                 "reason": "no_candidates",
                 "date": key,
                 "mode": effective_mode,
                 "turns": len(turns),
+                "turn_source": turn_source,
                 "window_summaries": len(window_summaries),
+                "source_start_seq": raw_event_cursor_id,
+                "source_end_seq": audit["source_end_seq"],
+                "last_raw_event_id": cursor_target,
+                "cursor_updated": cursor_updated,
+                "run_id": run_id,
+                "model_candidate_count": audit["model_candidate_count"],
+                "hard_rejects": audit["hard_rejects"],
+                "soft_flags": audit["soft_flags"],
             }
 
         if effective_mode == "review":
@@ -2495,19 +2647,27 @@ class ReflectionEngine:
             ]
             pending = self._store_daily_chat_memory_pending(candidates, force=force)
             cursor_updated = (
-                self._update_daily_chat_memory_raw_cursor(profile_id, max_seen_raw_event_id, key)
-                if turn_source == "raw_events"
+                self._update_daily_chat_memory_raw_cursor(profile_id, cursor_target, key)
+                if turn_source == "raw_events" and cursor_target > raw_event_cursor_id
                 else False
             )
+            audit["status"] = "partial" if partial else "success"
+            audit["pending_count"] = pending.get("added", 0)
+            audit["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._store_daily_chat_memory_run_audit(audit)
             return {
-                "status": "pending",
+                "status": "partial" if partial else "pending",
+                "reason": "window_extraction_failed" if partial else "",
                 "date": key,
                 "mode": effective_mode,
                 "turns": len(turns),
                 "turn_source": turn_source,
                 "window_summaries": len(window_summaries),
-                "last_raw_event_id": max_seen_raw_event_id or raw_event_cursor_id,
+                "source_start_seq": raw_event_cursor_id,
+                "source_end_seq": audit["source_end_seq"],
+                "last_raw_event_id": cursor_target,
                 "cursor_updated": cursor_updated,
+                "run_id": run_id,
                 "candidates": candidates,
                 **pending,
             }
@@ -2536,19 +2696,28 @@ class ReflectionEngine:
             for candidate in candidates
         ]
         cursor_updated = (
-            self._update_daily_chat_memory_raw_cursor(profile_id, max_seen_raw_event_id, key)
-            if turn_source == "raw_events"
+            self._update_daily_chat_memory_raw_cursor(profile_id, cursor_target, key)
+            if turn_source == "raw_events" and cursor_target > raw_event_cursor_id
             else False
         )
+        applied_count = sum(1 for candidate in candidates if candidate.get("status") == "applied")
+        audit["status"] = "partial" if partial else ("success" if write_result.get("created") else "exists")
+        audit["auto_applied_count"] = applied_count
+        audit["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self._store_daily_chat_memory_run_audit(audit)
         return {
-            "status": "created" if write_result.get("created") else "exists",
+            "status": "partial" if partial else ("created" if write_result.get("created") else "exists"),
+            "reason": "window_extraction_failed" if partial else "",
             "date": key,
             "mode": effective_mode,
             "turns": len(turns),
             "turn_source": turn_source,
             "window_summaries": len(window_summaries),
-            "last_raw_event_id": max_seen_raw_event_id or raw_event_cursor_id,
+            "source_start_seq": raw_event_cursor_id,
+            "source_end_seq": audit["source_end_seq"],
+            "last_raw_event_id": cursor_target,
             "cursor_updated": cursor_updated,
+            "run_id": run_id,
             "candidates": candidates,
             **write_result,
         }
@@ -2659,6 +2828,8 @@ class ReflectionEngine:
             display["confirm_blocked"] = bool(blocked_reasons)
             display["blocked_reasons"] = blocked_reasons
             display["has_source_preview"] = has_source
+            display["soft_flags"] = list(candidate.get("soft_flags") or [])
+            display["needs_owner_edit"] = "needs_owner_edit" in (candidate.get("soft_flags") or [])
             display["confirm_blocked_reason"] = (
                 "候选来源无法核对或原文含内部控制标记，无法批准，请拒绝。"
                 if blocked_reasons
@@ -2673,13 +2844,22 @@ class ReflectionEngine:
         raw_event_store=None,
         conversation_turn_store=None,
         profile_id: str = "default",
+        source_kind: str = "",
+        source_id: str = "",
+        offset: int = 0,
+        limit: int = 4000,
     ) -> dict:
         """Owner-only read of the complete sanitized source text behind a candidate.
 
         The full original is never stored in the candidate record; it stays pointed
         at by source_event_ids / source_turn_ids and is fetched here for the
         Dashboard "查看完整原文" expander. All returned text goes through the
-        unified owner-visible sanitizer (no <silent>, no internal markers)."""
+        unified owner-visible sanitizer (no <silent>, no internal markers).
+
+        Paging semantics: each source item carries its chunk (`text`), `truncated`,
+        `full_length` and `continue_after`. A follow-up call with
+        source_kind + source_id + offset returns the next chunk. Truncation is
+        always explicit — never a silent fixed-length ellipsis."""
         rid = str(candidate_id or "").strip()
         if not rid:
             return {"status": "missing"}
@@ -2697,8 +2877,18 @@ class ReflectionEngine:
         event_ids = [int(v) for v in (candidate.get("source_event_ids") or []) if str(v).isdigit()]
         turn_ids = [int(v) for v in (candidate.get("source_turn_ids") or []) if str(v).isdigit()]
         date_key = str(candidate.get("date") or item.get("date") or "")
+        safe_offset = max(0, int(offset or 0))
+        safe_limit = max(256, min(20000, int(limit or 4000)))
         events: list[dict] = []
         turns: list[dict] = []
+
+        def chunked(payload: str, item_offset: int) -> tuple[str, bool, int, int]:
+            full_length = len(payload)
+            if item_offset >= full_length:
+                return "", False, full_length, -1
+            end = min(full_length, item_offset + safe_limit)
+            return payload[item_offset:end], end < full_length, full_length, end if end < full_length else -1
+
         if event_ids and raw_event_store:
             rows: list[dict] = []
             try:
@@ -2718,11 +2908,18 @@ class ReflectionEngine:
                 except (TypeError, ValueError):
                     continue
                 if event_id in wanted:
+                    if source_kind == "event" and source_id and str(event_id) != str(source_id):
+                        continue
+                    full_text = self._daily_chat_memory_owner_text(str(event.get("text") or ""))
+                    chunk, truncated, full_length, continue_after = chunked(full_text, safe_offset)
                     events.append(
                         {
                             "id": event_id,
                             "role": str(event.get("role") or ""),
-                            "text": self._daily_chat_memory_owner_text(str(event.get("text") or "")),
+                            "text": chunk,
+                            "truncated": truncated,
+                            "full_length": full_length,
+                            "continue_after": continue_after,
                         }
                     )
             events.sort(key=lambda entry: entry["id"])
@@ -2746,20 +2943,30 @@ class ReflectionEngine:
                 except (TypeError, ValueError):
                     continue
                 if turn_id in wanted:
+                    if source_kind == "turn" and source_id and str(turn_id) != str(source_id):
+                        continue
+                    user_text = self._daily_chat_memory_owner_text(str(turn.get("user_text") or ""))
+                    assistant_text = self._daily_chat_memory_owner_text(str(turn.get("assistant_text") or ""))
+                    full_text = f"{user_text} {assistant_text}".strip()
+                    chunk, truncated, full_length, continue_after = chunked(full_text, safe_offset)
                     turns.append(
                         {
                             "id": turn_id,
                             "session_id": str(turn.get("session_id") or ""),
-                            "user_text": self._daily_chat_memory_owner_text(str(turn.get("user_text") or "")),
-                            "assistant_text": self._daily_chat_memory_owner_text(
-                                str(turn.get("assistant_text") or "")
-                            ),
+                            "user_text": user_text,
+                            "assistant_text": assistant_text,
+                            "text": chunk,
+                            "truncated": truncated,
+                            "full_length": full_length,
+                            "continue_after": continue_after,
                         }
                     )
             turns.sort(key=lambda entry: entry["id"])
         return {
             "status": "ok",
             "candidate_id": rid,
+            "offset": safe_offset,
+            "limit": safe_limit,
             "events": events,
             "turns": turns,
             "missing_event_ids": sorted(set(event_ids) - {entry["id"] for entry in events}),
@@ -2789,7 +2996,13 @@ class ReflectionEngine:
                 "missing": 0,
                 "request_id": "",
             }
-        safe_action = "reject" if str(action or "").strip().lower() == "reject" else "confirm"
+        safe_action_raw = str(action or "").strip().lower()
+        if safe_action_raw == "defer":
+            safe_action = "defer"
+        elif safe_action_raw == "reject":
+            safe_action = "reject"
+        else:
+            safe_action = "confirm"
         safe_edits = edits if isinstance(edits, dict) else {}
         rid = str(request_id or "").strip() or hashlib.sha1(
             f"{safe_action}|{sorted(ids)}|{datetime.now(timezone.utc).isoformat(timespec='seconds')}".encode("utf-8")
@@ -2810,13 +3023,14 @@ class ReflectionEngine:
                 "request_id": rid,
                 "created": 0,
                 "rejected": 0,
+                "deferred": 0,
                 "missing": 0,
                 "results": [],
             }
 
         items = self._load_daily_chat_memory_pending()
         changed = False
-        created = rejected = missing = 0
+        created = rejected = deferred = missing = 0
         results: list[dict] = []
         seen: set[str] = set()
         for item in items:
@@ -2826,6 +3040,17 @@ class ReflectionEngine:
             seen.add(item_id)
             if str(item.get("status") or "") != "pending":
                 results.append({"id": item_id, "status": item.get("status") or "skipped"})
+                continue
+            if safe_action == "defer":
+                # 暂缓: keep the item, remove it from the active pending view. It
+                # is NOT a reject and can be reviewed again later.
+                item["status"] = "deferred"
+                item["deferred_at"] = action_time.isoformat(timespec="seconds")
+                item["action_source"] = "owner"
+                item["request_id"] = rid
+                deferred += 1
+                changed = True
+                results.append({"id": item_id, "status": "deferred"})
                 continue
             if safe_action == "reject":
                 item["status"] = "rejected"
@@ -2866,6 +3091,18 @@ class ReflectionEngine:
                 item["stale_reason"] = reason
                 results.append({"id": item_id, "status": "invalid_source", "reason": reason})
                 continue
+            soft_flags = set(candidate.get("soft_flags") or [])
+            if "needs_owner_edit" in soft_flags and not safe_edits.get(item_id):
+                # Wholesale-copy candidates must be rewritten by the owner before
+                # they can be approved; they stay visible in Review.
+                results.append(
+                    {
+                        "id": item_id,
+                        "status": "needs_owner_edit",
+                        "reason": "candidate_requires_edit",
+                    }
+                )
+                continue
             write_result = await self._write_daily_chat_memory_candidates(
                 [candidate],
                 bucket_mgr,
@@ -2890,6 +3127,7 @@ class ReflectionEngine:
             "action": safe_action,
             "created": created,
             "rejected": rejected,
+            "deferred": deferred,
             "missing": missing,
             "request_id": rid,
             "candidate_ids": sorted(ids),
@@ -2975,6 +3213,57 @@ class ReflectionEngine:
         except OSError as exc:
             logger.warning("Daily chat memory request ledger write failed: %s", exc)
 
+    # ------------------------------------------------------------------
+    # V4 run audit (append-only metadata) and run concurrency lock.
+    # ------------------------------------------------------------------
+    def _load_daily_chat_memory_run_audit(self) -> list[dict]:
+        try:
+            with open(self.daily_chat_memory_run_audit_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)]
+
+    def _store_daily_chat_memory_run_audit(self, audit: dict) -> None:
+        try:
+            ledger = self._load_daily_chat_memory_run_audit()
+            ledger.append(dict(audit))
+            ledger = ledger[-500:]
+            os.makedirs(os.path.dirname(self.daily_chat_memory_run_audit_path), exist_ok=True)
+            tmp_path = self.daily_chat_memory_run_audit_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(ledger, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.daily_chat_memory_run_audit_path)
+        except OSError as exc:
+            logger.warning("Daily chat memory run audit write failed: %s", exc)
+
+    def list_daily_chat_memory_run_audit(self, *, limit: int = 20) -> list[dict]:
+        safe_limit = max(1, min(200, int(limit or 20)))
+        return self._load_daily_chat_memory_run_audit()[-safe_limit:]
+
+    def daily_chat_memory_run_cursor(self, profile_id: str = "default") -> dict:
+        cursor = self._load_daily_chat_memory_cursor()
+        raw = cursor.get("raw_events") if isinstance(cursor.get("raw_events"), dict) else {}
+        entry = raw.get(self._daily_chat_memory_cursor_key(profile_id))
+        if not isinstance(entry, dict):
+            return {"last_raw_event_id": 0, "updated_at": ""}
+        try:
+            last_id = max(0, int(entry.get("last_raw_event_id") or 0))
+        except (TypeError, ValueError):
+            last_id = 0
+        return {"last_raw_event_id": last_id, "updated_at": str(entry.get("updated_at") or "")}
+
+    def _daily_chat_memory_run_lock_acquire(self) -> bool:
+        if self._daily_chat_memory_run_lock:
+            return False
+        self._daily_chat_memory_run_lock = True
+        return True
+
+    def _daily_chat_memory_run_lock_release(self) -> None:
+        self._daily_chat_memory_run_lock = False
+
     async def _extract_daily_chat_memory_candidates(
         self,
         key: str,
@@ -2983,120 +3272,180 @@ class ReflectionEngine:
         self_context: str = "",
         window_summaries: list[dict] | None = None,
         max_candidates: int | None = None,
-    ) -> list[dict]:
-        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=True)
-        if client:
-            summaries = window_summaries or []
-            # Replay a bounded set of original turns into the final stage so the
-            # model selects/verifies against source text, not only summaries.
-            extraction_turns = self._daily_chat_memory_extraction_turns(turns, summaries)
-            payload = {
-                "date": key,
-                "identity": {
-                    "ai_name": self.identity["ai_name"],
-                    "user_name": self.identity["user_name"],
-                    "user_display_name": self.identity["user_display_name"],
-                    "user_aliases": self.identity.get("user_aliases", []),
-                },
-                "self_anchor_entry": self_context,
-                "window_summaries": summaries,
-                "conversation_turns": extraction_turns,
-            }
-            try:
-                response = await self._daily_chat_memory_create_completion(
-                    client,
-                    model=model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": self._daily_chat_memory_prompt(max_candidates=max_candidates),
-                        },
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                    ],
-                    max_tokens=self.daily_chat_memory_candidate_max_tokens,
-                    temperature=self.temperature,
-                    use_daily_client=use_daily_client,
-                )
-                raw = self._completion_content(response)
-                parsed = self._parse_json_object(raw or "")
-                candidates = parsed.get("candidates") if isinstance(parsed, dict) else []
-                if isinstance(candidates, list):
-                    return [item for item in candidates if isinstance(item, dict)]
-            except Exception as exc:
-                logger.warning("Daily chat memory extraction failed, using heuristic: %s", exc)
-        return self._heuristic_daily_chat_memory_candidates(
-            key,
-            turns,
-            max_candidates=max_candidates,
-        )
+        audit: dict | None = None,
+    ) -> tuple[list[dict], dict]:
+        """V4 full-day windowed extraction.
 
-    def _daily_chat_memory_extraction_turns(
-        self,
-        turns: list[dict],
-        summaries: list[dict] | None,
-    ) -> list[dict]:
-        """Pick a bounded replay of original turns for the final extraction stage.
+        Every valid window of the day is actually checked (bounded model calls per
+        window), covering the beginning / middle / end. Deterministic noise windows
+        are skipped and recorded in the audit. The first window model failure stops
+        the run (status=partial); the failed range is never faked as processed and
+        the watermark only advances to the last successfully processed window.
 
-        Summaries only point at candidate windows; turns referenced by any summary
-        source id are replayed first. The remaining budget is then sampled evenly
-        across the whole day (beginning / middle / end) so no time segment is lost
-        just because a summary window skipped it.
+        Returns (raw_candidates, meta) where meta carries:
+        - partial: bool
+        - last_processed_event_id: max raw event id fully processed so far
+        - model_call_count / skipped_noise_window_count
         """
+        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=True)
+        meta: dict = {
+            "partial": False,
+            "last_processed_event_id": 0,
+            "model_call_count": 0,
+            "skipped_noise_window_count": 0,
+            "window_failures": 0,
+            "failed_window_index": None,
+        }
+        if audit is not None:
+            audit["window_count"] = 0
+            audit["skipped_noise_window_count"] = 0
+            audit["model_call_count"] = 0
+            audit["window_failures"] = 0
+        if not client:
+            heuristic = self._heuristic_daily_chat_memory_candidates(
+                key,
+                turns,
+                max_candidates=max_candidates,
+            )
+            return heuristic, meta
+        windows = self._daily_chat_memory_extraction_windows(turns)
+        if audit is not None:
+            audit["window_count"] = len(windows)
+        raw_candidates: list[dict] = []
+        processed_event_id = 0
+        for index, window in enumerate(windows):
+            window_max_event = max(
+                (int(v) for turn in window for v in (turn.get("raw_event_ids") or []) if str(v).isdigit()),
+                default=0,
+            )
+            if self._daily_chat_memory_window_is_noise(window):
+                processed_event_id = max(processed_event_id, window_max_event)
+                meta["skipped_noise_window_count"] += 1
+                if audit is not None:
+                    audit["skipped_noise_window_count"] = meta["skipped_noise_window_count"]
+                continue
+            try:
+                window_candidates = await self._extract_window_candidates(
+                    key,
+                    window,
+                    self_context=self_context,
+                    max_candidates=max_candidates,
+                    window_index=index + 1,
+                    window_total=len(windows),
+                )
+                meta["model_call_count"] += 1
+                if audit is not None:
+                    audit["model_call_count"] = meta["model_call_count"]
+            except Exception as exc:
+                logger.warning("Daily chat memory window %s extraction failed: %s", index + 1, exc)
+                meta["partial"] = True
+                meta["window_failures"] = 1
+                meta["failed_window_index"] = index + 1
+                if audit is not None:
+                    audit["window_failures"] = 1
+                    audit["partial"] = True
+                break
+            processed_event_id = max(processed_event_id, window_max_event)
+            raw_candidates.extend(window_candidates)
+        meta["last_processed_event_id"] = processed_event_id
+        return raw_candidates, meta
+
+    def _daily_chat_memory_extraction_windows(self, turns: list[dict]) -> list[list[dict]]:
+        """Deterministic pre-filtered, bounded windows covering the whole day.
+
+        Window size/stride adapt so the entire day fits within the per-run model
+        call budget; the per-window input is also bounded by characters."""
         if not turns:
             return []
-        budget = self.daily_chat_memory_extraction_turns
-        if len(turns) <= budget:
-            return turns
-        referenced_turn_ids: set[int] = set()
-        referenced_event_ids: set[int] = set()
-        for summary in summaries or []:
-            for value in self._string_list(summary.get("source_turn_ids"), limit=80):
-                if str(value).isdigit():
-                    referenced_turn_ids.add(int(value))
-            for value in self._string_list(summary.get("source_event_ids"), limit=160):
-                if str(value).isdigit():
-                    referenced_event_ids.add(int(value))
-        picked: list[dict] = []
-        picked_keys: set[str] = set()
-
-        def add_turn(turn: dict) -> None:
-            key_value = str(turn.get("id") or turn.get("session_id") or "")
-            if key_value in picked_keys:
-                return
-            picked.append(turn)
-            picked_keys.add(key_value)
-
-        for turn in turns:
-            turn_id = turn.get("id")
-            event_ids = {int(v) for v in (turn.get("raw_event_ids") or []) if str(v).isdigit()}
-            if (
-                (turn_id is not None and str(turn_id).isdigit() and int(turn_id) in referenced_turn_ids)
-                or (event_ids & referenced_event_ids)
-            ):
-                add_turn(turn)
-            if len(picked) >= budget:
+        size = self.daily_chat_memory_window_turns
+        stride = self.daily_chat_memory_window_stride_turns
+        max_windows = self.daily_chat_memory_max_windows_per_run
+        total_len = sum(
+            len(str(turn.get("user_text") or "")) + len(str(turn.get("assistant_text") or ""))
+            for turn in turns
+        )
+        if len(turns) > size:
+            needed = (len(turns) - size) // stride + 2
+            if needed > max_windows:
+                size = max(4, -(-len(turns) // max_windows))
+                stride = max(1, size // 2)
+        avg_len = max(1, total_len // max(1, len(turns)))
+        char_bounded_size = max(
+            4,
+            min(size, self.daily_chat_memory_window_max_input_chars // max(1, avg_len)),
+        )
+        size = char_bounded_size
+        stride = min(stride, size)
+        windows: list[list[dict]] = []
+        start = 0
+        while start < len(turns):
+            windows.append(turns[start : start + size])
+            if start + size >= len(turns):
                 break
-        if len(picked) < budget:
-            # Evenly sample the remaining day instead of only taking the tail.
-            candidates_indices = [
-                index
-                for index, turn in enumerate(turns)
-                if str(turn.get("id") or turn.get("session_id") or "") not in picked_keys
-            ]
-            if candidates_indices:
-                for fraction in (0.0, 0.25, 0.5, 0.75, 0.99):
-                    if len(picked) >= budget:
-                        break
-                    index = candidates_indices[min(len(candidates_indices) - 1, int(fraction * len(candidates_indices)))]
-                    add_turn(turns[index])
-                # Fill any remaining budget by walking forward from the middle evenly.
-                step = max(1, len(candidates_indices) // max(1, budget - len(picked) + 1))
-                for offset in range(0, len(candidates_indices), step):
-                    if len(picked) >= budget:
-                        break
-                    add_turn(turns[candidates_indices[offset]])
-        picked.sort(key=lambda item: (str(item.get("created_at") or ""), int(item.get("id") or 0)))
-        return picked
+            start += stride
+        return windows
+
+    @classmethod
+    def _daily_chat_memory_window_is_noise(cls, window: list[dict]) -> bool:
+        """Deterministic noise pre-filter: assistant-only chit-chat with no durable
+        signal and no user statement is not worth a model call (recorded in audit)."""
+        durable_markers = (
+            "承诺", "约定", "答应", "以后", "边界", "暗号", "偏好", "希望",
+            "不要", "不再", "部署", "决定", "正式", "一起", "约定好", "答应",
+        )
+        has_user_statement = False
+        for turn in window or []:
+            user_text = cls._daily_chat_memory_owner_text(str(turn.get("user_text") or ""))
+            assistant_text = cls._daily_chat_memory_owner_text(str(turn.get("assistant_text") or ""))
+            if user_text:
+                has_user_statement = True
+            if any(marker in (user_text + assistant_text) for marker in durable_markers):
+                return False
+        return not has_user_statement
+
+    async def _extract_window_candidates(
+        self,
+        key: str,
+        window: list[dict],
+        *,
+        self_context: str = "",
+        max_candidates: int | None = None,
+        window_index: int = 1,
+        window_total: int = 1,
+    ) -> list[dict]:
+        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=True)
+        payload = {
+            "date": key,
+            "identity": {
+                "ai_name": self.identity["ai_name"],
+                "user_name": self.identity["user_name"],
+                "user_display_name": self.identity["user_display_name"],
+                "user_aliases": self.identity.get("user_aliases", []),
+            },
+            "self_anchor_entry": self_context,
+            "window": {"index": window_index, "total": window_total},
+            "conversation_turns": window,
+        }
+        response = await self._daily_chat_memory_create_completion(
+            client,
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": self._daily_chat_memory_prompt(max_candidates=max_candidates),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            max_tokens=self.daily_chat_memory_candidate_max_tokens,
+            temperature=self.temperature,
+            use_daily_client=use_daily_client,
+        )
+        raw = self._completion_content(response)
+        parsed = self._parse_json_object(raw or "")
+        candidates = parsed.get("candidates") if isinstance(parsed, dict) else []
+        if not isinstance(candidates, list):
+            return []
+        return [item for item in candidates if isinstance(item, dict)]
 
     def _heuristic_daily_chat_memory_candidates(
         self,
@@ -3141,6 +3490,10 @@ class ReflectionEngine:
                 ["关系定位", "我们是", "正式在一起", "在一起了", "第一次见面", "搬来和我住", "关系变了"],
             ),
             (
+                "self_insight",
+                ["我发现自己", "我意识到", "我其实", "我原来", "我发现我", "我才知道我自己", "我明白了自己"],
+            ),
+            (
                 "key_event",
                 ["终于", "特别开心", "很感动", "值得记住", "重要的日子", "第一次做", "第一次一起"],
             ),
@@ -3153,6 +3506,7 @@ class ReflectionEngine:
             "boundary",
             "project_state",
             "relationship_anchor",
+            "self_insight",
             "stable_preference",
             "key_event",
         ]
@@ -3263,6 +3617,8 @@ class ReflectionEngine:
             return excerpt if self._starts_with_identity(excerpt) else f"项目状态：{excerpt}"
         if kind == "relationship_anchor":
             return excerpt if self._starts_with_identity(excerpt) else f"{ai_name}记得这段关系锚点：{excerpt}"
+        if kind == "self_insight":
+            return excerpt if self._starts_with_identity(excerpt) else f"{user_display_name}的自我认识：{excerpt}"
         if kind == "boundary":
             return excerpt if self._starts_with_identity(excerpt) else f"{user_display_name}的边界：{excerpt}"
         if kind == "signal":
@@ -3747,28 +4103,51 @@ class ReflectionEngine:
         *,
         max_candidates: int | None = None,
         min_confidence: float | None = None,
+        mode: str = "review",
+        audit: dict | None = None,
     ) -> list[dict]:
         valid_turn_ids, valid_event_ids = self._daily_chat_memory_valid_source_maps(turns)
         normalized = []
-        # Compare against everything already proposed, including items 润润 已经
-        # 否决过的. Without this the dedup only ever saw the current run's batch,
-        # so identical content resurfaced day after day and past rejections were
-        # silently ignored.
-        # Stored records wrap the real payload: {"id","date","status","candidate":{...}}.
-        # The comparator needs the inner candidate dicts, not the wrappers.
-        history = [
-            record.get("candidate") or record
-            for record in (self._load_daily_chat_memory_payload().get("items") or [])
+        effective_mode = self._normalize_daily_chat_memory_mode(mode or "review")
+        # History is compared with status so exact duplicates are suppressed but
+        # similar-to-rejected candidates only get a soft warning (no permanent
+        # blackhole), and similar-to-confirmed candidates get possible_duplicate.
+        history_records: list[dict] = [
+            record for record in (self._load_daily_chat_memory_payload().get("items") or [])
             if isinstance(record, dict)
         ]
+        history_candidates: list[tuple[dict, str]] = []
+        for record in history_records:
+            candidate = record.get("candidate") if isinstance(record.get("candidate"), dict) else record
+            if isinstance(candidate, dict):
+                history_candidates.append((candidate, str(record.get("status") or "").strip().lower()))
+        history_only = [candidate for candidate, _status in history_candidates]
+
+        hard_reject_counts: dict[str, int] = {}
+        if audit is not None:
+            audit["hard_rejects"] = hard_reject_counts
+            audit["soft_flags"] = {}
+            audit["merged_duplicates"] = 0
+
+        def record_hard(reason: str) -> None:
+            hard_reject_counts[reason] = hard_reject_counts.get(reason, 0) + 1
+
+        def record_soft(flag: str) -> None:
+            if audit is not None:
+                flags = audit["soft_flags"]
+                flags[flag] = flags.get(flag, 0) + 1
+
         for candidate in candidates or []:
             if candidate.get("should_write") is False:
                 continue
             candidate_tags = self._string_list(candidate.get("tags"), limit=8)
             content = self._trim_daily_chat_memory_content(str(candidate.get("content") or "").strip())
             if not content:
+                # proposed_memory empty: hard reject (invalid structure).
+                record_hard("empty_proposed_memory")
                 continue
             if self._daily_chat_memory_noise(content):
+                record_hard("system_noise_content")
                 continue
             kind = self._normalize_auto_memory_kind(
                 candidate.get("kind"),
@@ -3776,22 +4155,17 @@ class ReflectionEngine:
                 tags=candidate_tags,
             )
             if not kind or kind == "love_letter":
-                continue
-            if self._daily_chat_memory_low_value_social_noise(content, kind):
+                record_hard("invalid_candidate_type")
                 continue
             title = str(candidate.get("title") or "").strip()
-            if self._daily_chat_memory_low_value_episode(content, kind, title):
-                continue
             confidence = self._clamp(candidate.get("confidence", 0.0))
-            threshold = self.daily_chat_memory_min_confidence if min_confidence is None else min_confidence
-            if confidence < threshold:
+            # A tiny absolute floor is structural; everything above it is decided
+            # by the mode gate below.
+            if confidence < 0.1:
+                record_hard("invalid_confidence")
                 continue
-            if self._daily_chat_memory_title_is_generic(title):
-                title = self._daily_chat_memory_title(content, kind, key)
             domain = self._auto_memory_domain(kind, content, candidate_tags, candidate.get("domain"))
             # Strict source resolution: ids must exist in this day's real turns.
-            # Missing or fabricated ids drop the candidate; never fall back to the
-            # whole day (that was a root cause of untraceable derived candidates).
             raw_turn_ids = [
                 int(turn_id)
                 for turn_id in self._string_list(candidate.get("source_turn_ids"), limit=20)
@@ -3805,6 +4179,7 @@ class ReflectionEngine:
             source_turn_ids = sorted({turn_id for turn_id in raw_turn_ids if turn_id in valid_turn_ids})
             source_event_ids = sorted({event_id for event_id in raw_event_ids if event_id in valid_event_ids})
             if not source_turn_ids and not source_event_ids:
+                record_hard("missing_or_fabricated_source")
                 continue
             source_turns = self._daily_chat_memory_turns_by_ids(
                 turns,
@@ -3812,10 +4187,9 @@ class ReflectionEngine:
                 source_event_ids,
             )
             if not source_turns:
+                record_hard("source_not_found")
                 continue
-            # V3: only clean, owner-visible source turns may support a candidate.
-            # Internal material dumps (e.g. "近期素材" [app/bridge] payloads) and
-            # turns with no remaining clean text after sanitization are excluded.
+            # V3/V4: only clean, owner-visible source turns may support a candidate.
             source_turns = [
                 turn
                 for turn in source_turns
@@ -3827,29 +4201,72 @@ class ReflectionEngine:
                 if self._daily_chat_memory_turn_has_clean_text(turn)
             ]
             if not clean_turns:
-                # No complete, clean source available: drop, never guess/fill.
+                record_hard("no_clean_source")
                 continue
-            # The stored excerpt is always system-derived from bound turns with
-            # complete-sentence boundaries and the unified owner-visible
-            # sanitizer. A model-supplied original_excerpt is never stored as-is
-            # (it was the source of mid-tag / mid-sentence slices).
             original_excerpt = self._daily_chat_memory_excerpt_for_turns(candidate, clean_turns)
             if not original_excerpt:
+                record_hard("no_clean_source_sentence")
                 continue
             generation_source = str(candidate.get("generation_source") or "model").strip().lower() or "model"
+            if not self._daily_chat_memory_source_supports_kind(kind, clean_turns):
+                # candidate_type must be supported by the source; ordinary comfort
+                # replies must not become boundary/key_event/stable_preference.
+                record_hard("candidate_type_not_supported_by_source")
+                continue
+            source_hash = self._daily_chat_memory_source_hash_for_turns(clean_turns)
+            # ---- V4 soft flags: Review keeps these visible for the owner ----
+            soft_flags: list[str] = []
             if generation_source == "model" and self._daily_chat_memory_proposed_echoes_excerpt(
                 content,
                 original_excerpt,
             ):
-                # The model just echoed the original as the proposed memory.
+                # Wholesale copy: keep in Review as needs-editing, never approve
+                # until the owner rewrites the proposed memory.
+                soft_flags += ["excerpt_overlap", "needs_owner_edit"]
+            if self._daily_chat_memory_source_is_weak(kind, clean_turns):
+                soft_flags.append("weak_source_support")
+            if self._daily_chat_memory_low_value_social_noise(content, kind):
+                soft_flags.append("possibly_transient")
+            if self._daily_chat_memory_low_value_episode(content, kind, title):
+                soft_flags += ["possibly_transient", "possibly_generic"]
+            if self._daily_chat_memory_title_is_generic(title):
+                soft_flags.append("possibly_generic")
+                title = self._daily_chat_memory_title(content, kind, key)
+            mode_threshold = self.daily_chat_memory_min_confidence if min_confidence is None else min_confidence
+            if confidence < mode_threshold:
+                if effective_mode == "auto":
+                    # Auto is strict: below the auto threshold is a hard reject.
+                    record_hard("below_auto_confidence")
+                    continue
+                # Review keeps low-confidence candidates visible with a flag.
+                soft_flags.append("low_confidence")
+            candidate_id = self._daily_chat_memory_candidate_id(key, kind, content)
+            # Exact duplicates (same identity / same source_hash+kind) are
+            # suppressed idempotently; similar items only warn.
+            if self._daily_chat_memory_exact_duplicate(
+                {"id": candidate_id, "kind": kind, "source_hash": source_hash},
+                history_only,
+            ):
+                record_hard("exact_duplicate")
                 continue
-            if not self._daily_chat_memory_source_supports_kind(kind, clean_turns):
-                # candidate_type must be supported by the source; ordinary comfort
-                # replies must not become boundary/key_event/stable_preference.
-                continue
-            source_hash = self._daily_chat_memory_source_hash_for_turns(clean_turns)
+            similar_status = self._daily_chat_memory_similar_history_status(
+                {
+                    "kind": kind,
+                    "date": key,
+                    "title": title,
+                    "content": content,
+                    "source_turn_ids": source_turn_ids,
+                    "source_event_ids": source_event_ids,
+                },
+                history_candidates,
+            )
+            if similar_status == "rejected":
+                soft_flags.append("previously_rejected_similar")
+            elif similar_status == "confirmed":
+                soft_flags.append("possible_duplicate")
+            soft_flags = list(dict.fromkeys(soft_flags))
             item = self._daily_chat_memory_enrich_candidate_terms({
-                "id": self._daily_chat_memory_candidate_id(key, kind, content),
+                "id": candidate_id,
                 "date": key,
                 "kind": kind,
                 "candidate_type": kind,
@@ -3860,6 +4277,7 @@ class ReflectionEngine:
                 "generation_source": generation_source,
                 "source_hash": source_hash,
                 "source_verification": "verified",
+                "soft_flags": soft_flags,
                 "tags": candidate_tags,
                 "keywords": self._string_list(candidate.get("keywords"), limit=12),
                 "domain": domain,
@@ -3871,9 +4289,8 @@ class ReflectionEngine:
                 "source_event_ids": source_event_ids[:160],
                 "reason": str(candidate.get("reason") or "").strip()[:160],
             })
-            if self._daily_chat_memory_duplicate_candidate(item, history):
-                # Past rejections/decisions are respected: do not resurface.
-                continue
+            for flag in soft_flags:
+                record_soft(flag)
             existing_duplicate = next(
                 (
                     existing
@@ -3886,11 +4303,57 @@ class ReflectionEngine:
                 # Overlapping windows produced the same candidate: merge into the
                 # existing one, keeping the most complete source references.
                 self._daily_chat_memory_merge_sources(existing_duplicate, item, turns)
+                if audit is not None:
+                    audit["merged_duplicates"] = audit.get("merged_duplicates", 0) + 1
                 continue
             normalized.append(item)
             if len(normalized) >= int(max_candidates or self.daily_chat_memory_max_per_day or 1):
                 break
         return normalized
+
+    @staticmethod
+    def _daily_chat_memory_exact_duplicate(item: dict, history: list[dict]) -> bool:
+        """Idempotent suppression: same candidate identity or same source_hash+kind."""
+        item_id = str(item.get("id") or "").strip()
+        item_hash = str(item.get("source_hash") or "").strip()
+        item_kind = str(item.get("kind") or "")
+        for existing in history:
+            if item_id and str(existing.get("id") or "").strip() == item_id:
+                return True
+            existing_hash = str(existing.get("source_hash") or "").strip()
+            if (
+                item_hash
+                and existing_hash == item_hash
+                and item_kind
+                and str(existing.get("kind") or "") == item_kind
+            ):
+                return True
+        return False
+
+    def _daily_chat_memory_similar_history_status(
+        self,
+        item: dict,
+        history: list[tuple[dict, str]],
+    ) -> str:
+        """Return 'rejected' / 'confirmed' when a similar (not exact) history item
+        exists, otherwise ''. Similar-to-rejected only warns (no blackhole)."""
+        for existing, status in history:
+            if status not in {"rejected", "confirmed"}:
+                continue
+            if self._daily_chat_memory_duplicate_candidate(item, [existing]):
+                return status
+        return ""
+
+    @classmethod
+    def _daily_chat_memory_source_is_weak(cls, kind: str, turns: list[dict]) -> bool:
+        """Assistant-only support or a very short single user utterance means the
+        source support for the candidate type is weak (soft warning, still kept)."""
+        user_texts = [cls._daily_chat_memory_owner_text(str(turn.get("user_text") or "")) for turn in turns or []]
+        if not any(text for text in user_texts):
+            return True
+        if sum(len(text) for text in user_texts) <= 20:
+            return True
+        return False
 
     def _daily_chat_memory_merge_sources(
         self,
@@ -4123,7 +4586,7 @@ class ReflectionEngine:
         has_user_statement = any(text for text in user_texts)
         assistant_pool = " ".join(text for text in assistant_texts if text)
         user_pool = " ".join(text for text in user_texts if text)
-        user_needed_kinds = {"key_event", "boundary", "stable_preference", "signal"}
+        user_needed_kinds = {"key_event", "boundary", "stable_preference", "signal", "self_insight"}
         if kind in user_needed_kinds and not has_user_statement:
             return False
         if any(marker in assistant_pool for marker in cls._COMFORT_MARKERS):
@@ -4172,6 +4635,13 @@ class ReflectionEngine:
                 str(edit.get("content") or "").strip()
             )
             updated["proposed_memory"] = updated["content"]
+            # The owner rewrote the proposed memory: the wholesale-copy flags no
+            # longer apply and the candidate becomes approvable.
+            updated["soft_flags"] = [
+                flag
+                for flag in (updated.get("soft_flags") or [])
+                if flag not in {"excerpt_overlap", "needs_owner_edit"}
+            ]
         if "kind" in edit:
             tags = self._string_list(updated.get("tags"), limit=12)
             kind = self._normalize_auto_memory_kind(
@@ -4842,6 +5312,7 @@ class ReflectionEngine:
             "commitment",
             "project_state",
             "relationship_anchor",
+            "self_insight",
             "love_letter",
         }
         return kind if kind in allowed else ""
@@ -4871,6 +5342,8 @@ class ReflectionEngine:
             return "stable_preference"
         if any(marker in text for marker in ["暗号", "信号", "口令", "切换", "称呼"]):
             return "signal"
+        if any(marker in text for marker in ["自我认识", "意识到", "发现自己", "我其实", "我原来"]):
+            return "self_insight"
         if domain == "project" or domain.startswith("project."):
             return "project_state"
         if domain in {"relationship", "intimacy"} or domain.startswith("relationship."):
@@ -4987,6 +5460,7 @@ class ReflectionEngine:
             "commitment": "commitment",
             "project_state": "project_event",
             "relationship_anchor": "relationship_event",
+            "self_insight": "self_insight",
             "love_letter": "relationship_event",
         }.get(kind, "relationship_event")
 
@@ -5000,6 +5474,7 @@ class ReflectionEngine:
             "commitment": "承诺",
             "project_state": "项目状态",
             "relationship_anchor": "关系锚点",
+            "self_insight": "自我认识",
             "love_letter": "情书摘要锚点",
         }.get(kind, "长期记忆")
 

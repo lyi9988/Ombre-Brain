@@ -215,8 +215,8 @@ def test_model_candidate_from_stable_preference_with_original_excerpt(tmp_path):
     assert captured[0]["payload"]  # model path actually ran
 
 
-def test_extraction_payload_always_replays_original_turns(tmp_path):
-    """两级压缩修复：有 window_summaries 时最终抽取阶段仍必须回看原文轮次。"""
+def test_extraction_window_payload_replays_original_turns(tmp_path):
+    """V4 分窗抽取：每个窗口的 payload 必须包含该窗口真实原文轮次。"""
     engine = ReflectionEngine(make_config(tmp_path, mode="review"))
     turns = [
         {
@@ -239,19 +239,19 @@ def test_extraction_payload_always_replays_original_turns(tmp_path):
             }
         ],
     )
-    result = asyncio.run(
+    candidates, meta = asyncio.run(
         engine._extract_daily_chat_memory_candidates(
             "2026-08-14",
             turns,
-            window_summaries=[
-                {"window_index": 1, "title": "w", "summary": "窗口摘要", "source_turn_ids": [1, 2, 3]}
-            ],
         )
     )
-    assert result
+    assert candidates
+    assert meta["model_call_count"] == 1
+    assert meta["partial"] is False
     user_payload = json.loads(captured[0]["payload"])
-    assert user_payload["window_summaries"]
-    assert user_payload["conversation_turns"], "final stage must see original turns even when summaries exist"
+    assert user_payload["window"]["index"] == 1
+    assert user_payload["conversation_turns"], "window payload must contain original turns"
+    assert {int(turn["id"]) for turn in user_payload["conversation_turns"]} == {1, 2, 3, 4, 5}
 
 
 def test_ordinary_debugging_chat_returns_zero_candidates_heuristic(tmp_path):
@@ -275,7 +275,7 @@ def test_ordinary_debugging_chat_returns_zero_candidates_heuristic(tmp_path):
     ]
     buckets = FakeBuckets()
     result = run_memory(engine, buckets, "review", turns=turns)
-    assert result["status"] == "skipped"
+    assert result["status"] == "zero_candidates"
     assert result["reason"] == "no_candidates"
     assert buckets.created == []
 
@@ -294,7 +294,7 @@ def test_ordinary_debugging_chat_returns_zero_candidates_model(tmp_path):
     patch_model(engine, [{"content": json.dumps({"candidates": []}, ensure_ascii=False)}])
     buckets = FakeBuckets()
     result = run_memory(engine, buckets, "review", turns=turns)
-    assert result["status"] == "skipped"
+    assert result["status"] == "zero_candidates"
     assert result["reason"] == "no_candidates"
 
 
@@ -311,7 +311,7 @@ def test_insufficient_material_returns_zero_candidates(tmp_path):
     ]
     buckets = FakeBuckets()
     result = run_memory(engine, buckets, "review", turns=turns)
-    assert result["status"] == "skipped"
+    assert result["status"] == "zero_candidates"
     assert result["reason"] == "no_candidates"
 
 
@@ -401,7 +401,7 @@ def test_source_ids_missing_dropped_no_all_day_fallback(tmp_path):
     buckets = FakeBuckets()
     result = run_memory(engine, buckets, "review", turns=turns)
     # 模型漏填来源 → 丢弃；绝不回退为全天 id。
-    assert result["status"] == "skipped"
+    assert result["status"] == "zero_candidates"
     assert result["reason"] == "no_candidates"
     assert engine._load_daily_chat_memory_pending() == []
 
@@ -443,10 +443,12 @@ def test_fabricated_source_ids_dropped(tmp_path):
     )
     buckets = FakeBuckets()
     result = run_memory(engine, buckets, "review", turns=turns)
-    assert result["status"] == "skipped"
+    assert result["status"] == "zero_candidates"
 
 
-def test_model_excerpt_not_matching_source_dropped(tmp_path):
+def test_model_excerpt_echo_kept_with_needs_owner_edit(tmp_path):
+    """V4：模型整段照抄原文时，候选保留在 Review 并标记 needs_owner_edit，
+    不再静默丢弃；未编辑前 approve 被拦截。"""
     engine = ReflectionEngine(make_config(tmp_path, mode="review"))
     turns = [
         {
@@ -469,9 +471,8 @@ def test_model_excerpt_not_matching_source_dropped(tmp_path):
                                 "kind": "stable_preference",
                                 "title": "x",
                                 "content": "以后默认先说明边界",
-                                "original_excerpt": "这是一段编造的原文摘录，并不存在于轮次中",
                                 "domain": "general",
-                                "confidence": 0.8,
+                                "confidence": 0.75,
                                 "source_turn_ids": [1],
                             }
                         ]
@@ -483,7 +484,16 @@ def test_model_excerpt_not_matching_source_dropped(tmp_path):
     )
     buckets = FakeBuckets()
     result = run_memory(engine, buckets, "review", turns=turns)
-    assert result["status"] == "skipped"
+    assert result["status"] == "pending"
+    candidate = result["candidates"][0]
+    assert "needs_owner_edit" in candidate["soft_flags"]
+    assert "excerpt_overlap" in candidate["soft_flags"]
+    # 未编辑 → approve 被拦截
+    confirmed = asyncio.run(
+        engine.confirm_daily_chat_memory([candidate["id"]], buckets, action="confirm", request_id="rq-echo-1")
+    )
+    assert confirmed["results"][0]["status"] == "needs_owner_edit"
+    assert buckets.created == []
 
 
 def test_auto_derived_excerpt_when_model_omits(tmp_path):
@@ -527,8 +537,9 @@ def test_auto_derived_excerpt_when_model_omits(tmp_path):
     assert "以后默认先说明边界" in candidate["original_excerpt"]
 
 
-def test_low_confidence_generic_candidate_dropped(tmp_path):
-    """Review 保持较高召回：只有低于 review 阈值(0.55)的候选才丢弃。"""
+def test_low_confidence_generic_candidate_kept_with_flag(tmp_path):
+    """V4：Review 保持高召回——低于 review 阈值的候选保留并标记 low_confidence，
+    不静默丢弃。"""
     engine = ReflectionEngine(make_config(tmp_path, mode="review"))
     turns = [
         {
@@ -550,7 +561,7 @@ def test_low_confidence_generic_candidate_dropped(tmp_path):
                                 "should_write": True,
                                 "kind": "key_event",
                                 "title": "泛泛",
-                                "content": "今天聊了天气",
+                                "content": "今天聊了天气，泛泛的内容",
                                 "original_excerpt": "今天天气不错",
                                 "domain": "general",
                                 "confidence": 0.5,
@@ -565,7 +576,10 @@ def test_low_confidence_generic_candidate_dropped(tmp_path):
     )
     buckets = FakeBuckets()
     result = run_memory(engine, buckets, "review", turns=turns)
-    assert result["status"] == "skipped"
+    assert result["status"] == "pending"
+    candidate = result["candidates"][0]
+    assert "low_confidence" in candidate["soft_flags"]
+    assert candidate["confidence"] == 0.5
 
 
 def test_review_keeps_moderate_confidence_for_recall(tmp_path):
@@ -656,7 +670,7 @@ def test_auto_uses_strict_confidence(tmp_path):
             force=True,
         )
     )
-    assert result["status"] == "skipped"
+    assert result["status"] == "zero_candidates"
     assert result["reason"] == "no_candidates"
     assert buckets.created == []
 
@@ -790,7 +804,7 @@ def test_project_state_requires_decided_marker(tmp_path):
     ]
     buckets = FakeBuckets()
     result = run_memory(engine, buckets, "review", turns=turns)
-    assert result["status"] == "skipped"
+    assert result["status"] == "zero_candidates"
 
 
 def test_project_state_allowed_for_stable_decision(tmp_path):
@@ -862,7 +876,7 @@ def test_heuristic_turn_without_source_id_skipped(tmp_path):
     buckets = FakeBuckets()
     result = run_memory(engine, buckets, "review", turns=turns)
     # 无 id 也无 raw_event_ids → 无法精确引用来源 → 不产出候选
-    assert result["status"] == "skipped"
+    assert result["status"] == "zero_candidates"
 
 
 # ---------------------------------------------------------------------------
@@ -1342,7 +1356,7 @@ def test_auto_candidate_without_source_not_applied(tmp_path):
             force=True,
         )
     )
-    assert result["status"] == "skipped"
+    assert result["status"] == "zero_candidates"
     assert result["reason"] == "no_candidates"
     assert buckets.created == []
 
@@ -1471,37 +1485,26 @@ def test_duplicate_overlapping_windows_merged_most_complete_source(tmp_path):
     assert merged["source_hash"]
 
 
-def test_extraction_turns_sample_beginning_middle_end(tmp_path):
-    """原文回看必须覆盖当天开头/中间/结尾，不能因摘要丢时间段。"""
-    engine = ReflectionEngine(make_config(tmp_path, mode="review"))
+def test_extraction_windows_cover_beginning_middle_end(tmp_path):
+    """V4 全天窗口覆盖：每段轮次都必须落入至少一个被检查的窗口。"""
+    engine = ReflectionEngine(
+        make_config(
+            tmp_path,
+            mode="review",
+            daily_chat_memory_window_turns=4,
+            daily_chat_memory_window_stride_turns=2,
+            daily_chat_memory_max_windows_per_run=10,
+        )
+    )
     turns = [
         {"id": n, "session_id": "s", "created_at": f"2026-08-14T{9 + n}:00:00+08:00",
          "user_text": f"内容 {n}", "assistant_text": f"回复 {n}"}
         for n in range(1, 11)
     ]
-    captured = patch_model(
-        engine,
-        [
-            {
-                "content": json.dumps(
-                    {"candidates": [{"should_write": True, "kind": "key_event", "content": "x",
-                                     "original_excerpt": "内容 5", "source_turn_ids": [5]}]},
-                    ensure_ascii=False,
-                )
-            }
-        ],
-    )
-    result = asyncio.run(
-        engine._extract_daily_chat_memory_candidates(
-            "2026-08-14",
-            turns,
-            window_summaries=[{"window_index": 1, "title": "w", "summary": "s", "source_turn_ids": [5]}],
-        )
-    )
-    assert result
-    payload = json.loads(captured[0]["payload"])
-    replayed_ids = {int(turn["id"]) for turn in payload["conversation_turns"]}
-    # 摘要引用的 5 号轮次 + 开头(1) + 结尾(10) 都必须被回看
-    assert 5 in replayed_ids
-    assert 1 in replayed_ids
-    assert 10 in replayed_ids
+    windows = engine._daily_chat_memory_extraction_windows(turns)
+    covered_ids: set[int] = set()
+    for window in windows:
+        covered_ids.update(int(turn["id"]) for turn in window if turn.get("id") is not None)
+    assert covered_ids == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+    # 开头 / 中间 / 结尾都在被检查的窗口内
+    assert 1 in covered_ids and 5 in covered_ids and 10 in covered_ids

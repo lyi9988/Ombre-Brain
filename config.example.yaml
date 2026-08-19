@@ -677,6 +677,11 @@ reflection:
   daily_chat_memory_summary_window_turns: 14    # overlapping context window so boundaries do not split causality
   daily_chat_memory_summary_stride_turns: 7     # start a new summary window every N turns
   daily_chat_memory_extraction_turns: 40        # bounded original turns replayed into the final candidate stage (no summary-of-summary)
+  daily_chat_memory_window_turns: 24            # V4: full-day windowed extraction window size (every window is checked)
+  daily_chat_memory_window_stride_turns: 12     # overlap stride between windows (beginning/middle/end coverage)
+  daily_chat_memory_max_windows_per_run: 10     # per-run model call budget; window size adapts so the whole day fits
+  daily_chat_memory_window_max_input_chars: 12000 # per-window input cap (cost control at the model layer, not UI)
+  daily_chat_memory_run_audit_path: ""          # optional; defaults to <state_dir>/daily_chat_memory_run_audit.json
   daily_chat_memory_heuristic_confidence: 0.70  # fixed confidence for durable-signal heuristic candidates (per-turn matching)
   daily_chat_memory_confirm_rate_limit_per_minute: 30 # owner approve/reject sliding-window rate limit (per process)
   daily_chat_memory_requests_path: ""           # optional; defaults to <state_dir>/daily_chat_memory_requests.json (request_id idempotency ledger)

@@ -11517,7 +11517,10 @@ async def api_daily_chat_memory_pending(request):
 
 @mcp.custom_route("/api/daily-chat-memory/source-preview", methods=["GET"])
 async def api_daily_chat_memory_source_preview(request):
-    """Owner-only read of the complete sanitized source text behind a candidate."""
+    """Owner-only read of the complete sanitized source text behind a candidate.
+
+    Paging: pass source_kind=event|turn + source_id + offset to load the next
+    chunk of a large source; truncated=true is always explicit, never silent."""
     from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
@@ -11531,10 +11534,32 @@ async def api_daily_chat_memory_source_preview(request):
         raw_event_store=raw_event_store,
         conversation_turn_store=gateway_state_store,
         profile_id=profile_id,
+        source_kind=str(request.query_params.get("source_kind") or "").strip(),
+        source_id=str(request.query_params.get("source_id") or "").strip(),
+        offset=_int_between(request.query_params.get("offset"), 0, 0, 100000000),
+        limit=_int_between(request.query_params.get("limit"), 4000, 256, 20000),
     )
     if result.get("status") == "missing":
         return JSONResponse({"error": "candidate not found"}, status_code=404)
     return JSONResponse(result)
+
+
+@mcp.custom_route("/api/daily-chat-memory/runs", methods=["GET"])
+async def api_daily_chat_memory_runs(request):
+    """Owner-only read of recent run audit entries (metadata only)."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    limit = _int_between(request.query_params.get("limit"), 20, 1, 200)
+    profile_id = str(getattr(persona_engine, "profile_id", "") or "default")
+    return JSONResponse(
+        {
+            "status": "ok",
+            "cursor": reflection_engine.daily_chat_memory_run_cursor(profile_id),
+            "runs": reflection_engine.list_daily_chat_memory_run_audit(limit=limit),
+        }
+    )
 
 
 @mcp.custom_route("/api/daily-chat-memory/confirm", methods=["POST"])
@@ -11551,7 +11576,12 @@ async def api_daily_chat_memory_confirm(request):
     if not isinstance(body, dict):
         return JSONResponse({"error": "json body must be an object"}, status_code=400)
     action = str(body.get("action") or "confirm").strip().lower()
-    required = "REJECT" if action == "reject" else "WRITE"
+    if action == "reject":
+        required = "REJECT"
+    elif action == "defer":
+        required = "DEFER"
+    else:
+        required = "WRITE"
     if body.get("confirm") != required:
         return JSONResponse({"error": f"confirmation required: {required}"}, status_code=400)
     ids = body.get("candidate_ids", [])
