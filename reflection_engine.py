@@ -239,6 +239,7 @@ user_text 永远是 {user_display_name} 的原话，里面的“我”指 {user_
 - 禁止把 key_event、stable_preference、boundary、project_state 这类 kind 写进 domain。
 - project_state 只允许写“已确认的稳定决定、长期项目状态、主人偏好或明确承诺”；普通排错过程、临时测试、一次修复动作、没有后续的状态不写。
 - key_event / boundary / stable_preference / signal 必须由 {user_display_name} 明确表达的内容支撑；{ai_name} 单纯的安慰、寒暄、情绪回复不能成为这些类型。{ai_name} 的内容只有包含明确长期承诺、关系约定或稳定行为边界时，才可作为 commitment / relationship_anchor / boundary 的来源。
+- source_turn_ids 与 source_event_ids 是来源核对字段，核对不过的候选会被整条丢弃：source_turn_ids 的每个数字必须原样复制自 conversation_turns 里某一条的 id 字段；source_event_ids 的每个数字必须原样复制自那一条的 raw_event_ids 数组。两组至少一组非空；禁止编造数字，也不要照抄示例中的 [101, 102] 或 [1, 2]。
 
 输出纯 JSON：
 {
@@ -1712,9 +1713,15 @@ class ReflectionEngine:
                 continue
             row["raw_event_ids"] = list(dict.fromkeys(row["raw_event_ids"]))
             row["source_event_ids"] = list(dict.fromkeys(row["source_event_ids"]))
+            # Raw-event turns have no store-assigned id; give each turn a real,
+            # citable id so source verification (and the model) can reference it.
+            turn_id = row.get("round_id")
+            if turn_id is None:
+                turn_id = row["raw_event_ids"][0] if row["raw_event_ids"] else None
             selected.append(
                 {
                     **row,
+                    "id": turn_id,
                     "user_text": row["user_text"][:1200],
                     "assistant_text": row["assistant_text"][:1200],
                 }
@@ -2564,7 +2571,7 @@ class ReflectionEngine:
             "model": "",
             "status": "failed",
             "error_category": "",
-            "prompt_version": "daily_chat_memory_v4.1",
+            "prompt_version": "daily_chat_memory_v4.2",
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "completed_at": "",
         }
