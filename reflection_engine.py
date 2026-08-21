@@ -211,7 +211,7 @@ DAILY_CHAT_MEMORY_PROMPT_TEMPLATE = """你是 {ai_name}。现在是凌晨，你�
 - window_summaries：按连续窗口压缩的对话摘要，只用来定位“可能值得写”的候选窗口，不是最终依据。
 - conversation_turns：原始对话片段（可能按窗口命中做了裁剪），是最终选择与来源核对必须回到的原文。
 原始对话里可能夹带 <silent mood=… as=… reason=…></silent> 等内部控制标记、[语音:…] 等媒体转写，以及“近期素材/今天的聊天”这类内部材料转储；这些都不是主人可见内容，一律忽略，不得作为候选依据，也不要复制进任何字段。
-user_text 永远是 {user_display_name} 的原话，里面的“我”指 {user_display_name}；assistant_text 永远是 {ai_name} 的回复，里面的“我”指 {ai_name}。请最多挑选 {max_candidates} 条候选，宁可返回空，也不要把聊天流水写进记忆。
+user_text 永远是 {user_display_name} 的原话，里面的“我”指 {user_display_name}；assistant_text 永远是 {ai_name} 的回复，里面的“我”指 {ai_name}。请最多挑选 {max_candidates} 条候选。你必须返回一个合法的 JSON 对象；即使没有任何值得写的候选，也要返回 {"candidates": []}，绝不要返回空字符串或 JSON 以外的文字；宁可候选为空，也不要把聊天流水写进记忆。
 先通读 window_summaries 定位候选窗口，然后回到 conversation_turns 原文逐字核对：候选是否真实存在、来源轮次是否准确、建议记忆能否被原文支持。不要只根据摘要写“摘要的摘要”，也不要凭单轮、单句或一个称呼下判断。
 目标不是把一天压成一条日报，而是把当天分散出现的高价值信号拆成多条可确认候选。
 
@@ -1500,7 +1500,7 @@ class ReflectionEngine:
             **self._completion_options(
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
-                thinking_mode="" if use_dehydration else None,
+                thinking_mode="disabled" if use_dehydration else None,
             ),
         )
         raw = response.choices[0].message.content if response.choices else ""
@@ -2559,9 +2559,12 @@ class ReflectionEngine:
             "merged_duplicates": 0,
             "pending_count": 0,
             "auto_applied_count": 0,
+            "empty_output_count": 0,
+            "parse_failure_count": 0,
+            "model": "",
             "status": "failed",
             "error_category": "",
-            "prompt_version": "daily_chat_memory_v4",
+            "prompt_version": "daily_chat_memory_v4.1",
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "completed_at": "",
         }
@@ -2610,6 +2613,30 @@ class ReflectionEngine:
                 "cursor_updated": False,
                 "run_id": run_id,
                 "error_category": "window_extraction_failed",
+            }
+        empty_outputs = int(extraction_meta.get("empty_output_count") or 0)
+        model_calls = int(extraction_meta.get("model_call_count") or 0)
+        if not candidates and model_calls > 0 and empty_outputs >= model_calls:
+            # Every model call returned an empty body: systemic degradation, not a
+            # legitimate zero-candidate day. The watermark stays put so the same
+            # range is re-scanned once the provider/code issue is fixed.
+            audit["status"] = "degraded_empty_outputs"
+            audit["error_category"] = "empty_model_outputs"
+            audit["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._store_daily_chat_memory_run_audit(audit)
+            return {
+                "status": "degraded_empty_outputs",
+                "reason": "empty_model_outputs",
+                "date": key,
+                "mode": effective_mode,
+                "turns": len(turns),
+                "turn_source": turn_source,
+                "source_start_seq": raw_event_cursor_id,
+                "source_end_seq": audit["source_end_seq"],
+                "processed_until_seq": raw_event_cursor_id,
+                "cursor_updated": False,
+                "run_id": run_id,
+                "error_category": "empty_model_outputs",
             }
         if not candidates:
             # All windows scanned, none produced: zero_candidates (allowed), and
@@ -3295,12 +3322,17 @@ class ReflectionEngine:
             "skipped_noise_window_count": 0,
             "window_failures": 0,
             "failed_window_index": None,
+            "empty_output_count": 0,
+            "parse_failure_count": 0,
         }
         if audit is not None:
             audit["window_count"] = 0
             audit["skipped_noise_window_count"] = 0
             audit["model_call_count"] = 0
             audit["window_failures"] = 0
+            audit["empty_output_count"] = 0
+            audit["parse_failure_count"] = 0
+            audit["model"] = str(model or "")
         if not client:
             heuristic = self._heuristic_daily_chat_memory_candidates(
                 key,
@@ -3325,7 +3357,7 @@ class ReflectionEngine:
                     audit["skipped_noise_window_count"] = meta["skipped_noise_window_count"]
                 continue
             try:
-                window_candidates = await self._extract_window_candidates(
+                window_candidates, window_stats = await self._extract_window_candidates(
                     key,
                     window,
                     self_context=self_context,
@@ -3334,8 +3366,20 @@ class ReflectionEngine:
                     window_total=len(windows),
                 )
                 meta["model_call_count"] += 1
+                if window_stats.get("empty_output"):
+                    meta["empty_output_count"] += 1
+                    logger.warning(
+                        "Daily chat memory window %s/%s empty model output (finish_reason=%s)",
+                        index + 1,
+                        len(windows),
+                        window_stats.get("finish_reason") or "unknown",
+                    )
+                if window_stats.get("parse_failure"):
+                    meta["parse_failure_count"] += 1
                 if audit is not None:
                     audit["model_call_count"] = meta["model_call_count"]
+                    audit["empty_output_count"] = meta["empty_output_count"]
+                    audit["parse_failure_count"] = meta["parse_failure_count"]
             except Exception as exc:
                 logger.warning("Daily chat memory window %s extraction failed: %s", index + 1, exc)
                 meta["partial"] = True
@@ -3412,7 +3456,7 @@ class ReflectionEngine:
         max_candidates: int | None = None,
         window_index: int = 1,
         window_total: int = 1,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], dict]:
         client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=True)
         payload = {
             "date": key,
@@ -3441,11 +3485,17 @@ class ReflectionEngine:
             use_daily_client=use_daily_client,
         )
         raw = self._completion_content(response)
+        stats: dict = {
+            "empty_output": not str(raw or "").strip(),
+            "parse_failure": False,
+            "finish_reason": self._completion_finish_reason(response),
+        }
         parsed = self._parse_json_object(raw or "")
         candidates = parsed.get("candidates") if isinstance(parsed, dict) else []
         if not isinstance(candidates, list):
-            return []
-        return [item for item in candidates if isinstance(item, dict)]
+            stats["parse_failure"] = bool(str(raw or "").strip())
+            return [], stats
+        return [item for item in candidates if isinstance(item, dict)], stats
 
     def _heuristic_daily_chat_memory_candidates(
         self,
@@ -5729,13 +5779,20 @@ class ReflectionEngine:
         return {
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "extra_body": {"enable_thinking": False},
+            "extra_body": {"thinking": {"type": "disabled"}},
         }
 
     @staticmethod
     def _completion_content(response: Any) -> str:
         try:
             return str(response.choices[0].message.content or "") if response.choices else ""
+        except (AttributeError, IndexError, TypeError):
+            return ""
+
+    @staticmethod
+    def _completion_finish_reason(response: Any) -> str:
+        try:
+            return str(response.choices[0].finish_reason or "") if response.choices else ""
         except (AttributeError, IndexError, TypeError):
             return ""
 
@@ -5758,7 +5815,7 @@ class ReflectionEngine:
             completion_options = self._completion_options(
                 max_tokens=max_tokens,
                 temperature=temperature,
-                thinking_mode="",
+                thinking_mode="disabled",
             )
         return await client.chat.completions.create(
             model=model,

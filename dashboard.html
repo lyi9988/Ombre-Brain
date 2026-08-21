@@ -7374,7 +7374,7 @@ function hideNetworkPopover() {
 }
 
 function esc(s) {
-  if (!s) return '';
+  if (s === undefined || s === null || s === '') return '';
   var d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;

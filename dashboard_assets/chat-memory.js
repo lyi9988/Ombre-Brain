@@ -506,7 +506,7 @@
       runLines = runs.map(function (run) {
         var hard = run.hard_rejects || {};
         var hardText = Object.keys(hard).length ? Object.keys(hard).map(function (k) { return k + ':' + hard[k]; }).join('，') : '0';
-        var statusText = run.status === 'zero_candidates' ? '0 条候选（窗口已全部检查）' : run.status;
+        var statusText = run.status === 'zero_candidates' ? '0 条候选（窗口已全部检查）' : (run.status === 'degraded_empty_outputs' ? '空转（模型答复为空，未推水位）' : run.status);
         return '<div class="chat-memory-run-item">' +
           '<div class="chat-memory-run-head">' + esc(run.date || '') + ' · ' + esc(statusText) + ' · ' + esc(String(run.completed_at || run.created_at || '').slice(0, 19)) + '</div>' +
           '<div class="chat-memory-run-meta">seq ' + esc(run.source_start_seq || 0) + '→' + esc(run.source_end_seq || 0) +
@@ -514,6 +514,8 @@
             ' · 窗口 ' + esc(run.window_count || 0) + '（跳过噪音 ' + esc(run.skipped_noise_window_count || 0) + '）' +
             ' · 模型调用 ' + esc(run.model_call_count || 0) +
             ' · 模型候选 ' + esc(run.model_candidate_count || 0) +
+            ' · 空输出 ' + esc(run.empty_output_count || 0) +
+            ' · 解析失败 ' + esc(run.parse_failure_count || 0) +
             ' · 硬拒绝 ' + esc(hardText) +
             ' · 进入Review ' + esc(run.pending_count || 0) +
             ' · 合并去重 ' + esc(run.merged_duplicates || 0) +
