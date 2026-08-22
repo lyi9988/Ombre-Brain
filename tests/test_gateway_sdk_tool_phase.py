@@ -15,6 +15,7 @@ Coverage maps to the 18 required gateway tests (task book section IV).
 import asyncio
 import sqlite3
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -388,6 +389,74 @@ def test_retry_continuation_final_recorded_once(tmp_path):
         profile_id="jiajia-main", session_id="jiajia", limit=10)
     assert len(turns) == 1
     assert turns[0]["canonical_key"] == "key-final"
+
+
+# ---------------------------------------------------------------------------
+# Migration: pre-existing production DB without canonical_key column must be
+# upgraded in place (fresh DBs include the column via CREATE TABLE).
+# ---------------------------------------------------------------------------
+
+def test_existing_db_migrated_with_canonical_key_column(tmp_path):
+    """Simulate a production gateway_state.db created BEFORE Scheme P: build
+    the old schema, then open GatewayStateStore against it -- the additive
+    migration must add the column + index and never fail on index creation."""
+    db_path = tmp_path / "state" / "gateway_state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            round_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            user_text TEXT NOT NULL DEFAULT '',
+            assistant_text TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            client TEXT NOT NULL DEFAULT '',
+            route TEXT NOT NULL DEFAULT '',
+            UNIQUE(profile_id, session_id, round_id)
+        )
+    """)
+    conn.execute("""
+        INSERT INTO conversation_turns
+        (profile_id, session_id, round_id, created_at, user_text, assistant_text)
+        VALUES ('jiajia-main', 'main', 1, ?, '旧消息', '旧回复')
+    """, (datetime.now(timezone.utc).isoformat(timespec="seconds"),))
+    conn.commit()
+    conn.close()
+
+    store = GatewayStateStore(str(db_path))  # must not raise
+    columns = [
+        row["name"]
+        for row in store._connect().execute(
+            "PRAGMA table_info(conversation_turns)").fetchall()
+    ]
+    assert "canonical_key" in columns
+    # Existing legacy row is preserved and behaves as before.
+    turns = store.list_recent_conversation_turns(
+        profile_id="jiajia-main", session_id="main", limit=10)
+    assert len(turns) == 1
+    assert turns[0]["canonical_key"] == ""
+    # New keyed write works and dedupes.
+    store.record_conversation_turn(
+        profile_id="jiajia-main", session_id="main", round_id=2,
+        user_text="新", assistant_text="新回复", canonical_key="k1",
+    )
+    assert store.canonical_turn_key_exists(
+        profile_id="jiajia-main", session_id="main", canonical_key="k1") is True
+    assert store.canonical_turn_key_exists(
+        profile_id="jiajia-main", session_id="main", canonical_key="k2") is False
+
+
+def test_fresh_db_includes_column_and_migration_is_noop(tmp_path):
+    store = GatewayStateStore(str(tmp_path / "state" / "gateway_state.db"))
+    columns = [
+        row["name"]
+        for row in store._connect().execute(
+            "PRAGMA table_info(conversation_turns)").fetchall()
+    ]
+    assert "canonical_key" in columns
 
 
 # ---------------------------------------------------------------------------

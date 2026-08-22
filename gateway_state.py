@@ -115,12 +115,6 @@ class GatewayStateStore:
         )
         conn.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_conversation_turns_canonical_key
-            ON conversation_turns (profile_id, session_id, canonical_key)
-            """
-        )
-        conn.execute(
-            """
             CREATE TABLE IF NOT EXISTS upstream_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -151,9 +145,9 @@ class GatewayStateStore:
 
     @staticmethod
     def _migrate_conversation_turns_canonical_key(conn: sqlite3.Connection) -> None:
-        """Add the canonical_key column to pre-existing conversation_turns
-        tables (Scheme P final-turn idempotency). Additive migration; existing
-        rows keep canonical_key = '' and behave exactly as before."""
+        """Ensure conversation_turns has the canonical_key column + index
+        (Scheme P final-turn idempotency). Additive migration; existing rows
+        keep canonical_key = '' and behave exactly as before."""
         try:
             columns = {
                 str(row["name"])
@@ -161,12 +155,13 @@ class GatewayStateStore:
             }
         except Exception:
             return
-        if "canonical_key" in columns:
-            return
-        conn.execute(
-            "ALTER TABLE conversation_turns "
-            "ADD COLUMN canonical_key TEXT NOT NULL DEFAULT ''"
-        )
+        if "canonical_key" not in columns:
+            conn.execute(
+                "ALTER TABLE conversation_turns "
+                "ADD COLUMN canonical_key TEXT NOT NULL DEFAULT ''"
+            )
+        # Index created AFTER the column is guaranteed present (fresh table via
+        # CREATE TABLE includes the column; migrated table gets ALTER above).
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_conversation_turns_canonical_key
