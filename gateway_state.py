@@ -96,6 +96,7 @@ class GatewayStateStore:
                 model TEXT NOT NULL DEFAULT '',
                 client TEXT NOT NULL DEFAULT '',
                 route TEXT NOT NULL DEFAULT '',
+                canonical_key TEXT NOT NULL DEFAULT '',
                 UNIQUE(profile_id, session_id, round_id)
             )
             """
@@ -110,6 +111,12 @@ class GatewayStateStore:
             """
             CREATE INDEX IF NOT EXISTS idx_conversation_turns_session
             ON conversation_turns (profile_id, session_id, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_conversation_turns_canonical_key
+            ON conversation_turns (profile_id, session_id, canonical_key)
             """
         )
         conn.execute(
@@ -138,8 +145,34 @@ class GatewayStateStore:
             ON upstream_usage (session_id, id DESC)
             """
         )
+        self._migrate_conversation_turns_canonical_key(conn)
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def _migrate_conversation_turns_canonical_key(conn: sqlite3.Connection) -> None:
+        """Add the canonical_key column to pre-existing conversation_turns
+        tables (Scheme P final-turn idempotency). Additive migration; existing
+        rows keep canonical_key = '' and behave exactly as before."""
+        try:
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(conversation_turns)").fetchall()
+            }
+        except Exception:
+            return
+        if "canonical_key" in columns:
+            return
+        conn.execute(
+            "ALTER TABLE conversation_turns "
+            "ADD COLUMN canonical_key TEXT NOT NULL DEFAULT ''"
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_conversation_turns_canonical_key
+            ON conversation_turns (profile_id, session_id, canonical_key)
+            """
+        )
 
     def record_success(
         self,
@@ -323,6 +356,7 @@ class GatewayStateStore:
         model: str = "",
         client: str = "",
         route: str = "",
+        canonical_key: str = "",
         created_at: datetime | None = None,
         max_entries: int = 500,
     ) -> int:
@@ -334,8 +368,8 @@ class GatewayStateStore:
         cursor = conn.execute(
             """
             INSERT OR REPLACE INTO conversation_turns
-            (profile_id, session_id, round_id, created_at, user_text, assistant_text, model, client, route)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (profile_id, session_id, round_id, created_at, user_text, assistant_text, model, client, route, canonical_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 safe_profile_id,
@@ -347,6 +381,7 @@ class GatewayStateStore:
                 str(model or ""),
                 str(client or ""),
                 str(route or ""),
+                str(canonical_key or ""),
             ),
         )
         if max_entries > 0:
@@ -390,7 +425,7 @@ class GatewayStateStore:
         rows = conn.execute(
             f"""
             SELECT id, profile_id, session_id, round_id, created_at,
-                   user_text, assistant_text, model, client, route
+                   user_text, assistant_text, model, client, route, canonical_key
             FROM conversation_turns
             WHERE {where_clause}
             ORDER BY id DESC
@@ -411,9 +446,36 @@ class GatewayStateStore:
                 "model": row["model"] or "",
                 "client": row["client"] or "",
                 "route": row["route"] or "",
+                "canonical_key": row["canonical_key"] or "",
             }
             for row in rows
         ]
+
+    def canonical_turn_key_exists(
+        self,
+        *,
+        profile_id: str,
+        session_id: str,
+        canonical_key: str,
+    ) -> bool:
+        """True when a conversation turn was already recorded under the given
+        canonical key (Scheme P final-turn idempotency)."""
+        canonical_key = str(canonical_key or "").strip()
+        if not canonical_key:
+            return False
+        safe_profile_id = str(profile_id or "default").strip() or "default"
+        safe_session_id = str(session_id or "default").strip() or "default"
+        conn = self._connect()
+        row = conn.execute(
+            """
+            SELECT 1 FROM conversation_turns
+            WHERE profile_id = ? AND session_id = ? AND canonical_key = ?
+            LIMIT 1
+            """,
+            (safe_profile_id, safe_session_id, canonical_key),
+        ).fetchone()
+        conn.close()
+        return row is not None
 
     def list_conversation_turns_between(
         self,

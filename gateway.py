@@ -22,6 +22,15 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+# Canonical turn-phase contract (L3-SDK-C1, Scheme P).
+# Aizizhu carries H1/H2 on EVERY request; the optional phase header is present
+# ONLY on tool-loop continuation requests and only takes effect when H1+H2 are
+# both non-empty and the value is exactly CANONICAL_TURN_PHASE_CONTINUATION.
+CANONICAL_TURN_PHASE_HEADER = "X-Ombre-Canonical-Turn-Phase"
+CANONICAL_TURN_PHASE_CONTINUATION = "continuation_after_tool"
+CANONICAL_SOURCE_EVENT_ID_HEADER = "X-Ombre-Canonical-Source-Event-Id"
+CANONICAL_ASSISTANT_SOURCE_EVENT_ID_HEADER = "X-Ombre-Canonical-Assistant-Source-Event-Id"
+
 from bucket_manager import BucketManager
 from canonical_continuation import CanonicalContinuationAdapter, ContinuationBatch
 from dehydrator import Dehydrator
@@ -2044,8 +2053,19 @@ class GatewayService:
             include_favorite_memory = marker_favorite or self._truthy_header(
                 request.headers.get("X-Ombre-Include-Favorite-Memory")
             )
+            continuation_phase = self._continuation_phase_enabled(request)
             persona_user_message = self._extract_last_user_query(payload.get("messages", []))
-            canonical_current_user = self._extract_current_turn_user_query(payload.get("messages", []))
+            if continuation_phase:
+                # Tool-loop continuation: the current turn's real user is the
+                # last genuine role=user (assistant tool_calls / role=tool
+                # results and injected system/developer entries are skipped).
+                canonical_current_user = self._extract_continuation_turn_user_query(
+                    payload.get("messages", [])
+                )
+            else:
+                canonical_current_user = self._extract_current_turn_user_query(
+                    payload.get("messages", [])
+                )
             payload, canonical_state = await self._prepare_canonical_turn(
                 request, payload, session_id, canonical_current_user,
             )
@@ -2059,6 +2079,7 @@ class GatewayService:
                     if str(request.headers.get("X-Ombre-Debug-Detail") or "").strip().lower() == "full"
                     else "compact"
                 ),
+                continuation_phase=continuation_phase,
             )
             if isinstance(injection_debug, dict):
                 injection_debug["canonical_continuation"] = canonical_state
@@ -2082,6 +2103,7 @@ class GatewayService:
                     persona_user_message,
                     client_label,
                     injection_debug,
+                    canonical_key=self._canonical_turn_key(request),
                 )
             except RuntimeError as exc:
                 return JSONResponse(
@@ -2110,6 +2132,7 @@ class GatewayService:
                     client=client_label,
                     route="/v1/chat/completions",
                     upstream_usage=upstream_usage,
+                    canonical_key=self._canonical_turn_key(request),
                 )
                 await self._update_persona_after_assistant_message(
                     session_id,
@@ -2148,6 +2171,7 @@ class GatewayService:
                 client=client_label,
                 route="/v1/chat/completions",
                 upstream_usage=upstream_usage,
+                canonical_key=self._canonical_turn_key(request),
             )
             await self._update_persona_after_assistant_message(
                 session_id,
@@ -2191,8 +2215,16 @@ class GatewayService:
             include_favorite_memory = marker_favorite or self._truthy_header(
                 request.headers.get("X-Ombre-Include-Favorite-Memory")
             )
+            continuation_phase = self._continuation_phase_enabled(request)
             persona_user_message = self._extract_last_user_query(openai_payload.get("messages", []))
-            canonical_current_user = self._extract_current_turn_user_query(openai_payload.get("messages", []))
+            if continuation_phase:
+                canonical_current_user = self._extract_continuation_turn_user_query(
+                    openai_payload.get("messages", [])
+                )
+            else:
+                canonical_current_user = self._extract_current_turn_user_query(
+                    openai_payload.get("messages", [])
+                )
             openai_payload, canonical_state = await self._prepare_canonical_turn(
                 request, openai_payload, session_id, canonical_current_user,
             )
@@ -2206,6 +2238,7 @@ class GatewayService:
                     if str(request.headers.get("X-Ombre-Debug-Detail") or "").strip().lower() == "full"
                     else "compact"
                 ),
+                continuation_phase=continuation_phase,
             )
             if isinstance(injection_debug, dict):
                 injection_debug["canonical_continuation"] = canonical_state
@@ -2222,6 +2255,7 @@ class GatewayService:
                 persona_user_message,
                 client_label,
                 injection_debug,
+                canonical_key=self._canonical_turn_key(request),
             )
 
         route = self._resolve_upstream_for_model(str(forward_payload.get("model") or ""))
@@ -2249,6 +2283,7 @@ class GatewayService:
                     client=client_label,
                     route="/v1/messages",
                     upstream_usage=upstream_usage,
+                    canonical_key=self._canonical_turn_key(request),
                 )
                 await self._update_persona_after_assistant_message(
                     session_id,
@@ -2287,6 +2322,7 @@ class GatewayService:
                 client=client_label,
                 route="/v1/messages",
                 upstream_usage=upstream_usage,
+                canonical_key=self._canonical_turn_key(request),
             )
             await self._update_persona_after_assistant_message(
                 session_id,
@@ -2697,6 +2733,7 @@ class GatewayService:
         include_favorite_memory: bool = False,
         include_debug: bool = False,
         debug_detail: str = "full",
+        continuation_phase: bool = False,
     ) -> tuple[dict, list[str] | None] | tuple[dict, list[str] | None, dict[str, Any]]:
         prepare_started_at = time.perf_counter()
         prepare_steps_ms: dict[str, int] = {}
@@ -2721,7 +2758,13 @@ class GatewayService:
         mark_step("list_all_buckets", stage_started_at)
 
         stage_started_at = time.perf_counter()
-        current_user_query = self._extract_current_turn_user_query(messages)
+        if continuation_phase:
+            # Scheme P: a legal continuation request is a current user turn --
+            # the backward scan skips tool results / assistant tool_calls /
+            # injected system+developer entries and lands on the real user.
+            current_user_query = self._extract_continuation_turn_user_query(messages)
+        else:
+            current_user_query = self._extract_current_turn_user_query(messages)
         is_new_user_turn = bool(current_user_query)
         has_handoff_context = self._messages_contain_handoff_context(messages)
         is_session_start = self.state_store.get_last_success_at(session_id) is None
@@ -3731,6 +3774,7 @@ class GatewayService:
         user_message: str,
         client: str = "",
         injection_debug: dict[str, Any] | None = None,
+        canonical_key: str = "",
     ) -> Response:
         model = str(payload.get("model") or "").strip()
         route = self._resolve_upstream_for_model(model)
@@ -3743,6 +3787,7 @@ class GatewayService:
                 user_message,
                 client=client,
                 injection_debug=injection_debug,
+                canonical_key=canonical_key,
             )
         stream_started_at = time.perf_counter()
         upstream_open_started_at = time.perf_counter()
@@ -3873,6 +3918,7 @@ class GatewayService:
         client: str = "",
         route: str = "",
         upstream_usage: dict[str, Any] | None = None,
+        canonical_key: str = "",
     ) -> None:
         if recalled_ids is None:
             logger.info(
@@ -3948,6 +3994,7 @@ class GatewayService:
             model=model,
             client=client,
             route=route,
+            canonical_key=canonical_key,
         )
         if isinstance(upstream_usage, dict) and upstream_usage:
             try:
@@ -3999,6 +4046,7 @@ class GatewayService:
         model: str,
         client: str,
         route: str,
+        canonical_key: str = "",
     ) -> None:
         if not user_message.strip():
             return
@@ -4014,6 +4062,19 @@ class GatewayService:
         if not user_text and not assistant_text:
             return
         profile_id = str(getattr(self.persona_engine, "profile_id", "") or "default")
+        canonical_key = str(canonical_key or "").strip()
+        if canonical_key and self._canonical_turn_key_already_recorded(
+            profile_id=profile_id,
+            session_id=session_id,
+            canonical_key=canonical_key,
+        ):
+            logger.info(
+                "Gateway conversation turn skipped as canonical-key duplicate "
+                "| session=%s round=%s",
+                session_id,
+                round_id,
+            )
+            return
         if self._is_recent_duplicate_conversation_turn(
             profile_id=profile_id,
             session_id=session_id,
@@ -4039,6 +4100,7 @@ class GatewayService:
                 model=model,
                 client=client,
                 route=route,
+                canonical_key=canonical_key,
                 max_entries=self.conversation_turns_max_entries,
             )
         except Exception as exc:
@@ -4096,6 +4158,32 @@ class GatewayService:
                 continue
             return True
         return False
+
+    def _canonical_turn_key_already_recorded(
+        self,
+        *,
+        profile_id: str,
+        session_id: str,
+        canonical_key: str,
+    ) -> bool:
+        """Scheme P final-turn idempotency: a final assistant turn recorded once
+        under (profile, session, canonical_key) must not be recorded again by a
+        retry_continuation replay carrying the same H1/H2 key."""
+        try:
+            return bool(
+                self.state_store.canonical_turn_key_exists(
+                    profile_id=profile_id,
+                    session_id=session_id,
+                    canonical_key=canonical_key,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "Gateway canonical-turn key lookup failed | session=%s error=%s",
+                session_id,
+                exc,
+            )
+            return False
 
     def _conversation_turn_original_text(self, text: str, *, role: str) -> str:
         if not text:
@@ -5014,6 +5102,7 @@ class GatewayService:
         user_message: str,
         client: str = "",
         injection_debug: dict[str, Any] | None = None,
+        canonical_key: str = "",
     ) -> None:
         upstream_usage = self._log_cache_usage_from_stream_state(
             session_id,
@@ -5033,6 +5122,7 @@ class GatewayService:
             client=client,
             route=route,
             upstream_usage=upstream_usage,
+            canonical_key=canonical_key,
         )
         self._schedule_persona_post_reply_update(
             session_id,
@@ -5964,6 +6054,7 @@ class GatewayService:
         user_message: str,
         client: str = "",
         injection_debug: dict[str, Any] | None = None,
+        canonical_key: str = "",
     ) -> Response:
         model = str(payload.get("model") or "").strip()
         route = self._resolve_upstream_for_model(model)
@@ -5976,6 +6067,7 @@ class GatewayService:
                 user_message,
                 client=client,
                 injection_debug=injection_debug,
+                canonical_key=canonical_key,
             )
 
         stream_started_at = time.perf_counter()
@@ -6038,6 +6130,7 @@ class GatewayService:
                     user_message=user_message,
                     client=client,
                     injection_debug=injection_debug,
+                    canonical_key=canonical_key,
                 )
 
             try:
@@ -6236,6 +6329,7 @@ class GatewayService:
         user_message: str,
         client: str = "",
         injection_debug: dict[str, Any] | None = None,
+        canonical_key: str = "",
     ) -> Response:
         model = str(payload.get("model") or "").strip()
         stream_started_at = time.perf_counter()
@@ -6306,6 +6400,7 @@ class GatewayService:
                     user_message=user_message,
                     client=client,
                     injection_debug=injection_debug,
+                    canonical_key=canonical_key,
                 )
 
             def openai_chunk(delta: dict[str, Any], finish_reason: str | None = None) -> bytes:
@@ -6453,6 +6548,7 @@ class GatewayService:
         user_message: str,
         client: str = "",
         injection_debug: dict[str, Any] | None = None,
+        canonical_key: str = "",
     ) -> Response:
         model = str(payload.get("model") or "").strip()
         stream_started_at = time.perf_counter()
@@ -6509,6 +6605,7 @@ class GatewayService:
                     user_message=user_message,
                     client=client,
                     injection_debug=injection_debug,
+                    canonical_key=canonical_key,
                 )
 
             try:
@@ -6898,6 +6995,81 @@ class GatewayService:
                 return cleaned
             continue
         return ""
+
+    # ---- L3-SDK-C1 Scheme P: tool-loop continuation semantics -----------
+
+    def _continuation_phase_enabled(self, request: Request) -> bool:
+        """Whether the request carries a legal canonical turn-phase marker.
+
+        Fail-closed (Scheme P contract): the phase header only takes effect
+        when the Gateway request is authenticated (already enforced by the
+        caller before this is reached), H1 and H2 are both non-empty, and the
+        header value is exactly CANONICAL_TURN_PHASE_CONTINUATION.  Any other
+        combination returns False so legacy requests keep their exact original
+        semantics.
+        """
+        phase = str(
+            request.headers.get(CANONICAL_TURN_PHASE_HEADER) or ""
+        ).strip()
+        if phase != CANONICAL_TURN_PHASE_CONTINUATION:
+            return False
+        h1 = str(
+            request.headers.get(CANONICAL_SOURCE_EVENT_ID_HEADER) or ""
+        ).strip()
+        h2 = str(
+            request.headers.get(CANONICAL_ASSISTANT_SOURCE_EVENT_ID_HEADER) or ""
+        ).strip()
+        return bool(h1 and h2)
+
+    def _extract_continuation_turn_user_query(
+        self, messages: list[dict[str, Any]],
+    ) -> str:
+        """Backward scan for the current turn's LAST real role=user message.
+
+        A tool-loop continuation request ends with assistant tool_calls /
+        role=tool results (SDK-internal control messages).  Those are skipped
+        together with system/developer injections so the found user is the
+        genuine owner of the current turn (Scheme P, Gateway continuation
+        semantics item 1-2).  Returns "" when no real user is found.
+        """
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            if role in ("system", "developer"):
+                continue
+            if role in ("tool", "function"):
+                continue
+            if role == "assistant":
+                # assistant tool_call carriers are SDK-internal; skip.
+                if message.get("tool_calls"):
+                    continue
+                # A textual assistant reply is a completed turn, not the
+                # current user; keep scanning backward.
+                continue
+            if role != "user":
+                continue
+            content = self._coerce_message_text(message.get("content"))
+            cleaned = self._strip_external_context_from_user_text(content)
+            if cleaned:
+                return cleaned
+            continue
+        return ""
+
+    def _canonical_turn_key(self, request: Request) -> str:
+        """Stable idempotency key for the final conversation turn.
+
+        Built from H1 and H2 (both must be present -- same rule as
+        ``_continuation_phase_enabled``).  retry_continuation replays reuse the
+        exact same H1/H2 values, so this key dedupes a final assistant turn
+        recorded once across retries and concurrent replays without relying on
+        response text hashes (Scheme P final-turn idempotency).
+        """
+        h1 = str(request.headers.get(CANONICAL_SOURCE_EVENT_ID_HEADER) or "").strip()
+        h2 = str(request.headers.get(CANONICAL_ASSISTANT_SOURCE_EVENT_ID_HEADER) or "").strip()
+        if not h1 or not h2:
+            return ""
+        return hashlib.sha256(f"{h1}|{h2}".encode("utf-8")).hexdigest()[:40]
 
     def _messages_contain_handoff_context(self, messages: list[dict[str, Any]]) -> bool:
         for message in messages:
