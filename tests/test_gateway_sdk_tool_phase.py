@@ -594,10 +594,10 @@ def test_prepare_payload_continuation_sets_new_user_turn(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 15. Two conversations do not cross (keys scoped to profile+session)
+# 15. Different canonical source events do not cross
 # ---------------------------------------------------------------------------
 
-def test_canonical_keys_are_per_session(tmp_path):
+def test_canonical_keys_are_distinct_for_different_source_events(tmp_path):
     item = minimal_service(tmp_path)
     k_a1 = item._canonical_turn_key(
         make_request({H1: "app:da:c1", H2: "turn:ua1:assistant"}))
@@ -608,3 +608,69 @@ def test_canonical_keys_are_per_session(tmp_path):
     k_a2 = item._canonical_turn_key(
         make_request({PHASE: PHASE_CONT, H1: "app:da:c1", H2: "turn:ua1:assistant"}))
     assert k_a2 == k_a1
+
+
+def test_same_canonical_key_across_sessions_is_claimed_once(tmp_path):
+    item = minimal_service(tmp_path)
+    first = item.state_store.record_conversation_turn(
+        profile_id="jiajia-main", session_id="main", round_id=1,
+        user_text="Reality user", assistant_text="Reality reply",
+        canonical_key="source-key-1",
+    )
+    second = item.state_store.record_conversation_turn(
+        profile_id="jiajia-main", session_id="jiajia-main", round_id=1,
+        user_text="Telegram replay", assistant_text="Telegram reply",
+        canonical_key="source-key-1",
+    )
+    assert first > 0
+    assert second == 0
+    assert len(item.state_store.list_recent_conversation_turns(
+        profile_id="jiajia-main", limit=10, hours=24 * 3650)) == 1
+    assert item.state_store.canonical_turn_key_exists(
+        profile_id="jiajia-main", session_id="main",
+        canonical_key="source-key-1") is True
+    assert item.state_store.canonical_turn_key_exists(
+        profile_id="jiajia-main", session_id="jiajia-main",
+        canonical_key="source-key-1") is True
+
+
+def test_existing_cross_session_claim_conflict_stops_migration_without_delete(tmp_path):
+    db_path = tmp_path / "state" / "gateway_state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE conversation_turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            round_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            user_text TEXT NOT NULL DEFAULT '',
+            assistant_text TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            client TEXT NOT NULL DEFAULT '',
+            route TEXT NOT NULL DEFAULT '',
+            canonical_key TEXT NOT NULL DEFAULT '',
+            UNIQUE(profile_id, session_id, round_id)
+        )
+    """)
+    conn.executemany(
+        """
+        INSERT INTO conversation_turns
+        (profile_id, session_id, round_id, created_at, user_text,
+         assistant_text, canonical_key)
+        VALUES ('jiajia-main', ?, ?, ?, ?, ?, 'conflict-key')
+        """,
+        [
+            ("main", 1, "2026-08-23T00:00:00+00:00", "a", "b"),
+            ("jiajia-main", 1, "2026-08-23T00:00:01+00:00", "c", "d"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(RuntimeError, match="canonical_key conflicts"):
+        GatewayStateStore(str(db_path))
+    conn = sqlite3.connect(str(db_path))
+    assert conn.execute("SELECT COUNT(*) FROM conversation_turns").fetchone()[0] == 2
+    conn.close()

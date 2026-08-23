@@ -103,6 +103,25 @@ class GatewayStateStore:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS canonical_turn_claims (
+                profile_id TEXT NOT NULL,
+                canonical_key TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                round_id INTEGER NOT NULL,
+                conversation_turn_id INTEGER,
+                claimed_at TEXT NOT NULL,
+                PRIMARY KEY (profile_id, canonical_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_canonical_turn_claims_session
+            ON canonical_turn_claims (profile_id, session_id, claimed_at DESC)
+            """
+        )
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_conversation_turns_recent
             ON conversation_turns (profile_id, created_at DESC, id DESC)
             """
@@ -140,6 +159,7 @@ class GatewayStateStore:
             """
         )
         self._migrate_conversation_turns_canonical_key(conn)
+        self._migrate_canonical_turn_claims(conn)
         conn.commit()
         conn.close()
 
@@ -166,6 +186,49 @@ class GatewayStateStore:
             """
             CREATE INDEX IF NOT EXISTS idx_conversation_turns_canonical_key
             ON conversation_turns (profile_id, session_id, canonical_key)
+            """
+        )
+
+    @staticmethod
+    def _migrate_canonical_turn_claims(conn: sqlite3.Connection) -> None:
+        """Backfill the cross-session claim table without changing old rows.
+
+        ``canonical_key`` is already derived from authoritative H1/H2 source
+        event IDs.  The claim table makes that identity global to one profile,
+        instead of incorrectly scoping it to the transport session.  Existing
+        non-empty conflicts are deliberately fatal: deployment must report and
+        resolve them explicitly rather than deleting or merging history.
+        """
+        conflicts = conn.execute(
+            """
+            SELECT profile_id, canonical_key, COUNT(*) AS row_count
+            FROM conversation_turns
+            WHERE TRIM(canonical_key) <> ''
+            GROUP BY profile_id, canonical_key
+            HAVING COUNT(*) > 1
+            ORDER BY profile_id, canonical_key
+            LIMIT 20
+            """
+        ).fetchall()
+        if conflicts:
+            rendered = ", ".join(
+                f"{row['profile_id']}:{row['canonical_key']}({row['row_count']})"
+                for row in conflicts
+            )
+            raise RuntimeError(
+                "canonical_turn_claims migration found existing canonical_key "
+                f"conflicts; no rows changed: {rendered}"
+            )
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO canonical_turn_claims
+                (profile_id, canonical_key, session_id, round_id,
+                 conversation_turn_id, claimed_at)
+            SELECT profile_id, canonical_key, session_id, round_id,
+                   id, created_at
+            FROM conversation_turns
+            WHERE TRIM(canonical_key) <> ''
             """
         )
 
@@ -359,44 +422,82 @@ class GatewayStateStore:
         created_iso = created_at.isoformat(timespec="seconds")
         safe_profile_id = str(profile_id or "default").strip() or "default"
         safe_session_id = str(session_id or "default").strip() or "default"
+        safe_canonical_key = str(canonical_key or "").strip()
         conn = self._connect()
-        cursor = conn.execute(
-            """
-            INSERT OR REPLACE INTO conversation_turns
-            (profile_id, session_id, round_id, created_at, user_text, assistant_text, model, client, route, canonical_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                safe_profile_id,
-                safe_session_id,
-                int(round_id),
-                created_iso,
-                str(user_text or ""),
-                str(assistant_text or ""),
-                str(model or ""),
-                str(client or ""),
-                str(route or ""),
-                str(canonical_key or ""),
-            ),
-        )
-        if max_entries > 0:
-            conn.execute(
+        try:
+            # The claim and conversation_turn write are one transaction.  A
+            # replay arriving through another session therefore becomes a
+            # metadata-only no-op and cannot create a second effective turn.
+            if safe_canonical_key:
+                claim = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO canonical_turn_claims
+                        (profile_id, canonical_key, session_id, round_id,
+                         claimed_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        safe_profile_id,
+                        safe_canonical_key,
+                        safe_session_id,
+                        int(round_id),
+                        created_iso,
+                    ),
+                )
+                if claim.rowcount != 1:
+                    conn.rollback()
+                    return 0
+
+            cursor = conn.execute(
                 """
-                DELETE FROM conversation_turns
-                WHERE profile_id = ?
-                  AND id NOT IN (
-                    SELECT id FROM conversation_turns
-                    WHERE profile_id = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                  )
+                INSERT OR REPLACE INTO conversation_turns
+                (profile_id, session_id, round_id, created_at, user_text, assistant_text, model, client, route, canonical_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (safe_profile_id, safe_profile_id, max(1, int(max_entries))),
+                (
+                    safe_profile_id,
+                    safe_session_id,
+                    int(round_id),
+                    created_iso,
+                    str(user_text or ""),
+                    str(assistant_text or ""),
+                    str(model or ""),
+                    str(client or ""),
+                    str(route or ""),
+                    safe_canonical_key,
+                ),
             )
-        conn.commit()
-        turn_id = int(cursor.lastrowid or 0)
-        conn.close()
-        return turn_id
+            turn_id = int(cursor.lastrowid or 0)
+            if safe_canonical_key:
+                conn.execute(
+                    """
+                    UPDATE canonical_turn_claims
+                    SET conversation_turn_id=?
+                    WHERE profile_id=? AND canonical_key=?
+                    """,
+                    (turn_id, safe_profile_id, safe_canonical_key),
+                )
+            if max_entries > 0:
+                conn.execute(
+                    """
+                    DELETE FROM conversation_turns
+                    WHERE profile_id = ?
+                      AND id NOT IN (
+                        SELECT id FROM conversation_turns
+                        WHERE profile_id = ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                      )
+                    """,
+                    (safe_profile_id, safe_profile_id, max(1, int(max_entries))),
+                )
+            conn.commit()
+            return turn_id
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def list_recent_conversation_turns(
         self,
@@ -450,24 +551,27 @@ class GatewayStateStore:
         self,
         *,
         profile_id: str,
-        session_id: str,
+        session_id: str | None = None,
         canonical_key: str,
     ) -> bool:
-        """True when a conversation turn was already recorded under the given
-        canonical key (Scheme P final-turn idempotency)."""
+        """True when a profile has claimed the canonical key.
+
+        ``session_id`` remains accepted for compatibility with the existing
+        Gateway call sites, but it is intentionally not part of the lookup:
+        canonical/source identity is cross-session by contract.
+        """
         canonical_key = str(canonical_key or "").strip()
         if not canonical_key:
             return False
         safe_profile_id = str(profile_id or "default").strip() or "default"
-        safe_session_id = str(session_id or "default").strip() or "default"
         conn = self._connect()
         row = conn.execute(
             """
-            SELECT 1 FROM conversation_turns
-            WHERE profile_id = ? AND session_id = ? AND canonical_key = ?
+            SELECT 1 FROM canonical_turn_claims
+            WHERE profile_id = ? AND canonical_key = ?
             LIMIT 1
             """,
-            (safe_profile_id, safe_session_id, canonical_key),
+            (safe_profile_id, canonical_key),
         ).fetchone()
         conn.close()
         return row is not None

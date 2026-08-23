@@ -308,8 +308,14 @@ gateway:
     device_id: "ombre-gateway-operit"
     conversation_id: "conv-jiajia-main"
     channel_id: "operit"
-    session_id: "jiajia"
+    session_id: "jiajia-main"
     profile_id: "jiajia-main"
+    # The effective cache/cooldown/continuation namespace is the resolved
+    # session ID above.  Revision is audit metadata only and never part of a
+    # cache key, so Reality and Operit remain in the same jiajia-main namespace.
+    session_mapping_revision: "CONT-R1"
+    session_channels:
+      jiajia-main: "operit"
     max_events: 40
     instruction: ""  # reserved; current implementation never injects this
   upstream_base_url: "https://api.openai.com/v1"

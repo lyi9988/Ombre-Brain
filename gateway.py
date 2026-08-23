@@ -838,10 +838,13 @@ class GatewayService:
             else {}
         )
         self.canonical_target_session_id = str(
-            canonical_cfg.get("session_id") or "jiajia"
+            canonical_cfg.get("session_id") or "jiajia-main"
         ).strip()
         self.canonical_target_profile_id = str(
             canonical_cfg.get("profile_id") or "jiajia-main"
+        ).strip()
+        self.canonical_session_mapping_revision = str(
+            canonical_cfg.get("session_mapping_revision") or ""
         ).strip()
         # session_id -> channel_id. Each channel keeps its own read cursor over the
         # one shared ledger, so a client that never sends X-Ombre-Session-Id (and
@@ -925,6 +928,8 @@ class GatewayService:
                 "canonical_continuation": {
                     "enabled": self.canonical_adapter.enabled,
                     "target_session_id": self.canonical_target_session_id,
+                    "target_session_label": self.canonical_target_session_id,
+                    "session_mapping_revision": self.canonical_session_mapping_revision,
                     "target_profile_id": self.canonical_target_profile_id,
                     "conversation_id": self.canonical_adapter.conversation_id,
                     "channel_id": self.canonical_adapter.channel_id,
@@ -4091,7 +4096,7 @@ class GatewayService:
             )
             return
         try:
-            self.state_store.record_conversation_turn(
+            turn_id = self.state_store.record_conversation_turn(
                 profile_id=profile_id,
                 session_id=session_id,
                 round_id=round_id,
@@ -4103,6 +4108,14 @@ class GatewayService:
                 canonical_key=canonical_key,
                 max_entries=self.conversation_turns_max_entries,
             )
+            if canonical_key and not turn_id:
+                logger.info(
+                    "Gateway conversation turn skipped as cross-session "
+                    "canonical claim duplicate | session=%s round=%s",
+                    session_id,
+                    round_id,
+                )
+                return
         except Exception as exc:
             logger.warning(
                 "Gateway conversation turn record failed | session=%s round=%s error=%s",
@@ -4167,8 +4180,9 @@ class GatewayService:
         canonical_key: str,
     ) -> bool:
         """Scheme P final-turn idempotency: a final assistant turn recorded once
-        under (profile, session, canonical_key) must not be recorded again by a
-        retry_continuation replay carrying the same H1/H2 key."""
+        under (profile, canonical_key) must not be recorded again by a
+        retry_continuation replay carrying the same H1/H2 key, even when the
+        retry arrives through another transport session."""
         try:
             return bool(
                 self.state_store.canonical_turn_key_exists(
