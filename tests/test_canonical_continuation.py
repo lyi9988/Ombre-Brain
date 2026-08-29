@@ -25,8 +25,8 @@ def test_pull_filters_non_natural_and_own_events_then_merges_before_current_user
                 "conversation_id": "conv-jiajia-main", "next_after_seq": 8,
                 "items": [
                     {"seq": 4, "event_type": "turn.started", "role": "system"},
-                    {"seq": 5, "event_type": "message", "role": "user", "content": "那我下午去。", "source": "app"},
-                    {"seq": 6, "event_type": "message", "role": "assistant", "content": "别盯着针。", "source": "conversation-service"},
+                    {"seq": 5, "id": "evt-reality-user", "event_type": "message", "role": "user", "content": "那我下午去。", "source": "app", "source_event_id": "reality:r5:user"},
+                    {"seq": 6, "id": "evt-reality-assistant", "event_type": "message", "role": "assistant", "content": "别盯着针。", "source": "conversation-service", "source_event_id": "reality:r5:assistant"},
                     {"seq": 7, "event_type": "message", "role": "assistant", "content": "own",
                      "source": "ombre-gateway", "source_event_id": "operit:r9:assistant"},
                     {"seq": 8, "event_type": "message", "role": "tool", "content": "secret", "source": "app"},
@@ -37,6 +37,12 @@ def test_pull_filters_non_natural_and_own_events_then_merges_before_current_user
         batch = await item.pull()
         assert [(event["role"], event["content"]) for event in batch.events] == [
             ("user", "那我下午去。"), ("assistant", "别盯着针。"),
+        ]
+        assert [event["event_id"] for event in batch.events] == [
+            "evt-reality-user", "evt-reality-assistant",
+        ]
+        assert [event["source_event_id"] for event in batch.events] == [
+            "reality:r5:user", "reality:r5:assistant",
         ]
         messages = [{"role": "system", "content": "role card"}, {"role": "user", "content": "但不会很疼吧？"}]
         merged = item.merge_messages(messages, batch)
