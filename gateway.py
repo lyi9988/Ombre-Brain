@@ -7,6 +7,7 @@ import json
 import codecs
 import time
 import asyncio
+import uuid
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -31,6 +32,15 @@ CANONICAL_TURN_PHASE_CONTINUATION = "continuation_after_tool"
 CANONICAL_SOURCE_EVENT_ID_HEADER = "X-Ombre-Canonical-Source-Event-Id"
 CANONICAL_ASSISTANT_SOURCE_EVENT_ID_HEADER = "X-Ombre-Canonical-Assistant-Source-Event-Id"
 
+
+def _usage_from_httpx_response(response: httpx.Response) -> dict | None:
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    usage = body.get("usage") if isinstance(body, dict) else None
+    return dict(usage) if isinstance(usage, dict) else None
+
 from bucket_manager import BucketManager
 from canonical_continuation import CanonicalContinuationAdapter, ContinuationBatch
 from dehydrator import Dehydrator
@@ -39,6 +49,7 @@ from embedding_engine import EmbeddingEngine
 from favorite_tags import has_favorite_memory_tag, is_flavor_tag
 from identity import identity_names
 from gateway_state import GatewayStateStore
+from model_request_trace import ModelRequestTraceStore
 from memory_diffusion import (
     diffuse_memory,
     diffusion_options_from_config,
@@ -510,6 +521,10 @@ class GatewayService:
         )
         self.state_store = state_store or GatewayStateStore(
             os.path.join(config["buckets_dir"], "gateway_state.db")
+        )
+        self.model_request_trace = ModelRequestTraceStore(
+            self.gateway_cfg.get("model_request_trace_path")
+            or os.path.join(config["buckets_dir"], "model_request_trace.sqlite3")
         )
         self.raw_event_store = raw_event_store or RawEventStore(config)
         self.reminder_store = ReminderStore(config)
@@ -1920,6 +1935,87 @@ class GatewayService:
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
 
+    @staticmethod
+    def _canonical_identity_keys(event: dict[str, Any]) -> set[str]:
+        """Return exact, typed canonical identity keys for set-difference.
+
+        A bridge deployment may expose event_id/version_id or only the stable
+        source_event_id/seq fields.  Keys are namespaced so a version string
+        cannot collide with an event id.  This deliberately does not use
+        max_seq or global text matching.
+        """
+        if not isinstance(event, dict):
+            return set()
+        values = {
+            "event_id": event.get("event_id") or event.get("id"),
+            "version_id": event.get("version_id"),
+            "source_event_id": event.get("source_event_id"),
+        }
+        result = set()
+        for name, value in values.items():
+            if value is None or str(value).strip() == "":
+                continue
+            result.add(f"{name}:{str(value).strip()}")
+        return result
+
+    @classmethod
+    def _coverage_identity_keys(cls, coverage: dict[str, Any]) -> set[str]:
+        items = coverage.get("items") if isinstance(coverage, dict) else []
+        if not isinstance(items, list):
+            return set()
+        keys: set[str] = set()
+        for item in items[:128]:
+            if isinstance(item, dict):
+                keys.update(cls._canonical_identity_keys(item))
+        return keys
+
+    @classmethod
+    def _dedupe_canonical_batch(
+        cls, batch: ContinuationBatch, coverage: dict[str, Any],
+    ) -> tuple[ContinuationBatch, dict[str, Any]]:
+        """Remove only canonical events whose exact key is in Aizizhu coverage."""
+        coverage_keys = cls._coverage_identity_keys(coverage)
+        candidates = []
+        deduped = []
+        inserted = []
+        kept = []
+        for event in batch.events:
+            keys = sorted(cls._canonical_identity_keys(event))
+            row = {
+                "keys": keys,
+                "seq": event.get("seq"),
+                "event_id": event.get("event_id") or event.get("id") or "",
+                "version_id": event.get("version_id") or "",
+                "source_event_id": event.get("source_event_id") or "",
+                "role": event.get("role") or "",
+                "content_sha256": hashlib.sha256(
+                    str(event.get("content") or "").encode("utf-8")
+                ).hexdigest(),
+            }
+            candidates.append(row)
+            overlap = sorted(set(keys).intersection(coverage_keys))
+            if overlap:
+                row["dedup_reason"] = "coverage_exact_key"
+                row["matched_coverage_keys"] = overlap
+                deduped.append(row)
+                continue
+            row["dedup_reason"] = "coverage_missing"
+            row["matched_coverage_keys"] = []
+            inserted.append(row)
+            kept.append(event)
+        fingerprint = str(coverage.get("fingerprint") or "") if isinstance(coverage, dict) else ""
+        debug = {
+            "coverage_fingerprint": fingerprint,
+            "coverage_items": coverage.get("items", [])[:128] if isinstance(coverage, dict) and isinstance(coverage.get("items"), list) else [],
+            "coverage_key_count": len(coverage_keys),
+            "candidates": candidates,
+            "deduped": deduped,
+            "inserted_missing": inserted,
+            "dedup_reason": "exact_identity_set_difference",
+            "legacy_text_fallback_used": False,
+        }
+        return ContinuationBatch(tuple(kept), batch.through_seq), debug
+
     async def _prepare_canonical_turn(
         self, request: Request, payload: dict, session_id: str, current_user_text: str,
     ) -> tuple[dict, dict[str, Any]]:
@@ -1958,12 +2054,28 @@ class GatewayService:
         try:
             batch = await self.canonical_adapter.pull(channel_id)
             state["through_seq"] = batch.through_seq
-            state["event_count"] = len(batch.events)
+            trace = self._trace_from_payload(payload)
+            coverage = trace.get("coverage") if isinstance(trace, dict) else {}
+            filtered_batch, dedup_debug = self._dedupe_canonical_batch(
+                batch, coverage if isinstance(coverage, dict) else {})
+            state["coverage"] = {
+                "conversation_id": (coverage or {}).get("conversation_id", "") if isinstance(coverage, dict) else "",
+                "context_revision": (coverage or {}).get("context_revision") if isinstance(coverage, dict) else None,
+                "current_user_source_event_id": (coverage or {}).get("current_user_source_event_id", "") if isinstance(coverage, dict) else "",
+                "fingerprint": dedup_debug["coverage_fingerprint"],
+                "item_count": len(dedup_debug["coverage_items"]),
+            }
+            state["dedup"] = dedup_debug
+            state["candidate_event_count"] = len(batch.events)
+            state["deduped_event_count"] = len(dedup_debug["deduped"])
+            state["inserted_event_count"] = len(dedup_debug["inserted_missing"])
+            state["event_count"] = len(filtered_batch.events)
             messages = payload.get("messages")
             if isinstance(messages, list):
                 payload = deepcopy(payload)
-                payload["messages"] = self.canonical_adapter.merge_messages(messages, batch)
-            state["status"] = "injected" if batch.events else "no_delta"
+                payload["messages"] = self.canonical_adapter.merge_messages(messages, filtered_batch)
+            state["status"] = "injected" if filtered_batch.events else (
+                "deduped" if batch.events else "no_delta")
         except Exception as exc:
             state["status"] = "pull_failed"
             state["pull_error_type"] = type(exc).__name__
@@ -2045,6 +2157,12 @@ class GatewayService:
                 status_code=400,
             )
 
+        payload["_ombre_trace_context"] = self._trace_context_from_request(
+            request, session_id=session_id, request_type=(
+                "continuation" if self._continuation_phase_enabled(request) else "initial"
+            ), client_id=request.headers.get("X-Ombre-Client-Id", "reality"),
+        )
+
         logger.info(
             "Gateway incoming chat | session=%s model=%s stream=%s messages=%s",
             session_id,
@@ -2086,8 +2204,8 @@ class GatewayService:
                 ),
                 continuation_phase=continuation_phase,
             )
-            if isinstance(injection_debug, dict):
-                injection_debug["canonical_continuation"] = canonical_state
+            self._attach_canonical_trace_debug(injection_debug, canonical_state)
+            self._record_logical_trace(forward_payload, injection_debug, client_label)
         except ValueError as exc:
             return JSONResponse(
                 {"error": {"message": str(exc), "type": "invalid_request_error"}},
@@ -2127,6 +2245,16 @@ class GatewayService:
                     route="/v1/chat/completions",
                 )
                 assistant_message = self._extract_assistant_message_from_anthropic_response(upstream_response)
+                self._record_reasoning_trace(
+                    forward_payload, assistant_message,
+                    replayed=bool(self._trace_from_payload(forward_payload).get("request_ordinal", 1) > 1),
+                )
+                trace_id = str(self._trace_from_payload(forward_payload).get("trace_id") or "")
+                outcome = "tool_call" if isinstance(assistant_message, dict) and assistant_message.get("tool_calls") else "final_answer"
+                self.model_request_trace.set_outcome(trace_id, outcome)
+                self.model_request_trace.update_latest_attempt(
+                    trace_id, result_status="http_completed", outcome=outcome,
+                    usage=upstream_usage)
                 await self._record_successful_round(
                     session_id,
                     recalled_ids,
@@ -2147,6 +2275,10 @@ class GatewayService:
                 )
                 return self._anthropic_response_to_openai(upstream_response, forward_payload["model"])
 
+            trace_id = str(self._trace_from_payload(forward_payload).get("trace_id") or "")
+            self.model_request_trace.set_outcome(trace_id, "error")
+            self.model_request_trace.update_latest_attempt(
+                trace_id, result_status="http_error", outcome="error")
             return self._proxy_response(upstream_response)
 
         upstream_response = await self._forward_upstream(forward_payload)
@@ -2166,6 +2298,17 @@ class GatewayService:
             )
             self._capture_reasoning_from_response(session_id, upstream_response)
             assistant_message = self._extract_assistant_message_from_response(upstream_response)
+            self._record_reasoning_trace(
+                forward_payload, assistant_message,
+                replayed=bool(self._trace_from_payload(forward_payload).get("request_ordinal", 1) > 1),
+            )
+            trace_id = str(self._trace_from_payload(forward_payload).get("trace_id") or "")
+            outcome = "tool_call" if isinstance(assistant_message, dict) and assistant_message.get("tool_calls") else "final_answer"
+            self.model_request_trace.set_outcome(
+                trace_id, outcome)
+            self.model_request_trace.update_latest_attempt(
+                trace_id, result_status="http_completed", outcome=outcome,
+                usage=upstream_usage)
             await self._record_successful_round(
                 session_id,
                 recalled_ids,
@@ -2185,6 +2328,11 @@ class GatewayService:
                 recalled_ids or [],
             )
 
+        if not 200 <= upstream_response.status_code < 300:
+            trace_id = str(self._trace_from_payload(forward_payload).get("trace_id") or "")
+            self.model_request_trace.set_outcome(trace_id, "error")
+            self.model_request_trace.update_latest_attempt(
+                trace_id, result_status="http_error", outcome="error")
         return self._proxy_response(upstream_response)
 
     async def handle_anthropic_messages(self, request: Request) -> Response:
@@ -2207,6 +2355,12 @@ class GatewayService:
             openai_payload = self._anthropic_request_to_openai(payload)
         except ValueError as exc:
             return self._anthropic_error(str(exc), status_code=400)
+
+        openai_payload["_ombre_trace_context"] = self._trace_context_from_request(
+            request, session_id=session_id, request_type=(
+                "continuation" if self._continuation_phase_enabled(request) else "initial"
+            ), client_id=request.headers.get("X-Ombre-Client-Id", "reality"),
+        )
 
         logger.info(
             "Gateway incoming Anthropic messages | session=%s model=%s messages=%s",
@@ -2245,8 +2399,12 @@ class GatewayService:
                 ),
                 continuation_phase=continuation_phase,
             )
-            if isinstance(injection_debug, dict):
-                injection_debug["canonical_continuation"] = canonical_state
+            self._attach_canonical_trace_debug(injection_debug, canonical_state)
+            # The logical Gateway record describes the post-injection payload
+            # that is about to be sent.  Keep the Anthropic wire conversion
+            # transparent: its physical attempt still owns the exact
+            # provider-shaped Raw payload.
+            self._record_logical_trace(forward_payload, injection_debug, client_label)
         except ValueError as exc:
             return self._anthropic_error(str(exc), status_code=400)
         except RuntimeError as exc:
@@ -2278,6 +2436,17 @@ class GatewayService:
                     route="/v1/messages",
                 )
                 assistant_message = self._extract_assistant_message_from_anthropic_response(upstream_response)
+                self._record_reasoning_trace(
+                    forward_payload, assistant_message,
+                    replayed=bool(self._trace_from_payload(forward_payload).get("request_ordinal", 1) > 1),
+                )
+                trace_id = str(self._trace_from_payload(forward_payload).get("trace_id") or "")
+                outcome = "tool_call" if isinstance(assistant_message, dict) and assistant_message.get("tool_calls") else "final_answer"
+                self.model_request_trace.set_outcome(
+                    trace_id, outcome)
+                self.model_request_trace.update_latest_attempt(
+                    trace_id, result_status="http_completed", outcome=outcome,
+                    usage=upstream_usage)
                 await self._record_successful_round(
                     session_id,
                     recalled_ids,
@@ -2298,6 +2467,10 @@ class GatewayService:
                 )
                 return self._proxy_response(upstream_response)
 
+            trace_id = str(self._trace_from_payload(forward_payload).get("trace_id") or "")
+            self.model_request_trace.set_outcome(trace_id, "error")
+            self.model_request_trace.update_latest_attempt(
+                trace_id, result_status="http_error", outcome="error")
             return self._proxy_anthropic_error_response(upstream_response)
 
         upstream_response = await self._forward_upstream(forward_payload)
@@ -2317,6 +2490,16 @@ class GatewayService:
             )
             self._capture_reasoning_from_response(session_id, upstream_response)
             assistant_message = self._extract_assistant_message_from_response(upstream_response)
+            self._record_reasoning_trace(
+                forward_payload, assistant_message,
+                replayed=bool(self._trace_from_payload(forward_payload).get("request_ordinal", 1) > 1),
+            )
+            trace_id = str(self._trace_from_payload(forward_payload).get("trace_id") or "")
+            outcome = "tool_call" if isinstance(assistant_message, dict) and assistant_message.get("tool_calls") else "final_answer"
+            self.model_request_trace.set_outcome(trace_id, outcome)
+            self.model_request_trace.update_latest_attempt(
+                trace_id, result_status="http_completed", outcome=outcome,
+                usage=upstream_usage)
             await self._record_successful_round(
                 session_id,
                 recalled_ids,
@@ -2337,6 +2520,10 @@ class GatewayService:
             )
             return self._openai_response_to_anthropic(upstream_response, forward_payload["model"])
 
+        trace_id = str(self._trace_from_payload(forward_payload).get("trace_id") or "")
+        self.model_request_trace.set_outcome(trace_id, "error")
+        self.model_request_trace.update_latest_attempt(
+            trace_id, result_status="http_error", outcome="error")
         return self._proxy_anthropic_error_response(upstream_response)
 
     async def handle_models(self, request: Request) -> Response:
@@ -3398,6 +3585,25 @@ class GatewayService:
             prepare_timing_debug["total_ms"] = max(0, int((time.perf_counter() - prepare_started_at) * 1000))
             prepare_timing_debug["steps_ms"] = dict(prepare_steps_ms)
             debug_payload["prepare_timing_debug"] = prepare_timing_debug
+            debug_payload["post_injection_presence"] = {
+                "persona": bool(str(persona_block or "").strip()),
+                "emotion_relationship": bool(str(relationship_weather or "").strip()),
+                "memory_recall": bool(str(
+                    recalled_memory or related_memory or targeted_memory_detail or "").strip()),
+                "core_memory": bool(str(core_memory or "").strip()),
+                "portrait_memory": bool(str(portrait_memory or "").strip()),
+                "canonical_continuation": bool(continuation_phase),
+            }
+            trace_context = payload.get("_ombre_trace_context")
+            if isinstance(trace_context, dict):
+                debug_payload["trace_id"] = str(trace_context.get("trace_id") or "")
+                debug_payload["logical_request_id"] = str(
+                    trace_context.get("logical_request_id") or ""
+                )
+                debug_payload["request_ordinal"] = int(trace_context.get("request_ordinal") or 1)
+                debug_payload["request_type"] = str(trace_context.get("request_type") or "initial")
+                debug_payload["parent_request_id"] = str(trace_context.get("parent_request_id") or "")
+                debug_payload["tool_round"] = trace_context.get("tool_round")
             log_prepare_timing()
             return forward_payload, injected_ids, debug_payload
         log_prepare_timing()
@@ -3431,25 +3637,278 @@ class GatewayService:
         return route
 
     def _authorize(self, auth_header: str) -> JSONResponse | None:
+        no_store = {"Cache-Control": "no-store", "Pragma": "no-cache"}
         if not self.gateway_token:
             return JSONResponse(
                 {"error": {"message": "Gateway token is not configured", "type": "server_error"}},
-                status_code=503,
+                status_code=503, headers=no_store,
             )
 
         scheme, _, token = auth_header.partition(" ")
         if scheme.lower() != "bearer" or not token:
             return JSONResponse(
                 {"error": {"message": "Authorization: Bearer token is required", "type": "authentication_error"}},
-                status_code=401,
+                status_code=401, headers=no_store,
             )
 
         if not secrets.compare_digest(token, self.gateway_token):
             return JSONResponse(
                 {"error": {"message": "Invalid gateway token", "type": "authentication_error"}},
-                status_code=401,
+                status_code=401, headers=no_store,
             )
         return None
+
+    def _trace_context_from_request(self, request: Request, *, session_id: str,
+                                    request_type: str, client_id: str) -> dict[str, Any]:
+        """Consume internal trace headers without changing H1/H2/session."""
+        marker = str(client_id or "").strip().lower()
+        if marker not in {"reality", "telegram", "operit"}:
+            marker = "unknown"
+        trace_id = str(request.headers.get("X-Guyan-Trace-Id") or "").strip()
+        if not trace_id:
+            trace_id = f"trace-{uuid.uuid4().hex}"
+        logical_id = str(request.headers.get("X-Guyan-Logical-Request-Id") or "").strip()
+        if not logical_id:
+            logical_id = f"{trace_id}:model:1"
+        try:
+            ordinal = max(1, int(request.headers.get("X-Guyan-Request-Ordinal") or 1))
+        except (TypeError, ValueError):
+            ordinal = 1
+        coverage_raw = str(request.headers.get("X-Guyan-Canonical-Coverage") or "").strip()
+        try:
+            coverage = json.loads(coverage_raw) if coverage_raw else {}
+        except (TypeError, ValueError):
+            coverage = {"parse_error": True}
+        if not isinstance(coverage, dict):
+            coverage = {}
+        worldbook_raw = str(request.headers.get("X-Guyan-Worldbook-Projection") or "").strip()
+        try:
+            worldbook = json.loads(worldbook_raw) if worldbook_raw else []
+        except (TypeError, ValueError):
+            worldbook = []
+        if not isinstance(worldbook, list):
+            worldbook = []
+        return {
+            "trace_id": trace_id[:120], "logical_request_id": logical_id[:200],
+            "request_ordinal": ordinal, "request_type": str(request_type or "initial"),
+            "parent_request_id": str(request.headers.get("X-Guyan-Parent-Request-Id") or "")[:200],
+            "tool_round": max(0, ordinal - 1),
+            "conversation_id": str(request.headers.get("X-Guyan-Conversation-Id") or "")[:200],
+            "turn_id": str(request.headers.get("X-Guyan-Turn-Id") or "")[:200],
+            "request_id": str(request.headers.get("X-Guyan-Request-Id") or logical_id)[:200],
+            "worker_operation_id": str(request.headers.get("X-Guyan-Worker-Operation-Id") or "")[:200],
+            "client_id": marker, "session_id": session_id[:160],
+            "coverage": coverage, "worldbook": worldbook[:64],
+        }
+
+    @staticmethod
+    def _trace_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        value = payload.get("_ombre_trace_context")
+        return value if isinstance(value, dict) else {}
+
+    def _set_trace_outcome(
+        self, payload: dict[str, Any] | None, outcome: str,
+        *, result_status: str = "",
+    ) -> None:
+        trace_id = str(self._trace_from_payload(payload or {}).get("trace_id") or "")
+        if not trace_id:
+            return
+        self.model_request_trace.set_outcome(trace_id, outcome)
+        self.model_request_trace.update_latest_attempt(
+            trace_id, result_status=result_status or None, outcome=outcome)
+
+    @staticmethod
+    def _reasoning_trace_metadata(messages: Any, *, body_visibility: str = "metadata_only") -> dict[str, Any]:
+        """Report only public reasoning transport facts, never its body."""
+        returned = 0
+        replay_required = 0
+        replayed = 0
+        omitted = 0
+        if isinstance(messages, list):
+            for item in messages:
+                if not isinstance(item, dict) or item.get("role") != "assistant":
+                    continue
+                has_reasoning = bool(str(item.get("reasoning_content") or "").strip())
+                has_tools = bool(item.get("tool_calls"))
+                if has_reasoning:
+                    returned += 1
+                if has_tools:
+                    replay_required += 1
+                    if has_reasoning:
+                        replayed += 1
+                    else:
+                        omitted += 1
+        return {
+            "returned": returned > 0,
+            "returned_count": returned,
+            "replay_required": replay_required > 0,
+            "replay_required_count": replay_required,
+            "replayed": replayed > 0,
+            "replayed_count": replayed,
+            "omitted": omitted > 0,
+            "omitted_count": omitted,
+            "body_visibility": body_visibility if body_visibility in {
+                "hidden", "metadata_only", "provider_exposed"
+            } else "metadata_only",
+        }
+
+    def _record_reasoning_trace(self, payload: dict[str, Any],
+                                assistant_message: dict[str, Any] | None,
+                                *, replayed: bool = False) -> None:
+        trace_id = str(self._trace_from_payload(payload).get("trace_id") or "")
+        if not trace_id:
+            return
+        message = assistant_message if isinstance(assistant_message, dict) else {}
+        has_reasoning = bool(str(message.get("reasoning_content") or "").strip())
+        has_tools = bool(message.get("tool_calls"))
+        trace_settings = self.model_request_trace.settings()
+        body_visibility = str(trace_settings.get("body_visibility") or "metadata_only")
+        input_reasoning = self._reasoning_trace_metadata(
+            payload.get("messages"), body_visibility=body_visibility)
+        self.model_request_trace.update_metadata(trace_id, {"reasoning": {
+            "returned": has_reasoning,
+            "returned_count": 1 if has_reasoning else 0,
+            "replay_required": has_tools,
+            "replayed": bool(replayed and has_reasoning) or bool(input_reasoning.get("replayed")),
+            "omitted": bool(has_tools and not has_reasoning) or bool(input_reasoning.get("omitted")),
+            "body_available": bool(
+                has_reasoning
+                and body_visibility == "provider_exposed"
+                and trace_settings.get("capture_mode") == "full_owner_body"
+            ),
+            "body_visibility": body_visibility,
+        }})
+        self.model_request_trace.record_tool_calls(trace_id, message.get("tool_calls"))
+
+    @staticmethod
+    def _attach_canonical_trace_debug(
+        injection_debug: dict[str, Any] | None,
+        canonical_state: dict[str, Any] | None,
+    ) -> None:
+        """Attach canonical set-difference truth to post-injection metadata."""
+        if not isinstance(injection_debug, dict):
+            return
+        state = canonical_state if isinstance(canonical_state, dict) else {}
+        injection_debug["canonical_continuation"] = state
+        presence = injection_debug.get("post_injection_presence")
+        if isinstance(presence, dict):
+            # Transport phase does not prove that an event was inserted: the
+            # exact Aizizhu coverage may already contain every candidate.
+            presence["canonical_continuation"] = bool(state.get("event_count"))
+
+    def _record_logical_trace(self, payload: dict[str, Any], injection_debug: dict[str, Any] | None,
+                              client_id: str) -> None:
+        try:
+            trace = self._trace_from_payload(payload)
+            debug = injection_debug if isinstance(injection_debug, dict) else {}
+            # Keep the logical layer body-free. Physical body truth is recorded
+            # separately by the exact payload sent to upstream.
+            trace_settings = self.model_request_trace.settings()
+            body_visibility = str(trace_settings.get("body_visibility") or "metadata_only")
+            resolved = {
+                "message_count": len(payload.get("messages") or []),
+                "roles": [str(item.get("role") or "") for item in payload.get("messages", [])
+                          if isinstance(item, dict)],
+                "tool_count": len(payload.get("tools") or []),
+                "loaded_tool_schema": bool(payload.get("tools")),
+                "params": {key: payload.get(key) for key in (
+                    "temperature", "max_tokens", "max_completion_tokens", "reasoning_effort",
+                    "thinking", "enable_thinking", "thinking_mode", "reasoning", "stream", "tool_choice", "parallel_tool_calls",
+                    "extra_body", "extra_args") if key in payload},
+                "reasoning": self._reasoning_trace_metadata(
+                    payload.get("messages"), body_visibility=body_visibility),
+            }
+            metadata = {
+                "resolved": resolved,
+                "worker_operation_id": str(trace.get("worker_operation_id") or ""),
+                "canonical_continuation": debug.get("canonical_continuation", {}),
+                "coverage": trace.get("coverage", {}),
+                "injection_presence": {
+                    key: bool(debug.get(key)) for key in (
+                        "portrait_memory_injected", "just_now_context_injected",
+                        "recent_context_injected", "date_recall_injected",
+                        "dream_context_injected", "active_reminders_injected")
+                },
+                "post_injection_presence": debug.get("post_injection_presence") or {},
+                "worldbook": trace.get("worldbook") or debug.get("worldbook", {}),
+            }
+            # ``client_id`` is the independent owner-safe marker consumed from
+            # X-Ombre-Client-Id.  Keep the older User-Agent/client label in
+            # metadata only; it must never become the canonical session or
+            # Persona/Memory namespace.
+            marker = str(trace.get("client_id") or "").strip() or str(client_id or "")
+            metadata["client_label"] = str(client_id or "")[:120]
+            self.model_request_trace.begin_logical({**trace, "provider": "ombre-gateway",
+                                                    "model": payload.get("model"),
+                                                    "client_id": marker,
+                                                    "metadata": metadata})
+        except Exception:
+            logger.debug("Gateway model trace logical record failed", exc_info=True)
+
+    async def handle_model_request_trace(self, request: Request) -> JSONResponse:
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        trace_id = str(request.path_params.get("trace_id") or request.query_params.get("trace_id") or "").strip()
+        view = str(request.query_params.get("view") or "metadata").strip().lower()
+        if view not in {"metadata", "resolved", "raw_redacted", "full_owner_body"}:
+            return JSONResponse({"error": "invalid view"}, status_code=400, headers={"Cache-Control": "no-store"})
+        item = self.model_request_trace.get(trace_id, view=view) if trace_id else None
+        if item is None:
+            return JSONResponse({"error": "trace not found"}, status_code=404, headers={"Cache-Control": "no-store"})
+        return JSONResponse(item, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+    async def handle_model_request_trace_list(self, request: Request) -> JSONResponse:
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        try:
+            limit = max(1, min(1000, int(request.query_params.get("limit", "100"))))
+        except (TypeError, ValueError):
+            limit = 100
+        return JSONResponse({"items": self.model_request_trace.list_recent(
+            limit=limit, conversation_id=str(request.query_params.get("conversation_id") or ""),
+            turn_id=str(request.query_params.get("turn_id") or "")),
+            "settings": self.model_request_trace.settings()},
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+    async def handle_model_request_trace_events(self, request: Request) -> JSONResponse:
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        return JSONResponse({"items": self.model_request_trace.events_recent(limit=200)},
+                            headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+    async def handle_model_request_trace_settings(self, request: Request) -> JSONResponse:
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        if request.method == "GET":
+            payload = {"settings": self.model_request_trace.settings()}
+        else:
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "invalid JSON"}, status_code=400,
+                                    headers={"Cache-Control": "no-store"})
+            if not isinstance(body, dict):
+                return JSONResponse({"error": "settings must be an object"}, status_code=400,
+                                    headers={"Cache-Control": "no-store"})
+            try:
+                settings = self.model_request_trace.update_settings(
+                    body, expected_revision=body.get("expected_revision"))
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409,
+                                    headers={"Cache-Control": "no-store"})
+            payload = {"settings": settings}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+    async def handle_model_request_trace_clear(self, request: Request) -> JSONResponse:
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        self.model_request_trace.clear()
+        return JSONResponse({"cleared": True}, headers={"Cache-Control": "no-store"})
 
     def _authorize_anthropic_request(self, request: Request) -> JSONResponse | None:
         if not self.gateway_token:
@@ -3491,6 +3950,14 @@ class GatewayService:
 
         for attempt, key_entry in enumerate(key_entries, start=1):
             started_at = time.perf_counter()
+            trace = self._trace_from_payload(payload)
+            attempt_id = self.model_request_trace.record_attempt(
+                trace_id=str(trace.get("trace_id") or ""), ordinal=attempt,
+                provider=upstream.get("name", ""), upstream=upstream.get("name", ""),
+                model=route["upstream_model"], alias=model,
+                retry_reason="provider_retry" if attempt > 1 else "",
+                payload=upstream_payload,
+            )
             try:
                 response = await self.http_client.post(
                     url,
@@ -3502,6 +3969,10 @@ class GatewayService:
                 )
             except httpx.RequestError as exc:
                 latency_ms = int((time.perf_counter() - started_at) * 1000)
+                if attempt_id:
+                    self.model_request_trace.update_attempt(
+                        attempt_id, duration_ms=latency_ms, result_status="transport_error",
+                        outcome="error")
                 last_error = exc
                 self._cool_down_upstream_key(upstream, key_entry)
                 logger.warning(
@@ -3520,6 +3991,11 @@ class GatewayService:
 
             latency_ms = int((time.perf_counter() - started_at) * 1000)
             last_response = response
+            if attempt_id:
+                self.model_request_trace.update_attempt(
+                    attempt_id, duration_ms=latency_ms, http_status=response.status_code,
+                    result_status="http", outcome=("final_answer" if 200 <= response.status_code < 300 else "error"),
+                    usage=_usage_from_httpx_response(response))
             logger.info(
                 "Gateway upstream response | upstream=%s key=%s model=%s upstream_model=%s "
                 "status=%s attempt=%s/%s latency_ms=%s",
@@ -3563,6 +4039,14 @@ class GatewayService:
 
         for attempt, key_entry in enumerate(key_entries, start=1):
             started_at = time.perf_counter()
+            trace = self._trace_from_payload(payload)
+            attempt_id = self.model_request_trace.record_attempt(
+                trace_id=str(trace.get("trace_id") or ""), ordinal=attempt,
+                provider=upstream.get("name", ""), upstream=upstream.get("name", ""),
+                model=route["upstream_model"], alias=model,
+                retry_reason="provider_retry" if attempt > 1 else "",
+                payload=upstream_payload,
+            )
             try:
                 response = await self.http_client.post(
                     url,
@@ -3571,6 +4055,10 @@ class GatewayService:
                 )
             except httpx.RequestError as exc:
                 latency_ms = int((time.perf_counter() - started_at) * 1000)
+                if attempt_id:
+                    self.model_request_trace.update_attempt(
+                        attempt_id, duration_ms=latency_ms, result_status="transport_error",
+                        outcome="error")
                 last_error = exc
                 self._cool_down_upstream_key(upstream, key_entry)
                 logger.warning(
@@ -3589,6 +4077,11 @@ class GatewayService:
 
             latency_ms = int((time.perf_counter() - started_at) * 1000)
             last_response = response
+            if attempt_id:
+                self.model_request_trace.update_attempt(
+                    attempt_id, duration_ms=latency_ms, http_status=response.status_code,
+                    result_status="http", outcome=("final_answer" if 200 <= response.status_code < 300 else "error"),
+                    usage=_usage_from_httpx_response(response))
             logger.info(
                 "Gateway Anthropic upstream response | upstream=%s key=%s model=%s upstream_model=%s "
                 "status=%s attempt=%s/%s latency_ms=%s",
@@ -3639,10 +4132,22 @@ class GatewayService:
                 json=upstream_payload,
             )
             started_at = time.perf_counter()
+            trace = self._trace_from_payload(payload)
+            attempt_id = self.model_request_trace.record_attempt(
+                trace_id=str(trace.get("trace_id") or ""), ordinal=attempt,
+                provider=upstream.get("name", ""), upstream=upstream.get("name", ""),
+                model=route["upstream_model"], alias=model,
+                retry_reason="provider_retry" if attempt > 1 else "",
+                payload=upstream_payload,
+            )
             try:
                 upstream_response = await self.http_client.send(request, stream=True)
             except httpx.RequestError as exc:
                 latency_ms = int((time.perf_counter() - started_at) * 1000)
+                if attempt_id:
+                    self.model_request_trace.update_attempt(
+                        attempt_id, duration_ms=latency_ms, result_status="transport_error",
+                        outcome="error")
                 last_error = exc
                 self._cool_down_upstream_key(upstream, key_entry)
                 logger.warning(
@@ -3672,6 +4177,12 @@ class GatewayService:
                 len(key_entries),
                 latency_ms,
             )
+            if attempt_id:
+                self.model_request_trace.update_attempt(
+                    attempt_id, duration_ms=latency_ms,
+                    http_status=upstream_response.status_code,
+                    result_status="stream_headers",
+                    outcome=("final_answer" if 200 <= upstream_response.status_code < 300 else "error"))
             if 200 <= upstream_response.status_code < 300:
                 self._clear_upstream_key_cooldown(upstream, key_entry)
                 return upstream_response
@@ -3716,10 +4227,22 @@ class GatewayService:
                 json=upstream_payload,
             )
             started_at = time.perf_counter()
+            trace = self._trace_from_payload(payload)
+            attempt_id = self.model_request_trace.record_attempt(
+                trace_id=str(trace.get("trace_id") or ""), ordinal=attempt,
+                provider=upstream.get("name", ""), upstream=upstream.get("name", ""),
+                model=route["upstream_model"], alias=model,
+                retry_reason="provider_retry" if attempt > 1 else "",
+                payload=upstream_payload,
+            )
             try:
                 upstream_response = await self.http_client.send(request, stream=True)
             except httpx.RequestError as exc:
                 latency_ms = int((time.perf_counter() - started_at) * 1000)
+                if attempt_id:
+                    self.model_request_trace.update_attempt(
+                        attempt_id, duration_ms=latency_ms, result_status="transport_error",
+                        outcome="error")
                 last_error = exc
                 self._cool_down_upstream_key(upstream, key_entry)
                 logger.warning(
@@ -3749,6 +4272,12 @@ class GatewayService:
                 len(key_entries),
                 latency_ms,
             )
+            if attempt_id:
+                self.model_request_trace.update_attempt(
+                    attempt_id, duration_ms=latency_ms,
+                    http_status=upstream_response.status_code,
+                    result_status="stream_headers",
+                    outcome=("final_answer" if 200 <= upstream_response.status_code < 300 else "error"))
             if 200 <= upstream_response.status_code < 300:
                 self._clear_upstream_key_cooldown(upstream, key_entry)
                 return upstream_response
@@ -3802,6 +4331,8 @@ class GatewayService:
         upstream = route["upstream"]
 
         if not 200 <= upstream_response.status_code < 300:
+            self._set_trace_outcome(
+                payload, "error", result_status="stream_http_error")
             body_read_started_at = time.perf_counter()
             body = await upstream_response.aread()
             await upstream_response.aclose()
@@ -3878,6 +4409,16 @@ class GatewayService:
                         yield chunk
                 self._consume_stream_capture_chunk(stream_state, b"", final=True)
                 await finalize_once()
+            except asyncio.CancelledError:
+                if not finalized:
+                    self._set_trace_outcome(
+                        payload, "cancelled", result_status="stream_cancelled")
+                raise
+            except Exception:
+                if not finalized:
+                    self._set_trace_outcome(
+                        payload, "error", result_status="stream_aborted")
+                raise
             finally:
                 logger.info(
                     "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
@@ -5125,7 +5666,25 @@ class GatewayService:
             route=route,
         )
         self._capture_reasoning_from_stream_state(session_id, stream_state)
-        assistant_message = self._build_stream_assistant_message(stream_state)
+        assistant_message = self._build_stream_assistant_message(stream_state) or {"role": "assistant"}
+        trace_id = str((injection_debug or {}).get("trace_id") or "")
+        if trace_id:
+            self._record_reasoning_trace(
+                {"_ombre_trace_context": {"trace_id": trace_id,
+                                           "request_ordinal": (injection_debug or {}).get("request_ordinal", 1)}},
+                assistant_message,
+                replayed=bool((injection_debug or {}).get("request_ordinal", 1) > 1),
+            )
+            self.model_request_trace.set_outcome(
+                trace_id,
+                "tool_call" if assistant_message.get("tool_calls") else "final_answer",
+            )
+            self.model_request_trace.update_latest_attempt(
+                trace_id,
+                result_status="stream_completed",
+                outcome="tool_call" if assistant_message.get("tool_calls") else "final_answer",
+                usage=upstream_usage,
+            )
         await self._record_successful_round(
             session_id,
             recalled_ids,
@@ -6091,6 +6650,8 @@ class GatewayService:
         upstream = route["upstream"]
 
         if not 200 <= upstream_response.status_code < 300:
+            self._set_trace_outcome(
+                payload, "error", result_status="stream_http_error")
             body_read_started_at = time.perf_counter()
             body = await upstream_response.aread()
             await upstream_response.aclose()
@@ -6301,6 +6862,16 @@ class GatewayService:
                     "message_stop",
                     {"type": "message_stop"},
                 )
+            except asyncio.CancelledError:
+                if not finalized:
+                    self._set_trace_outcome(
+                        payload, "cancelled", result_status="stream_cancelled")
+                raise
+            except Exception:
+                if not finalized:
+                    self._set_trace_outcome(
+                        payload, "error", result_status="stream_aborted")
+                raise
             finally:
                 logger.info(
                     "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
@@ -6353,6 +6924,8 @@ class GatewayService:
         upstream = route["upstream"]
 
         if not 200 <= upstream_response.status_code < 300:
+            self._set_trace_outcome(
+                payload, "error", result_status="stream_http_error")
             body_read_started_at = time.perf_counter()
             body = await upstream_response.aread()
             await upstream_response.aclose()
@@ -6520,6 +7093,16 @@ class GatewayService:
                 if not final_sent:
                     yield final_openai_chunk()
                     yield b"data: [DONE]\n\n"
+            except asyncio.CancelledError:
+                if not finalized:
+                    self._set_trace_outcome(
+                        payload, "cancelled", result_status="stream_cancelled")
+                raise
+            except Exception:
+                if not finalized:
+                    self._set_trace_outcome(
+                        payload, "error", result_status="stream_aborted")
+                raise
             finally:
                 logger.info(
                     "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
@@ -6572,6 +7155,8 @@ class GatewayService:
         upstream = route["upstream"]
 
         if not 200 <= upstream_response.status_code < 300:
+            self._set_trace_outcome(
+                payload, "error", result_status="stream_http_error")
             body_read_started_at = time.perf_counter()
             body = await upstream_response.aread()
             await upstream_response.aclose()
@@ -6651,6 +7236,16 @@ class GatewayService:
                         yield chunk
                 self._consume_anthropic_stream_capture_chunk(stream_state, b"", final=True)
                 await finalize_once()
+            except asyncio.CancelledError:
+                if not finalized:
+                    self._set_trace_outcome(
+                        payload, "cancelled", result_status="stream_cancelled")
+                raise
+            except Exception:
+                if not finalized:
+                    self._set_trace_outcome(
+                        payload, "error", result_status="stream_aborted")
+                raise
             finally:
                 logger.info(
                     "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
@@ -6981,6 +7576,7 @@ class GatewayService:
                 },
             },
             status_code=status_code,
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         )
 
     def _extract_last_user_query(self, messages: list[dict[str, Any]]) -> str:
@@ -20596,6 +21192,9 @@ class GatewayService:
 
     def _payload_for_upstream_model(self, payload: dict, upstream_model: str) -> dict:
         upstream_payload = deepcopy(payload)
+        # Internal Aizizhu trace context is consumed by Gateway storage only;
+        # it must never reach a provider and is not part of H1/H2 identity.
+        upstream_payload.pop("_ombre_trace_context", None)
         upstream_payload["model"] = upstream_model
         return upstream_payload
 
@@ -20879,6 +21478,21 @@ def create_gateway_app(
     async def upstream_usage_debug(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_upstream_usage_debug(request)
 
+    async def model_request_trace(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_model_request_trace(request)
+
+    async def model_request_trace_list(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_model_request_trace_list(request)
+
+    async def model_request_trace_events(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_model_request_trace_events(request)
+
+    async def model_request_trace_settings(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_model_request_trace_settings(request)
+
+    async def model_request_trace_clear(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_model_request_trace_clear(request)
+
     app = Starlette(
         debug=False,
         routes=[
@@ -20888,6 +21502,11 @@ def create_gateway_app(
             Route("/api/hook/recall", hook_recall, methods=["POST"]),
             Route("/api/debug/recall-eval", recall_eval_debug, methods=["GET"]),
             Route("/api/debug/upstream-usage", upstream_usage_debug, methods=["GET"]),
+            Route("/api/debug/model-requests", model_request_trace_list, methods=["GET"]),
+            Route("/api/debug/model-requests/events", model_request_trace_events, methods=["GET"]),
+            Route("/api/debug/model-requests/settings", model_request_trace_settings, methods=["GET", "PUT"]),
+            Route("/api/debug/model-requests/clear", model_request_trace_clear, methods=["POST"]),
+            Route("/api/debug/model-requests/{trace_id}", model_request_trace, methods=["GET"]),
             Route("/v1/models", models, methods=["GET"]),
             Route("/v1/chat/completions", chat_completions, methods=["POST"]),
             Route("/v1/messages", anthropic_messages, methods=["POST"]),

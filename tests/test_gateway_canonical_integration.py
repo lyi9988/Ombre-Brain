@@ -171,3 +171,50 @@ def test_unmapped_session_is_still_not_target():
         assert state == {"enabled": False, "status": "not_target"}
         assert item.canonical_adapter.pull_calls == 0
     asyncio.run(scenario())
+
+
+def test_continuation_presence_is_based_on_inserted_canonical_events():
+    debug = {"post_injection_presence": {"canonical_continuation": True}}
+
+    GatewayService._attach_canonical_trace_debug(
+        debug, {"enabled": True, "status": "deduped", "event_count": 0}
+    )
+    assert debug["post_injection_presence"]["canonical_continuation"] is False
+
+    GatewayService._attach_canonical_trace_debug(
+        debug, {"enabled": True, "status": "injected", "event_count": 1}
+    )
+    assert debug["post_injection_presence"]["canonical_continuation"] is True
+
+
+def test_coverage_dedup_is_exact_and_same_text_different_event_survives():
+    batch = ContinuationBatch((
+        {"seq": 11, "event_id": "evt-covered", "version_id": "v1",
+         "source_event_id": "app:covered", "role": "user", "content": "相同文字"},
+        {"seq": 12, "event_id": "evt-distinct", "version_id": "v2",
+         "source_event_id": "telegram:distinct", "role": "user", "content": "相同文字"},
+    ), 12)
+    filtered, debug = GatewayService._dedupe_canonical_batch(batch, {
+        "conversation_id": "conv-1",
+        "context_revision": 7,
+        "items": [{
+            "event_id": "evt-covered", "version_id": "v1",
+            "source_event_id": "app:covered",
+        }],
+        "fingerprint": "coverage-fp",
+    })
+    assert [event["event_id"] for event in filtered.events] == ["evt-distinct"]
+    assert debug["coverage_fingerprint"] == "coverage-fp"
+    assert debug["deduped"][0]["dedup_reason"] == "coverage_exact_key"
+    assert debug["inserted_missing"][0]["event_id"] == "evt-distinct"
+    assert debug["legacy_text_fallback_used"] is False
+
+
+def test_client_marker_is_diagnostic_and_does_not_replace_session_identity():
+    item = service()
+    trace = item._trace_context_from_request(
+        request({"X-Ombre-Client-Id": "telegram"}),
+        session_id="jiajia-main", request_type="initial", client_id="telegram",
+    )
+    assert trace["client_id"] == "telegram"
+    assert trace["session_id"] == "jiajia-main"

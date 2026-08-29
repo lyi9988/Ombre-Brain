@@ -157,6 +157,8 @@ class CanonicalContinuationAdapter:
                 continue
             selected.append({
                 "seq": int(event.get("seq") or 0),
+                "event_id": str(event.get("event_id") or event.get("id") or ""),
+                "version_id": str(event.get("version_id") or ""),
                 "role": event["role"],
                 "content": content,
                 "source_event_id": str(event.get("source_event_id") or ""),
