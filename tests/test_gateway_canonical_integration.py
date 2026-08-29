@@ -64,6 +64,9 @@ def service(profile="jiajia-main"):
     item.canonical_target_session_id = "jiajia"
     item.canonical_target_profile_id = "jiajia-main"
     item.canonical_session_channels = {"jiajia": "operit", "main": "reality"}
+    item.canonical_client_channels = {
+        "operit": "operit", "reality": "reality", "telegram": "telegram",
+    }
     item.canonical_adapter = FakeAdapter()
     return item
 
@@ -160,6 +163,27 @@ def test_second_channel_uses_its_own_prefix_and_cursor():
         await item._finalize_canonical_turn(state, {"role": "assistant", "content": "嗯。"})
         assert item.canonical_adapter.ingested[-1]["source_event_id"] == "reality:req-9:assistant"
         assert item.canonical_adapter.committed == [(12, "reality")]
+    asyncio.run(scenario())
+
+
+def test_shared_session_uses_client_marker_for_a_separate_continuation_cursor():
+    """Reality and Operit share jiajia-main, but must not share a read cursor.
+
+    The marker is cursor selection only: the session remains the caller's
+    canonical identity and is still what activates the continuation bridge.
+    """
+    async def scenario():
+        item = service()
+        payload = {"messages": [{"role": "user", "content": "从 Reality 继续"}]}
+        _prepared, state = await item._prepare_canonical_turn(
+            request({"X-Request-ID": "reality-1", "X-Ombre-Client-Id": "reality"}),
+            payload, "jiajia", "从 Reality 继续",
+        )
+        assert state["channel_id"] == "reality"
+        assert state["channel_selection"] == "client_marker"
+        assert state["client_marker"] == "reality"
+        assert item.canonical_adapter.pull_channels == ["reality"]
+        assert item.canonical_adapter.ingested[0]["source_event_id"] == "reality:reality-1:user"
     asyncio.run(scenario())
 
 

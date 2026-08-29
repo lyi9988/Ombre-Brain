@@ -876,6 +876,20 @@ class GatewayService:
         self.canonical_session_channels.setdefault(
             self.canonical_target_session_id, primary_channel
         )
+        # The canonical session remains the sole Persona/Memory identity. A
+        # client marker only selects an independent continuation *cursor* so
+        # one client cannot consume canonical deltas before another client has
+        # read them. This is deliberately separate from session_channels.
+        self.canonical_client_channels: dict[str, str] = {}
+        raw_client_channels = canonical_cfg.get("client_channels")
+        if isinstance(raw_client_channels, dict):
+            for raw_client, raw_channel in raw_client_channels.items():
+                client_key = str(raw_client or "").strip().lower()
+                channel_value = str(raw_channel or "").strip()
+                if client_key and channel_value:
+                    self.canonical_client_channels[client_key] = channel_value
+        for marker in ("reality", "telegram", "operit"):
+            self.canonical_client_channels.setdefault(marker, marker)
         self.canonical_adapter = CanonicalContinuationAdapter(
             enabled=self._bool_config_value(canonical_cfg.get("enabled"), False),
             base_url=str(canonical_cfg.get("base_url") or ""),
@@ -951,9 +965,11 @@ class GatewayService:
                     "max_events": self.canonical_adapter.max_events,
                     "cursor": self.canonical_adapter.cursor() if self.canonical_adapter.enabled else 0,
                     "session_channels": dict(self.canonical_session_channels),
+                    "client_channels": dict(self.canonical_client_channels),
                     "channel_cursors": {
                         channel: self.canonical_adapter.cursor(channel)
-                        for channel in sorted(set(self.canonical_session_channels.values()))
+                        for channel in sorted(set(self.canonical_session_channels.values())
+                                              | set(self.canonical_client_channels.values()))
                     } if self.canonical_adapter.enabled else {},
                     "outbox_pending": (
                         self.canonical_adapter.outbox_size() if self.canonical_adapter.enabled else 0
@@ -1909,6 +1925,26 @@ class GatewayService:
     def _canonical_channel_for_session(self, session_id: str) -> str:
         return self.canonical_session_channels.get(str(session_id or "").strip(), "")
 
+    def _canonical_channel_for_request(
+        self, request: Request, session_id: str,
+    ) -> tuple[str, str]:
+        """Choose only the continuation cursor, never the canonical session.
+
+        All Reality/Telegram/Operit requests may legitimately carry the one
+        ``jiajia-main`` session. Using that shared session as the cursor key
+        lets whichever client speaks first consume the other client's unread
+        canonical events. The bounded client marker repairs that asymmetry;
+        unknown/legacy callers retain the session mapping fallback.
+        """
+        marker = str(request.headers.get("X-Ombre-Client-Id") or "").strip().lower()
+        client_channels = getattr(self, "canonical_client_channels", {})
+        if marker and isinstance(client_channels, dict):
+            channel_id = str(client_channels.get(marker) or "").strip()
+            if channel_id:
+                return channel_id, "client_marker"
+        channel_id = self._canonical_channel_for_session(session_id)
+        return channel_id, "session_fallback" if channel_id else "none"
+
     def _canonical_continuation_active(self, session_id: str) -> bool:
         profile_id = str(getattr(self.persona_engine, "profile_id", "") or "").strip()
         return bool(
@@ -2023,7 +2059,7 @@ class GatewayService:
         if not self._canonical_continuation_active(session_id):
             return payload, state
         state = {"enabled": True, "status": "preparing"}
-        channel_id = self._canonical_channel_for_session(session_id)
+        channel_id, channel_selection = self._canonical_channel_for_request(request, session_id)
         request_id = self._canonical_request_id(request, payload, session_id)
         user_source_event_id = f"{channel_id}:{request_id}:user"
         origin_source_event_ids = list(dict.fromkeys(
@@ -2036,6 +2072,8 @@ class GatewayService:
         ))
         state.update({
             "channel_id": channel_id,
+            "channel_selection": channel_selection,
+            "client_marker": str(request.headers.get("X-Ombre-Client-Id") or "").strip().lower(),
             "request_id": request_id,
             "user_source_event_id": user_source_event_id,
             "through_seq": self.canonical_adapter.cursor(channel_id),
