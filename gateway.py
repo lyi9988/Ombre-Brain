@@ -2172,7 +2172,12 @@ class GatewayService:
             # origin events are not locally re-authored, while the shared bridge
             # still receives an idempotent projection for other clients.
             "mirror_write_enabled": not bool(origin_source_event_ids),
-            "bridge_write_enabled": True,
+            # Aizizhu-owned H1/H2 events already live in the shared canonical
+            # bridge.  Writing a channel-prefixed copy here would create a
+            # second user/assistant event in that same ledger, which is exactly
+            # the Reality double-send observed in production.  Origin-less
+            # clients (Operit/legacy) still write one bridge projection.
+            "bridge_write_enabled": not bool(origin_source_event_ids),
         })
         try:
             flush = await self.canonical_adapter.flush_outbox()

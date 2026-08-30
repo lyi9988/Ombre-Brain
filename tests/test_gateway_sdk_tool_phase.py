@@ -510,11 +510,11 @@ def test_legacy_plain_chat_round_records_without_canonical_key(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 14. H1/H2 stay origin-owned while the shared bridge receives one idempotent
-#     projection for the other client.
+# 14. H1/H2 stay origin-owned and an Aizizhu-owned turn is not mirrored into
+#     the already-shared canonical bridge a second time.
 # ---------------------------------------------------------------------------
 
-def test_origin_headers_keep_local_mirror_off_but_bridge_write_enabled(tmp_path):
+def test_origin_headers_keep_local_and_bridge_mirror_off(tmp_path):
     from canonical_continuation import ContinuationBatch
 
     class FakeAdapter:
@@ -551,19 +551,13 @@ def test_origin_headers_keep_local_mirror_off_but_bridge_write_enabled(tmp_path)
     prepared, state = asyncio.run(item._prepare_canonical_turn(
         req, payload, "jiajia", canonical_user))
     assert state["mirror_write_enabled"] is False
-    assert state["bridge_write_enabled"] is True
-    assert state["user_write_status"] == "created"
-    assert item.canonical_adapter.ingested == [{
-        "source_event_id": "operit:app:d1:c1", "role": "user",
-        "content": canonical_user,
-    }]
+    assert state["bridge_write_enabled"] is False
+    assert state["user_write_status"] == "skipped_origin_owned"
+    assert item.canonical_adapter.ingested == []
     asyncio.run(item._finalize_canonical_turn(
         state, {"role": "assistant", "content": "晴，24°C"}))
-    assert state["assistant_write_status"] == "created"
-    assert item.canonical_adapter.ingested[-1] == {
-        "source_event_id": "operit:turn:u1:assistant", "role": "assistant",
-        "content": "晴，24°C", "correlation_id": "operit:app:d1:c1",
-    }
+    assert state["assistant_write_status"] == "skipped_origin_owned"
+    assert item.canonical_adapter.ingested == []
 
 
 # ---------------------------------------------------------------------------
