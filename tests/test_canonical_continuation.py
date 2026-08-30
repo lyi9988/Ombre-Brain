@@ -3,7 +3,7 @@ import asyncio
 import httpx
 import pytest
 
-from canonical_continuation import CanonicalContinuationAdapter
+from canonical_continuation import CanonicalContinuationAdapter, ContinuationBatch
 
 
 def adapter(tmp_path, handler, **overrides):
@@ -57,6 +57,24 @@ def test_pull_filters_non_natural_and_own_events_then_merges_before_current_user
         assert item.commit_cursor(3) == 8
         await item.http_client.aclose()
     asyncio.run(scenario())
+
+
+def test_merge_continuation_inserts_before_current_user_not_after_tool_result():
+    batch = ContinuationBatch(({
+        "seq": 5, "event_id": "evt-cross-user", "version_id": "v5",
+        "source_event_id": "reality:cross-user", "role": "user",
+        "content": "跨端前序消息",
+    },), 5)
+    messages = [
+        {"role": "system", "content": "role card"},
+        {"role": "user", "content": "当前 staged"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "tool result"},
+    ]
+    merged = CanonicalContinuationAdapter.merge_messages(messages, batch)
+    assert [item.get("content") for item in merged] == [
+        "role card", "跨端前序消息", "当前 staged", "", "tool result",
+    ]
 
 def test_ingest_uses_fixed_endpoint_and_no_prompt_metadata(tmp_path):
     async def scenario():

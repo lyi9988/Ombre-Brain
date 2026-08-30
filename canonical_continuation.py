@@ -172,9 +172,21 @@ class CanonicalContinuationAdapter:
         result = [dict(item) for item in messages]
         current_user = None
         for index in range(len(result) - 1, -1, -1):
-            role = result[index].get("role")
-            if role == "system":
+            message = result[index]
+            if not isinstance(message, dict):
                 continue
+            role = message.get("role")
+            if role in {"system", "developer", "tool", "function"}:
+                # Tool-loop continuations end with tool protocol items.  They
+                # are not a new user turn and must not become the insertion
+                # anchor for canonical cross-client events.
+                continue
+            if role == "assistant":
+                if message.get("tool_calls") or not str(message.get("content") or "").strip():
+                    continue
+                # A completed textual assistant reply means there is no
+                # current user tail to augment in this request.
+                break
             if role == "user":
                 current_user = index
             break

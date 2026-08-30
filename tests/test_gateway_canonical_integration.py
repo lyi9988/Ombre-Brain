@@ -1,10 +1,22 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 from starlette.requests import Request
 
 from canonical_continuation import ContinuationBatch
-from gateway import GatewayService
+from gateway import (
+    CANONICAL_ASSISTANT_SOURCE_EVENT_ID_HEADER,
+    CANONICAL_SOURCE_EVENT_ID_HEADER,
+    CANONICAL_TURN_PHASE_CONTINUATION,
+    CANONICAL_TURN_PHASE_HEADER,
+    GatewayService,
+)
+
+H1 = CANONICAL_SOURCE_EVENT_ID_HEADER
+H2 = CANONICAL_ASSISTANT_SOURCE_EVENT_ID_HEADER
+PHASE = CANONICAL_TURN_PHASE_HEADER
+PHASE_CONT = CANONICAL_TURN_PHASE_CONTINUATION
 
 
 class FakeAdapter:
@@ -241,6 +253,92 @@ def test_coverage_dedup_is_exact_and_same_text_different_event_survives():
     assert debug["deduped"][0]["dedup_reason"] == "coverage_exact_key"
     assert debug["inserted_missing"][0]["event_id"] == "evt-distinct"
     assert debug["legacy_text_fallback_used"] is False
+
+
+def test_five_staged_events_are_deduped_before_initial_and_tool_continuation_merge():
+    """#4916 shape: Aizizhu already selected five staged events, while the
+    Gateway pull contains the same five canonical candidates.  Neither the
+    initial request nor the tool continuation may materialize a second copy.
+    """
+    async def scenario():
+        staged = [{
+            "event_id": f"evt-staged-{index}",
+            "version_id": f"version-staged-{index}",
+            "source_event_id": f"runrun-phone:web:staged-{index}",
+            "role": "user", "content": f"STAGED-PROOF-{index}",
+        } for index in range(1, 6)]
+
+        class FiveEventAdapter(FakeAdapter):
+            async def pull(self, channel_id=None):
+                self.pull_calls += 1
+                self.pull_channels.append(channel_id)
+                return ContinuationBatch(tuple({
+                    **event, "seq": index + 10,
+                } for index, event in enumerate(staged, 1)), 15)
+
+        coverage = {
+            "conversation_id": "conv-jiajia-main",
+            "context_revision": 1,
+            "current_user_source_event_id": staged[-1]["source_event_id"],
+            "items": [dict(event) for event in staged],
+            "fingerprint": "staged-proof-coverage",
+        }
+
+        for continuation in (False, True):
+            item = service()
+            adapter = FiveEventAdapter()
+            item.canonical_adapter = adapter
+            messages = [
+                {"role": "system", "content": "role card"},
+                *[{"role": event["role"], "content": event["content"]}
+                  for event in staged],
+            ]
+            if continuation:
+                messages.extend([
+                    {"role": "assistant", "content": "", "tool_calls": [{
+                        "id": "proof-call", "type": "function",
+                        "function": {"name": "proof", "arguments": "{}"},
+                    }]},
+                    {"role": "tool", "tool_call_id": "proof-call",
+                     "content": "proof-result"},
+                ])
+            payload = {
+                "model": "proof-model",
+                "messages": messages,
+                "_ombre_trace_context": {"coverage": coverage},
+            }
+            headers = {
+                H1: "app:proof:user",
+                H2: "turn:proof:assistant",
+                "X-Ombre-Client-Id": "reality",
+            }
+            if continuation:
+                headers[PHASE] = PHASE_CONT
+            req = request(headers)
+            current = (
+                item._extract_continuation_turn_user_query(messages)
+                if continuation else staged[-1]["content"]
+            )
+            prepared, state = await item._prepare_canonical_turn(
+                req, payload, "jiajia", current,
+            )
+            user_content = [
+                message["content"] for message in prepared["messages"]
+                if message.get("role") == "user"
+            ]
+            assert user_content == [event["content"] for event in staged]
+            assert all(user_content.count(event["content"]) == 1 for event in staged)
+            assert state["candidate_event_count"] == 5
+            assert state["deduped_event_count"] == 5
+            assert state["inserted_event_count"] == 0
+            assert state["event_count"] == 0
+            assert state["status"] == "deduped"
+            assert state["bridge_write_enabled"] is False
+            await item._finalize_canonical_turn(
+                state, {"role": "assistant", "content": "proof answer"},
+            )
+            assert adapter.ingested == []
+    asyncio.run(scenario())
 
 
 def test_legacy_bridge_source_prefix_is_explicit_identity_fallback_only():
