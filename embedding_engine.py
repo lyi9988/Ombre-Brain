@@ -20,6 +20,7 @@ import asyncio
 import time
 from pathlib import Path
 
+import httpx
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("ombre_brain.embedding")
@@ -141,12 +142,28 @@ class EmbeddingEngine:
         prepared = self._prepare_embedding_input(text, kind=kind)
         truncated = prepared[: self.max_chars]
         try:
-            response = await self.client.embeddings.create(
-                model=self.model,
-                input=truncated,
-            )
-            if response.data and len(response.data) > 0:
-                vector = response.data[0].embedding
+            # Use the same plain OpenAI-compatible HTTP path as the reranker.
+            # The provider is a compatible proxy rather than the OpenAI API;
+            # its direct request is fast, while the optional SDK client can
+            # remain stuck in its httpx2/TLS path and hit the Gateway's small
+            # semantic-query budget.
+            endpoint = f"{self.base_url.rstrip('/')}/embeddings"
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    endpoint,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"model": self.model, "input": truncated},
+                )
+            self._runtime["last_http_status"] = response.status_code
+            response.raise_for_status()
+            body = response.json()
+            data = body.get("data") if isinstance(body, dict) else None
+            first = data[0] if isinstance(data, list) and data else None
+            vector = first.get("embedding") if isinstance(first, dict) else None
+            if vector:
                 self._runtime.update({
                     "last_status": "ok",
                     "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
