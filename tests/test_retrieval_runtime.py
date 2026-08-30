@@ -2,6 +2,8 @@ import asyncio
 from types import SimpleNamespace
 from pathlib import Path
 
+import httpx
+
 from embedding_engine import EmbeddingEngine
 from reranker_engine import RerankerEngine
 from gateway import GatewayService
@@ -270,3 +272,43 @@ def test_candidate_stage_telemetry_keeps_provider_window_explicit():
         "reason": "final moment rerank",
         "duration_ms": 123,
     }]
+
+
+def test_memory_detail_recall_debug_reports_trigger_and_retry_timing():
+    service = GatewayService.__new__(GatewayService)
+    service.memory_detail_recall_enabled = True
+    service.memory_detail_recall_max_ids = 2
+    service.memory_detail_recall_budget = 200
+    async def detail_context(_ids):
+        return "detail body", []
+
+    async def retry_response(_payload):
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "retried"}}]},
+        )
+
+    service._build_memory_detail_recall_context = detail_context
+    service._insert_memory_detail_context = lambda messages, detail: [
+        *messages, {"role": "system", "content": detail}
+    ]
+    service._forward_upstream = retry_response
+
+    response, debug = asyncio.run(service._maybe_retry_with_memory_detail(
+        forward_payload={"messages": [{"role": "user", "content": "query"}], "stream": False},
+        upstream_response=httpx.Response(
+            200,
+            json={"choices": [{"message": {
+                "role": "assistant",
+                "content": '[memory_detail ids="bucket-1"]need detail',
+            }}]},
+        ),
+        injection_debug={"injected_bucket_ids": ["bucket-1"]},
+    ))
+
+    assert response.status_code == 200
+    assert debug["trigger_count"] == 1
+    assert debug["retry_request_count"] == 1
+    assert debug["retried"] is True
+    assert debug["retry_status_code"] == 200
+    assert debug["elapsed_ms"] >= debug["retry_elapsed_ms"] >= 0

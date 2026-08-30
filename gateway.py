@@ -2834,6 +2834,11 @@ class GatewayService:
             )
             if memory_detail_debug and isinstance(injection_debug, dict):
                 injection_debug["memory_detail_recall_debug"] = memory_detail_debug
+            trace_id = str(self._trace_from_payload(forward_payload).get("trace_id") or "")
+            self.model_request_trace.update_metadata(
+                trace_id,
+                {"memory_detail_recall": memory_detail_debug or {}},
+            )
             upstream_usage = self._log_cache_usage_from_response(
                 session_id,
                 forward_payload["model"],
@@ -3026,6 +3031,11 @@ class GatewayService:
             )
             if memory_detail_debug and isinstance(injection_debug, dict):
                 injection_debug["memory_detail_recall_debug"] = memory_detail_debug
+            trace_id = str(self._trace_from_payload(forward_payload).get("trace_id") or "")
+            self.model_request_trace.update_metadata(
+                trace_id,
+                {"memory_detail_recall": memory_detail_debug or {}},
+            )
             upstream_usage = self._log_cache_usage_from_response(
                 session_id,
                 forward_payload["model"],
@@ -4420,6 +4430,21 @@ class GatewayService:
                 "candidate_stages": list(debug.get("candidate_stages") or []),
                 "worldbook": trace.get("worldbook") or debug.get("worldbook", {}),
             }
+            detail_debug = debug.get("memory_detail_recall_debug")
+            if not isinstance(detail_debug, dict):
+                detail_debug = self._memory_detail_recall_debug_base(
+                    [
+                        str(bucket_id)
+                        for bucket_id in debug.get("injected_bucket_ids", []) or []
+                        if str(bucket_id or "").strip()
+                    ]
+                )
+                detail_debug["skip_reason"] = (
+                    "stream_request_no_detail_retry"
+                    if payload.get("stream") is True
+                    else "awaiting_response"
+                )
+            metadata["memory_detail_recall"] = detail_debug
             # ``client_id`` is the independent owner-safe marker consumed from
             # X-Ombre-Client-Id.  Keep the older User-Agent/client label in
             # metadata only; it must never become the canonical session or
@@ -5414,19 +5439,7 @@ class GatewayService:
         upstream_response: httpx.Response,
         injection_debug: dict[str, Any] | None,
     ) -> tuple[httpx.Response, dict[str, Any] | None]:
-        try:
-            body = upstream_response.json()
-        except ValueError:
-            return upstream_response, None
-
-        assistant_message = self._extract_assistant_message_from_response_body(body)
-        if not isinstance(assistant_message, dict):
-            return upstream_response, None
-        text = self._coerce_message_text(assistant_message.get("content"))
-        requested_ids, stripped_text = self._parse_memory_detail_request(text)
-        if not requested_ids:
-            return upstream_response, None
-
+        started_at = time.perf_counter()
         allowed_ids = []
         if isinstance(injection_debug, dict):
             allowed_ids = [
@@ -5435,13 +5448,38 @@ class GatewayService:
                 if str(bucket_id or "").strip()
             ]
         debug = self._memory_detail_recall_debug_base(allowed_ids)
+
+        def finish(response: httpx.Response) -> tuple[httpx.Response, dict[str, Any]]:
+            debug["elapsed_ms"] = max(0, int((time.perf_counter() - started_at) * 1000))
+            return response, debug
+
+        try:
+            body = upstream_response.json()
+        except ValueError:
+            debug["skip_reason"] = "non_json_response"
+            return finish(upstream_response)
+
+        assistant_message = self._extract_assistant_message_from_response_body(body)
+        if not isinstance(assistant_message, dict):
+            debug["skip_reason"] = "no_assistant_message"
+            return finish(upstream_response)
+        text = self._coerce_message_text(assistant_message.get("content"))
+        requested_ids, stripped_text = self._parse_memory_detail_request(text)
+        if not requested_ids:
+            debug["skip_reason"] = (
+                "stream_request_no_detail_retry"
+                if forward_payload.get("stream") is True
+                else "not_requested"
+            )
+            return finish(upstream_response)
         debug["triggered"] = True
+        debug["trigger_count"] = 1
         debug["requested_ids"] = requested_ids
 
         stripped_response = self._response_with_assistant_content(upstream_response, body, stripped_text)
         if not self.memory_detail_recall_enabled:
             debug["skip_reason"] = "disabled"
-            return stripped_response, debug
+            return finish(stripped_response)
 
         allowed_set = set(allowed_ids)
         accepted_ids = []
@@ -5461,13 +5499,13 @@ class GatewayService:
         debug["rejected_ids"] = rejected_ids
         if not accepted_ids:
             debug["skip_reason"] = "no_allowed_ids"
-            return stripped_response, debug
+            return finish(stripped_response)
 
         detail_context, missing_ids = await self._build_memory_detail_recall_context(accepted_ids)
         debug["missing_ids"] = missing_ids
         if not detail_context.strip():
             debug["skip_reason"] = "empty_detail_context"
-            return stripped_response, debug
+            return finish(stripped_response)
 
         retry_payload = deepcopy(forward_payload)
         retry_payload["stream"] = False
@@ -5476,14 +5514,17 @@ class GatewayService:
             detail_context,
         )
         debug["detail_tokens"] = count_tokens_approx(detail_context)
+        debug["retry_request_count"] = 1
+        retry_started_at = time.perf_counter()
         retry_response = await self._forward_upstream(retry_payload)
+        debug["retry_elapsed_ms"] = max(0, int((time.perf_counter() - retry_started_at) * 1000))
         debug["retry_status_code"] = retry_response.status_code
         if 200 <= retry_response.status_code < 300:
             debug["retried"] = True
-            return self._strip_memory_detail_marker_from_response(retry_response), debug
+            return finish(self._strip_memory_detail_marker_from_response(retry_response))
 
         debug["skip_reason"] = "retry_failed"
-        return stripped_response, debug
+        return finish(stripped_response)
 
     def _strip_memory_detail_marker_from_response(self, upstream_response: httpx.Response) -> httpx.Response:
         try:
@@ -5507,11 +5548,15 @@ class GatewayService:
             "skip_reason": "",
             "allowed_ids": list(allowed_ids or []),
             "requested_ids": [],
+            "trigger_count": 0,
+            "retry_request_count": 0,
             "accepted_ids": [],
             "rejected_ids": [],
             "missing_ids": [],
             "detail_tokens": 0,
             "retry_status_code": None,
+            "elapsed_ms": 0,
+            "retry_elapsed_ms": 0,
         }
 
     @staticmethod
