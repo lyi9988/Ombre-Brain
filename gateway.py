@@ -1041,6 +1041,7 @@ class GatewayService:
                     "runtime": embedding_runtime["reranker"],
                 },
                 "embedding": embedding_runtime["embedding"],
+                "retrieval_runtime": embedding_runtime,
                 "upstreams": [
                     {
                         "name": upstream["name"],
