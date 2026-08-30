@@ -7,14 +7,17 @@ import json
 import codecs
 import time
 import asyncio
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import yaml
 import httpx
 import uvicorn
 from starlette.applications import Starlette
@@ -482,6 +485,17 @@ class GatewayService:
         self.config = config
         self.identity = identity_names(config)
         self.gateway_cfg = config.get("gateway", {})
+        self._runtime_overlay_path = str(config.get("_runtime_config_path") or "").strip()
+        self._runtime_overlay_lock = threading.RLock()
+        self._runtime_overlay_signature = None
+        self._runtime_overlay_status = {
+            "present": False,
+            "sha256": "",
+            "mtime_ms": None,
+            "last_reload_status": "not_checked",
+            "last_changed": [],
+            "reload_count": 0,
+        }
         self.self_anchor_cfg = config.get("self_anchor", {}) if isinstance(config.get("self_anchor", {}), dict) else {}
         self.self_anchor_entry_bucket_id = str(self.self_anchor_cfg.get("entry_bucket_id") or "").strip()
         self.embedding_cfg = config.get("embedding", {}) if isinstance(config.get("embedding", {}), dict) else {}
@@ -901,6 +915,7 @@ class GatewayService:
             http_client=self.http_client,
             max_events=max(1, min(200, int(canonical_cfg.get("max_events", 40)))),
         )
+        self._maybe_reload_runtime_overlay(force=True)
 
     async def close(self) -> None:
         if self.http_client and not getattr(self.http_client, "is_closed", False):
@@ -942,6 +957,7 @@ class GatewayService:
         )
 
     async def health_payload(self) -> dict:
+        self._maybe_reload_runtime_overlay()
         stats = await self.bucket_mgr.get_stats()
         embedding_runtime = self._retrieval_runtime_debug()
         return {
@@ -1071,7 +1087,182 @@ class GatewayService:
             "embedding": read(self.embedding_engine),
             "reranker": read(self.reranker_engine),
             "embedding_query_timeout_seconds": self.embedding_query_timeout_seconds,
+            "runtime_overlay": dict(getattr(self, "_runtime_overlay_status", {})),
         }
+
+    @staticmethod
+    def _runtime_env_value(name: str) -> str:
+        """Read one secret from the mounted .env without exposing its value."""
+        if not name:
+            return ""
+        path = Path(__file__).with_name(".env")
+        try:
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key.strip() != name:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                return value
+        except Exception:
+            return ""
+        return ""
+
+    def _runtime_overlay_snapshot(self) -> dict[str, Any]:
+        path_text = str(getattr(self, "_runtime_overlay_path", "") or "").strip()
+        path = Path(path_text) if path_text else None
+        raw = b""
+        parsed: dict[str, Any] = {}
+        valid = True
+        if path:
+            try:
+                raw = path.read_bytes()
+                value = yaml.safe_load(raw.decode("utf-8")) or {}
+                if not isinstance(value, dict):
+                    valid = False
+                else:
+                    parsed = value
+            except FileNotFoundError:
+                raw = b""
+            except Exception:
+                valid = False
+        env_path = Path(__file__).with_name(".env")
+        try:
+            env_stat = env_path.stat()
+            env_signature = (env_stat.st_mtime_ns, env_stat.st_size)
+        except OSError:
+            env_signature = (0, 0)
+        try:
+            overlay_stat = path.stat() if path else None
+            overlay_signature = (
+                overlay_stat.st_mtime_ns if overlay_stat else 0,
+                overlay_stat.st_size if overlay_stat else 0,
+            )
+            mtime_ms = int(overlay_stat.st_mtime * 1000) if overlay_stat else None
+        except OSError:
+            overlay_signature = (0, 0)
+            mtime_ms = None
+        digest = hashlib.sha256(raw).hexdigest() if raw else ""
+        return {
+            "config": parsed,
+            "valid": valid,
+            "present": bool(raw),
+            "sha256": digest,
+            "mtime_ms": mtime_ms,
+            "signature": (overlay_signature, digest, env_signature),
+            "env_changed": env_signature,
+        }
+
+    def _apply_runtime_overlay(self, overlay: dict[str, Any], *, env_changed: bool) -> list[str]:
+        changed: list[str] = []
+        embedding = overlay.get("embedding") if isinstance(overlay.get("embedding"), dict) else {}
+        reranker = overlay.get("reranker") if isinstance(overlay.get("reranker"), dict) else {}
+        gateway = overlay.get("gateway") if isinstance(overlay.get("gateway"), dict) else {}
+
+        if embedding or env_changed:
+            current = self.config.setdefault("embedding", {})
+            for key in ("enabled", "model", "base_url", "max_chars", "query_instruction", "document_instruction"):
+                if key in embedding:
+                    current[key] = embedding[key]
+            engine = self.embedding_engine
+            engine.model = str(current.get("model") or getattr(engine, "model", "") or "")
+            engine.base_url = str(current.get("base_url") or getattr(engine, "base_url", "") or "").rstrip("/")
+            engine.api_key = str(
+                current.get("api_key")
+                or self._runtime_env_value("OMBRE_EMBEDDING_API_KEY")
+                or getattr(engine, "api_key", "")
+            )
+            engine.enabled = bool(engine.api_key and engine.base_url) and self._bool_config_value(
+                current.get("enabled"), True
+            )
+            self.embedding_cfg = current
+            changed.append("embedding")
+
+        if reranker or env_changed:
+            current = self.config.setdefault("reranker", {})
+            for key in ("enabled", "model", "base_url", "timeout_seconds", "candidate_limit", "score_weight"):
+                if key in reranker:
+                    current[key] = reranker[key]
+            engine = self.reranker_engine
+            engine.model = str(current.get("model") or getattr(engine, "model", "") or "")
+            engine.base_url = str(current.get("base_url") or getattr(engine, "base_url", "") or "").rstrip("/")
+            engine.api_key = str(
+                current.get("api_key")
+                or self._runtime_env_value("OMBRE_RERANKER_API_KEY")
+                or getattr(engine, "api_key", "")
+            )
+            engine.enabled = bool(engine.api_key and engine.base_url) and self._bool_config_value(
+                current.get("enabled"), True
+            )
+            try:
+                engine.timeout = max(1.0, min(120.0, float(current.get("timeout_seconds", engine.timeout))))
+            except (TypeError, ValueError):
+                pass
+            try:
+                engine.candidate_limit = max(1, min(100, int(current.get("candidate_limit", engine.candidate_limit))))
+            except (TypeError, ValueError):
+                pass
+            try:
+                engine.score_weight = max(0.0, min(1.0, float(current.get("score_weight", engine.score_weight))))
+            except (TypeError, ValueError):
+                pass
+            changed.append("reranker")
+
+        if gateway:
+            current = self.gateway_cfg
+            self.config.setdefault("gateway", current)
+            if "current_inner_state_interval_rounds" in gateway:
+                current["current_inner_state_interval_rounds"] = gateway["current_inner_state_interval_rounds"]
+                self.current_inner_state_interval_rounds = max(0, int(gateway["current_inner_state_interval_rounds"]))
+                changed.append("gateway.current_inner_state_interval_rounds")
+            if "relationship_weather_interval_rounds" in gateway:
+                current["relationship_weather_interval_rounds"] = gateway["relationship_weather_interval_rounds"]
+                self.relationship_weather_interval_rounds = max(0, int(gateway["relationship_weather_interval_rounds"]))
+                changed.append("gateway.relationship_weather_interval_rounds")
+            if "embedding_query_timeout_seconds" in gateway:
+                current["embedding_query_timeout_seconds"] = gateway["embedding_query_timeout_seconds"]
+                self.embedding_query_timeout_seconds = max(
+                    0.0, min(30.0, float(gateway["embedding_query_timeout_seconds"]))
+                )
+                changed.append("gateway.embedding_query_timeout_seconds")
+        return list(dict.fromkeys(changed))
+
+    def _maybe_reload_runtime_overlay(self, *, force: bool = False) -> None:
+        snapshot = self._runtime_overlay_snapshot()
+        previous = getattr(self, "_runtime_overlay_signature", None)
+        if not force and previous == snapshot["signature"]:
+            return
+        lock = getattr(self, "_runtime_overlay_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._runtime_overlay_lock = lock
+        with lock:
+            snapshot = self._runtime_overlay_snapshot()
+            previous = getattr(self, "_runtime_overlay_signature", None)
+            if not force and previous == snapshot["signature"]:
+                return
+            status = getattr(self, "_runtime_overlay_status", {})
+            status.update({
+                "present": snapshot["present"],
+                "sha256": snapshot["sha256"],
+                "mtime_ms": snapshot["mtime_ms"],
+            })
+            self._runtime_overlay_signature = snapshot["signature"]
+            if not snapshot["valid"]:
+                status["last_reload_status"] = "invalid_yaml_preserved_previous"
+                status["last_changed"] = []
+                return
+            changed = self._apply_runtime_overlay(
+                snapshot["config"],
+                env_changed=(previous is not None and previous[2] != snapshot["signature"][2]),
+            )
+            status["last_reload_status"] = "reloaded" if changed else "observed"
+            status["last_changed"] = changed
+            status["reload_count"] = int(status.get("reload_count") or 0) + (1 if changed else 0)
 
     def _gateway_memory_config_payload(self) -> dict[str, Any]:
         return {
@@ -1870,6 +2061,7 @@ class GatewayService:
         return updated
 
     async def handle_config(self, request: Request) -> JSONResponse:
+        self._maybe_reload_runtime_overlay()
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
             return auth_result
@@ -3094,6 +3286,7 @@ class GatewayService:
         debug_detail: str = "full",
         continuation_phase: bool = False,
     ) -> tuple[dict, list[str] | None] | tuple[dict, list[str] | None, dict[str, Any]]:
+        self._maybe_reload_runtime_overlay()
         prepare_started_at = time.perf_counter()
         prepare_steps_ms: dict[str, int] = {}
 
