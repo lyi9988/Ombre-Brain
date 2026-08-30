@@ -4210,6 +4210,10 @@ class GatewayService:
                 },
                 "post_injection_presence": debug.get("post_injection_presence") or {},
                 "retrieval_runtime": debug.get("retrieval_runtime") or self._retrieval_runtime_debug(),
+                # Owner-safe timing only: no query/body is persisted here.
+                # The exact physical payload remains in raw_requests; this
+                # metadata explains where request preparation spent time.
+                "prepare_timing_debug": debug.get("prepare_timing_debug") or {},
                 "worldbook": trace.get("worldbook") or debug.get("worldbook", {}),
             }
             # ``client_id`` is the independent owner-safe marker consumed from
