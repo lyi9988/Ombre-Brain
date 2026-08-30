@@ -1038,6 +1038,7 @@ class GatewayService:
                 "current_inner_state_interval_rounds": self.current_inner_state_interval_rounds,
                 "direct_render_mode": self.direct_render_mode,
                 "retrieval_mode": self.retrieval_mode,
+                "graph_bucket_rerank_enabled": self.graph_bucket_rerank_enabled,
                 "bucket_list_cache_ttl_seconds": self.bucket_list_cache_ttl_seconds,
                 "recall_fusion_mode": self.recall_fusion_mode,
                 "reranker": {
