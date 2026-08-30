@@ -1953,6 +1953,31 @@ class GatewayService:
             and profile_id == self.canonical_target_profile_id
         )
 
+    def _session_id_for_request(self, request: Request) -> str:
+        """Resolve the canonical session without treating client markers as it.
+
+        Older Operit callers omit ``X-Ombre-Session-Id`` and therefore arrive
+        with the gateway's generic ``main`` default.  When the configured
+        canonical bridge has a different explicit target, use that target as
+        the legacy missing-header fallback.  An explicit session header always
+        wins; ``X-Ombre-Client-Id`` remains cursor selection only and never
+        becomes Persona/Memory/canonical identity.
+        """
+        explicit = str(request.headers.get("X-Ombre-Session-Id") or "").strip()
+        if explicit:
+            return explicit
+        fallback = str(self.default_session_id or "main").strip()
+        target = str(self.canonical_target_session_id or "").strip()
+        if (
+            self.canonical_adapter.enabled
+            and target
+            and target != fallback
+            and self._canonical_channel_for_session(target)
+            and not self._canonical_channel_for_session(fallback)
+        ):
+            return target
+        return fallback
+
     def _canonical_request_id(self, request: Request, payload: dict, session_id: str) -> str:
         explicit = str(
             request.headers.get("X-Request-ID")
@@ -2005,16 +2030,42 @@ class GatewayService:
                 keys.update(cls._canonical_identity_keys(item))
         return keys
 
+    @staticmethod
+    def _legacy_source_aliases(value: Any) -> set[str]:
+        """Return only the documented bridge-prefix compatibility aliases.
+
+        Early bridge writers namespaced an origin source id as
+        ``operit:<origin>`` or ``reality:<origin>``.  New Aizizhu coverage
+        carries the origin id itself.  This is an identity migration shim,
+        not text deduplication: it is considered only for source_event_id and
+        is reported separately in Inspector debug data.
+        """
+        source = str(value or "").strip()
+        if not source:
+            return set()
+        aliases = {source}
+        for prefix in ("operit:", "reality:", "telegram:"):
+            if source.startswith(prefix) and source[len(prefix):].strip():
+                aliases.add(source[len(prefix):].strip())
+        return aliases
+
     @classmethod
     def _dedupe_canonical_batch(
         cls, batch: ContinuationBatch, coverage: dict[str, Any],
     ) -> tuple[ContinuationBatch, dict[str, Any]]:
         """Remove only canonical events whose exact key is in Aizizhu coverage."""
         coverage_keys = cls._coverage_identity_keys(coverage)
+        coverage_items = coverage.get("items") if isinstance(coverage, dict) else []
+        coverage_sources = {
+            str(item.get("source_event_id") or "").strip()
+            for item in (coverage_items if isinstance(coverage_items, list) else [])
+            if isinstance(item, dict) and str(item.get("source_event_id") or "").strip()
+        }
         candidates = []
         deduped = []
         inserted = []
         kept = []
+        legacy_fallback_used = False
         for event in batch.events:
             keys = sorted(cls._canonical_identity_keys(event))
             row = {
@@ -2030,9 +2081,23 @@ class GatewayService:
             }
             candidates.append(row)
             overlap = sorted(set(keys).intersection(coverage_keys))
+            legacy_overlap = []
+            source_event_id = str(event.get("source_event_id") or "").strip()
+            if not overlap and source_event_id and coverage_sources:
+                candidate_aliases = cls._legacy_source_aliases(source_event_id)
+                for covered_source in sorted(coverage_sources):
+                    if candidate_aliases.intersection(cls._legacy_source_aliases(covered_source)) and covered_source != source_event_id:
+                        legacy_overlap.append(f"source_event_id:{covered_source}")
             if overlap:
                 row["dedup_reason"] = "coverage_exact_key"
                 row["matched_coverage_keys"] = overlap
+                deduped.append(row)
+                continue
+            if legacy_overlap:
+                legacy_fallback_used = True
+                row["dedup_reason"] = "legacy_bridge_identity_fallback"
+                row["matched_coverage_keys"] = legacy_overlap
+                row["legacy_source_aliases"] = sorted(cls._legacy_source_aliases(source_event_id))
                 deduped.append(row)
                 continue
             row["dedup_reason"] = "coverage_missing"
@@ -2042,13 +2107,14 @@ class GatewayService:
         fingerprint = str(coverage.get("fingerprint") or "") if isinstance(coverage, dict) else ""
         debug = {
             "coverage_fingerprint": fingerprint,
-            "coverage_items": coverage.get("items", [])[:128] if isinstance(coverage, dict) and isinstance(coverage.get("items"), list) else [],
+            "coverage_items": coverage_items[:128] if isinstance(coverage_items, list) else [],
             "coverage_key_count": len(coverage_keys),
             "candidates": candidates,
             "deduped": deduped,
             "inserted_missing": inserted,
             "dedup_reason": "exact_identity_set_difference",
             "legacy_text_fallback_used": False,
+            "legacy_identity_fallback_used": legacy_fallback_used,
         }
         return ContinuationBatch(tuple(kept), batch.through_seq), debug
 
@@ -2062,26 +2128,51 @@ class GatewayService:
         channel_id, channel_selection = self._canonical_channel_for_request(request, session_id)
         request_id = self._canonical_request_id(request, payload, session_id)
         user_source_event_id = f"{channel_id}:{request_id}:user"
+        origin_user_source_event_id = str(
+            request.headers.get("X-Ombre-Canonical-Source-Event-Id") or ""
+        ).strip()
+        origin_assistant_source_event_id = str(
+            request.headers.get("X-Ombre-Canonical-Assistant-Source-Event-Id") or ""
+        ).strip()
         origin_source_event_ids = list(dict.fromkeys(
-            value
-            for value in (
-                str(request.headers.get("X-Ombre-Canonical-Source-Event-Id") or "").strip(),
-                str(request.headers.get("X-Ombre-Canonical-Assistant-Source-Event-Id") or "").strip(),
-            )
-            if value
+            value for value in (
+                origin_user_source_event_id,
+                origin_assistant_source_event_id,
+            ) if value
         ))
+        # H1/H2 remain the canonical origin contract.  The bridge key is a
+        # separate, deterministic transport identity so an Aizizhu-owned turn
+        # is visible to the other client without changing Persona/Memory
+        # session mapping or creating a second Reality UI event.
+        # H1/H2 identify the origin turn and stay untouched. The shared
+        # bridge uses a channel-owned source key so the adapter's own-echo
+        # guard can exclude the event on the writing client while the other
+        # client still sees the exact same canonical event.
+        bridge_user_source_event_id = (
+            f"{channel_id}:{origin_user_source_event_id}"
+            if origin_user_source_event_id else f"{channel_id}:{request_id}:user"
+        )
+        bridge_assistant_source_event_id = (
+            f"{channel_id}:{origin_assistant_source_event_id}"
+            if origin_assistant_source_event_id else f"{channel_id}:{request_id}:assistant"
+        )
         state.update({
             "channel_id": channel_id,
             "channel_selection": channel_selection,
             "client_marker": str(request.headers.get("X-Ombre-Client-Id") or "").strip().lower(),
             "request_id": request_id,
             "user_source_event_id": user_source_event_id,
+            "origin_user_source_event_id": origin_user_source_event_id,
+            "origin_assistant_source_event_id": origin_assistant_source_event_id,
+            "bridge_user_source_event_id": bridge_user_source_event_id,
+            "bridge_assistant_source_event_id": bridge_assistant_source_event_id,
             "through_seq": self.canonical_adapter.cursor(channel_id),
             "event_count": 0,
-            # Aizizhu already owns the canonical user/assistant events for turns
-            # carrying origin IDs. Keep pull/merge and all prompt injection, but
-            # do not mirror the same logical turn back into its event ledger.
+            # Keep this legacy field explicit for Inspector compatibility: the
+            # origin events are not locally re-authored, while the shared bridge
+            # still receives an idempotent projection for other clients.
             "mirror_write_enabled": not bool(origin_source_event_ids),
+            "bridge_write_enabled": True,
         })
         try:
             flush = await self.canonical_adapter.flush_outbox()
@@ -2118,11 +2209,12 @@ class GatewayService:
             state["status"] = "pull_failed"
             state["pull_error_type"] = type(exc).__name__
         user_text = str(current_user_text or "").strip()
-        if not state["mirror_write_enabled"]:
+        if not state.get("bridge_write_enabled", True):
             state["user_write_status"] = "skipped_origin_owned"
         elif user_text:
             result = await self.canonical_adapter.ingest_or_queue(
-                source_event_id=user_source_event_id, role="user", content=user_text,
+                source_event_id=str(state.get("bridge_user_source_event_id") or user_source_event_id),
+                role="user", content=user_text,
             )
             state["user_write_status"] = "queued" if result.get("queued") else (
                 "created" if result.get("created") else "duplicate"
@@ -2136,7 +2228,7 @@ class GatewayService:
     ) -> None:
         if not isinstance(state, dict) or not state.get("enabled"):
             return
-        if not state.get("mirror_write_enabled", True):
+        if not state.get("bridge_write_enabled", True):
             state["assistant_write_status"] = "skipped_origin_owned"
             through_seq = max(0, int(state.get("through_seq") or 0))
             if state.get("status") != "pull_failed":
@@ -2160,9 +2252,15 @@ class GatewayService:
             state["assistant_write_status"] = "skipped_no_channel"
             return
         result = await self.canonical_adapter.ingest_or_queue(
-            source_event_id=f"{channel_id}:{request_id}:assistant",
+            source_event_id=str(
+                state.get("bridge_assistant_source_event_id")
+                or f"{channel_id}:{request_id}:assistant"
+            ),
             role="assistant", content=assistant_text,
-            correlation_id=str(state.get("user_source_event_id") or ""),
+            correlation_id=str(
+                state.get("bridge_user_source_event_id")
+                or state.get("user_source_event_id") or ""
+            ),
         )
         state["assistant_write_status"] = "queued" if result.get("queued") else (
             "created" if result.get("created") else "duplicate"
@@ -2178,7 +2276,7 @@ class GatewayService:
         if auth_result is not None:
             return auth_result
 
-        session_id = (request.headers.get("X-Ombre-Session-Id") or self.default_session_id).strip()
+        session_id = self._session_id_for_request(request)
         client_label = self._client_label_from_request(request, "/v1/chat/completions")
 
         try:
@@ -2378,7 +2476,7 @@ class GatewayService:
         if auth_result is not None:
             return auth_result
 
-        session_id = (request.headers.get("X-Ombre-Session-Id") or self.default_session_id).strip()
+        session_id = self._session_id_for_request(request)
         client_label = self._client_label_from_request(request, "/v1/messages")
 
         try:

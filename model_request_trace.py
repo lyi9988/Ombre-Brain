@@ -139,6 +139,7 @@ class ModelRequestTraceStore:
             db.execute("""CREATE TABLE IF NOT EXISTS logical_requests (
                 trace_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL DEFAULT '',
                 turn_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
+                logical_request_id TEXT NOT NULL DEFAULT '',
                 request_ordinal INTEGER NOT NULL DEFAULT 1,
                 parent_request_id TEXT NOT NULL DEFAULT '', tool_round INTEGER,
                 request_type TEXT NOT NULL DEFAULT 'initial', outcome TEXT NOT NULL DEFAULT '',
@@ -146,6 +147,14 @@ class ModelRequestTraceStore:
                 client_id TEXT NOT NULL DEFAULT '', metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
             )""")
+            columns = {
+                row[1] for row in db.execute(
+                    "PRAGMA table_info(logical_requests)").fetchall()
+            }
+            if "logical_request_id" not in columns:
+                db.execute(
+                    "ALTER TABLE logical_requests ADD COLUMN logical_request_id TEXT NOT NULL DEFAULT ''"
+                )
             db.execute("""CREATE TABLE IF NOT EXISTS physical_attempts (
                 attempt_id TEXT PRIMARY KEY, trace_id TEXT NOT NULL,
                 attempt_ordinal INTEGER NOT NULL, provider TEXT NOT NULL DEFAULT '',
@@ -204,6 +213,10 @@ class ModelRequestTraceStore:
         visibility = str(merged["body_visibility"] or "metadata_only")
         if mode not in BODY_MODES or visibility not in REASONING_VISIBILITY:
             raise ValueError("invalid trace capture/body visibility")
+        # ``0`` is an owner-configurable no-time-expiry value.  It must not
+        # make an in-flight request disappear between begin_logical() and its
+        # first physical attempt; request_limit and disk_budget still bound
+        # the retained set.
         merged["retention_days"] = max(0, min(3650, int(merged["retention_days"])))
         merged["request_limit"] = max(1, min(100000, int(merged["request_limit"])))
         merged["disk_budget_mb"] = max(1, min(102400, int(merged["disk_budget_mb"])))
@@ -225,21 +238,23 @@ class ModelRequestTraceStore:
         trace_id = str(metadata.get("trace_id") or uuid.uuid4().hex).strip()[:120]
         now = _now_ms()
         safe = {key: metadata.get(key) for key in (
-            "conversation_id", "turn_id", "request_id", "request_ordinal",
+            "conversation_id", "turn_id", "request_id", "logical_request_id", "request_ordinal",
             "parent_request_id", "tool_round", "request_type", "provider",
             "model", "client_id")}
         # logical metadata may contain provenance/debug state, never bodies.
         safe["metadata"] = metadata.get("metadata") if isinstance(metadata.get("metadata"), dict) else {}
         with self._connect() as db:
             db.execute("""INSERT INTO logical_requests(
-                trace_id, conversation_id, turn_id, request_id, request_ordinal,
+                trace_id, conversation_id, turn_id, request_id, logical_request_id, request_ordinal,
                 parent_request_id, tool_round, request_type, outcome, provider,
                 model, client_id, metadata_json, created_at_ms, updated_at_ms)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(trace_id) DO UPDATE SET
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(trace_id) DO UPDATE SET
+                logical_request_id=excluded.logical_request_id,
                 metadata_json=excluded.metadata_json, outcome=excluded.outcome,
                 updated_at_ms=excluded.updated_at_ms""", (
                 trace_id, str(safe.get("conversation_id") or "")[:200],
                 str(safe.get("turn_id") or "")[:200], str(safe.get("request_id") or "")[:200],
+                str(safe.get("logical_request_id") or "")[:240],
                 int(safe.get("request_ordinal") or 1), str(safe.get("parent_request_id") or "")[:200],
                 safe.get("tool_round"), str(safe.get("request_type") or "initial")[:40],
                 str(metadata.get("outcome") or "")[:40], str(safe.get("provider") or "")[:120],
@@ -341,18 +356,40 @@ class ModelRequestTraceStore:
                         self._event(db, row["trace_id"], "usage", {
                             "attempt_id": attempt_id, "usage": usage,
                         })
-                    self._event(db, row["trace_id"], "completed", {"attempt_id": attempt_id,
-                                                                       "status": http_status, "outcome": outcome,
-                                                                       "usage": usage or {}})
+                    # A physical attempt is not the logical request. The
+                    # logical terminal event is emitted exactly once by
+                    # set_outcome(); emitting ``completed`` here made every
+                    # attempt update look like another model completion.
         except Exception:
             return
 
     def set_outcome(self, trace_id: str, outcome: str) -> None:
         try:
             with self._connect() as db:
-                db.execute("UPDATE logical_requests SET outcome=?, updated_at_ms=? WHERE trace_id=?",
-                           (str(outcome or "")[:40], _now_ms(), trace_id))
-                self._event(db, trace_id, "completed", {"outcome": str(outcome or "")[:40]})
+                result = db.execute(
+                    "UPDATE logical_requests SET outcome=?, updated_at_ms=? WHERE trace_id=?",
+                    (str(outcome or "")[:40], _now_ms(), trace_id),
+                )
+                # A retention/budget purge may have removed an old request.
+                # Never recreate an event-only phantom trace in that case.
+                if result.rowcount:
+                    terminal_payload = {"outcome": str(outcome or "")[:40]}
+                    existing = db.execute(
+                        "SELECT id FROM trace_events WHERE trace_id=? "
+                        "AND event_type='completed' ORDER BY id DESC LIMIT 1",
+                        (trace_id,),
+                    ).fetchone()
+                    if existing:
+                        # A late cleanup/error path may call set_outcome after
+                        # the normal response path. Keep one terminal event
+                        # identity and refresh its payload instead of
+                        # appending a second completion to the terminal.
+                        db.execute(
+                            "UPDATE trace_events SET payload_json=?, created_at_ms=? WHERE id=?",
+                            (_json(terminal_payload), _now_ms(), existing["id"]),
+                        )
+                    else:
+                        self._event(db, trace_id, "completed", terminal_payload)
         except Exception:
             return
 
@@ -474,8 +511,19 @@ class ModelRequestTraceStore:
             attempts = db.execute("SELECT * FROM physical_attempts WHERE trace_id=? ORDER BY attempt_ordinal", (trace_id,)).fetchall()
             events = db.execute("SELECT event_type,payload_json,created_at_ms FROM trace_events WHERE trace_id=? ORDER BY id", (trace_id,)).fetchall()
         metadata = json.loads(logical["metadata_json"] or "{}")
+        event_items = [{"type": row["event_type"], "payload": json.loads(row["payload_json"] or "{}"),
+                        "created_at_ms": row["created_at_ms"]} for row in events]
+        logical_request_id = str(logical["logical_request_id"] or "")
+        if not logical_request_id:
+            logical_request_id = next(
+                (str(item["payload"].get("logical_request_id") or "")
+                 for item in event_items if isinstance(item.get("payload"), dict)
+                 and item["payload"].get("logical_request_id")),
+                f"{logical['request_id']}:model:{int(logical['request_ordinal'] or 1)}",
+            )
         result = {"trace_id": trace_id, "conversation_id": logical["conversation_id"],
                   "turn_id": logical["turn_id"], "request_id": logical["request_id"],
+                  "logical_request_id": logical_request_id,
                   "request_ordinal": logical["request_ordinal"],
                   "parent_request_id": logical["parent_request_id"], "tool_round": logical["tool_round"],
                   "request_type": logical["request_type"], "outcome": logical["outcome"],
@@ -484,8 +532,7 @@ class ModelRequestTraceStore:
                   "attempts": [self._public(row, include_raw=include_raw,
                                              reasoning_visibility=settings["body_visibility"])
                                for row in attempts],
-                  "events": [{"type": row["event_type"], "payload": json.loads(row["payload_json"] or "{}"),
-                              "created_at_ms": row["created_at_ms"]} for row in events],
+                  "events": event_items,
                   "view": view, "settings_revision": settings["revision_no"]}
         if view == "resolved":
             result["resolved"] = metadata.get("resolved") or metadata
@@ -504,13 +551,17 @@ class ModelRequestTraceStore:
             rows = db.execute("SELECT * FROM logical_requests" + where + " ORDER BY created_at_ms DESC LIMIT ?", args).fetchall()
         return [{"trace_id": row["trace_id"], "conversation_id": row["conversation_id"],
                  "turn_id": row["turn_id"], "request_id": row["request_id"],
+                 "logical_request_id": row["logical_request_id"],
                  "request_ordinal": row["request_ordinal"], "request_type": row["request_type"],
                  "outcome": row["outcome"], "model": row["model"],
                  "provider": row["provider"], "created_at_ms": row["created_at_ms"]} for row in rows]
 
     def events_recent(self, *, limit: int = 200) -> list[dict]:
         with self._connect() as db:
-            rows = db.execute("SELECT trace_id,event_type,payload_json,created_at_ms FROM trace_events ORDER BY id DESC LIMIT ?",
+            rows = db.execute("""SELECT trace_id,event_type,payload_json,created_at_ms
+                FROM trace_events
+                WHERE EXISTS (SELECT 1 FROM logical_requests l WHERE l.trace_id=trace_events.trace_id)
+                ORDER BY id DESC LIMIT ?""",
                               (max(1, min(2000, int(limit))),)).fetchall()
         return [{"trace_id": row["trace_id"], "type": row["event_type"],
                  "payload": json.loads(row["payload_json"] or "{}"),
@@ -558,12 +609,20 @@ class ModelRequestTraceStore:
     def purge(self):
         try:
             settings = self.settings()
-            cutoff = _now_ms() - settings["retention_days"] * 86400000
             with self._connect() as db:
-                db.execute("DELETE FROM raw_requests WHERE created_at_ms < ?", (cutoff,))
-                db.execute("DELETE FROM physical_attempts WHERE created_at_ms < ?", (cutoff,))
-                db.execute("DELETE FROM logical_requests WHERE created_at_ms < ?", (cutoff,))
-                db.execute("DELETE FROM trace_events WHERE created_at_ms < ?", (cutoff,))
+                retention_days = int(settings["retention_days"])
+                if retention_days > 0:
+                    cutoff = _now_ms() - retention_days * 86400000
+                    db.execute("DELETE FROM raw_requests WHERE created_at_ms < ?", (cutoff,))
+                    db.execute("DELETE FROM physical_attempts WHERE created_at_ms < ?", (cutoff,))
+                    db.execute("DELETE FROM logical_requests WHERE created_at_ms < ?", (cutoff,))
+                    db.execute("DELETE FROM trace_events WHERE created_at_ms < ?", (cutoff,))
+                # Clean historical orphan rows left by older versions.  Trace
+                # events are derived data and must never outlive their logical
+                # request authority.
+                db.execute("DELETE FROM trace_events WHERE trace_id NOT IN (SELECT trace_id FROM logical_requests)")
+                db.execute("DELETE FROM physical_attempts WHERE trace_id NOT IN (SELECT trace_id FROM logical_requests)")
+                db.execute("DELETE FROM raw_requests WHERE trace_id NOT IN (SELECT trace_id FROM logical_requests)")
                 db.execute("DELETE FROM logical_requests WHERE trace_id NOT IN (SELECT trace_id FROM logical_requests ORDER BY created_at_ms DESC LIMIT ?)",
                            (settings["request_limit"],))
                 db.execute("DELETE FROM physical_attempts WHERE trace_id NOT IN (SELECT trace_id FROM logical_requests)")
@@ -575,6 +634,13 @@ class ModelRequestTraceStore:
                         "SELECT trace_id FROM logical_requests ORDER BY created_at_ms ASC LIMIT 1"
                     ).fetchone()
                     if row is None:
+                        break
+                    # Keep the newest logical request observable even when a
+                    # single raw body exceeds the owner's budget.  The budget
+                    # remains an eviction target for older traces, but it must
+                    # not manufacture an empty Inspector for the live turn.
+                    count = db.execute("SELECT COUNT(*) FROM logical_requests").fetchone()[0]
+                    if int(count or 0) <= 1:
                         break
                     self._delete_trace_ids(db, [str(row["trace_id"])])
         except Exception:

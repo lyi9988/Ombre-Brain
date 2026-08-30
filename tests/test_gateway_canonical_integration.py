@@ -197,6 +197,15 @@ def test_unmapped_session_is_still_not_target():
     asyncio.run(scenario())
 
 
+def test_missing_session_header_uses_configured_canonical_target_not_client_marker():
+    item = service()
+    item.default_session_id = "main"
+    item.canonical_target_session_id = "jiajia"
+    item.canonical_session_channels = {"jiajia": "operit"}
+    resolved = item._session_id_for_request(request({"X-Ombre-Client-Id": "reality"}))
+    assert resolved == "jiajia"
+
+
 def test_continuation_presence_is_based_on_inserted_canonical_events():
     debug = {"post_injection_presence": {"canonical_continuation": True}}
 
@@ -232,6 +241,37 @@ def test_coverage_dedup_is_exact_and_same_text_different_event_survives():
     assert debug["deduped"][0]["dedup_reason"] == "coverage_exact_key"
     assert debug["inserted_missing"][0]["event_id"] == "evt-distinct"
     assert debug["legacy_text_fallback_used"] is False
+
+
+def test_legacy_bridge_source_prefix_is_explicit_identity_fallback_only():
+    batch = ContinuationBatch((
+        {"seq": 11, "event_id": "evt-legacy", "version_id": "v1",
+         "source_event_id": "operit:app:covered", "role": "user",
+         "content": "相同文字"},
+        {"seq": 12, "event_id": "evt-distinct", "version_id": "v2",
+         "source_event_id": "operit:app:distinct", "role": "user",
+         "content": "相同文字"},
+    ), 12)
+    filtered, debug = GatewayService._dedupe_canonical_batch(batch, {
+        "items": [{"source_event_id": "app:covered"}],
+        "fingerprint": "legacy-fallback-fp",
+    })
+    assert [event["event_id"] for event in filtered.events] == ["evt-distinct"]
+    assert debug["deduped"][0]["dedup_reason"] == "legacy_bridge_identity_fallback"
+    assert debug["legacy_identity_fallback_used"] is True
+
+
+def test_legacy_bridge_fallback_does_not_delete_same_text_from_other_source():
+    batch = ContinuationBatch((
+        {"seq": 11, "event_id": "evt-other", "version_id": "v1",
+         "source_event_id": "operit:app:other", "role": "user",
+         "content": "相同文字"},
+    ), 11)
+    filtered, debug = GatewayService._dedupe_canonical_batch(batch, {
+        "items": [{"source_event_id": "app:covered"}],
+    })
+    assert [event["event_id"] for event in filtered.events] == ["evt-other"]
+    assert debug["deduped"] == []
 
 
 def test_client_marker_is_diagnostic_and_does_not_replace_session_identity():
