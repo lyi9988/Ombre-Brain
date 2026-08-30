@@ -209,7 +209,10 @@ class CanonicalContinuationAdapter:
                 # rows in the derived outbox for inspection, but stop retrying
                 # them after a bounded number of attempts.
                 "SELECT source_event_id,role,content,correlation_id,attempts "
-                "FROM canonical_outbox WHERE attempts < ? ORDER BY created_at LIMIT ?",
+                # Newest events are prioritised so a historical poison row
+                # cannot delay the owner's next cross-client continuation.
+                "FROM canonical_outbox WHERE attempts < ? "
+                "ORDER BY created_at DESC, source_event_id DESC LIMIT ?",
                 (3, max(1, min(100, int(limit)))),
             ).fetchall()
         delivered = 0
