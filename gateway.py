@@ -20542,6 +20542,8 @@ class GatewayService:
 
         debug_payload = {
             "query_preview": self._clip_text(query, 500),
+            "effective_config": self._effective_config_metadata(),
+            "retrieval_runtime": self._retrieval_runtime_debug(),
             "domain_sentinel_debug": domain_sentinel_debug,
             "query_planner_debug": query_planner_debug,
             "memory_sentinel_debug": memory_sentinel_debug,
