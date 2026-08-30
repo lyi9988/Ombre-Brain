@@ -18,9 +18,10 @@ import sqlite3
 import logging
 import asyncio
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-import httpx
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("ombre_brain.embedding")
@@ -142,24 +143,20 @@ class EmbeddingEngine:
         prepared = self._prepare_embedding_input(text, kind=kind)
         truncated = prepared[: self.max_chars]
         try:
-            # Use the same plain OpenAI-compatible HTTP path as the reranker.
-            # The provider is a compatible proxy rather than the OpenAI API;
-            # its direct request is fast, while the optional SDK client can
-            # remain stuck in its httpx2/TLS path and hit the Gateway's small
-            # semantic-query budget.
+            # The provider is a compatible proxy rather than the OpenAI API.
+            # Its standard-library HTTP path is fast in the Gateway container,
+            # while the optional SDK/httpx2 path can stall during TLS setup and
+            # hit the Gateway's small semantic-query budget. Run that blocking
+            # transport off the event loop so chat/streaming stays responsive.
             endpoint = f"{self.base_url.rstrip('/')}/embeddings"
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    endpoint,
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={"model": self.model, "input": truncated},
-                )
-            self._runtime["last_http_status"] = response.status_code
-            response.raise_for_status()
-            body = response.json()
+            http_status, body = await asyncio.to_thread(
+                self._request_embedding_sync,
+                endpoint,
+                self.api_key,
+                self.model,
+                truncated,
+            )
+            self._runtime["last_http_status"] = http_status
             data = body.get("data") if isinstance(body, dict) else None
             first = data[0] if isinstance(data, list) and data else None
             vector = first.get("embedding") if isinstance(first, dict) else None
@@ -177,6 +174,15 @@ class EmbeddingEngine:
                 "last_result_count": 0,
             })
             return []
+        except urllib.error.HTTPError as e:
+            self._runtime.update({
+                "last_status": "error",
+                "last_error_type": type(e).__name__,
+                "last_http_status": e.code,
+                "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+            })
+            logger.warning(f"Embedding API call failed: {e}")
+            return []
         except asyncio.CancelledError:
             self._runtime.update({
                 "last_status": "cancelled",
@@ -192,6 +198,26 @@ class EmbeddingEngine:
             })
             logger.warning(f"Embedding API call failed: {e}")
             return []
+
+    @staticmethod
+    def _request_embedding_sync(
+        endpoint: str,
+        api_key: str,
+        model: str,
+        input_value: str,
+    ) -> tuple[int, dict]:
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps({"model": model, "input": input_value}).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=30.0) as response:
+            body = json.loads(response.read())
+            return int(response.status), body if isinstance(body, dict) else {}
 
     def _store_embedding(self, bucket_id: str, embedding: list[float]):
         """Store embedding in SQLite."""
