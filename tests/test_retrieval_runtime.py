@@ -1,11 +1,10 @@
 import asyncio
-from types import SimpleNamespace
 
 from embedding_engine import EmbeddingEngine
 from reranker_engine import RerankerEngine
 
 
-def test_embedding_runtime_debug_records_success_without_body_or_credentials(tmp_path):
+def test_embedding_runtime_debug_records_success_without_body_or_credentials(tmp_path, monkeypatch):
     engine = EmbeddingEngine({
         "buckets_dir": str(tmp_path),
         "embedding": {
@@ -16,11 +15,26 @@ def test_embedding_runtime_debug_records_success_without_body_or_credentials(tmp
         },
     })
 
-    class FakeEmbeddings:
-        async def create(self, **kwargs):
-            return SimpleNamespace(data=[SimpleNamespace(embedding=[0.1, 0.2, 0.3])])
+    class FakeResponse:
+        status_code = 200
 
-    engine.client = SimpleNamespace(embeddings=FakeEmbeddings())
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr("embedding_engine.httpx.AsyncClient", lambda **kwargs: FakeClient())
     vector = asyncio.run(engine._generate_embedding("private query", kind="query"))
 
     assert vector == [0.1, 0.2, 0.3]
@@ -33,17 +47,23 @@ def test_embedding_runtime_debug_records_success_without_body_or_credentials(tmp
     assert "private query" not in str(debug)
 
 
-def test_embedding_runtime_debug_records_failure_type(tmp_path):
+def test_embedding_runtime_debug_records_failure_type(tmp_path, monkeypatch):
     engine = EmbeddingEngine({
         "buckets_dir": str(tmp_path),
         "embedding": {"enabled": True, "api_key": "k", "base_url": "https://example/v1"},
     })
 
-    class FailingEmbeddings:
-        async def create(self, **kwargs):
+    class FailingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
             raise TimeoutError("provider timed out")
 
-    engine.client = SimpleNamespace(embeddings=FailingEmbeddings())
+    monkeypatch.setattr("embedding_engine.httpx.AsyncClient", lambda **kwargs: FailingClient())
     assert asyncio.run(engine._generate_embedding("query", kind="query")) == []
     debug = engine.runtime_debug()
     assert debug["last_status"] == "error"
@@ -51,17 +71,23 @@ def test_embedding_runtime_debug_records_failure_type(tmp_path):
     assert debug["last_result_count"] is None
 
 
-def test_embedding_runtime_debug_records_cancellation(tmp_path):
+def test_embedding_runtime_debug_records_cancellation(tmp_path, monkeypatch):
     engine = EmbeddingEngine({
         "buckets_dir": str(tmp_path),
         "embedding": {"enabled": True, "api_key": "k", "base_url": "https://example/v1"},
     })
 
-    class CancelledEmbeddings:
-        async def create(self, **kwargs):
+    class CancelledClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
             raise asyncio.CancelledError()
 
-    engine.client = SimpleNamespace(embeddings=CancelledEmbeddings())
+    monkeypatch.setattr("embedding_engine.httpx.AsyncClient", lambda **kwargs: CancelledClient())
     try:
         asyncio.run(engine._generate_embedding("query", kind="query"))
     except asyncio.CancelledError:
