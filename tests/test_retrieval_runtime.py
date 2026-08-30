@@ -176,3 +176,97 @@ def test_graph_bucket_rerank_defaults_off_to_avoid_duplicate_remote_roundtrip():
     service.graph_bucket_rerank_enabled = GatewayService._bool_config_value(
         service.gateway_cfg.get("graph_bucket_rerank_enabled"), False)
     assert service.graph_bucket_rerank_enabled is False
+
+
+def test_effective_retrieval_config_has_stable_hash_and_no_credentials():
+    service = GatewayService.__new__(GatewayService)
+    service.embedding_engine = SimpleNamespace(
+        enabled=True,
+        model="gitee/qwen3-embedding-8b",
+        base_url="https://embedding.example/v1",
+        max_chars=6000,
+        api_key="embedding-secret",
+    )
+    service.reranker_engine = SimpleNamespace(
+        enabled=True,
+        model="qwen3-reranker-8b",
+        base_url="https://reranker.example/v1",
+        timeout=12.0,
+        candidate_limit=9,
+        score_weight=0.65,
+        api_key="reranker-secret",
+    )
+    service.diffusion_options = SimpleNamespace(
+        enabled=True,
+        max_hops=2,
+        top_k=4,
+        min_activation=0.18,
+        chain_walk_enabled=True,
+        chain_max_hops=3,
+        chain_min_strength=0.2,
+        chain_min_confidence=0.72,
+        chain_min_relation_priority=60,
+        chain_max_frontier=10,
+    )
+    service.retrieval_mode = "graph"
+    service.dynamic_top_k = 10
+    service.semantic_candidate_top_k = 50
+    service.moment_search_limit = 50
+    service.graph_bucket_rerank_enabled = False
+    service.recalled_budget = 400
+    service.related_memory_budget = 110
+    service.embedding_query_timeout_seconds = 8.0
+    service.query_planner_enabled = True
+    service.query_planner_model = "deepseek-v4-flash"
+    service.query_planner_max_queries = 3
+    service.query_planner_max_tokens = 360
+    service.query_planner_supplemental_semantic = False
+    service.memory_detail_recall_enabled = True
+    service.memory_detail_recall_max_ids = 2
+    service.memory_detail_recall_budget = 200
+    service.current_inner_state_interval_rounds = 1
+    service.operit_context_rewrite_enabled = True
+    service._runtime_overlay_status = {
+        "present": True,
+        "sha256": "overlay-sha",
+    }
+
+    first = service._effective_config_metadata()
+    second = service._effective_config_metadata()
+    assert first == second
+    assert first["revision"] == 1
+    assert len(first["sha256"]) == 64
+    assert "embedding-secret" not in str(first)
+    assert "reranker-secret" not in str(first)
+
+    service.semantic_candidate_top_k = 24
+    changed = service._effective_config_metadata()
+    assert changed["revision"] == 2
+    assert changed["sha256"] != first["sha256"]
+
+
+def test_candidate_stage_telemetry_keeps_provider_window_explicit():
+    stages = []
+    GatewayService._record_candidate_stage(
+        stages,
+        "moment_rerank",
+        50,
+        50,
+        limit=9,
+        provider_input_count=9,
+        provider_output_count=9,
+        duration_ms=123,
+        reason="final moment rerank",
+    )
+
+    assert stages == [{
+        "stage": "moment_rerank",
+        "input_count": 50,
+        "output_count": 50,
+        "skipped": False,
+        "limit": 9,
+        "provider_input_count": 9,
+        "provider_output_count": 9,
+        "reason": "final moment rerank",
+        "duration_ms": 123,
+    }]

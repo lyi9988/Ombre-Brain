@@ -496,6 +496,12 @@ class GatewayService:
             "last_changed": [],
             "reload_count": 0,
         }
+        # A process-local revision makes it easy to tell whether two requests
+        # were prepared against the same in-memory effective retrieval config.
+        # The accompanying sha256 is the stable cross-restart identity; neither
+        # value contains credentials or provider response bodies.
+        self._effective_config_revision_no = 0
+        self._effective_config_sha256 = ""
         self.self_anchor_cfg = config.get("self_anchor", {}) if isinstance(config.get("self_anchor", {}), dict) else {}
         self.self_anchor_entry_bucket_id = str(self.self_anchor_cfg.get("entry_bucket_id") or "").strip()
         self.embedding_cfg = config.get("embedding", {}) if isinstance(config.get("embedding", {}), dict) else {}
@@ -1064,6 +1070,7 @@ class GatewayService:
                     }
                     for upstream in self.upstreams
                 ],
+                "effective_config": self._effective_config_metadata(),
             },
             "persona": {
                 "enabled": bool(self.persona_engine.enabled),
@@ -1097,7 +1104,164 @@ class GatewayService:
             "reranker": read(self.reranker_engine),
             "embedding_query_timeout_seconds": self.embedding_query_timeout_seconds,
             "runtime_overlay": dict(getattr(self, "_runtime_overlay_status", {})),
+            "effective_config": self._effective_config_metadata(),
         }
+
+    def _effective_retrieval_config_projection(self) -> dict[str, Any]:
+        """Return the non-secret config that controls memory retrieval.
+
+        This is deliberately an explicit allow-list instead of a dump of
+        ``self.config``.  The latter contains API keys, upstream credentials,
+        and unrelated Brain settings.  The allow-list is also the contract
+        for the effective-config fingerprint shown in Inspector.
+        """
+        embedding_engine = getattr(self, "embedding_engine", None)
+        reranker_engine = getattr(self, "reranker_engine", None)
+        diffusion = getattr(self, "diffusion_options", None)
+        return {
+            "schema_version": 1,
+            "embedding": {
+                "enabled": bool(getattr(embedding_engine, "enabled", False)),
+                "model": str(getattr(embedding_engine, "model", "") or ""),
+                "base_url": str(getattr(embedding_engine, "base_url", "") or ""),
+                "max_chars": int(getattr(embedding_engine, "max_chars", 0) or 0),
+                "api_ready": bool(getattr(embedding_engine, "api_key", "")),
+            },
+            "reranker": {
+                "enabled": bool(getattr(reranker_engine, "enabled", False)),
+                "model": str(getattr(reranker_engine, "model", "") or ""),
+                "base_url": str(getattr(reranker_engine, "base_url", "") or ""),
+                "timeout_seconds": float(getattr(reranker_engine, "timeout", 0) or 0),
+                "candidate_limit": int(getattr(reranker_engine, "candidate_limit", 0) or 0),
+                "score_weight": float(getattr(reranker_engine, "score_weight", 0) or 0),
+                "api_ready": bool(getattr(reranker_engine, "api_key", "")),
+            },
+            "gateway": {
+                "retrieval_mode": str(getattr(self, "retrieval_mode", "") or ""),
+                "dynamic_top_k": int(getattr(self, "dynamic_top_k", 0) or 0),
+                "semantic_candidate_top_k": int(getattr(self, "semantic_candidate_top_k", 0) or 0),
+                "moment_search_limit": int(getattr(self, "moment_search_limit", 0) or 0),
+                "graph_bucket_rerank_enabled": bool(
+                    getattr(self, "graph_bucket_rerank_enabled", False)
+                ),
+                "recalled_memory_budget": int(getattr(self, "recalled_budget", 0) or 0),
+                "related_memory_budget": int(getattr(self, "related_memory_budget", 0) or 0),
+                "embedding_query_timeout_seconds": float(
+                    getattr(self, "embedding_query_timeout_seconds", 0) or 0
+                ),
+                "query_planner_enabled": bool(getattr(self, "query_planner_enabled", False)),
+                "query_planner_model": str(getattr(self, "query_planner_model", "") or ""),
+                "query_planner_max_queries": int(getattr(self, "query_planner_max_queries", 0) or 0),
+                "query_planner_max_tokens": int(getattr(self, "query_planner_max_tokens", 0) or 0),
+                "query_planner_supplemental_semantic": bool(
+                    getattr(self, "query_planner_supplemental_semantic", False)
+                ),
+                "memory_detail_recall_enabled": bool(
+                    getattr(self, "memory_detail_recall_enabled", False)
+                ),
+                "memory_detail_recall_max_ids": int(
+                    getattr(self, "memory_detail_recall_max_ids", 0) or 0
+                ),
+                "memory_detail_recall_budget": int(
+                    getattr(self, "memory_detail_recall_budget", 0) or 0
+                ),
+                "current_inner_state_interval_rounds": int(
+                    getattr(self, "current_inner_state_interval_rounds", 0) or 0
+                ),
+                "operit_context_rewrite_enabled": bool(
+                    getattr(self, "operit_context_rewrite_enabled", False)
+                ),
+            },
+            "memory_diffusion": {
+                "enabled": bool(getattr(diffusion, "enabled", False)),
+                "max_hops": int(getattr(diffusion, "max_hops", 0) or 0),
+                "top_k": int(getattr(diffusion, "top_k", 0) or 0),
+                "min_activation": float(getattr(diffusion, "min_activation", 0) or 0),
+                "chain_walk_enabled": bool(getattr(diffusion, "chain_walk_enabled", False)),
+                "chain_max_hops": int(getattr(diffusion, "chain_max_hops", 0) or 0),
+                "chain_min_strength": float(getattr(diffusion, "chain_min_strength", 0) or 0),
+                "chain_min_confidence": float(getattr(diffusion, "chain_min_confidence", 0) or 0),
+                "chain_min_relation_priority": int(
+                    getattr(diffusion, "chain_min_relation_priority", 0) or 0
+                ),
+                "chain_max_frontier": int(getattr(diffusion, "chain_max_frontier", 0) or 0),
+            },
+        }
+
+    def _effective_config_metadata(self) -> dict[str, Any]:
+        """Return the owner-safe effective retrieval config identity."""
+        projection = self._effective_retrieval_config_projection()
+        canonical = json.dumps(
+            projection,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        previous = str(getattr(self, "_effective_config_sha256", "") or "")
+        if previous != digest:
+            self._effective_config_sha256 = digest
+            self._effective_config_revision_no = int(
+                getattr(self, "_effective_config_revision_no", 0) or 0
+            ) + 1
+        overlay_status = getattr(self, "_runtime_overlay_status", {})
+        return {
+            "scope": "gateway.retrieval",
+            "revision": int(getattr(self, "_effective_config_revision_no", 1) or 1),
+            "sha256": digest,
+            "runtime_overlay_present": bool(overlay_status.get("present")),
+            "runtime_overlay_sha256": str(overlay_status.get("sha256") or ""),
+            "projection_schema_version": 1,
+        }
+
+    @staticmethod
+    def _record_candidate_stage(
+        stage_log: list[dict[str, Any]] | None,
+        name: str,
+        input_count: Any,
+        output_count: Any,
+        *,
+        timing_key: str = "",
+        limit: Any = None,
+        provider_input_count: Any = None,
+        provider_output_count: Any = None,
+        secondary_output_count: Any = None,
+        skipped: bool = False,
+        reason: str = "",
+        **extra: Any,
+    ) -> None:
+        """Append count-only retrieval telemetry; never append query/body text."""
+        if not isinstance(stage_log, list):
+            return
+
+        def count(value: Any) -> int:
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        row: dict[str, Any] = {
+            "stage": str(name or "stage")[:120],
+            "input_count": count(input_count),
+            "output_count": count(output_count),
+            "skipped": bool(skipped),
+        }
+        if timing_key:
+            row["timing_key"] = str(timing_key)[:120]
+        if limit is not None:
+            row["limit"] = count(limit)
+        if provider_input_count is not None:
+            row["provider_input_count"] = count(provider_input_count)
+        if provider_output_count is not None:
+            row["provider_output_count"] = count(provider_output_count)
+        if secondary_output_count is not None:
+            row["secondary_output_count"] = count(secondary_output_count)
+        if reason:
+            row["reason"] = str(reason)[:160]
+        for key, value in extra.items():
+            if value is not None:
+                row[str(key)[:80]] = value
+        stage_log.append(row)
 
     @staticmethod
     def _runtime_env_value(name: str) -> str:
@@ -1281,6 +1445,7 @@ class GatewayService:
 
     def _gateway_memory_config_payload(self) -> dict[str, Any]:
         return {
+            "effective_config": self._effective_config_metadata(),
             "cooldown_hours": self.cooldown_hours,
             "skip_recent_rounds": self.skip_recent_rounds,
             "recent_context_cooldown_hours": self.recent_context_cooldown_hours,
@@ -2089,6 +2254,7 @@ class GatewayService:
                 "reranker": self._reranker_config_payload(),
                 "persona": self._persona_config_payload(),
                 "dream": self._dream_config_payload(),
+                "effective_config": self._effective_config_metadata(),
             })
 
         try:
@@ -2147,6 +2313,7 @@ class GatewayService:
             "reranker": self._reranker_config_payload(),
             "persona": self._persona_config_payload(),
             "dream": self._dream_config_payload(),
+            "effective_config": self._effective_config_metadata(),
         })
 
     async def handle_health(self, request: Request) -> JSONResponse:
@@ -3682,6 +3849,19 @@ class GatewayService:
                     context_mode=context_mode,
                 )
                 mark_step("memory_diffusion", stage_started_at)
+                candidate_stages = query_planner_debug.setdefault("candidate_stages", [])
+                self._record_candidate_stage(
+                    candidate_stages,
+                    "diffusion",
+                    len(recalled_moments),
+                    len(diffused_moment_debug),
+                    limit=self.diffusion_inject_max_items,
+                    injected_count=sum(
+                        1 for row in diffused_moment_debug
+                        if isinstance(row, dict) and row.get("injected")
+                    ),
+                    reason="graph diffusion candidates and injected subset",
+                )
             else:
                 related_memory = ""
             stage_started_at = time.perf_counter()
@@ -3868,9 +4048,22 @@ class GatewayService:
         mark_step("finalize_forward_payload", stage_started_at)
 
         prepare_total_ms = max(0, int((time.perf_counter() - prepare_started_at) * 1000))
+        effective_config = self._effective_config_metadata()
+        candidate_stages = []
+        for raw_stage in query_planner_debug.get("candidate_stages") or []:
+            if not isinstance(raw_stage, dict):
+                continue
+            stage = dict(raw_stage)
+            timing_key = str(stage.get("timing_key") or "")
+            if timing_key in prepare_steps_ms:
+                stage["duration_ms"] = prepare_steps_ms[timing_key]
+            candidate_stages.append(stage)
+        query_planner_debug["candidate_stages"] = candidate_stages
         prepare_timing_debug = {
             "total_ms": prepare_total_ms,
             "steps_ms": dict(prepare_steps_ms),
+            "effective_config": effective_config,
+            "candidate_stages": candidate_stages,
             "query_chars": len(current_user_query),
             "message_count": len(messages),
             "bucket_count": len(all_buckets),
@@ -3964,6 +4157,8 @@ class GatewayService:
             prepare_timing_debug["total_ms"] = max(0, int((time.perf_counter() - prepare_started_at) * 1000))
             prepare_timing_debug["steps_ms"] = dict(prepare_steps_ms)
             debug_payload["prepare_timing_debug"] = prepare_timing_debug
+            debug_payload["effective_config"] = effective_config
+            debug_payload["candidate_stages"] = candidate_stages
             debug_payload["post_injection_presence"] = {
                 "persona": bool(str(persona_block or "").strip()),
                 "emotion_relationship": bool(str(relationship_weather or "").strip()),
@@ -4214,6 +4409,9 @@ class GatewayService:
                 # The exact physical payload remains in raw_requests; this
                 # metadata explains where request preparation spent time.
                 "prepare_timing_debug": debug.get("prepare_timing_debug") or {},
+                "effective_config": debug.get("effective_config")
+                or (debug.get("retrieval_runtime") or {}).get("effective_config", {}),
+                "candidate_stages": list(debug.get("candidate_stages") or []),
                 "worldbook": trace.get("worldbook") or debug.get("worldbook", {}),
             }
             # ``client_id`` is the independent owner-safe marker consumed from
@@ -10769,6 +10967,7 @@ class GatewayService:
     ]:
         query_planner_debug = self._query_planner_debug_base(query)
         timing_debug = query_planner_debug.setdefault("timing_ms", {})
+        candidate_stages = query_planner_debug.setdefault("candidate_stages", [])
         if not query or self.inject_max_cards <= 0:
             return self._empty_moment_selection(
                 include_query_planner_debug=include_query_planner_debug,
@@ -10821,6 +11020,14 @@ class GatewayService:
             search_query=search_query,
             allow_rerank=allow_bucket_rerank,
             include_query_planner_debug=True,
+        )
+        candidate_stages = query_planner_debug.setdefault("candidate_stages", [])
+        self._record_candidate_stage(
+            candidate_stages,
+            "moment.eligible_bucket_ids",
+            len(all_buckets),
+            len(eligible_ids),
+            reason="eligible buckets for moment recall",
         )
         query_planner_debug["bucket_rerank"] = {
             "enabled": bool(allow_bucket_rerank),
@@ -10883,8 +11090,10 @@ class GatewayService:
             if raw_moment_query and raw_moment_query != search_query:
                 moment_search_queries.append(raw_moment_query)
             seen_moment_ids: set[str] = set()
-            for moment_query in moment_search_queries:
+            search_input_count = len(all_moments) if all_moments is not None else len(eligible_ids)
+            for search_index, moment_query in enumerate(moment_search_queries):
                 search_limit = max(self.moment_search_limit, self.inject_max_cards * 8)
+                before_search_count = len(candidates)
                 if all_moments is None:
                     query_planner_debug["moment_search_source"] = "sqlite_store"
                     searched_moments = self.memory_moment_store.search_moments(
@@ -10909,8 +11118,19 @@ class GatewayService:
                     if moment_id:
                         seen_moment_ids.add(moment_id)
                     candidates.append(moment)
+                self._record_candidate_stage(
+                    candidate_stages,
+                    f"moment.search_{search_index}",
+                    search_input_count,
+                    len(candidates) - before_search_count,
+                    timing_key="moment.search_moments",
+                    limit=search_limit,
+                    raw_output_count=len(searched_moments or []),
+                    reason="deduplicated moment search results",
+                )
         self._add_timing_ms(timing_debug, "moment.search_moments", stage_started_at)
         stage_started_at = time.perf_counter()
+        before_filter_count = len(candidates)
         explicit_lookup = self._query_explicitly_requests_caution_memory(query)
         candidates = [
             moment for moment in candidates
@@ -10919,9 +11139,37 @@ class GatewayService:
         ]
         candidates = self._apply_relevance_to_moment_candidates(query, candidates)
         self._add_timing_ms(timing_debug, "moment.filter_relevance", stage_started_at)
+        self._record_candidate_stage(
+            candidate_stages,
+            "moment.filter_relevance",
+            before_filter_count,
+            len(candidates),
+            reason="eligible, direct-seed, and relevance filters",
+        )
         stage_started_at = time.perf_counter()
+        before_moment_rerank_count = len(candidates)
         candidates = await self._rerank_moment_candidates(query, candidates)
         self._add_timing_ms(timing_debug, "moment.rerank_candidates", stage_started_at)
+        moment_rerank_runtime_method = getattr(self.reranker_engine, "runtime_debug", None)
+        moment_rerank_runtime = (
+            moment_rerank_runtime_method() if callable(moment_rerank_runtime_method) else {}
+        )
+        moment_rerank_enabled = bool(getattr(self.reranker_engine, "enabled", False))
+        moment_rerank_limit = min(
+            before_moment_rerank_count,
+            max(1, int(getattr(self.reranker_engine, "candidate_limit", 20) or 20)),
+        )
+        self._record_candidate_stage(
+            candidate_stages,
+            "moment_rerank",
+            before_moment_rerank_count,
+            len(candidates),
+            limit=moment_rerank_limit,
+            provider_input_count=moment_rerank_limit if moment_rerank_enabled else 0,
+            provider_output_count=(moment_rerank_runtime or {}).get("last_result_count") if moment_rerank_enabled else 0,
+            skipped=not moment_rerank_enabled or before_moment_rerank_count <= 0,
+            reason="final moment rerank" if moment_rerank_enabled else "reranker unavailable",
+        )
         stage_started_at = time.perf_counter()
         admitted_bucket_ids = set(selected_bucket_ids)
         admitted_candidates = []
@@ -10986,6 +11234,13 @@ class GatewayService:
                 suppressed_candidates.append(item)
         candidates = admitted_candidates
         self._add_timing_ms(timing_debug, "moment.admit_candidates", stage_started_at)
+        self._record_candidate_stage(
+            candidate_stages,
+            "moment.admit_candidates",
+            len(admitted_candidates) + len(suppressed_candidates),
+            len(admitted_candidates),
+            reason="moment recall policy admission",
+        )
 
         selected: list[dict] = []
         seen_buckets: set[str] = set()
@@ -11070,6 +11325,14 @@ class GatewayService:
                 seen_buckets.add(bucket_id)
         self._add_timing_ms(timing_debug, "moment.pick_selected", stage_started_at)
         selected = self._promote_reliable_moment_hits_to_direct_seed(query, selected, candidates)
+        self._record_candidate_stage(
+            candidate_stages,
+            "moment.final_output",
+            len(candidates),
+            len(selected[: self.inject_max_cards]),
+            limit=self.inject_max_cards,
+            reason="selected direct moments after reliable promotion",
+        )
 
         if selected:
             result = (selected[: self.inject_max_cards], candidates, suppressed_candidates, suppressed_buckets)
@@ -11094,6 +11357,14 @@ class GatewayService:
             if len(selected) >= self.inject_max_cards:
                 break
         self._add_timing_ms(timing_debug, "moment.fallback_select", stage_started_at)
+        self._record_candidate_stage(
+            candidate_stages,
+            "moment.fallback_output",
+            len(active_candidates),
+            len(selected[: self.inject_max_cards]),
+            limit=self.inject_max_cards,
+            reason="fallback moment selection",
+        )
         result = (selected, candidates, suppressed_candidates, suppressed_buckets)
         if include_query_planner_debug:
             return (*result, query_planner_debug)
@@ -14430,6 +14701,10 @@ class GatewayService:
                 "error": "",
                 "timing_ms": 0,
             },
+            # Count-only recall pipeline telemetry.  It is intentionally kept
+            # separate from candidate bodies so Inspector can explain cost and
+            # fan-out without persisting more memory content.
+            "candidate_stages": [],
             "timing_ms": {},
         }
 
@@ -16180,9 +16455,24 @@ class GatewayService:
         context_query: str = "",
         timing_debug: dict[str, Any] | None = None,
         timing_prefix: str = "candidate",
+        candidate_stages: list[dict[str, Any]] | None = None,
     ) -> tuple[list[dict], list[dict]]:
         def mark(name: str, started_at: float) -> None:
             self._add_timing_ms(timing_debug, f"{timing_prefix}.{name}", started_at)
+
+        def record(name: str, input_count: Any, output_count: Any, **kwargs: Any) -> None:
+            timing_name = {
+                "embedding_candidates": "semantic_candidates",
+                "bucket_rerank": "rerank_bucket_candidates",
+            }.get(name, name)
+            self._record_candidate_stage(
+                candidate_stages,
+                f"{timing_prefix}.{name}",
+                input_count,
+                output_count,
+                timing_key=f"{timing_prefix}.{timing_name}",
+                **kwargs,
+            )
 
         if not query or self.inject_max_cards <= 0:
             return [], []
@@ -16227,6 +16517,13 @@ class GatewayService:
             if self._is_semantic_candidate_bucket(bucket)
         ]
         mark("eligible_filter", stage_started_at)
+        record(
+            "eligible_filter",
+            len(all_buckets),
+            len(eligible),
+            secondary_output_count=len(semantic_eligible),
+            reason="eligible and semantic-eligible pools",
+        )
         if not eligible and not semantic_eligible:
             return [], []
 
@@ -16294,6 +16591,14 @@ class GatewayService:
         stage_started_at = time.perf_counter()
         keyword_scores = self._get_keyword_candidates(normalized_query, eligible) if normalized_query else {}
         mark("keyword_candidates", stage_started_at)
+        record(
+            "keyword_candidates",
+            len(eligible),
+            len(keyword_scores),
+            limit=self.dynamic_top_k,
+            skipped=not bool(normalized_query),
+            reason="empty normalized query" if not normalized_query else "keyword score hits",
+        )
         stage_started_at = time.perf_counter()
         if allow_semantic:
             semantic_query = self._identity_name_semantic_query(raw_query) or raw_query
@@ -16301,6 +16606,14 @@ class GatewayService:
         else:
             semantic_scores = {}
         mark("semantic_candidates", stage_started_at)
+        record(
+            "embedding_candidates",
+            len(semantic_bucket_map),
+            len(semantic_scores),
+            limit=self.semantic_candidate_top_k,
+            skipped=not allow_semantic,
+            reason="disabled for this recall branch" if not allow_semantic else "eligible ids after embedding search",
+        )
         bucket_map = dict(eligible_map)
         for bucket_id in semantic_scores:
             bucket = semantic_bucket_map.get(bucket_id)
@@ -16316,6 +16629,12 @@ class GatewayService:
         else:
             exact_scores, exact_debug = self._get_exact_anchor_candidates(raw_query, normalized_query, eligible)
         mark("exact_anchor_candidates", stage_started_at)
+        record(
+            "exact_anchor_candidates",
+            len(eligible),
+            len(exact_scores),
+            reason="exact anchor matches",
+        )
         stage_started_at = time.perf_counter()
         if normalized_query:
             word_map_scores, word_map_debug = self._get_word_map_hint_scores(
@@ -16326,6 +16645,18 @@ class GatewayService:
         else:
             word_map_scores, word_map_debug = {}, {}
         mark("word_map_hint", stage_started_at)
+        word_map_available = self._word_map_hint_available()
+        record(
+            "word_map_candidates",
+            len(eligible),
+            len(word_map_scores),
+            skipped=not bool(normalized_query) or not word_map_available,
+            reason=(
+                "disabled or empty normalized query"
+                if not normalized_query or not word_map_available
+                else "word-map hint hits"
+            ),
+        )
         stage_started_at = time.perf_counter()
         raw_query_plan = self._recall_query_plan(raw_query)
         lexical_terms = self._planner_lexical_match_terms(required_terms)
@@ -16356,6 +16687,32 @@ class GatewayService:
         }
         entity_edge_boosts = self._get_entity_edge_boosts(raw_query, all_bucket_ids)
         candidate_ids |= set(entity_edge_boosts)
+        record(
+            "candidate_union",
+            sum(
+                len(values)
+                for values in (
+                    keyword_scores,
+                    semantic_scores,
+                    exact_scores,
+                    word_map_scores,
+                    retrieval_alias_scores,
+                    entity_edge_boosts,
+                    {bucket_id: True for bucket_id in lexical_ids},
+                )
+            ),
+            len(candidate_ids),
+            source_counts={
+                "keyword": len(keyword_scores),
+                "semantic": len(semantic_scores),
+                "exact": len(exact_scores),
+                "lexical": len(lexical_ids),
+                "word_map": len(word_map_scores),
+                "retrieval_alias": len(retrieval_alias_scores),
+                "entity_edge": len(entity_edge_boosts),
+            },
+            reason="deduplicated candidate id union",
+        )
         if not candidate_ids:
             return [], []
 
@@ -16560,6 +16917,12 @@ class GatewayService:
                 }
             )
         mark("score_candidates", stage_started_at)
+        record(
+            "score_candidates",
+            len(candidate_ids),
+            len(scored_candidates),
+            reason="candidate ids with a usable bucket and relevance score",
+        )
 
         stage_started_at = time.perf_counter()
         scored_candidates.sort(
@@ -16570,6 +16933,29 @@ class GatewayService:
         if allow_rerank:
             scored_candidates = await self._rerank_scored_bucket_candidates(query, scored_candidates)
         mark("rerank_bucket_candidates", stage_started_at)
+        rerank_runtime_method = getattr(self.reranker_engine, "runtime_debug", None)
+        rerank_runtime = rerank_runtime_method() if callable(rerank_runtime_method) else {}
+        bucket_rerank_enabled = bool(allow_rerank and getattr(self.reranker_engine, "enabled", False))
+        rerank_limit = min(
+            len(scored_candidates),
+            max(1, int(getattr(self.reranker_engine, "candidate_limit", 20) or 20)),
+        )
+        record(
+            "bucket_rerank",
+            len(scored_candidates),
+            len(scored_candidates),
+            limit=rerank_limit,
+            provider_input_count=rerank_limit if bucket_rerank_enabled else 0,
+            provider_output_count=(rerank_runtime or {}).get("last_result_count") if bucket_rerank_enabled else 0,
+            skipped=not bucket_rerank_enabled,
+            reason=(
+                "graph final moment rerank owns ordering"
+                if not allow_rerank
+                else "reranker unavailable"
+                if not bucket_rerank_enabled
+                else "bucket rerank"
+            ),
+        )
         stage_started_at = time.perf_counter()
         hard_excluded_ids = self._session_hard_exclude_bucket_ids(session_id)
         scored_candidates, session_suppressed_candidates = self._filter_session_hard_excluded_bucket_items(
@@ -16618,6 +17004,8 @@ class GatewayService:
                     suppressed.append(item)
             return admitted, suppressed
 
+        admission_input_count = len(active_pool)
+        admission_retried = False
         admitted_pool, suppressed_candidates = admit_candidate_pool(active_pool)
         suppressed_candidates = session_suppressed_candidates + suppressed_candidates
         if (
@@ -16625,9 +17013,18 @@ class GatewayService:
             and filtered
             and len(filtered) < len(scored_candidates)
         ):
+            admission_input_count = len(scored_candidates)
+            admission_retried = True
             admitted_pool, retry_suppressed = admit_candidate_pool(scored_candidates)
             suppressed_candidates = session_suppressed_candidates + retry_suppressed
         mark("admit_candidates", stage_started_at)
+        record(
+            "admit_candidates",
+            admission_input_count,
+            len(admitted_pool),
+            retried=admission_retried,
+            reason="recall policy admission",
+        )
         stage_started_at = time.perf_counter()
         if allow_semantic_session_dedupe:
             admitted_pool, semantic_dedupe_suppressed = await self._filter_semantic_session_deduped_bucket_items(
@@ -16640,8 +17037,21 @@ class GatewayService:
             semantic_dedupe_suppressed = []
         suppressed_candidates.extend(semantic_dedupe_suppressed)
         mark("semantic_session_dedupe", stage_started_at)
+        record(
+            "semantic_session_dedupe",
+            len(admitted_pool) + len(semantic_dedupe_suppressed),
+            len(admitted_pool),
+            skipped=not allow_semantic_session_dedupe,
+            reason="semantic session dedupe" if allow_semantic_session_dedupe else "disabled for branch",
+        )
         admitted_pool = self._boost_explicit_relation_edge_bucket_items(policy_query, admitted_pool)
         admitted_pool.sort(key=lambda item: self._bucket_final_candidate_rank(policy_query, item, recent_ids=recent_ids))
+        record(
+            "bucket_output",
+            len(admitted_pool),
+            len(admitted_pool),
+            reason="bucket candidates forwarded to selector",
+        )
         return admitted_pool, suppressed_candidates
 
     async def _select_dynamic_buckets(
@@ -16659,6 +17069,7 @@ class GatewayService:
     ) -> tuple[list[dict], list[dict]] | tuple[list[dict], list[dict], dict[str, Any]]:
         planner_debug = self._query_planner_debug_base(query)
         timing_debug = planner_debug.setdefault("timing_ms", {})
+        candidate_stages = planner_debug.setdefault("candidate_stages", [])
         if not query or self.inject_max_cards <= 0:
             if include_query_planner_debug:
                 return [], [], planner_debug
@@ -16684,6 +17095,7 @@ class GatewayService:
             allow_rerank=allow_rerank,
             timing_debug=timing_debug,
             timing_prefix="direct",
+            candidate_stages=candidate_stages,
         )
         structural_activation_items = list(active_pool) + list(suppressed_candidates)
         self._add_timing_ms(timing_debug, "direct.candidate_items_total", stage_started_at)
@@ -16694,6 +17106,15 @@ class GatewayService:
         direct_selected = self._pick_dynamic_cards(active_pool, query=query)
         selected_items = list(direct_selected)
         self._add_timing_ms(timing_debug, "direct.pick_cards", stage_started_at)
+        self._record_candidate_stage(
+            candidate_stages,
+            "direct.pick_cards",
+            len(active_pool),
+            len(direct_selected),
+            timing_key="direct.pick_cards",
+            limit=self.inject_max_cards,
+            reason="direct bucket card capacity",
+        )
 
         rescue_debug = planner_debug.setdefault("semantic_rescue", {})
         if not self.semantic_rescue_enabled:
@@ -16763,6 +17184,7 @@ class GatewayService:
                     context_query=query,
                     timing_debug=timing_debug,
                     timing_prefix=f"relation_axis_{index}",
+                    candidate_stages=candidate_stages,
                 )
                 self._add_timing_ms(
                     timing_debug,
@@ -16800,6 +17222,15 @@ class GatewayService:
                 merged_items.sort(key=lambda item: self._bucket_final_candidate_rank(query, item))
                 selected_items = self._pick_dynamic_cards(merged_items, query=query)
                 self._add_timing_ms(timing_debug, "relation_axis.pick_cards", stage_started_at)
+                self._record_candidate_stage(
+                    candidate_stages,
+                    "relation_axis.merge_pick_cards",
+                    len(merged_items),
+                    len(selected_items),
+                    timing_key="relation_axis.pick_cards",
+                    limit=self.inject_max_cards,
+                    reason="relation-axis merge capacity",
+                )
 
         stage_started_at = time.perf_counter()
         trigger_reason = self._query_planner_trigger_reason(query, direct_selected)
@@ -16840,6 +17271,7 @@ class GatewayService:
                             allow_rerank=allow_rerank,
                             timing_debug=timing_debug,
                             timing_prefix=f"supplemental_{index}",
+                            candidate_stages=candidate_stages,
                         )
                         self._add_timing_ms(
                             timing_debug,
@@ -16888,6 +17320,15 @@ class GatewayService:
                         merged_items.sort(key=lambda item: self._bucket_final_candidate_rank(query, item))
                         selected_items = self._pick_dynamic_cards(merged_items, query=query)
                         self._add_timing_ms(timing_debug, "supplemental.pick_cards", stage_started_at)
+                        self._record_candidate_stage(
+                            candidate_stages,
+                            "supplemental.pick_cards",
+                            len(merged_items),
+                            len(selected_items),
+                            timing_key="supplemental.pick_cards",
+                            limit=self.inject_max_cards,
+                            reason="supplemental query merge capacity",
+                        )
                 else:
                     planner_debug["skip_reason"] = "planner_returned_no_search"
         elif trigger_reason:
@@ -16910,6 +17351,14 @@ class GatewayService:
             for item in selected_items
             if isinstance(item.get("bucket"), dict)
         ]
+        self._record_candidate_stage(
+            candidate_stages,
+            "bucket.final_output",
+            len(selected_items),
+            len(selected_buckets),
+            limit=self.inject_max_cards,
+            reason="selected bucket candidates",
+        )
         result = (selected_buckets, suppressed_candidates)
         if include_query_planner_debug:
             return (*result, planner_debug)
