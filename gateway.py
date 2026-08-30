@@ -11155,12 +11155,13 @@ class GatewayService:
         )
         stage_started_at = time.perf_counter()
         before_moment_rerank_count = len(candidates)
-        candidates = await self._rerank_moment_candidates(query, candidates)
-        self._add_timing_ms(timing_debug, "moment.rerank_candidates", stage_started_at)
-        moment_rerank_runtime_method = getattr(self.reranker_engine, "runtime_debug", None)
-        moment_rerank_runtime = (
-            moment_rerank_runtime_method() if callable(moment_rerank_runtime_method) else {}
+        moment_rerank_diagnostics: dict[str, Any] = {}
+        candidates = await self._rerank_moment_candidates(
+            query,
+            candidates,
+            diagnostics=moment_rerank_diagnostics,
         )
+        self._add_timing_ms(timing_debug, "moment.rerank_candidates", stage_started_at)
         moment_rerank_enabled = bool(getattr(self.reranker_engine, "enabled", False))
         moment_rerank_limit = min(
             before_moment_rerank_count,
@@ -11173,8 +11174,8 @@ class GatewayService:
             len(candidates),
             timing_key="moment.rerank_candidates",
             limit=moment_rerank_limit,
-            provider_input_count=moment_rerank_limit if moment_rerank_enabled else 0,
-            provider_output_count=(moment_rerank_runtime or {}).get("last_result_count") if moment_rerank_enabled else 0,
+            provider_input_count=moment_rerank_diagnostics.get("provider_input_count", 0),
+            provider_output_count=moment_rerank_diagnostics.get("provider_output_count", 0),
             skipped=not moment_rerank_enabled or before_moment_rerank_count <= 0,
             reason="final moment rerank" if moment_rerank_enabled else "reranker unavailable",
         )
@@ -11459,8 +11460,21 @@ class GatewayService:
             -self._safe_float(moment.get("combined_score", moment.get("score")), 0.0),
         )
 
-    async def _rerank_moment_candidates(self, query: str, candidates: list[dict]) -> list[dict]:
-        if not candidates or not getattr(self.reranker_engine, "enabled", False):
+    async def _rerank_moment_candidates(
+        self,
+        query: str,
+        candidates: list[dict],
+        *,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> list[dict]:
+        enabled = bool(getattr(self.reranker_engine, "enabled", False))
+        if not candidates or not enabled:
+            if isinstance(diagnostics, dict):
+                diagnostics.update({
+                    "provider_input_count": 0,
+                    "provider_output_count": 0,
+                    "skipped": True,
+                })
             return candidates
         candidate_limit = min(
             len(candidates),
@@ -11468,10 +11482,22 @@ class GatewayService:
         )
         head = candidates[:candidate_limit]
         tail = candidates[candidate_limit:]
+        if isinstance(diagnostics, dict):
+            diagnostics["provider_input_count"] = len(head)
         documents = [self._moment_rerank_document(moment) for moment in head]
         results = await self.reranker_engine.rerank(query, documents, top_n=len(head))
         if not results:
+            if isinstance(diagnostics, dict):
+                diagnostics.update({
+                    "provider_output_count": 0,
+                    "skipped": False,
+                })
             return candidates
+        if isinstance(diagnostics, dict):
+            diagnostics.update({
+                "provider_output_count": len(results),
+                "skipped": False,
+            })
 
         by_index = {result.index: result.score for result in results}
         weight = max(0.0, min(1.0, float(getattr(self.reranker_engine, "score_weight", 0.65))))
@@ -16941,11 +16967,14 @@ class GatewayService:
         )
         mark("sort_candidates", stage_started_at)
         stage_started_at = time.perf_counter()
+        bucket_rerank_diagnostics: dict[str, Any] = {}
         if allow_rerank:
-            scored_candidates = await self._rerank_scored_bucket_candidates(query, scored_candidates)
+            scored_candidates = await self._rerank_scored_bucket_candidates(
+                query,
+                scored_candidates,
+                diagnostics=bucket_rerank_diagnostics,
+            )
         mark("rerank_bucket_candidates", stage_started_at)
-        rerank_runtime_method = getattr(self.reranker_engine, "runtime_debug", None)
-        rerank_runtime = rerank_runtime_method() if callable(rerank_runtime_method) else {}
         bucket_rerank_enabled = bool(allow_rerank and getattr(self.reranker_engine, "enabled", False))
         rerank_limit = min(
             len(scored_candidates),
@@ -16956,8 +16985,8 @@ class GatewayService:
             len(scored_candidates),
             len(scored_candidates),
             limit=rerank_limit,
-            provider_input_count=rerank_limit if bucket_rerank_enabled else 0,
-            provider_output_count=(rerank_runtime or {}).get("last_result_count") if bucket_rerank_enabled else 0,
+            provider_input_count=bucket_rerank_diagnostics.get("provider_input_count", 0),
+            provider_output_count=bucket_rerank_diagnostics.get("provider_output_count", 0),
             skipped=not bucket_rerank_enabled,
             reason=(
                 "graph final moment rerank owns ordering"
@@ -17708,8 +17737,21 @@ class GatewayService:
             return semantic_score
         return 0.0
 
-    async def _rerank_scored_bucket_candidates(self, query: str, scored_candidates: list[dict]) -> list[dict]:
-        if not scored_candidates or not getattr(self.reranker_engine, "enabled", False):
+    async def _rerank_scored_bucket_candidates(
+        self,
+        query: str,
+        scored_candidates: list[dict],
+        *,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> list[dict]:
+        enabled = bool(getattr(self.reranker_engine, "enabled", False))
+        if not scored_candidates or not enabled:
+            if isinstance(diagnostics, dict):
+                diagnostics.update({
+                    "provider_input_count": 0,
+                    "provider_output_count": 0,
+                    "skipped": True,
+                })
             return scored_candidates
         candidate_limit = min(
             len(scored_candidates),
@@ -17723,10 +17765,22 @@ class GatewayService:
         head_pairs = [(index, scored_candidates[index]) for index in range(len(scored_candidates)) if index in head_indices]
         tail = [item for index, item in enumerate(scored_candidates) if index not in head_indices]
         head = [item for _index, item in head_pairs]
+        if isinstance(diagnostics, dict):
+            diagnostics["provider_input_count"] = len(head)
         documents = [self._bucket_rerank_document(item["bucket"]) for item in head]
         results = await self.reranker_engine.rerank(query, documents, top_n=len(head))
         if not results:
+            if isinstance(diagnostics, dict):
+                diagnostics.update({
+                    "provider_output_count": 0,
+                    "skipped": False,
+                })
             return scored_candidates
+        if isinstance(diagnostics, dict):
+            diagnostics.update({
+                "provider_output_count": len(results),
+                "skipped": False,
+            })
 
         by_index = {result.index: result.score for result in results}
         weight = max(0.0, min(1.0, float(getattr(self.reranker_engine, "score_weight", 0.65))))
