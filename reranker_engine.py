@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -105,6 +106,14 @@ class RerankerEngine:
                 self._runtime["last_http_status"] = response.status_code
                 response.raise_for_status()
                 body = response.json()
+        except asyncio.CancelledError:
+            self._runtime.update({
+                "last_status": "cancelled",
+                "last_error_type": "CancelledError",
+                "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                "last_result_count": 0,
+            })
+            raise
         except Exception as exc:
             self._runtime.update({
                 "last_status": "error",

@@ -160,6 +160,13 @@ class EmbeddingEngine:
                 "last_result_count": 0,
             })
             return []
+        except asyncio.CancelledError:
+            self._runtime.update({
+                "last_status": "cancelled",
+                "last_error_type": "CancelledError",
+                "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+            })
+            raise
         except Exception as e:
             self._runtime.update({
                 "last_status": "error",
