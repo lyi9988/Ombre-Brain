@@ -638,6 +638,13 @@ class GatewayService:
         self.retrieval_mode = self._normalize_retrieval_mode(
             self.gateway_cfg.get("retrieval_mode", "graph")
         )
+        # Graph retrieval performs the final ranking on moments.  A bucket
+        # rerank immediately before that is redundant and adds a second remote
+        # reranker round-trip to ordinary replies.  Keep it configurable for
+        # experiments, but default to one final moment rerank.
+        self.graph_bucket_rerank_enabled = self._bool_config_value(
+            self.gateway_cfg.get("graph_bucket_rerank_enabled"), False
+        )
         self.relationship_weather_budget = int(self.gateway_cfg.get("relationship_weather_budget", 220))
         self.relationship_weather_include_weekly = bool(
             self.gateway_cfg.get("relationship_weather_include_weekly", False)
@@ -1230,6 +1237,12 @@ class GatewayService:
                     0.0, min(30.0, float(gateway["embedding_query_timeout_seconds"]))
                 )
                 changed.append("gateway.embedding_query_timeout_seconds")
+            if "graph_bucket_rerank_enabled" in gateway:
+                current["graph_bucket_rerank_enabled"] = gateway["graph_bucket_rerank_enabled"]
+                self.graph_bucket_rerank_enabled = self._bool_config_value(
+                    gateway["graph_bucket_rerank_enabled"], False
+                )
+                changed.append("gateway.graph_bucket_rerank_enabled")
         return list(dict.fromkeys(changed))
 
     def _maybe_reload_runtime_overlay(self, *, force: bool = False) -> None:
@@ -1309,6 +1322,7 @@ class GatewayService:
             "current_inner_state_interval_rounds": self.current_inner_state_interval_rounds,
             "direct_render_mode": self.direct_render_mode,
             "retrieval_mode": self.retrieval_mode,
+            "graph_bucket_rerank_enabled": self.graph_bucket_rerank_enabled,
             "bucket_list_cache_ttl_seconds": self.bucket_list_cache_ttl_seconds,
             "recall_fusion_mode": self.recall_fusion_mode,
             "word_map_hint_enabled": self.word_map_hint_enabled,
@@ -3606,6 +3620,7 @@ class GatewayService:
                             current_user_query,
                             memory_sentinel_debug,
                         ),
+                        allow_bucket_rerank=self.graph_bucket_rerank_enabled,
                         include_query_planner_debug=True,
                     )
                     mark_step("dynamic_recall_graph_select", stage_started_at)
@@ -10742,6 +10757,7 @@ class GatewayService:
         *,
         all_moments: list[dict] | None = None,
         search_query: str = "",
+        allow_bucket_rerank: bool = False,
         include_query_planner_debug: bool = False,
     ) -> tuple[list[dict], list[dict], list[dict], list[dict]] | tuple[
         list[dict], list[dict], list[dict], list[dict], dict[str, Any]
@@ -10798,8 +10814,17 @@ class GatewayService:
             session_id,
             all_buckets,
             search_query=search_query,
+            allow_rerank=allow_bucket_rerank,
             include_query_planner_debug=True,
         )
+        query_planner_debug["bucket_rerank"] = {
+            "enabled": bool(allow_bucket_rerank),
+            "reason": (
+                "owner_configured"
+                if allow_bucket_rerank
+                else "skipped_graph_final_moment_rerank"
+            ),
+        }
         timing_debug = query_planner_debug.setdefault("timing_ms", {})
         self._add_timing_ms(timing_debug, "moment.select_dynamic_buckets", stage_started_at)
         stage_started_at = time.perf_counter()

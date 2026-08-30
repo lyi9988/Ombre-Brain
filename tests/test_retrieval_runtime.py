@@ -122,6 +122,7 @@ def test_gateway_reloads_runtime_overlay_without_rebuilding_brain(tmp_path):
         "  current_inner_state_interval_rounds: 1\n"
         "  relationship_weather_interval_rounds: 0\n"
         "  embedding_query_timeout_seconds: 8\n"
+        "  graph_bucket_rerank_enabled: false\n"
         "embedding:\n"
         "  model: gitee/qwen3-embedding-8b\n"
         "  base_url: https://api.pie-xian.com/v1\n"
@@ -151,6 +152,7 @@ def test_gateway_reloads_runtime_overlay_without_rebuilding_brain(tmp_path):
     service.current_inner_state_interval_rounds = 15
     service.relationship_weather_interval_rounds = 0
     service.embedding_query_timeout_seconds = 3.0
+    service.graph_bucket_rerank_enabled = True
     service._runtime_overlay_path = str(overlay)
     service._runtime_overlay_signature = None
     service._runtime_overlay_lock = __import__("threading").RLock()
@@ -163,5 +165,14 @@ def test_gateway_reloads_runtime_overlay_without_rebuilding_brain(tmp_path):
     assert service.reranker_engine.base_url == "https://api.futureppo.top/v1"
     assert service.current_inner_state_interval_rounds == 1
     assert service.embedding_query_timeout_seconds == 8.0
+    assert service.graph_bucket_rerank_enabled is False
     assert service._runtime_overlay_status["last_reload_status"] == "reloaded"
     assert service._runtime_overlay_status["sha256"]
+
+
+def test_graph_bucket_rerank_defaults_off_to_avoid_duplicate_remote_roundtrip():
+    service = GatewayService.__new__(GatewayService)
+    service.gateway_cfg = {}
+    service.graph_bucket_rerank_enabled = GatewayService._bool_config_value(
+        service.gateway_cfg.get("graph_bucket_rerank_enabled"), False)
+    assert service.graph_bucket_rerank_enabled is False
