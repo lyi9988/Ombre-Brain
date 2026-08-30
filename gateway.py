@@ -3403,6 +3403,9 @@ class GatewayService:
             "sections": sections,
             "memory_sentinel": (debug or {}).get("memory_sentinel_debug") or {},
             "query_planner": (debug or {}).get("query_planner_debug") or {},
+            "effective_config": (debug or {}).get("effective_config") or {},
+            "prepare_timing_debug": (debug or {}).get("prepare_timing_debug") or {},
+            "candidate_stages": list((debug or {}).get("candidate_stages") or []),
         }
         if include_context:
             result["context"] = text
@@ -3855,6 +3858,7 @@ class GatewayService:
                     "diffusion",
                     len(recalled_moments),
                     len(diffused_moment_debug),
+                    timing_key="memory_diffusion",
                     limit=self.diffusion_inject_max_items,
                     injected_count=sum(
                         1 for row in diffused_moment_debug
@@ -4049,14 +4053,16 @@ class GatewayService:
 
         prepare_total_ms = max(0, int((time.perf_counter() - prepare_started_at) * 1000))
         effective_config = self._effective_config_metadata()
+        candidate_timing_ms = dict(query_planner_debug.get("timing_ms") or {})
+        candidate_timing_ms.update(prepare_steps_ms)
         candidate_stages = []
         for raw_stage in query_planner_debug.get("candidate_stages") or []:
             if not isinstance(raw_stage, dict):
                 continue
             stage = dict(raw_stage)
             timing_key = str(stage.get("timing_key") or "")
-            if timing_key in prepare_steps_ms:
-                stage["duration_ms"] = prepare_steps_ms[timing_key]
+            if timing_key in candidate_timing_ms:
+                stage["duration_ms"] = candidate_timing_ms[timing_key]
             candidate_stages.append(stage)
         query_planner_debug["candidate_stages"] = candidate_stages
         prepare_timing_debug = {
@@ -11144,6 +11150,7 @@ class GatewayService:
             "moment.filter_relevance",
             before_filter_count,
             len(candidates),
+            timing_key="moment.filter_relevance",
             reason="eligible, direct-seed, and relevance filters",
         )
         stage_started_at = time.perf_counter()
@@ -11164,6 +11171,7 @@ class GatewayService:
             "moment_rerank",
             before_moment_rerank_count,
             len(candidates),
+            timing_key="moment.rerank_candidates",
             limit=moment_rerank_limit,
             provider_input_count=moment_rerank_limit if moment_rerank_enabled else 0,
             provider_output_count=(moment_rerank_runtime or {}).get("last_result_count") if moment_rerank_enabled else 0,
@@ -11239,6 +11247,7 @@ class GatewayService:
             "moment.admit_candidates",
             len(admitted_candidates) + len(suppressed_candidates),
             len(admitted_candidates),
+            timing_key="moment.admit_candidates",
             reason="moment recall policy admission",
         )
 
@@ -11330,6 +11339,7 @@ class GatewayService:
             "moment.final_output",
             len(candidates),
             len(selected[: self.inject_max_cards]),
+            timing_key="moment.pick_selected",
             limit=self.inject_max_cards,
             reason="selected direct moments after reliable promotion",
         )
@@ -11362,6 +11372,7 @@ class GatewayService:
             "moment.fallback_output",
             len(active_candidates),
             len(selected[: self.inject_max_cards]),
+            timing_key="moment.fallback_select",
             limit=self.inject_max_cards,
             reason="fallback moment selection",
         )
