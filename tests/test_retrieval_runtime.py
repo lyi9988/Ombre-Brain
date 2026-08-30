@@ -1,7 +1,10 @@
 import asyncio
+from types import SimpleNamespace
+from pathlib import Path
 
 from embedding_engine import EmbeddingEngine
 from reranker_engine import RerankerEngine
+from gateway import GatewayService
 
 
 def test_embedding_runtime_debug_records_success_without_body_or_credentials(tmp_path, monkeypatch):
@@ -110,3 +113,55 @@ def test_reranker_runtime_debug_records_success_without_documents(monkeypatch):
     assert debug["last_http_status"] == 200
     assert debug["last_result_count"] == 1
     assert "embedding-secret" not in str(debug)
+
+
+def test_gateway_reloads_runtime_overlay_without_rebuilding_brain(tmp_path):
+    overlay = Path(tmp_path) / "config.runtime.yaml"
+    overlay.write_text(
+        "gateway:\n"
+        "  current_inner_state_interval_rounds: 1\n"
+        "  relationship_weather_interval_rounds: 0\n"
+        "  embedding_query_timeout_seconds: 8\n"
+        "embedding:\n"
+        "  model: gitee/qwen3-embedding-8b\n"
+        "  base_url: https://api.pie-xian.com/v1\n"
+        "  enabled: true\n"
+        "reranker:\n"
+        "  model: qwen3-reranker-8b\n"
+        "  base_url: https://api.futureppo.top/v1\n"
+        "  enabled: true\n",
+        encoding="utf-8",
+    )
+    service = GatewayService.__new__(GatewayService)
+    service.config = {
+        "_runtime_config_path": str(overlay),
+        "gateway": {},
+        "embedding": {"model": "old-embedding", "base_url": "https://old.example/v1", "enabled": True},
+        "reranker": {"model": "old-reranker", "base_url": "https://old.example/v1", "enabled": True},
+    }
+    service.gateway_cfg = service.config["gateway"]
+    service.embedding_cfg = service.config["embedding"]
+    service.embedding_engine = SimpleNamespace(
+        model="old-embedding", base_url="https://old.example/v1", api_key="embedding-key", enabled=True,
+    )
+    service.reranker_engine = SimpleNamespace(
+        model="old-reranker", base_url="https://old.example/v1", api_key="reranker-key", enabled=True,
+        timeout=12.0, candidate_limit=20, score_weight=0.65,
+    )
+    service.current_inner_state_interval_rounds = 15
+    service.relationship_weather_interval_rounds = 0
+    service.embedding_query_timeout_seconds = 3.0
+    service._runtime_overlay_path = str(overlay)
+    service._runtime_overlay_signature = None
+    service._runtime_overlay_lock = __import__("threading").RLock()
+    service._runtime_overlay_status = {}
+
+    service._maybe_reload_runtime_overlay(force=True)
+
+    assert service.embedding_engine.model == "gitee/qwen3-embedding-8b"
+    assert service.embedding_engine.base_url == "https://api.pie-xian.com/v1"
+    assert service.reranker_engine.base_url == "https://api.futureppo.top/v1"
+    assert service.current_inner_state_interval_rounds == 1
+    assert service.embedding_query_timeout_seconds == 8.0
+    assert service._runtime_overlay_status["last_reload_status"] == "reloaded"
+    assert service._runtime_overlay_status["sha256"]
