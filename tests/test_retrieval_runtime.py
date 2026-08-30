@@ -51,6 +51,28 @@ def test_embedding_runtime_debug_records_failure_type(tmp_path):
     assert debug["last_result_count"] is None
 
 
+def test_embedding_runtime_debug_records_cancellation(tmp_path):
+    engine = EmbeddingEngine({
+        "buckets_dir": str(tmp_path),
+        "embedding": {"enabled": True, "api_key": "k", "base_url": "https://example/v1"},
+    })
+
+    class CancelledEmbeddings:
+        async def create(self, **kwargs):
+            raise asyncio.CancelledError()
+
+    engine.client = SimpleNamespace(embeddings=CancelledEmbeddings())
+    try:
+        asyncio.run(engine._generate_embedding("query", kind="query"))
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("cancellation must be propagated")
+    debug = engine.runtime_debug()
+    assert debug["last_status"] == "cancelled"
+    assert debug["last_error_type"] == "CancelledError"
+
+
 def test_reranker_runtime_debug_records_success_without_documents(monkeypatch):
     engine = RerankerEngine({
         "embedding": {"api_key": "embedding-secret", "base_url": "https://example/v1"},
