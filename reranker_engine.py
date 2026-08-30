@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,9 +44,35 @@ class RerankerEngine:
         self.timeout = _float_between(rerank_cfg.get("timeout_seconds", 12), 12, 1, 120)
         self.candidate_limit = _int_between(rerank_cfg.get("candidate_limit", 20), 20, 1, 100)
         self.score_weight = _float_between(rerank_cfg.get("score_weight", 0.65), 0.65, 0.0, 1.0)
+        self._runtime = {
+            "last_status": "not_requested",
+            "last_error_type": "",
+            "last_http_status": None,
+            "last_latency_ms": None,
+            "last_result_count": None,
+        }
+
+    def runtime_debug(self) -> dict:
+        """Return owner-safe rerank health without credentials or documents."""
+        return {
+            "enabled": bool(self.enabled),
+            "configured": bool(self.api_key and self.base_url),
+            "model": self.model,
+            "base_url": self.base_url,
+            "timeout_seconds": self.timeout,
+            "candidate_limit": self.candidate_limit,
+            **dict(self._runtime),
+        }
 
     async def rerank(self, query: str, documents: list[str], top_n: int | None = None) -> list[RerankResult]:
         if not self.enabled or not query or not documents:
+            self._runtime.update({
+                "last_status": "disabled" if not self.enabled else "empty_input",
+                "last_error_type": "",
+                "last_http_status": None,
+                "last_latency_ms": 0,
+                "last_result_count": 0,
+            })
             return []
         endpoint = f"{self.base_url}/rerank"
         payload: dict[str, Any] = {
@@ -57,6 +84,14 @@ class RerankerEngine:
         if top_n is not None:
             payload["top_n"] = max(1, min(int(top_n), len(documents)))
 
+        started = time.perf_counter()
+        self._runtime.update({
+            "last_status": "started",
+            "last_error_type": "",
+            "last_http_status": None,
+            "last_latency_ms": None,
+            "last_result_count": None,
+        })
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
@@ -67,9 +102,16 @@ class RerankerEngine:
                     },
                     json=payload,
                 )
+                self._runtime["last_http_status"] = response.status_code
                 response.raise_for_status()
                 body = response.json()
         except Exception as exc:
+            self._runtime.update({
+                "last_status": "error",
+                "last_error_type": type(exc).__name__,
+                "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                "last_result_count": 0,
+            })
             logger.warning("Reranker request failed: %s", exc)
             return []
 
@@ -83,6 +125,11 @@ class RerankerEngine:
             if 0 <= index < len(documents):
                 results.append(RerankResult(index=index, score=max(0.0, min(1.0, score))))
         results.sort(key=lambda item: item.score, reverse=True)
+        self._runtime.update({
+            "last_status": "ok",
+            "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+            "last_result_count": len(results),
+        })
         return results
 
 

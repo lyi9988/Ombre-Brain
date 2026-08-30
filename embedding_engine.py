@@ -17,6 +17,7 @@ import math
 import sqlite3
 import logging
 import asyncio
+import time
 from pathlib import Path
 
 from openai import AsyncOpenAI
@@ -48,6 +49,15 @@ class EmbeddingEngine:
             or "Given a memory search query, retrieve relevant long-term memory passages."
         ).strip()
         self.document_instruction = str(embed_cfg.get("document_instruction") or "").strip()
+        self._runtime = {
+            "last_operation": "none",
+            "last_status": "not_requested",
+            "last_error_type": "",
+            "last_http_status": None,
+            "last_latency_ms": None,
+            "last_vector_dimension": None,
+            "last_result_count": None,
+        }
 
         # --- SQLite path: buckets_dir/embeddings.db ---
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
@@ -65,6 +75,16 @@ class EmbeddingEngine:
 
         # --- Initialize SQLite ---
         self._init_db()
+
+    def runtime_debug(self) -> dict:
+        """Return owner-safe runtime health without credentials or content."""
+        return {
+            "enabled": bool(self.enabled),
+            "configured": bool(self.api_key and self.base_url),
+            "model": self.model,
+            "base_url": self.base_url,
+            **dict(self._runtime),
+        }
 
     def _init_db(self):
         """Create embeddings table if not exists."""
@@ -105,6 +125,18 @@ class EmbeddingEngine:
 
     async def _generate_embedding(self, text: str, *, kind: str = "document") -> list[float]:
         """Call API to generate embedding vector."""
+        started = time.perf_counter()
+        self._runtime.update({
+            "last_operation": str(kind or "document"),
+            "last_status": "disabled" if not self.enabled else "started",
+            "last_error_type": "",
+            "last_http_status": None,
+            "last_latency_ms": None,
+            "last_vector_dimension": None,
+            "last_result_count": None,
+        })
+        if not self.enabled:
+            return []
         # Truncate to avoid token limits
         prepared = self._prepare_embedding_input(text, kind=kind)
         truncated = prepared[: self.max_chars]
@@ -114,9 +146,26 @@ class EmbeddingEngine:
                 input=truncated,
             )
             if response.data and len(response.data) > 0:
-                return response.data[0].embedding
+                vector = response.data[0].embedding
+                self._runtime.update({
+                    "last_status": "ok",
+                    "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                    "last_vector_dimension": len(vector or []),
+                    "last_result_count": 1,
+                })
+                return vector
+            self._runtime.update({
+                "last_status": "empty",
+                "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                "last_result_count": 0,
+            })
             return []
         except Exception as e:
+            self._runtime.update({
+                "last_status": "error",
+                "last_error_type": type(e).__name__,
+                "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+            })
             logger.warning(f"Embedding API call failed: {e}")
             return []
 
@@ -212,6 +261,7 @@ class EmbeddingEngine:
         conn.close()
 
         if not rows:
+            self._runtime["last_result_count"] = 0
             return []
 
         # Calculate cosine similarity
@@ -227,6 +277,7 @@ class EmbeddingEngine:
                 continue
 
         results.sort(key=lambda x: x[1], reverse=True)
+        self._runtime["last_result_count"] = min(len(results), top_k)
         return results[:top_k]
 
     def _prepare_embedding_input(self, text: str, *, kind: str) -> str:

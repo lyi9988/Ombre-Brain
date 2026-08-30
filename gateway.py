@@ -943,6 +943,7 @@ class GatewayService:
 
     async def health_payload(self) -> dict:
         stats = await self.bucket_mgr.get_stats()
+        embedding_runtime = self._retrieval_runtime_debug()
         return {
             "status": "ok",
             "gateway": {
@@ -1021,7 +1022,9 @@ class GatewayService:
                     "model": getattr(self.reranker_engine, "model", ""),
                     "base_url": getattr(self.reranker_engine, "base_url", ""),
                     "candidate_limit": getattr(self.reranker_engine, "candidate_limit", 0),
+                    "runtime": embedding_runtime["reranker"],
                 },
+                "embedding": embedding_runtime["embedding"],
                 "upstreams": [
                     {
                         "name": upstream["name"],
@@ -1045,6 +1048,29 @@ class GatewayService:
                 "api_ready": bool(self.persona_engine.api_key),
             },
             "buckets": stats,
+        }
+
+    def _retrieval_runtime_debug(self) -> dict[str, Any]:
+        """Expose retrieval health without keys, query text, or memory bodies."""
+        def read(engine: Any) -> dict[str, Any]:
+            method = getattr(engine, "runtime_debug", None)
+            if callable(method):
+                try:
+                    value = method()
+                    return value if isinstance(value, dict) else {}
+                except Exception:
+                    pass
+            return {
+                "enabled": bool(getattr(engine, "enabled", False)),
+                "configured": bool(getattr(engine, "api_key", "") and getattr(engine, "base_url", "")),
+                "model": str(getattr(engine, "model", "") or ""),
+                "base_url": str(getattr(engine, "base_url", "") or ""),
+                "last_status": "unavailable",
+            }
+        return {
+            "embedding": read(self.embedding_engine),
+            "reranker": read(self.reranker_engine),
+            "embedding_query_timeout_seconds": self.embedding_query_timeout_seconds,
         }
 
     def _gateway_memory_config_payload(self) -> dict[str, Any]:
@@ -3971,6 +3997,7 @@ class GatewayService:
                         "dream_context_injected", "active_reminders_injected")
                 },
                 "post_injection_presence": debug.get("post_injection_presence") or {},
+                "retrieval_runtime": debug.get("retrieval_runtime") or self._retrieval_runtime_debug(),
                 "worldbook": trace.get("worldbook") or debug.get("worldbook", {}),
             }
             # ``client_id`` is the independent owner-safe marker consumed from
@@ -19691,6 +19718,7 @@ class GatewayService:
             "moment_chunk_shadow_debug": moment_chunk_shadow_debug,
             "memory_sentinel_debug": memory_sentinel_debug or self._memory_sentinel_debug_base(query),
             "domain_sentinel_debug": domain_sentinel_debug or self._domain_sentinel_rule_plan(query),
+            "retrieval_runtime": self._retrieval_runtime_debug(),
             "memory_detail_recall_debug": self._memory_detail_recall_debug_base(injected_bucket_ids),
             "targeted_memory_detail_debug": targeted_memory_detail_debug
             or self._targeted_memory_detail_debug_base(),
