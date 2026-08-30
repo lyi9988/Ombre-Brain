@@ -2407,6 +2407,8 @@ class GatewayService:
         try:
             batch = await self.canonical_adapter.pull(channel_id)
             state["through_seq"] = batch.through_seq
+            if getattr(batch, "catch_up", None):
+                state["catch_up"] = dict(batch.catch_up)
             trace = self._trace_from_payload(payload)
             coverage = trace.get("coverage") if isinstance(trace, dict) else {}
             filtered_batch, dedup_debug = self._dedupe_canonical_batch(

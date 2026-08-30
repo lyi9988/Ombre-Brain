@@ -162,6 +162,45 @@ def test_pull_keeps_events_written_by_other_channels_through_same_bridge(tmp_pat
     asyncio.run(scenario())
 
 
+def test_stale_client_cursor_catches_up_to_latest_bounded_page(tmp_path):
+    async def scenario():
+        calls = []
+
+        async def handler(request):
+            after = int(request.url.params["after_seq"])
+            calls.append(after)
+            if after == 10:
+                return httpx.Response(200, json={
+                    "conversation_id": "conv-jiajia-main",
+                    "next_after_seq": 30, "max_seq": 100,
+                    "items": [{"seq": 11, "event_type": "message", "role": "user",
+                               "content": "旧页", "source_event_id": "reality:old"}],
+                })
+            assert after == 80
+            return httpx.Response(200, json={
+                "conversation_id": "conv-jiajia-main",
+                "next_after_seq": 100, "max_seq": 100,
+                "items": [{"seq": 99, "event_type": "message", "role": "user",
+                           "content": "最新跨端消息", "source_event_id": "reality:latest"}],
+            })
+
+        item = adapter(tmp_path, handler, max_events=20)
+        item.commit_cursor(10)
+        batch = await item.pull()
+        assert calls == [10, 80]
+        assert [event["content"] for event in batch.events] == ["最新跨端消息"]
+        assert batch.through_seq == 100
+        assert batch.catch_up == {
+            "mode": "latest_bounded_page", "cursor_before": 10,
+            "max_seq_before": 100, "requested_after_seq": 80,
+            "skipped_before_seq": 80, "skipped_through_seq": 80,
+            "returned_after_seq": 80, "through_seq": 100,
+            "returned_event_count": 1,
+        }
+        await item.http_client.aclose()
+    asyncio.run(scenario())
+
+
 def test_cursors_are_isolated_per_channel(tmp_path):
     """Each channel tracks its own read position in the shared ledger; a single
     shared cursor would let one channel consume events the other never sees."""

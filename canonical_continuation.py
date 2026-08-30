@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,7 @@ import httpx
 class ContinuationBatch:
     events: tuple[dict[str, Any], ...]
     through_seq: int
+    catch_up: dict[str, Any] = field(default_factory=dict)
 
 
 class CanonicalContinuationAdapter:
@@ -130,15 +131,39 @@ class CanonicalContinuationAdapter:
             baseline = max(0, int(state.get("max_seq") or 0))
             self.commit_cursor(baseline, channel_id)
             return ContinuationBatch((), baseline)
-        response = await self.http_client.get(
-            self.base_url + "/bridge/v1/events",
-            params={"after_seq": current, "limit": self.max_events},
-            headers=self._headers(),
-        )
-        response.raise_for_status()
-        body = response.json()
-        if body.get("conversation_id") != self.conversation_id:
-            raise RuntimeError("canonical event conversation mismatch")
+        async def fetch(after_seq: int) -> dict[str, Any]:
+            response = await self.http_client.get(
+                self.base_url + "/bridge/v1/events",
+                params={"after_seq": int(after_seq), "limit": self.max_events},
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            body = response.json()
+            if body.get("conversation_id") != self.conversation_id:
+                raise RuntimeError("canonical event conversation mismatch")
+            return body
+
+        body = await fetch(current)
+        max_seq = max(current, int(body.get("max_seq") or current))
+        catch_up: dict[str, Any] = {}
+        # A per-client cursor is intentionally retained for exact ownership,
+        # but an offline client must not spend its next request replaying an
+        # arbitrarily old page while the other client has already advanced the
+        # conversation.  Jump to the latest bounded page and expose the exact
+        # skipped range in the request trace; this is a coverage policy, not
+        # text deduplication and does not alter canonical storage.
+        if max_seq - current > self.max_events:
+            tail_after = max(0, max_seq - self.max_events)
+            if tail_after > current:
+                catch_up = {
+                    "mode": "latest_bounded_page",
+                    "cursor_before": current,
+                    "max_seq_before": max_seq,
+                    "requested_after_seq": tail_after,
+                    "skipped_before_seq": tail_after,
+                    "skipped_through_seq": tail_after,
+                }
+                body = await fetch(tail_after)
         through_seq = max(current, int(body.get("next_after_seq") or current))
         own_prefix = self.own_event_prefix(channel_id)
         selected = []
@@ -163,7 +188,11 @@ class CanonicalContinuationAdapter:
                 "content": content,
                 "source_event_id": str(event.get("source_event_id") or ""),
             })
-        return ContinuationBatch(tuple(selected), through_seq)
+        if catch_up:
+            catch_up["returned_after_seq"] = max(0, through_seq - self.max_events)
+            catch_up["through_seq"] = through_seq
+            catch_up["returned_event_count"] = len(body.get("items") or [])
+        return ContinuationBatch(tuple(selected), through_seq, catch_up)
 
     @staticmethod
     def merge_messages(messages: list[dict[str, Any]], batch: ContinuationBatch) -> list[dict[str, Any]]:
