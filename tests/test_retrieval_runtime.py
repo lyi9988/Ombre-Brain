@@ -15,26 +15,11 @@ def test_embedding_runtime_debug_records_success_without_body_or_credentials(tmp
         },
     })
 
-    class FakeResponse:
-        status_code = 200
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def post(self, *args, **kwargs):
-            return FakeResponse()
-
-    monkeypatch.setattr("embedding_engine.httpx.AsyncClient", lambda **kwargs: FakeClient())
+    monkeypatch.setattr(
+        engine,
+        "_request_embedding_sync",
+        lambda endpoint, api_key, model, input_value: (200, {"data": [{"embedding": [0.1, 0.2, 0.3]}]}),
+    )
     vector = asyncio.run(engine._generate_embedding("private query", kind="query"))
 
     assert vector == [0.1, 0.2, 0.3]
@@ -53,17 +38,13 @@ def test_embedding_runtime_debug_records_failure_type(tmp_path, monkeypatch):
         "embedding": {"enabled": True, "api_key": "k", "base_url": "https://example/v1"},
     })
 
-    class FailingClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def post(self, *args, **kwargs):
-            raise TimeoutError("provider timed out")
-
-    monkeypatch.setattr("embedding_engine.httpx.AsyncClient", lambda **kwargs: FailingClient())
+    monkeypatch.setattr(
+        engine,
+        "_request_embedding_sync",
+        lambda endpoint, api_key, model, input_value: (_ for _ in ()).throw(
+            TimeoutError("provider timed out")
+        ),
+    )
     assert asyncio.run(engine._generate_embedding("query", kind="query")) == []
     debug = engine.runtime_debug()
     assert debug["last_status"] == "error"
@@ -77,17 +58,13 @@ def test_embedding_runtime_debug_records_cancellation(tmp_path, monkeypatch):
         "embedding": {"enabled": True, "api_key": "k", "base_url": "https://example/v1"},
     })
 
-    class CancelledClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def post(self, *args, **kwargs):
-            raise asyncio.CancelledError()
-
-    monkeypatch.setattr("embedding_engine.httpx.AsyncClient", lambda **kwargs: CancelledClient())
+    monkeypatch.setattr(
+        engine,
+        "_request_embedding_sync",
+        lambda endpoint, api_key, model, input_value: (_ for _ in ()).throw(
+            asyncio.CancelledError()
+        ),
+    )
     try:
         asyncio.run(engine._generate_embedding("query", kind="query"))
     except asyncio.CancelledError:
