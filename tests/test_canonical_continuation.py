@@ -195,3 +195,35 @@ def test_flush_outbox_skips_poisoned_row_and_keeps_draining(tmp_path):
         assert result["pending"] == 1
         await item.http_client.aclose()
     asyncio.run(scenario())
+
+
+def test_flush_outbox_skips_exhausted_legacy_rows_for_fresh_events(tmp_path):
+    async def scenario():
+        seen = []
+
+        async def handler(request):
+            body = __import__("json").loads(request.content)
+            seen.append(body["source_event_id"])
+            return httpx.Response(201, json={"created": True})
+
+        item = adapter(tmp_path, handler)
+        item.queue_outbox(
+            source_event_id="reality:legacy-poison:user",
+            role="user", content="old",
+        )
+        with item._connect() as conn:
+            conn.execute(
+                "UPDATE canonical_outbox SET attempts=2603,last_error=? "
+                "WHERE source_event_id=?",
+                ("HTTPStatusError", "reality:legacy-poison:user"),
+            )
+        item.queue_outbox(
+            source_event_id="operit:fresh:user", role="user", content="fresh",
+        )
+        result = await item.flush_outbox()
+        assert result["delivered"] == 1
+        assert seen == ["operit:fresh:user"]
+        assert item.outbox_size() == 1
+        await item.http_client.aclose()
+
+    asyncio.run(scenario())

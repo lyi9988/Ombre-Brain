@@ -204,12 +204,16 @@ class CanonicalContinuationAdapter:
             return {"delivered": 0, "pending": 0}
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT source_event_id,role,content,correlation_id FROM canonical_outbox ORDER BY created_at LIMIT ?",
-                (max(1, min(100, int(limit))),),
+                # A permanently failing/oversized legacy row must not sit in
+                # front of fresh cross-client events forever.  Keep those
+                # rows in the derived outbox for inspection, but stop retrying
+                # them after a bounded number of attempts.
+                "SELECT source_event_id,role,content,correlation_id,attempts "
+                "FROM canonical_outbox WHERE attempts < ? ORDER BY created_at LIMIT ?",
+                (3, max(1, min(100, int(limit)))),
             ).fetchall()
         delivered = 0
         failed = 0
-        max_failures = 3
         for row in rows:
             try:
                 await self.ingest(
@@ -223,11 +227,10 @@ class CanonicalContinuationAdapter:
                         (type(exc).__name__, row["source_event_id"]),
                     )
                 # Skip this row and keep draining. A single undeliverable event
-                # (oversized summary, malformed content) used to break here and
-                # stall every later event behind it indefinitely.
+                # (oversized summary, malformed content) must never stall
+                # every later event behind it. ``attempts < 3`` above makes a
+                # repeatedly failing row self-quarantine on later cycles.
                 failed += 1
-                if failed >= max_failures:
-                    break
                 continue
             with self._connect() as conn:
                 conn.execute("DELETE FROM canonical_outbox WHERE source_event_id=?", (row["source_event_id"],))
