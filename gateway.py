@@ -4054,9 +4054,19 @@ class GatewayService:
             "handoff_tool_hint": handoff_tool_hint,
             "context_mode": context_mode,
         }
-        if prompt_plan is None:
+        if prompt_plan is None or prompt_plan.get("fallback_legacy"):
             stable_context, dynamic_context = (
                 self._build_injected_context_messages(**context_args))
+            if prompt_plan is not None:
+                prompt_composer_debug = {
+                    "status": prompt_plan.get(
+                        "status", "unavailable_or_mismatch"),
+                    "reason": prompt_plan.get("reason", ""),
+                    "scope": prompt_plan.get("scope", ""),
+                    "requested_identity": prompt_plan.get(
+                        "requested_identity") or {},
+                    "fallback": "gateway_legacy_injection",
+                }
         else:
             stable_context, dynamic_context, prompt_composer_debug = (
                 self._build_composed_context_messages(
@@ -4309,10 +4319,27 @@ class GatewayService:
             binding_revision = int(values["binding_revision"])
         except (TypeError, ValueError):
             raise ValueError("Prompt plan revision headers are invalid")
-        plan = self.prompt_plan_mirror.get_plan(
-            values["preset_id"], revision, include_slice=True)
+        def legacy_fallback(reason: str) -> dict[str, Any]:
+            return {
+                "fallback_legacy": True,
+                "status": "unavailable_or_mismatch",
+                "reason": str(reason or "prompt_plan_unavailable")[:160],
+                "scope": values["scope"],
+                "requested_identity": {
+                    "preset_id": values["preset_id"],
+                    "preset_revision": revision,
+                    "plan_sha256": values["plan_sha256"],
+                    "binding_revision": binding_revision,
+                },
+            }
+        try:
+            plan = self.prompt_plan_mirror.get_plan(
+                values["preset_id"], revision, include_slice=True)
+        except (PromptPlanMirrorNotFound, PromptPlanMirrorConflict,
+                PromptPlanMirrorValidationError):
+            return legacy_fallback("plan_unavailable")
         if plan["plan_sha256"] != values["plan_sha256"]:
-            raise ValueError("Prompt plan SHA does not match Gateway mirror")
+            return legacy_fallback("plan_sha_mismatch")
         conversation_id = str(
             request.headers.get("X-Guyan-Conversation-Id") or "").strip()
         binding = self.prompt_plan_mirror.get_binding(
@@ -4326,13 +4353,13 @@ class GatewayService:
                 "talk.initial", identity_id=session_id,
                 conversation_id=conversation_id)
         if binding.get("status") != "mirrored":
-            raise RuntimeError("Prompt binding mirror is not healthy")
+            return legacy_fallback("binding_unavailable")
         if (binding.get("preset_id") != values["preset_id"]
                 or int(binding.get("preset_revision") or 0) != revision
                 or binding.get("plan_sha256") != values["plan_sha256"]
                 or int(binding.get("aiz_binding_revision") or 0)
                 != binding_revision):
-            raise RuntimeError("Prompt binding mirror does not match request")
+            return legacy_fallback("binding_mismatch")
         return {
             **plan,
             "scope": values["scope"],

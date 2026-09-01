@@ -247,6 +247,21 @@ def test_request_plan_headers_require_verified_binding_and_phase(store):
     }
 
 
+def test_complete_but_missing_gateway_mirror_falls_back_to_legacy(store):
+    service = _service(store)
+    plan = service._prompt_plan_for_request(_Request(headers={
+        "X-Guyan-Prompt-Preset-Id": "preset:missing",
+        "X-Guyan-Prompt-Preset-Revision": "1",
+        "X-Guyan-Prompt-Plan-Sha256": "a" * 64,
+        "X-Guyan-Prompt-Binding-Revision": "1",
+        "X-Guyan-Prompt-Scope": "talk.initial",
+        "X-Guyan-Conversation-Id": "conv-main",
+    }), session_id="jiajia-main", continuation_phase=False)
+    assert plan["fallback_legacy"] is True
+    assert plan["status"] == "unavailable_or_mismatch"
+    assert plan["reason"] == "plan_unavailable"
+
+
 def _gateway_service_for_composer():
     service = object.__new__(GatewayService)
     service.identity = {"ai_name": "顾衍"}
