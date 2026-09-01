@@ -527,6 +527,83 @@ class PromptPlanMirrorStore:
                 ),
             }
 
+    def resolve_text(self, *, scope: str, source_id: str, live_body: str,
+                     identity_id: str = "jiajia-main",
+                     conversation_id: str = "") -> tuple[str, dict]:
+        """Resolve one standalone Gateway prompt from the derived mirror.
+
+        No binding is the exact legacy path.  The mirror never becomes an
+        editing authority; it only projects an immutable Aizizhu-owned plan.
+        """
+        scope = _identifier(scope, "scope")
+        source_id = _identifier(source_id, "source_id")
+        if source_id not in _GATEWAY_SOURCES:
+            raise PromptPlanMirrorValidationError("source_id is not a Gateway source")
+        live_body = str(live_body or "")
+        binding = self.get_binding(
+            scope, identity_id=identity_id,
+            conversation_id=conversation_id)
+        if binding.get("status") == "legacy_default":
+            return live_body, {
+                "status": "legacy_default", "binding": binding,
+                "payload_unchanged": True, "source_id": source_id,
+            }
+        if binding.get("status") != "mirrored":
+            raise PromptPlanMirrorConflict("background binding mirror is degraded")
+        plan = self.get_plan(
+            binding["preset_id"], binding["preset_revision"],
+            include_slice=True)
+        if plan["plan_sha256"] != binding["plan_sha256"]:
+            raise PromptPlanMirrorConflict("background plan SHA is stale")
+        blocks = [
+            item for item in plan["gateway_slice"].get("blocks") or []
+            if item.get("scope") == scope
+            and item.get("source_id") == source_id
+            and item.get("enabled", True)
+        ]
+        if not blocks:
+            return live_body, {
+                "status": "source_unmanaged", "binding": binding,
+                "payload_unchanged": True, "source_id": source_id,
+                "warning": "active preset has no Gateway block for source",
+            }
+        rendered = []
+        selected = []
+        for block in sorted(blocks, key=lambda item: (
+                int(item.get("order") or 0), int(item.get("priority") or 0),
+                str(item.get("block_id") or ""))):
+            mode = str(block.get("mode") or "live_source")
+            if mode == "off":
+                selected.append({"block_id": block.get("block_id"),
+                                 "mode": mode, "sha256": None})
+                continue
+            body = live_body if mode == "live_source" else str(
+                block.get("owner_body") if mode == "owner_override"
+                else block.get("frozen_body") if mode == "frozen_snapshot"
+                else "")
+            wrapper = str(block.get("wrapper_text") or "")
+            if wrapper and body:
+                body = (wrapper.replace("{{content}}", body)
+                        if "{{content}}" in wrapper else f"{wrapper}\n{body}")
+            budget = block.get("token_budget")
+            if budget not in (None, "", "all"):
+                body = body[:max(0, int(budget)) * 4]
+            if body:
+                rendered.append(body)
+            selected.append({
+                "block_id": block.get("block_id"), "mode": mode,
+                "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()
+                if body else None,
+            })
+        resolved = "\n\n".join(rendered)
+        return resolved, {
+            "status": "applied", "binding": binding,
+            "payload_unchanged": resolved == live_body,
+            "source_id": source_id, "selected_blocks": selected,
+            "resolved_sha256": hashlib.sha256(
+                resolved.encode("utf-8")).hexdigest(),
+        }
+
 
 __all__ = [
     "PromptPlanMirrorConflict", "PromptPlanMirrorError",

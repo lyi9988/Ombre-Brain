@@ -565,6 +565,7 @@ class GatewayService:
         self.raw_event_store = raw_event_store or RawEventStore(config)
         self.reminder_store = ReminderStore(config)
         self.persona_engine = persona_engine or PersonaStateEngine(config)
+        self.persona_engine.prompt_resolver = self._resolve_gateway_background_prompt
         self.dream_engine = dream_engine or DreamEngine(config)
         self.dream_cfg = config.get("dream", {}) if isinstance(config.get("dream", {}), dict) else {}
         self.dream_inject_enabled = bool(self.dream_cfg.get("inject_enabled", False))
@@ -4338,6 +4339,23 @@ class GatewayService:
             "binding": binding,
         }
 
+    def _resolve_gateway_background_prompt(
+        self, source_id: str, scope: str, live_body: str,
+    ) -> str:
+        """Project a standalone Gateway prompt from Aizizhu's mirror."""
+        try:
+            resolved, _meta = self.prompt_plan_mirror.resolve_text(
+                source_id=source_id, scope=scope, live_body=live_body,
+                identity_id=str(
+                    getattr(self.persona_engine, "canonical_session_id", "")
+                    or "jiajia-main"), conversation_id="")
+            return resolved
+        except Exception:
+            logger.exception(
+                "Prompt Composer background projection failed | scope=%s source=%s",
+                scope, source_id)
+            return str(live_body or "")
+
     def _trace_context_from_request(self, request: Request, *, session_id: str,
                                     request_type: str, client_id: str) -> dict[str, Any]:
         """Consume internal trace headers without changing H1/H2/session."""
@@ -4379,6 +4397,18 @@ class GatewayService:
             "worker_operation_id": str(request.headers.get("X-Guyan-Worker-Operation-Id") or "")[:200],
             "client_id": marker, "session_id": session_id[:160],
             "coverage": coverage, "worldbook": worldbook[:64],
+            "prompt_plan_identity": {
+                "preset_id": str(request.headers.get(
+                    PROMPT_PRESET_HEADER) or "")[:200],
+                "preset_revision": str(request.headers.get(
+                    PROMPT_REVISION_HEADER) or "")[:40],
+                "plan_sha256": str(request.headers.get(
+                    PROMPT_SHA_HEADER) or "")[:64],
+                "binding_revision": str(request.headers.get(
+                    PROMPT_BINDING_REVISION_HEADER) or "")[:40],
+                "scope": str(request.headers.get(
+                    PROMPT_SCOPE_HEADER) or "")[:120],
+            },
         }
 
     @staticmethod
@@ -4519,6 +4549,9 @@ class GatewayService:
                 or (debug.get("retrieval_runtime") or {}).get("effective_config", {}),
                 "candidate_stages": list(debug.get("candidate_stages") or []),
                 "worldbook": trace.get("worldbook") or debug.get("worldbook", {}),
+                "prompt_plan_identity": trace.get("prompt_plan_identity") or {},
+                "prompt_composer": debug.get("prompt_composer") or {
+                    "status": "legacy_default"},
             }
             detail_debug = debug.get("memory_detail_recall_debug")
             if not isinstance(detail_debug, dict):
@@ -15556,10 +15589,13 @@ class GatewayService:
         model = self.query_planner_model
         if not model:
             return None, "query_planner_model_missing"
+        planner_prompt = self._resolve_gateway_background_prompt(
+            "ombre.memory_query_planner_prompt", "memory.query_planner",
+            QUERY_PLANNER_SYSTEM_PROMPT)
         payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": QUERY_PLANNER_SYSTEM_PROMPT},
+                {"role": "system", "content": planner_prompt},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -15752,10 +15788,13 @@ class GatewayService:
             finish("no_candidate_content")
             return None
 
+        rescue_prompt = self._resolve_gateway_background_prompt(
+            "ombre.semantic_rescue_prompt", "memory.semantic_rescue",
+            SEMANTIC_RESCUE_SYSTEM_PROMPT)
         payload = {
             "model": self.semantic_rescue_model,
             "messages": [
-                {"role": "system", "content": SEMANTIC_RESCUE_SYSTEM_PROMPT},
+                {"role": "system", "content": rescue_prompt},
                 {
                     "role": "user",
                     "content": json.dumps(

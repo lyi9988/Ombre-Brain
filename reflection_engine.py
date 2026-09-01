@@ -14,6 +14,7 @@ from identity import generic_identity_names, identity_names, render_identity_tem
 from memory_edges import RELATION_TYPES, MemoryEdgeStore
 from memory_metadata import domain_prompt_options_text, normalize_domain_key
 from persona_event_selection import select_persona_events
+from prompt_plan_mirror import PromptPlanMirrorStore
 from self_anchor import is_self_anchor_bucket
 from utils import bucket_text_for_embedding, strip_wikilinks
 
@@ -395,6 +396,12 @@ class ReflectionEngine:
     def __init__(self, config: dict):
         self.config = config
         self.identity = identity_names(config)
+        gateway_cfg = config.get("gateway", {}) if isinstance(
+            config.get("gateway", {}), dict) else {}
+        self.prompt_plan_mirror = PromptPlanMirrorStore(
+            gateway_cfg.get("prompt_plan_mirror_path")
+            or os.path.join(config["buckets_dir"],
+                            "prompt_plan_mirror.sqlite3"))
         cfg = config.get("reflection", {}) if isinstance(config.get("reflection", {}), dict) else {}
         emb_cfg = config.get("embedding", {}) if isinstance(config.get("embedding", {}), dict) else {}
         persona_cfg = config.get("persona", {}) if isinstance(config.get("persona", {}), dict) else {}
@@ -701,12 +708,32 @@ class ReflectionEngine:
         self._save_daily_chat_memory_pending(payload.get("items") or [], cursor=cursor)
         return True
 
+    def _resolve_background_prompt(self, source_id: str, scope: str,
+                                   live_body: str) -> str:
+        try:
+            resolved, _meta = self.prompt_plan_mirror.resolve_text(
+                source_id=source_id, scope=scope, live_body=live_body,
+                identity_id=str(
+                    self.config.get("persona", {}).get(
+                        "canonical_session_id") or "jiajia-main"),
+                conversation_id="")
+            return resolved
+        except Exception:
+            logger.exception(
+                "Prompt Composer reflection projection failed | scope=%s source=%s",
+                scope, source_id)
+            return str(live_body or "")
+
     def _reflect_prompt(self) -> str:
-        return render_identity_template(REFLECT_PROMPT_TEMPLATE, self.identity)
+        return self._resolve_background_prompt(
+            "ombre.reflection_prompt", "memory.reflection",
+            render_identity_template(REFLECT_PROMPT_TEMPLATE, self.identity))
 
     def _diary_memory_prompt(self) -> str:
         prompt = DIARY_MEMORY_PROMPT_TEMPLATE.replace("{domain_options_text}", domain_prompt_options_text())
-        return render_identity_template(prompt, self.identity)
+        return self._resolve_background_prompt(
+            "ombre.diary_memory_prompt", "memory.reflection",
+            render_identity_template(prompt, self.identity))
 
     def _daily_chat_memory_prompt(self, max_candidates: int | None = None) -> str:
         prompt = DAILY_CHAT_MEMORY_PROMPT_TEMPLATE.replace(
@@ -716,13 +743,21 @@ class ReflectionEngine:
             "{domain_options_text}",
             domain_prompt_options_text(),
         )
-        return render_identity_template(prompt, self.identity)
+        return self._resolve_background_prompt(
+            "ombre.daily_chat_memory_prompt", "memory.daily_chat_review",
+            render_identity_template(prompt, self.identity))
 
     def _daily_chat_memory_summary_prompt(self) -> str:
-        return render_identity_template(DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE, self.identity)
+        return self._resolve_background_prompt(
+            "ombre.daily_chat_summary_prompt", "memory.daily_chat_review",
+            render_identity_template(
+                DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE, self.identity))
 
     def _daily_activity_summary_prompt(self) -> str:
-        return render_identity_template(DAILY_ACTIVITY_SUMMARY_PROMPT_TEMPLATE, self.identity)
+        return self._resolve_background_prompt(
+            "ombre.daily_activity_summary_prompt", "memory.daily_chat_review",
+            render_identity_template(
+                DAILY_ACTIVITY_SUMMARY_PROMPT_TEMPLATE, self.identity))
 
     async def enrich_bucket(
         self,
@@ -1238,7 +1273,9 @@ class ReflectionEngine:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": CLASSIFY_PROMPT},
+                {"role": "system", "content": self._resolve_background_prompt(
+                    "ombre.memory_classify_prompt", "memory.reflection",
+                    CLASSIFY_PROMPT)},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             **self._completion_options(max_tokens=self.max_tokens, temperature=self.temperature),

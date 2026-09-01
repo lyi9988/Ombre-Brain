@@ -117,6 +117,42 @@ def test_binding_reports_degraded_if_mirrored_plan_disappears(store):
     assert binding["detail"]
 
 
+def test_background_prompt_is_legacy_without_binding_and_owner_override_with_binding(store):
+    live, meta = store.resolve_text(
+        scope="memory.query_planner",
+        source_id="ombre.memory_query_planner_prompt",
+        live_body="live planner")
+    assert live == "live planner"
+    assert meta["status"] == "legacy_default"
+
+    gateway_slice = {
+        "blocks": [{
+            "block_id": "block:planner",
+            "source_id": "ombre.memory_query_planner_prompt",
+            "scope": "memory.query_planner",
+            "stage": "ombre_post_injection",
+            "mode": "owner_override",
+            "role": "system", "lane": "instruction",
+            "anchor": "instructions.end", "order": 10,
+            "priority": 10, "enabled": True,
+            "owner_body": "owner planner",
+            "wrapper_text": "BEGIN\n{{content}}\nEND",
+        }],
+    }
+    store.put_plan("preset:bg", 1, plan_sha256="9" * 64,
+                   gateway_slice=gateway_slice)
+    store.put_binding(
+        "memory.query_planner", preset_id="preset:bg",
+        preset_revision=1, plan_sha256="9" * 64,
+        aiz_binding_revision=1)
+    rendered, meta = store.resolve_text(
+        scope="memory.query_planner",
+        source_id="ombre.memory_query_planner_prompt",
+        live_body="live planner")
+    assert rendered == "BEGIN\nowner planner\nEND"
+    assert meta["status"] == "applied"
+
+
 def test_owner_override_body_is_bounded(store):
     with pytest.raises(PromptPlanMirrorValidationError):
         store.put_plan("preset:test", 1, plan_sha256="e" * 64,
@@ -199,6 +235,16 @@ def test_request_plan_headers_require_verified_binding_and_phase(store):
         service._prompt_plan_for_request(_Request(headers={
             "X-Guyan-Prompt-Preset-Id": "preset:test",
         }), session_id="jiajia-main", continuation_phase=False)
+
+    trace = service._trace_context_from_request(_Request(headers={
+        **base_headers, "X-Guyan-Prompt-Scope": "talk.initial",
+    }), session_id="jiajia-main", request_type="initial",
+        client_id="reality")
+    assert trace["prompt_plan_identity"] == {
+        "preset_id": "preset:test", "preset_revision": "1",
+        "plan_sha256": "f" * 64, "binding_revision": "3",
+        "scope": "talk.initial",
+    }
 
 
 def _gateway_service_for_composer():

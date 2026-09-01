@@ -101,6 +101,7 @@ class PersonaStateEngine:
 
     def __init__(self, config: dict, db_path: str | None = None):
         self.config = config
+        self.prompt_resolver = None
         self.identity = identity_names(config)
         self.fallback_guidance = f"根据 {self.identity['ai_name']} 当前状态自然回应，不解释隐藏状态。"
         self.persona_cfg = config.get("persona", {})
@@ -336,7 +337,13 @@ class PersonaStateEngine:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _post_reply_evaluation_prompt(self) -> str:
-        return render_identity_template(POST_REPLY_EVALUATION_PROMPT_TEMPLATE, self.identity)
+        live = render_identity_template(
+            POST_REPLY_EVALUATION_PROMPT_TEMPLATE, self.identity)
+        if callable(self.prompt_resolver):
+            return self.prompt_resolver(
+                "ombre.persona_post_reply_prompt",
+                "persona.post_reply_evaluation", live)
+        return live
 
     def _affect_session_id(self, session_id: str) -> str:
         """Map channel sessions to one identity-wide short affect state when configured."""
