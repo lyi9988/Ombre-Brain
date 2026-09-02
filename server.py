@@ -73,7 +73,7 @@ from dream_engine import DreamEngine
 from embedding_engine import EmbeddingEngine
 from favorite_tags import has_favorite_memory_tag, has_favorite_policy_tag
 from gateway_state import GatewayStateStore
-from identity import identity_names
+from identity import identity_names, render_identity_template
 from identity_semantics import IdentitySemanticStore
 from import_memory import ImportEngine
 from memory_diffusion import (
@@ -121,6 +121,12 @@ from memory_nodes import MemoryNodeStore
 from persona_engine import PersonaStateEngine
 from persona_event_selection import select_persona_events
 from portrait_engine import DailyPortraitMaintainer
+from profile_prompts import (
+    ANCHOR_PROPOSAL_PROMPT_TEMPLATE,
+    PROFILE_FACT_PROPOSAL_PROMPT_TEMPLATE,
+)
+from prompt_plan_mirror import PromptPlanMirrorStore
+from prompt_source_registry import fixed_prompt_source, render_factory_body, resolve_fixed_prompt
 from raw_events import RawEventStore
 from reflection_engine import ReflectionEngine
 from recall_diagnostics import RecallDiagnosticsLogger
@@ -162,21 +168,28 @@ def _coerce_memory_id(value) -> str:
 
 # --- Initialize core components / 初始化核心组件 ---
 bucket_mgr = BucketManager(config)                  # Bucket manager / 记忆桶管理器
-dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
+_gateway_cfg = config.get("gateway", {}) if isinstance(config.get("gateway", {}), dict) else {}
+prompt_plan_mirror = PromptPlanMirrorStore(
+    _gateway_cfg.get("prompt_plan_mirror_path")
+    or os.path.join(config.get("buckets_dir") or ".", "prompt_plan_mirror.sqlite3")
+)
+dehydrator = Dehydrator(config, prompt_plan_mirror)   # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 embedding_engine = EmbeddingEngine(config)            # Embedding engine / 向量化引擎
 reranker_engine = RerankerEngine(config)              # Reranker / 召回重排序
 recall_diagnostics = RecallDiagnosticsLogger(config)  # Recall diagnostics / 召回诊断
-import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+import_engine = ImportEngine(
+    config, bucket_mgr, dehydrator, embedding_engine, prompt_plan_mirror
+)  # Import engine / 导入引擎
 persona_engine = PersonaStateEngine(config)           # Persona state engine / 人格状态引擎
 memory_edge_store = MemoryEdgeStore(config)            # Explicit memory relationship edges / 显式记忆关系边
 entity_edge_store = EntityEdgeStore(config)            # Person/object hint edges / 人物对象轻边
 memory_node_store = MemoryNodeStore(config)            # Computable memory node index / 可计算记忆节点
 memory_moment_store = MemoryMomentStore(config)        # Structured bucket body/comment moment index / 记忆片段索引
 memory_write_gate = MemoryWriteGate(config)            # Automatic grow gate / 自动写入门卫
-reflection_engine = ReflectionEngine(config)           # Reflection worker / 关系天气与关系整理
-portrait_engine = DailyPortraitMaintainer(config)      # Daily portrait state / 每日画像状态
-dream_engine = DreamEngine(config)                     # Night dream worker / 夜梦
+reflection_engine = ReflectionEngine(config, prompt_plan_mirror)  # Reflection worker / 关系天气与关系整理
+portrait_engine = DailyPortraitMaintainer(config, prompt_plan_mirror)  # Daily portrait state / 每日画像状态
+dream_engine = DreamEngine(config, prompt_plan_mirror) # Night dream worker / 夜梦
 identity_semantic_store = IdentitySemanticStore(config) # Private relationship alias index / 私有关系语义索引
 word_map_store = WordMapStore(config)                   # Derived generic word co-occurrence index / 派生通用词图
 darkroom_store = DarkroomStore(config)                  # Private reflection room / 不回显正文的暗房
@@ -2664,40 +2677,33 @@ def _profile_fact_tags(current_tags: list | tuple | set | None, kind: str, predi
     return list(dict.fromkeys(tags))
 
 
-PROFILE_FACT_PROPOSAL_PROMPT_TEMPLATE = """你是一个证据化用户画像候选生成器。请只根据给定证据桶提出可能值得长期保存的画像事实。
-
-身份：
-- 当前用户：{user_display_name}
-- 当前 AI：{ai_name}
-
-边界：
-1. 只能提出能被证据直接支持的事实，不要补常识，不要推测。
-2. 不要提出 root prompt、pinned、protected、Core Memory 更新。
-3. 不要把短期情绪当长期画像，除非证据明确显示稳定偏好、边界、习惯、关系锚点或重要日期。
-4. 如果证据不足，返回 []。
-5. 只输出 JSON 数组，不要 markdown，不要解释。
-
-每个候选必须包含：
-{{
-  "fact": "一句可读中文事实",
-  "profile_kind": "preference|boundary|habit|identity|relationship_anchor|life_fact|work_state|other",
-  "subject": "user|ai|relationship",
-  "predicate": "snake_case_or_short_key",
-  "object": "事实对象，允许中文",
-  "evidence_bucket_id": "必须等于给定 bucket id",
-  "evidence_moment_id": "可为空",
-  "confidence": 0.0,
-  "reason": "为什么这条证据足够支撑"
-}}
-
-最多返回 3 条。"""
-
-
 def _strip_json_wrapper(raw: str) -> str:
     text = str(raw or "").strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
     return text
+
+
+def _resolve_server_fixed_prompt(source_id: str, factory_template: str) -> str:
+    """Resolve a server-owned fixed prompt and retain an explicit legacy path."""
+    try:
+        resolved, _prompt_meta = resolve_fixed_prompt(
+            prompt_plan_mirror,
+            source_id,
+            config=config,
+            identity_id=str(
+                config.get("persona", {}).get("canonical_session_id")
+                or "jiajia-main"
+            ),
+            conversation_id="",
+        )
+        return resolved
+    except Exception:
+        logger.exception("Prompt Composer server projection failed | source=%s", source_id)
+        spec = fixed_prompt_source(source_id)
+        if spec is not None:
+            return render_factory_body(spec, spec.factory_body(), config)
+        return render_identity_template(factory_template, _identity())
 
 
 async def _call_profile_fact_proposal_model(
@@ -2710,9 +2716,9 @@ async def _call_profile_fact_proposal_model(
         raise RuntimeError("dehydration API is not configured")
     meta = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
     identity = _identity()
-    prompt = PROFILE_FACT_PROPOSAL_PROMPT_TEMPLATE.format(
-        user_display_name=identity.get("user_display_name") or identity.get("user_name") or "用户",
-        ai_name=identity.get("ai_name") or "AI",
+    prompt = _resolve_server_fixed_prompt(
+        "ombre.profile_fact_proposal_prompt",
+        PROFILE_FACT_PROPOSAL_PROMPT_TEMPLATE,
     )
     content = strip_wikilinks(bucket.get("content", ""))
     if evidence_moment_id:
@@ -2824,32 +2830,6 @@ def _parse_profile_fact_proposals(
     return proposals, rejected
 
 
-ANCHOR_PROPOSAL_PROMPT_TEMPLATE = """你是一个长期锚点候选生成器。请判断给定记忆桶是否值得被人工标为 anchor。
-
-身份：
-- 当前用户：{user_display_name}
-- 当前 AI：{ai_name}
-
-边界：
-1. 只能判断这个既有 bucket 是否适合作为长期锚点，不要提出新记忆，不要改写正文。
-2. 不要建议 pinned、protected、Core Memory 或 profile_fact 更新。
-3. anchor 应该是未来长期会反复帮助理解用户、关系、承诺、重要经历或长期项目的记忆。
-4. 不要把今天很强烈但未被时间验证的短期情绪当 anchor。
-5. 如果不适合，返回 []。
-6. 只输出 JSON 数组，不要 markdown，不要解释。
-
-候选格式：
-{{
-  "bucket_id": "必须等于给定 bucket id",
-  "anchor_kind": "relationship|identity|commitment|life_event|project|preference|other",
-  "reason": "为什么它适合成为长期锚点",
-  "future_use": "以后什么场景需要它",
-  "confidence": 0.0
-}}
-
-最多返回 1 条。"""
-
-
 def _anchor_proposal_static_rejection(bucket: dict) -> str:
     meta = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
     if meta.get("anchor"):
@@ -2871,9 +2851,9 @@ async def _call_anchor_proposal_model(
         raise RuntimeError("dehydration API is not configured")
     meta = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
     identity = _identity()
-    prompt = ANCHOR_PROPOSAL_PROMPT_TEMPLATE.format(
-        user_display_name=identity.get("user_display_name") or identity.get("user_name") or "用户",
-        ai_name=identity.get("ai_name") or "AI",
+    prompt = _resolve_server_fixed_prompt(
+        "ombre.anchor_proposal_prompt",
+        ANCHOR_PROPOSAL_PROMPT_TEMPLATE,
     )
     evidence_payload = {
         "bucket_id": bucket.get("id", ""),
@@ -12552,7 +12532,7 @@ async def api_config_update(request):
             os.environ["OMBRE_REFLECTION_BASE_URL"] = reflection_cfg["base_url"]
         if "model" in r and reflection_cfg.get("model"):
             os.environ["OMBRE_REFLECTION_MODEL"] = reflection_cfg["model"]
-        reflection_engine = ReflectionEngine(config)
+        reflection_engine = ReflectionEngine(config, prompt_plan_mirror)
 
     # --- Portrait maintainer config ---
     if "portrait" in body:
@@ -12600,7 +12580,7 @@ async def api_config_update(request):
             os.environ["OMBRE_PORTRAIT_BASE_URL"] = portrait_cfg["base_url"]
         if "model" in p and portrait_cfg.get("model"):
             os.environ["OMBRE_PORTRAIT_MODEL"] = portrait_cfg["model"]
-        portrait_engine = DailyPortraitMaintainer(config)
+        portrait_engine = DailyPortraitMaintainer(config, prompt_plan_mirror)
 
     # --- Dream config ---
     if "dream" in body:
@@ -12644,7 +12624,7 @@ async def api_config_update(request):
             os.environ["OMBRE_DREAM_BASE_URL"] = str(dream_cfg["base_url"])
         if "model" in d and dream_cfg.get("model"):
             os.environ["OMBRE_DREAM_MODEL"] = str(dream_cfg["model"])
-        dream_engine = DreamEngine(config)
+        dream_engine = DreamEngine(config, prompt_plan_mirror)
 
     hot_update_status = await _hot_update_gateway_config(gateway_hot_update_payload)
     if hot_update_status:
@@ -13351,8 +13331,8 @@ if __name__ == "__main__":
             local_bucket_mgr = BucketManager(config)
             local_embedding_engine = EmbeddingEngine(config)
             local_persona_engine = PersonaStateEngine(config)
-            local_reflection_engine = ReflectionEngine(config)
-            local_portrait_engine = DailyPortraitMaintainer(config)
+            local_reflection_engine = ReflectionEngine(config, prompt_plan_mirror)
+            local_portrait_engine = DailyPortraitMaintainer(config, prompt_plan_mirror)
             local_memory_edge_store = MemoryEdgeStore(config)
             local_gateway_state_store = GatewayStateStore(os.path.join(config["buckets_dir"], "gateway_state.db"))
             while True:
@@ -13500,7 +13480,7 @@ if __name__ == "__main__":
             await asyncio.sleep(25)
             local_bucket_mgr = BucketManager(config)
             local_persona_engine = PersonaStateEngine(config)
-            local_portrait_engine = DailyPortraitMaintainer(config)
+            local_portrait_engine = DailyPortraitMaintainer(config, prompt_plan_mirror)
             while True:
                 try:
                     results = await local_portrait_engine.run_due(
@@ -13563,7 +13543,7 @@ if __name__ == "__main__":
             await asyncio.sleep(30)
             local_bucket_mgr = BucketManager(config)
             while True:
-                local_dream_engine = DreamEngine(config)
+                local_dream_engine = DreamEngine(config, prompt_plan_mirror)
                 local_embedding_engine = EmbeddingEngine(config)
                 try:
                     result = await local_dream_engine.run_due(

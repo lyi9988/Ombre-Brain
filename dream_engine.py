@@ -17,6 +17,12 @@ import yaml
 from openai import AsyncOpenAI
 
 from identity import identity_names
+from prompt_plan_mirror import PromptPlanMirrorStore
+from prompt_source_registry import (
+    fixed_prompt_source,
+    render_factory_body,
+    resolve_fixed_prompt,
+)
 from raw_events import raw_event_text_looks_injected, strip_raw_client_context
 from utils import bucket_text_for_embedding, strip_wikilinks
 
@@ -103,11 +109,18 @@ def _bool_env(name: str, fallback: bool) -> bool:
 class DreamEngine:
     """Night-Fall style latent dream generation and breath-gated surfacing."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, prompt_plan_mirror: PromptPlanMirrorStore | None = None):
         self.config = config
         self.identity = identity_names(config)
         cfg = config.get("dream", {}) if isinstance(config.get("dream", {}), dict) else {}
         state_dir = Path(config.get("state_dir") or ".").expanduser().resolve()
+        gateway_cfg = config.get("gateway", {}) if isinstance(
+            config.get("gateway", {}), dict) else {}
+        self.prompt_plan_mirror = prompt_plan_mirror or PromptPlanMirrorStore(
+            gateway_cfg.get("prompt_plan_mirror_path")
+            or os.path.join(config.get("buckets_dir") or str(state_dir),
+                            "prompt_plan_mirror.sqlite3")
+        )
 
         self.enabled = _bool_env("OMBRE_DREAM_ENABLED", bool(cfg.get("enabled", True)))
         self.auto_enabled = bool(cfg.get("auto_enabled", True))
@@ -158,6 +171,28 @@ class DreamEngine:
         self.client = None
         if self.enabled and self.api_key and self.base_url:
             self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url, timeout=60.0)
+
+    def _prompt_identity_id(self) -> str:
+        persona_cfg = self.config.get("persona", {})
+        if not isinstance(persona_cfg, dict):
+            persona_cfg = {}
+        return str(persona_cfg.get("canonical_session_id") or "jiajia-main").strip()
+
+    def _generation_prompt(self) -> str:
+        """Resolve the private dream-generation prompt through the mirror."""
+        try:
+            resolved, _meta = resolve_fixed_prompt(
+                self.prompt_plan_mirror,
+                "ombre.dream_generation_prompt",
+                config=self.config,
+                identity_id=self._prompt_identity_id(),
+                conversation_id="",
+            )
+            return resolved
+        except Exception:
+            logger.exception("Prompt Composer dream projection failed")
+            spec = fixed_prompt_source("ombre.dream_generation_prompt")
+            return render_factory_body(spec, spec.factory_body(), self.config) if spec else DREAM_PROMPT
 
     def _now(self, now: datetime | None = None) -> datetime:
         dt = now or datetime.now(self.tz)
@@ -610,7 +645,7 @@ class DreamEngine:
         options = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": DREAM_PROMPT},
+                {"role": "system", "content": self._generation_prompt()},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             "max_tokens": self.max_tokens,

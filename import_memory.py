@@ -28,6 +28,12 @@ from typing import Optional
 import jieba
 from rapidfuzz import fuzz
 
+from prompt_plan_mirror import PromptPlanMirrorStore
+from prompt_source_registry import (
+    fixed_prompt_source,
+    render_factory_body,
+    resolve_fixed_prompt,
+)
 from utils import bucket_text_for_embedding, count_tokens_approx, now_iso, strip_affect_anchor
 
 logger = logging.getLogger("ombre_brain.import")
@@ -674,11 +680,29 @@ class ImportEngine:
     将对话历史文件处理为 OB 记忆桶。
     """
 
-    def __init__(self, config: dict, bucket_mgr, dehydrator, embedding_engine=None):
+    def __init__(
+        self,
+        config: dict,
+        bucket_mgr,
+        dehydrator,
+        embedding_engine=None,
+        prompt_plan_mirror: PromptPlanMirrorStore | None = None,
+    ):
         self.config = config
         self.bucket_mgr = bucket_mgr
         self.dehydrator = dehydrator
         self.embedding_engine = embedding_engine
+        gateway_cfg = config.get("gateway", {}) if isinstance(
+            config.get("gateway", {}), dict) else {}
+        self.prompt_plan_mirror = (
+            prompt_plan_mirror
+            or getattr(dehydrator, "prompt_plan_mirror", None)
+            or PromptPlanMirrorStore(
+                gateway_cfg.get("prompt_plan_mirror_path")
+                or os.path.join(config.get("buckets_dir") or ".",
+                                "prompt_plan_mirror.sqlite3")
+            )
+        )
         import_cfg = config.get("import", {}) if isinstance(config.get("import", {}), dict) else {}
         self.chunk_target_tokens = _int_between(
             import_cfg.get("chunk_target_tokens"),
@@ -725,6 +749,28 @@ class ImportEngine:
         self._running = False
         self._chunks: list[dict] = []
         self._seen_import_hashes: set[str] = set()
+
+    def _prompt_identity_id(self) -> str:
+        persona_cfg = self.config.get("persona", {})
+        if not isinstance(persona_cfg, dict):
+            persona_cfg = {}
+        return str(persona_cfg.get("canonical_session_id") or "jiajia-main").strip()
+
+    def _extract_prompt(self) -> str:
+        """Resolve the import extraction factory through the mirror."""
+        try:
+            resolved, _meta = resolve_fixed_prompt(
+                self.prompt_plan_mirror,
+                "ombre.import_extract_prompt",
+                config=self.config,
+                identity_id=self._prompt_identity_id(),
+                conversation_id="",
+            )
+            return resolved
+        except Exception:
+            logger.exception("Prompt Composer import projection failed")
+            spec = fixed_prompt_source("ombre.import_extract_prompt")
+            return render_factory_body(spec, spec.factory_body(), self.config) if spec else IMPORT_EXTRACT_PROMPT
 
     @property
     def is_running(self) -> bool:
@@ -897,7 +943,7 @@ class ImportEngine:
         response = await self.dehydrator.client.chat.completions.create(
             model=self.dehydrator.model,
             messages=[
-                {"role": "system", "content": IMPORT_EXTRACT_PROMPT},
+                {"role": "system", "content": self._extract_prompt()},
                 {"role": "user", "content": user_content},
             ],
             max_tokens=4096,

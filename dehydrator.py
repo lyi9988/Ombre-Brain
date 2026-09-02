@@ -36,6 +36,13 @@ from openai import AsyncOpenAI
 from identity import generic_identity_names, identity_names, render_identity_template
 from memory_layers import normalize_write_classification
 from memory_metadata import domain_prompt_options_text, normalize_domain_key
+from prompt_plan_mirror import PromptPlanMirrorStore
+from prompt_source_registry import (
+    fixed_prompt_source,
+    render_factory_body,
+    render_runtime_placeholders,
+    resolve_fixed_prompt,
+)
 from utils import count_tokens_approx
 
 logger = logging.getLogger("ombre_brain.dehydrator")
@@ -251,6 +258,13 @@ ANALYZE_PROMPT_TEMPLATE = """你是一个内容分析器。请分析以下文本
 ANALYZE_PROMPT = ANALYZE_PROMPT_TEMPLATE.replace("{domain_options_text}", domain_prompt_options_text())
 
 
+# --- Short moment prompt: keep this independent from full dehydration. ---
+MOMENT_PROMPT = (
+    "你是一个记忆摘要器。请从以下正文里提取一句 15~40 字的短句，"
+    "描述核心事件或状态。只输出那句话，不要加引号、标题或解释。"
+)
+
+
 class Dehydrator:
     """
     Data dehydrator + content analyzer.
@@ -261,8 +275,15 @@ class Dehydrator:
     优先走 API，API 挂了自动降级到本地。
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, prompt_plan_mirror: PromptPlanMirrorStore | None = None):
+        self.config = config
         self.identity = identity_names(config)
+        gateway_cfg = config.get("gateway", {}) if isinstance(
+            config.get("gateway", {}), dict) else {}
+        self.prompt_plan_mirror = prompt_plan_mirror or PromptPlanMirrorStore(
+            gateway_cfg.get("prompt_plan_mirror_path")
+            or os.path.join(config["buckets_dir"], "prompt_plan_mirror.sqlite3")
+        )
         # --- Read dehydration API config / 读取脱水 API 配置 ---
         dehy_cfg = config.get("dehydration", {})
         self.api_key = dehy_cfg.get("api_key", "")
@@ -291,6 +312,43 @@ class Dehydrator:
         db_path = os.path.join(config["buckets_dir"], "dehydration_cache.db")
         self.cache_db_path = db_path
         self._init_cache_db()
+
+    def _prompt_identity_id(self) -> str:
+        persona_cfg = self.config.get("persona", {})
+        if not isinstance(persona_cfg, dict):
+            persona_cfg = {}
+        return str(persona_cfg.get("canonical_session_id") or "jiajia-main").strip()
+
+    def _resolve_prompt(
+        self,
+        source_id: str,
+        scope: str,
+        *,
+        runtime_values: dict[str, Any] | None = None,
+    ) -> str:
+        """Resolve a fixed factory through the derived mirror before a model call."""
+        try:
+            resolved, _meta = resolve_fixed_prompt(
+                self.prompt_plan_mirror,
+                source_id,
+                config=self.config,
+                identity_id=self._prompt_identity_id(),
+                conversation_id="",
+                runtime_values=runtime_values,
+            )
+            return resolved
+        except Exception:
+            logger.exception(
+                "Prompt Composer dehydrator projection failed | scope=%s source=%s",
+                scope,
+                source_id,
+            )
+            spec = fixed_prompt_source(source_id)
+            if spec is None:
+                return ""
+            factory_body = spec.factory_body()
+            rendered = render_factory_body(spec, factory_body, self.config)
+            return render_runtime_placeholders(source_id, rendered, runtime_values)
 
     def _init_cache_db(self):
         """Create dehydration cache table if not exists."""
@@ -437,7 +495,8 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": DEHYDRATE_PROMPT},
+                {"role": "system", "content": self._resolve_prompt(
+                    "ombre.dehydrate_prompt", "memory.dehydrate")},
                 {"role": "user", "content": content[:3000]},
             ],
             **self._completion_options(
@@ -454,7 +513,8 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": DIRECT_BUCKET_CAPSULE_PROMPT},
+                {"role": "system", "content": self._resolve_prompt(
+                    "ombre.direct_capsule_prompt", "memory.direct_capsule")},
                 {"role": "user", "content": content[:6000]},
             ],
             **self._completion_options(
@@ -479,7 +539,8 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": render_identity_template(MERGE_PROMPT_TEMPLATE, self.identity)},
+                {"role": "system", "content": self._resolve_prompt(
+                    "ombre.memory_merge_prompt", "memory.merge")},
                 {"role": "user", "content": user_msg},
             ],
             **self._completion_options(
@@ -573,7 +634,8 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": ANALYZE_PROMPT},
+                {"role": "system", "content": self._resolve_prompt(
+                    "ombre.memory_analyze_prompt", "memory.analyze")},
                 {"role": "user", "content": content[:2000]},
             ],
             **self._completion_options(
@@ -675,10 +737,8 @@ class Dehydrator:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": (
-                        "你是一个记忆摘要器。请从以下正文里提取一句 15~40 字的短句，"
-                        "描述核心事件或状态。只输出那句话，不要加引号、标题或解释。"
-                    )},
+                    {"role": "system", "content": self._resolve_prompt(
+                        "ombre.memory_moment_prompt", "memory.moment")},
                     {"role": "user", "content": body[:1500]},
                 ],
                 **self._completion_options(max_tokens=64, temperature=0.0),
@@ -735,7 +795,8 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": _render_dehydrator_template(DIGEST_PROMPT_TEMPLATE, self.identity)},
+                {"role": "system", "content": self._resolve_prompt(
+                    "ombre.memory_digest_prompt", "memory.digest")},
                 {"role": "user", "content": content[:5000]},
             ],
             **self._completion_options(

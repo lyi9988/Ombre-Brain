@@ -15,6 +15,12 @@ from memory_edges import RELATION_TYPES, MemoryEdgeStore
 from memory_metadata import domain_prompt_options_text, normalize_domain_key
 from persona_event_selection import select_persona_events
 from prompt_plan_mirror import PromptPlanMirrorStore
+from prompt_source_registry import (
+    fixed_prompt_source,
+    render_factory_body,
+    render_runtime_placeholders,
+    resolve_fixed_prompt,
+)
 from self_anchor import is_self_anchor_bucket
 from utils import bucket_text_for_embedding, strip_wikilinks
 
@@ -393,14 +399,18 @@ REFLECTION_FALLBACK_ANCHORS = [
 class ReflectionEngine:
     """LLM-backed memory enrichment and daily relationship weather."""
 
-    def __init__(self, config: dict):
+    def __init__(
+        self,
+        config: dict,
+        prompt_plan_mirror: PromptPlanMirrorStore | None = None,
+    ):
         self.config = config
         self.identity = identity_names(config)
         gateway_cfg = config.get("gateway", {}) if isinstance(
             config.get("gateway", {}), dict) else {}
-        self.prompt_plan_mirror = PromptPlanMirrorStore(
+        self.prompt_plan_mirror = prompt_plan_mirror or PromptPlanMirrorStore(
             gateway_cfg.get("prompt_plan_mirror_path")
-            or os.path.join(config["buckets_dir"],
+            or os.path.join(config.get("buckets_dir") or ".",
                             "prompt_plan_mirror.sqlite3"))
         cfg = config.get("reflection", {}) if isinstance(config.get("reflection", {}), dict) else {}
         emb_cfg = config.get("embedding", {}) if isinstance(config.get("embedding", {}), dict) else {}
@@ -708,56 +718,65 @@ class ReflectionEngine:
         self._save_daily_chat_memory_pending(payload.get("items") or [], cursor=cursor)
         return True
 
-    def _resolve_background_prompt(self, source_id: str, scope: str,
-                                   live_body: str) -> str:
+    def _resolve_background_prompt(
+        self,
+        source_id: str,
+        scope: str,
+        live_body: str = "",
+        *,
+        runtime_values: dict[str, Any] | None = None,
+    ) -> str:
         try:
-            resolved, _meta = self.prompt_plan_mirror.resolve_text(
-                source_id=source_id, scope=scope, live_body=live_body,
+            resolved, _meta = resolve_fixed_prompt(
+                self.prompt_plan_mirror, source_id, config=self.config,
                 identity_id=str(
                     self.config.get("persona", {}).get(
                         "canonical_session_id") or "jiajia-main"),
-                conversation_id="")
+                conversation_id="", runtime_values=runtime_values)
             return resolved
         except Exception:
             logger.exception(
                 "Prompt Composer reflection projection failed | scope=%s source=%s",
                 scope, source_id)
-            return str(live_body or "")
+            if live_body:
+                return str(live_body)
+            spec = fixed_prompt_source(source_id)
+            if spec is None:
+                return ""
+            rendered = render_factory_body(
+                spec, spec.factory_body(), self.config)
+            return render_runtime_placeholders(source_id, rendered, runtime_values)
 
     def _reflect_prompt(self) -> str:
         return self._resolve_background_prompt(
             "ombre.reflection_prompt", "memory.reflection",
-            render_identity_template(REFLECT_PROMPT_TEMPLATE, self.identity))
+            REFLECT_PROMPT_TEMPLATE)
 
     def _diary_memory_prompt(self) -> str:
-        prompt = DIARY_MEMORY_PROMPT_TEMPLATE.replace("{domain_options_text}", domain_prompt_options_text())
         return self._resolve_background_prompt(
             "ombre.diary_memory_prompt", "memory.reflection",
-            render_identity_template(prompt, self.identity))
+            DIARY_MEMORY_PROMPT_TEMPLATE)
 
     def _daily_chat_memory_prompt(self, max_candidates: int | None = None) -> str:
-        prompt = DAILY_CHAT_MEMORY_PROMPT_TEMPLATE.replace(
-            "{max_candidates}",
-            str(max(1, int(max_candidates or self.daily_chat_memory_max_per_day or 1))),
-        ).replace(
-            "{domain_options_text}",
-            domain_prompt_options_text(),
-        )
         return self._resolve_background_prompt(
             "ombre.daily_chat_memory_prompt", "memory.daily_chat_review",
-            render_identity_template(prompt, self.identity))
+            DAILY_CHAT_MEMORY_PROMPT_TEMPLATE,
+            runtime_values={
+                "max_candidates": max(
+                    1, int(max_candidates or self.daily_chat_memory_max_per_day or 1)
+                )
+            },
+        )
 
     def _daily_chat_memory_summary_prompt(self) -> str:
         return self._resolve_background_prompt(
             "ombre.daily_chat_summary_prompt", "memory.daily_chat_review",
-            render_identity_template(
-                DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE, self.identity))
+            DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE)
 
     def _daily_activity_summary_prompt(self) -> str:
         return self._resolve_background_prompt(
             "ombre.daily_activity_summary_prompt", "memory.daily_chat_review",
-            render_identity_template(
-                DAILY_ACTIVITY_SUMMARY_PROMPT_TEMPLATE, self.identity))
+            DAILY_ACTIVITY_SUMMARY_PROMPT_TEMPLATE)
 
     async def enrich_bucket(
         self,

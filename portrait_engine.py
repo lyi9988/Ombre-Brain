@@ -10,6 +10,12 @@ from zoneinfo import ZoneInfo
 from openai import AsyncOpenAI
 
 from identity import identity_names, render_identity_template
+from prompt_plan_mirror import PromptPlanMirrorStore
+from prompt_source_registry import (
+    fixed_prompt_source,
+    render_factory_body,
+    resolve_fixed_prompt,
+)
 from self_anchor import is_self_anchor_bucket
 from utils import bucket_text_for_embedding, count_tokens_approx, strip_wikilinks
 
@@ -143,13 +149,20 @@ STABLE_MAINTENANCE_PROMPT_TEMPLATE = """你是 {ai_name} 与 {user_display_name}
 class DailyPortraitMaintainer:
     """Maintains an evidence-bound portrait state outside memory buckets."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, prompt_plan_mirror: PromptPlanMirrorStore | None = None):
         self.config = config
         self.identity = identity_names(config)
         cfg = config.get("portrait", {}) if isinstance(config.get("portrait", {}), dict) else {}
         reflection_cfg = config.get("reflection", {}) if isinstance(config.get("reflection", {}), dict) else {}
         persona_cfg = config.get("persona", {}) if isinstance(config.get("persona", {}), dict) else {}
         dehy_cfg = config.get("dehydration", {}) if isinstance(config.get("dehydration", {}), dict) else {}
+        gateway_cfg = config.get("gateway", {}) if isinstance(
+            config.get("gateway", {}), dict) else {}
+        self.prompt_plan_mirror = prompt_plan_mirror or PromptPlanMirrorStore(
+            gateway_cfg.get("prompt_plan_mirror_path")
+            or os.path.join(config.get("buckets_dir") or ".",
+                            "prompt_plan_mirror.sqlite3")
+        )
 
         self.enabled = self._bool(cfg.get("enabled", True), True)
         self.auto_enabled = self._bool(cfg.get("auto_enabled", True), True)
@@ -2838,10 +2851,36 @@ class DailyPortraitMaintainer:
         return "\n\n".join(parts)
 
     def _prompt(self) -> str:
-        return render_identity_template(PORTRAIT_PROMPT_TEMPLATE, self.identity)
+        return self._resolve_prompt("ombre.portrait_patch_prompt", "portrait.patch")
 
     def _stable_prompt(self) -> str:
-        return render_identity_template(STABLE_MAINTENANCE_PROMPT_TEMPLATE, self.identity)
+        return self._resolve_prompt("ombre.portrait_stable_prompt", "portrait.stable")
+
+    def _prompt_identity_id(self) -> str:
+        persona_cfg = self.config.get("persona", {})
+        if not isinstance(persona_cfg, dict):
+            persona_cfg = {}
+        return str(persona_cfg.get("canonical_session_id") or "jiajia-main").strip()
+
+    def _resolve_prompt(self, source_id: str, scope: str) -> str:
+        """Resolve a fixed portrait prompt through the derived mirror."""
+        try:
+            resolved, _meta = resolve_fixed_prompt(
+                self.prompt_plan_mirror,
+                source_id,
+                config=self.config,
+                identity_id=self._prompt_identity_id(),
+                conversation_id="",
+            )
+            return resolved
+        except Exception:
+            logger.exception(
+                "Prompt Composer portrait projection failed | scope=%s source=%s",
+                scope,
+                source_id,
+            )
+            spec = fixed_prompt_source(source_id)
+            return render_factory_body(spec, spec.factory_body(), self.config) if spec else ""
 
     def _completion_options(
         self,

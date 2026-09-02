@@ -15,6 +15,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from prompt_source_registry import (
+    DYNAMIC_CONTEXT_SOURCES,
+    FIXED_PROMPT_SOURCES,
+    OWNER_AUTHORED_PROMPT_SOURCES,
+    RUNTIME_MECHANIC_SOURCES,
+    prompt_source_kind,
+    validate_required_placeholders,
+)
+
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _SHA_RE = re.compile(r"^[a-f0-9]{64}$")
@@ -31,21 +40,11 @@ _ANCHORS = {
     "current_user.after", "history", "current_user", "tool_exchange",
     "response_schema",
 }
-_GATEWAY_SOURCES = frozenset({
-    "ombre.core_memory", "ombre.portrait_memory", "ombre.just_now_context",
-    "ombre.date_recall", "ombre.context_mode", "ombre.active_reminders",
-    "ombre.memory_detail_request", "ombre.memory_reading_policy",
-    "ombre.recalled_memory", "ombre.targeted_memory_detail",
-    "ombre.diffused_memory", "ombre.recent_context",
-    "ombre.date_persona_trace", "ombre.handoff_hint",
-    "ombre.persona_state", "ombre.relationship_weather",
-    "ombre.favorite_memory", "ombre.dream_context",
-    "ombre.persona_post_reply_prompt", "ombre.memory_query_planner_prompt",
-    "ombre.semantic_rescue_prompt", "ombre.reflection_prompt",
-    "ombre.memory_classify_prompt", "ombre.diary_memory_prompt",
-    "ombre.daily_chat_memory_prompt", "ombre.daily_chat_summary_prompt",
-    "ombre.daily_activity_summary_prompt", "custom.gateway_block",
-})
+_GATEWAY_SOURCES = frozenset(
+    set(DYNAMIC_CONTEXT_SOURCES)
+    | set(FIXED_PROMPT_SOURCES)
+    | set(OWNER_AUTHORED_PROMPT_SOURCES)
+)
 
 
 class PromptPlanMirrorError(RuntimeError):
@@ -56,7 +55,7 @@ class PromptPlanMirrorValidationError(PromptPlanMirrorError):
     code = "prompt_plan_invalid"
 
 
-class PromptPlanMirrorConflict(PromptPlanMirrorError):
+class PromptPlanMirrorConflict(PromptPlanMirrorValidationError):
     code = "prompt_plan_conflict"
 
 
@@ -137,6 +136,17 @@ def normalize_gateway_slice(value: Any) -> dict:
         if mode == "owner_override" and not owner_body.strip():
             raise PromptPlanMirrorValidationError(
                 f"blocks[{index}] owner override body is empty")
+        body_kind = prompt_source_kind(source_id)
+        if body_kind == "dynamic_context":
+            if owner_body.strip() or frozen_body.strip():
+                # Keep the historical conflict classification for callers
+                # that attempted to mutate a dynamic source, while still
+                # making it a validation error for the stricter contract.
+                raise PromptPlanMirrorConflict(
+                    f"blocks[{index}] dynamic context cannot carry owner/frozen body")
+            if mode not in {"live_source", "off"}:
+                raise PromptPlanMirrorValidationError(
+                    f"blocks[{index}] dynamic context only supports live_source/off")
         frozen_revision = raw.get("frozen_source_revision")
         frozen_sha = str(raw.get("frozen_sha256") or "").strip().lower()
         if mode == "frozen_snapshot":
@@ -147,6 +157,14 @@ def normalize_gateway_slice(value: Any) -> dict:
             if frozen_sha != expected:
                 raise PromptPlanMirrorValidationError(
                     f"blocks[{index}] frozen snapshot SHA does not match")
+        if body_kind == "fixed_prompt" and mode in {
+                "owner_override", "frozen_snapshot"}:
+            candidate_body = owner_body if mode == "owner_override" else frozen_body
+            try:
+                validate_required_placeholders(source_id, candidate_body)
+            except ValueError as exc:
+                raise PromptPlanMirrorValidationError(
+                    f"blocks[{index}] {exc}") from exc
         if source_id == "custom.gateway_block" and mode == "live_source":
             raise PromptPlanMirrorValidationError(
                 "custom.gateway_block has no live source authority")

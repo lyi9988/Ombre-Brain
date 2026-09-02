@@ -12,6 +12,9 @@ import re
 from openai import AsyncOpenAI
 import frontmatter
 
+from prompt_plan_mirror import PromptPlanMirrorStore
+from prompt_source_registry import resolve_fixed_prompt
+
 ANALYZE_PROMPT = (
     "你是一个内容分析器。请分析以下文本，输出结构化的元数据。\n\n"
     "分析规则：\n"
@@ -42,6 +45,36 @@ DATA_DIR = "/data/dynamic"
 UNCLASS_DIR = os.path.join(DATA_DIR, "未分类")
 
 
+def _prompt_mirror_path() -> str:
+    return str(
+        os.environ.get("OMBRE_PROMPT_PLAN_MIRROR_PATH")
+        or os.environ.get("OMBRE_BUCKETS_DIR")
+        or "/data"
+    ).rstrip("/\\") + "/prompt_plan_mirror.sqlite3"
+
+
+def resolve_reclassify_prompt(
+    prompt_plan_mirror: PromptPlanMirrorStore | None = None,
+    *,
+    config: dict | None = None,
+) -> str:
+    """Resolve the reclassification factory through the Gateway mirror."""
+    store = prompt_plan_mirror or PromptPlanMirrorStore(_prompt_mirror_path())
+    try:
+        resolved, _meta = resolve_fixed_prompt(
+            store,
+            "ombre.reclassify_prompt",
+            config=config or {},
+            identity_id="jiajia-main",
+            conversation_id="",
+        )
+        return resolved
+    except Exception:
+        # Reclassify is a maintenance script and must remain usable when the
+        # optional mirror is absent/degraded; this is the explicit legacy path.
+        return ANALYZE_PROMPT
+
+
 def sanitize(name):
     name = re.sub(r'[<>:"/\\|?*\n\r]', '', name).strip()
     return name[:20] if name else "未命名"
@@ -53,6 +86,7 @@ async def reclassify():
         base_url="https://api.siliconflow.cn/v1",
         timeout=60.0,
     )
+    prompt_mirror = PromptPlanMirrorStore(_prompt_mirror_path())
 
     files = sorted(glob.glob(os.path.join(UNCLASS_DIR, "*.md")))
     print(f"找到 {len(files)} 个未分类文件\n")
@@ -68,7 +102,7 @@ async def reclassify():
             resp = await client.chat.completions.create(
                 model="deepseek-ai/DeepSeek-V3",
                 messages=[
-                    {"role": "system", "content": ANALYZE_PROMPT},
+                    {"role": "system", "content": resolve_reclassify_prompt(prompt_mirror)},
                     {"role": "user", "content": full_text[:2000]},
                 ],
                 max_tokens=256,
