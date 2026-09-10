@@ -13,12 +13,16 @@ SQLite file, and the actual production methods under test are executed:
 Coverage maps to the 18 required gateway tests (task book section IV).
 """
 import asyncio
+import json
+import logging
 import sqlite3
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from starlette.requests import Request
 
@@ -27,7 +31,11 @@ from gateway import (
     CANONICAL_SOURCE_EVENT_ID_HEADER,
     CANONICAL_TURN_PHASE_CONTINUATION,
     CANONICAL_TURN_PHASE_HEADER,
+    DEFAULT_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_GATEWAY_UPSTREAM_READ_TIMEOUT_SECONDS,
+    DEFAULT_GATEWAY_UPSTREAM_WRITE_TIMEOUT_SECONDS,
     GatewayService,
+    _default_gateway_upstream_timeout,
 )
 from gateway_state import GatewayStateStore
 
@@ -677,3 +685,371 @@ def test_existing_cross_session_claim_conflict_stops_migration_without_delete(tm
     conn = sqlite3.connect(str(db_path))
     assert conn.execute("SELECT COUNT(*) FROM conversation_turns").fetchone()[0] == 2
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Current-baseline R4: prepare snapshots, bounded upstream errors, and stream
+# cancellation telemetry.
+# ---------------------------------------------------------------------------
+
+def _snapshot_headers(scope="scope-a", h1="app:d1:c1", h2="turn:u1:assistant"):
+    return {
+        H1: h1,
+        H2: h2,
+        "X-Guyan-Conversation-Id": "conversation-1",
+        "X-Guyan-Context-Revision": "context-7",
+        "X-Guyan-Prompt-Preset-Id": "preset-main",
+        "X-Guyan-Prompt-Preset-Revision": "preset-rev-3",
+        "X-Guyan-Prompt-Plan-Sha256": "plan-sha-4",
+        "X-Guyan-Prompt-Binding-Revision": "binding-2",
+        "X-Guyan-Prompt-Scope": scope,
+    }
+
+
+def _snapshot_payload(messages, trace_id=""):
+    payload = {"model": "guyan", "messages": messages, "stream": False}
+    if trace_id:
+        payload["_ombre_trace_context"] = {"trace_id": trace_id}
+    return payload
+
+
+def _snapshot_service(tmp_path):
+    item = minimal_service(tmp_path)
+    item.persona_engine.enabled = False
+    item._route_memory_sentinel = async_return({"route": "skip"})
+    item._route_domain_sentinel = async_return({"route": "skip"})
+    item._domain_sentinel_should_skip_recall = lambda *a, **k: False
+    return item
+
+
+def test_prepare_snapshot_hits_exact_request_and_refreshes_trace_context(tmp_path):
+    item = _snapshot_service(tmp_path)
+    messages = [
+        {"role": "system", "content": "role card"},
+        {"role": "user", "content": "查一下今天的天气"},
+    ]
+    headers = _snapshot_headers()
+    _, _, first_debug = asyncio.run(item.prepare_payload(
+        _snapshot_payload(messages),
+        "jiajia",
+        include_debug=True,
+        request=make_request(headers),
+    ))
+    second, _, second_debug = asyncio.run(item.prepare_payload(
+        _snapshot_payload(messages, trace_id="trace-current"),
+        "jiajia",
+        include_debug=True,
+        request=make_request(headers),
+    ))
+
+    assert first_debug["prepare_snapshot_cache"]["status"] == "miss"
+    assert second_debug["prepare_snapshot_cache"]["status"] == "hit"
+    assert second["_ombre_trace_context"]["trace_id"] == "trace-current"
+    assert len(item._prepare_snapshots) == 1
+
+
+def test_prepare_snapshot_reuses_only_legal_tool_tail_and_keeps_new_tail(tmp_path):
+    item = _snapshot_service(tmp_path)
+    baseline = [
+        {"role": "system", "content": "role card"},
+        {"role": "user", "content": "查一下今天的天气"},
+    ]
+    headers = _snapshot_headers()
+    asyncio.run(item.prepare_payload(
+        _snapshot_payload(baseline),
+        "jiajia",
+        include_debug=True,
+        request=make_request(headers),
+    ))
+
+    first_tail = [
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call-old",
+            "type": "function",
+            "function": {"name": "weather", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call-old", "content": "old result"},
+    ]
+    _, _, first_debug = asyncio.run(item.prepare_payload(
+        _snapshot_payload([*baseline, *first_tail]),
+        "jiajia",
+        continuation_phase=True,
+        include_debug=True,
+        request=make_request({**headers, PHASE: PHASE_CONT}),
+    ))
+    second_tail = [
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call-new",
+            "type": "function",
+            "function": {"name": "weather", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call-new", "content": "new result"},
+    ]
+    prepared, _, second_debug = asyncio.run(item.prepare_payload(
+        _snapshot_payload([*baseline, *second_tail]),
+        "jiajia",
+        continuation_phase=True,
+        include_debug=True,
+        request=make_request({**headers, PHASE: PHASE_CONT}),
+    ))
+    assert first_debug["prepare_snapshot_cache"]["status"] == "hit"
+    assert second_debug["prepare_snapshot_cache"]["status"] == "hit"
+    assert prepared["messages"][-1]["content"] == "new result"
+    assert all(message.get("content") != "old result" for message in prepared["messages"])
+
+    invalid_tail = [
+        second_tail[0],
+        {"role": "tool", "tool_call_id": "wrong-call", "content": "bad"},
+    ]
+    _, _, invalid_debug = asyncio.run(item.prepare_payload(
+        _snapshot_payload([*baseline, *invalid_tail]),
+        "jiajia",
+        continuation_phase=True,
+        include_debug=True,
+        request=make_request({**headers, PHASE: PHASE_CONT}),
+    ))
+    assert "prepare_snapshot_cache" not in invalid_debug
+
+
+def test_prepare_snapshot_key_isolated_by_h1_h2_and_prompt_scope(tmp_path):
+    item = _snapshot_service(tmp_path)
+    messages = [
+        {"role": "system", "content": "role card"},
+        {"role": "user", "content": "同一轮"},
+    ]
+    _, _, first = asyncio.run(item.prepare_payload(
+        _snapshot_payload(messages),
+        "jiajia",
+        include_debug=True,
+        request=make_request(_snapshot_headers()),
+    ))
+    _, _, scope_miss = asyncio.run(item.prepare_payload(
+        _snapshot_payload(messages),
+        "jiajia",
+        include_debug=True,
+        request=make_request(_snapshot_headers(scope="scope-b")),
+    ))
+    _, _, h1_miss = asyncio.run(item.prepare_payload(
+        _snapshot_payload(messages),
+        "jiajia",
+        include_debug=True,
+        request=make_request(_snapshot_headers(h1="app:d1:c2")),
+    ))
+
+    assert first["prepare_snapshot_cache"]["status"] == "miss"
+    assert scope_miss["prepare_snapshot_cache"]["status"] == "miss"
+    assert h1_miss["prepare_snapshot_cache"]["status"] == "miss"
+    assert len(item._prepare_snapshots) == 3
+
+
+def test_prepare_snapshot_debug_contains_no_payload_body(tmp_path):
+    item = _snapshot_service(tmp_path)
+    _, _, debug = asyncio.run(item.prepare_payload(
+        _snapshot_payload([
+            {"role": "user", "content": "private body"},
+        ]),
+        "jiajia",
+        include_debug=True,
+        request=make_request(_snapshot_headers()),
+    ))
+    cache_debug = debug["prepare_snapshot_cache"]
+    assert set(cache_debug) == {
+        "status", "key_hash", "prepare_duration_ms", "age_ms", "ttl_seconds",
+    }
+    assert "private body" not in json.dumps(cache_debug, ensure_ascii=False)
+    assert cache_debug["ttl_seconds"] <= 90
+
+
+def test_default_upstream_timeout_is_explicit_and_bounded():
+    timeout = _default_gateway_upstream_timeout()
+    assert timeout.read == DEFAULT_GATEWAY_UPSTREAM_READ_TIMEOUT_SECONDS
+    assert timeout.connect == DEFAULT_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_SECONDS
+    assert timeout.write == DEFAULT_GATEWAY_UPSTREAM_WRITE_TIMEOUT_SECONDS
+    assert timeout.pool == DEFAULT_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_SECONDS
+
+
+def test_upstream_http_errors_are_coarse_and_body_safe(tmp_path):
+    item = minimal_service(tmp_path)
+    response = httpx.Response(
+        403,
+        json={"error": {"message": "provider secret", "token": "do-not-return"}},
+        headers={"Retry-After": "30"},
+    )
+    proxied = item._proxy_response(response)
+    body = json.loads(proxied.body)
+    assert proxied.status_code == 403
+    assert body["error"]["message"] == "Upstream authentication failed"
+    assert "provider secret" not in proxied.body.decode()
+    assert "do-not-return" not in proxied.body.decode()
+    assert proxied.headers["X-Ombre-Upstream-Error-Category"] == "auth"
+    assert proxied.headers["X-Ombre-Upstream-Status"] == "403"
+    assert proxied.headers["Retry-After"] == "30"
+    wrapped = httpx.Response(
+        500,
+        json={"error": {"message": "provider body"}},
+        headers={
+            "X-Ombre-Upstream-Error-Category": "auth",
+            "X-Ombre-Upstream-Status": "403",
+        },
+    )
+    wrapped_proxied = item._proxy_response(wrapped)
+    assert wrapped_proxied.headers["X-Ombre-Upstream-Error-Category"] == "auth"
+    assert wrapped_proxied.headers["X-Ombre-Upstream-Status"] == "403"
+
+
+def test_transport_errors_are_coarse_and_body_safe(tmp_path):
+    item = minimal_service(tmp_path)
+    response = item._upstream_request_error_response(
+        {"name": "provider-a"},
+        "guyan",
+        httpx.ReadTimeout("provider secret"),
+    )
+    proxied = item._proxy_response(response)
+    body = json.loads(proxied.body)
+    assert proxied.status_code == 502
+    assert body["error"]["message"] == "Upstream response timed out"
+    assert "provider secret" not in proxied.body.decode()
+    assert body["error"]["code"] == "upstream_timeout"
+    assert proxied.headers["X-Ombre-Upstream-Error-Category"] == "timeout"
+    assert proxied.headers["X-Ombre-Upstream-Timeout-Category"] == "first_byte"
+
+
+def test_stream_stall_telemetry_records_gap(caplog, tmp_path):
+    item = minimal_service(tmp_path)
+    item.upstream_stall_log_seconds = 0.5
+    telemetry = item._new_stream_telemetry()
+    telemetry["last_chunk_at"] = time.perf_counter() - 1.0
+    with caplog.at_level("INFO", logger="ombre_brain.gateway"):
+        item._note_stream_chunk_gap(
+            telemetry,
+            session_id="jiajia",
+            route="/v1/chat/completions",
+            upstream={"name": "provider-a"},
+            model="guyan",
+            upstream_model="provider-model",
+            status_code=200,
+        )
+    assert telemetry["max_gap_ms"] >= 500
+    assert telemetry["stall_count"] == 1
+    assert "Gateway stream stall" in caplog.text
+
+
+class _HangingStreamResponse:
+    def __init__(self):
+        self.status_code = 200
+        self.headers = httpx.Headers({"content-type": "text/event-stream"})
+        self.closed = False
+        self._gate = asyncio.Event()
+
+    async def aiter_bytes(self):
+        yield b'data: {"choices":[{"delta":{"content":"x"}}]}\n\n'
+        await self._gate.wait()
+
+    async def aclose(self):
+        self.closed = True
+
+
+def test_client_cancel_closes_upstream_stream(tmp_path):
+    item = minimal_service(tmp_path)
+    upstream_response = _HangingStreamResponse()
+    item._open_upstream_stream = async_return(upstream_response)
+    injection_debug = {}
+    payload = {
+        "model": "guyan",
+        "messages": [{"role": "user", "content": "stream"}],
+        "stream": True,
+    }
+
+    async def exercise():
+        response = await item._stream_upstream(
+            payload,
+            "jiajia",
+            None,
+            "stream",
+            injection_debug=injection_debug,
+        )
+        iterator = response.body_iterator
+        first = await iterator.__anext__()
+        assert b"content" in first
+        pending = asyncio.create_task(iterator.__anext__())
+        await asyncio.sleep(0)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert upstream_response.closed is True
+        assert injection_debug["stream_timing"]["cancel_propagated"] is True
+        assert injection_debug["stream_timing"]["first_byte_ms"] is not None
+
+    asyncio.run(exercise())
+
+
+def test_stream_timeout_records_first_byte_and_stall_categories(caplog, tmp_path):
+    item = minimal_service(tmp_path)
+
+    class _TimeoutResponse:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        def __init__(self, after_first_byte):
+            self.after_first_byte = after_first_byte
+            self.closed = False
+
+        async def aiter_bytes(self):
+            if self.after_first_byte:
+                yield b'data: {"choices":[{"delta":{"content":"x"}}]}\n\n'
+            raise httpx.ReadTimeout("upstream read timeout")
+
+        async def aclose(self):
+            self.closed = True
+
+    async def consume(response):
+        iterator = response.body_iterator
+        with pytest.raises(httpx.ReadTimeout):
+            while True:
+                await iterator.__anext__()
+
+    caplog.set_level(logging.INFO, logger="ombre_brain.gateway")
+
+    first_byte = _TimeoutResponse(after_first_byte=False)
+    first_debug = {}
+    item._open_upstream_stream = async_return(first_byte)
+    first_response = asyncio.run(item._stream_upstream(
+        {"model": "guyan", "stream": True, "messages": []},
+        "jiajia",
+        [],
+        "hello",
+        injection_debug=first_debug,
+    ))
+    asyncio.run(consume(first_response))
+
+    stall = _TimeoutResponse(after_first_byte=True)
+    stall_debug = {}
+    item._open_upstream_stream = async_return(stall)
+    stall_response = asyncio.run(item._stream_upstream(
+        {"model": "guyan", "stream": True, "messages": []},
+        "jiajia",
+        [],
+        "hello",
+        injection_debug=stall_debug,
+    ))
+    asyncio.run(consume(stall_response))
+
+    first_timing = first_debug["stream_timing"]
+    stall_timing = stall_debug["stream_timing"]
+    assert first_timing["first_byte_ms"] is None
+    assert first_timing["upstream_timeout_category"] == "first_byte"
+    assert stall_timing["first_byte_ms"] is not None
+    assert stall_timing["upstream_timeout_category"] == "stream_stall"
+    assert first_byte.closed is True
+    assert stall.closed is True
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "first_byte_ms=None" in message
+        and "upstream_timeout_category=first_byte" in message
+        for message in messages
+    )
+    assert any(
+        "first_byte_ms=" in message
+        and "upstream_timeout_category=stream_stall" in message
+        for message in messages
+    )
