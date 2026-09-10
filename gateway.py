@@ -136,7 +136,29 @@ GENERIC_LEXICAL_STOPWORD_KEYS = frozenset(
 )
 FAVORITE_MEMORY_MARKER = "[[ombre:favorite]]"
 RETRYABLE_UPSTREAM_STATUS_CODES = {401, 403, 429, 500, 502, 503, 504}
+# Upstream header/first-byte and per-chunk read bounds stay below Aizizhu's
+# 45-second client read bound. The 300-second whole-turn watchdog is separate.
+DEFAULT_GATEWAY_UPSTREAM_READ_TIMEOUT_SECONDS = 32.0
+DEFAULT_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_SECONDS = 8.0
+DEFAULT_GATEWAY_UPSTREAM_WRITE_TIMEOUT_SECONDS = 15.0
+DEFAULT_PREPARE_SNAPSHOT_TTL_SECONDS = 90.0
+DEFAULT_PREPARE_SNAPSHOT_MAX_ENTRIES = 64
+UPSTREAM_ERROR_CATEGORY_HEADER = "X-Ombre-Upstream-Error-Category"
+UPSTREAM_STATUS_HEADER = "X-Ombre-Upstream-Status"
+UPSTREAM_TIMEOUT_CATEGORY_HEADER = "X-Ombre-Upstream-Timeout-Category"
 DUPLICATE_CONVERSATION_TURN_WINDOW_SECONDS = 120
+
+
+def _default_gateway_upstream_timeout() -> httpx.Timeout:
+    return httpx.Timeout(
+        DEFAULT_GATEWAY_UPSTREAM_READ_TIMEOUT_SECONDS,
+        connect=DEFAULT_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+        write=DEFAULT_GATEWAY_UPSTREAM_WRITE_TIMEOUT_SECONDS,
+        pool=DEFAULT_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+        read=DEFAULT_GATEWAY_UPSTREAM_READ_TIMEOUT_SECONDS,
+    )
+
+
 DOMAIN_SENTINEL_ALLOWED_DOMAINS = frozenset(
     {
         "relationship",
@@ -662,6 +684,29 @@ class GatewayService:
             float(self.gateway_cfg.get("bucket_list_cache_ttl_seconds", 300)),
         )
         self._bucket_list_cache: dict[bool, dict[str, Any]] = {}
+        self.prepare_snapshot_ttl_seconds = max(
+            0.0,
+            min(
+                120.0,
+                float(self.gateway_cfg.get(
+                    "prepare_snapshot_ttl_seconds",
+                    DEFAULT_PREPARE_SNAPSHOT_TTL_SECONDS,
+                )),
+            ),
+        )
+        self.prepare_snapshot_max_entries = max(
+            8,
+            min(
+                256,
+                int(self.gateway_cfg.get(
+                    "prepare_snapshot_max_entries",
+                    DEFAULT_PREPARE_SNAPSHOT_MAX_ENTRIES,
+                )),
+            ),
+        )
+        # Process-local only. Never persisted or exposed as a second prompt
+        # or memory authority.
+        self._prepare_snapshots: dict[str, dict[str, Any]] = {}
         self.diffusion_options = diffusion_options_from_config(config)
         self.diffusion_inject_max_items = max(
             0,
@@ -831,7 +876,9 @@ class GatewayService:
         self.upstream_key_cooldowns: dict[tuple[str, str], float] = {}
         self.pending_tool_reasoning: dict[str, dict[tuple[str, ...], dict[str, Any]]] = {}
 
-        self.http_client = http_client or httpx.AsyncClient(timeout=60.0)
+        self.http_client = http_client or httpx.AsyncClient(
+            timeout=_default_gateway_upstream_timeout()
+        )
         canonical_cfg = (
             self.gateway_cfg.get("canonical_continuation", {})
             if isinstance(self.gateway_cfg.get("canonical_continuation", {}), dict)
@@ -2080,6 +2127,7 @@ class GatewayService:
                     else "compact"
                 ),
                 continuation_phase=continuation_phase,
+                request=request,
             )
             if isinstance(injection_debug, dict):
                 injection_debug["canonical_continuation"] = canonical_state
@@ -2239,6 +2287,7 @@ class GatewayService:
                     else "compact"
                 ),
                 continuation_phase=continuation_phase,
+                request=request,
             )
             if isinstance(injection_debug, dict):
                 injection_debug["canonical_continuation"] = canonical_state
@@ -2725,6 +2774,330 @@ class GatewayService:
         self._moment_graph_cache_edge_stamp = (0, 0)
         self._moment_graph_cache_store_stamp = (0, 0)
 
+    def _prepare_snapshot_baseline(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        continuation_phase: bool,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+        if not isinstance(messages, list) or not messages:
+            return None
+        if not continuation_phase:
+            return deepcopy(messages), []
+
+        current_user_index: int | None = None
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            if role in {"system", "developer", "tool", "function"}:
+                continue
+            if role == "assistant":
+                if message.get("tool_calls"):
+                    continue
+                continue
+            if role != "user":
+                continue
+            content = self._coerce_message_text(message.get("content"))
+            if self._strip_external_context_from_user_text(content).strip():
+                current_user_index = index
+                break
+        if current_user_index is None or current_user_index >= len(messages) - 1:
+            return None
+        tail = messages[current_user_index + 1 :]
+        if not any(
+            isinstance(message, dict) and self._message_has_tool_protocol(message)
+            for message in tail
+        ):
+            return None
+        return deepcopy(messages[: current_user_index + 1]), deepcopy(tail)
+
+    @staticmethod
+    def _prepare_snapshot_messages_sha256(messages: list[dict[str, Any]]) -> str:
+        serialized = json.dumps(
+            messages,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _prepare_snapshot_identity(
+        self,
+        payload: dict[str, Any],
+        session_id: str,
+        *,
+        continuation_phase: bool,
+        request: Request | None = None,
+        snapshot_identity: dict[str, Any] | None = None,
+        include_favorite_memory: bool = False,
+        include_debug: bool = False,
+        debug_detail: str = "full",
+    ) -> dict[str, Any] | None:
+        identity = dict(snapshot_identity or {})
+        headers = request.headers if request is not None else {}
+
+        def header_or_value(key: str, *header_names: str) -> str:
+            value = identity.get(key)
+            if value is None:
+                for header_name in header_names:
+                    value = headers.get(header_name)
+                    if value:
+                        break
+            return str(value or "").strip()
+
+        h1 = header_or_value(
+            "h1",
+            CANONICAL_SOURCE_EVENT_ID_HEADER,
+        )
+        h2 = header_or_value(
+            "h2",
+            CANONICAL_ASSISTANT_SOURCE_EVENT_ID_HEADER,
+        )
+        if not h1 or not h2:
+            # H1/H2 are the cross-request origin proof. Without both, caching
+            # could accidentally span two ordinary sessions with equal input.
+            return None
+
+        messages = payload.get("messages")
+        baseline = self._prepare_snapshot_baseline(
+            messages,
+            continuation_phase=continuation_phase,
+        )
+        if baseline is None:
+            return None
+        baseline_messages, tool_tail = baseline
+        baseline_sha = self._prepare_snapshot_messages_sha256(baseline_messages)
+        payload_options = {
+            key: value
+            for key, value in payload.items()
+            if key != "messages"
+        }
+        payload_options_sha = self._prepare_snapshot_messages_sha256(
+            [payload_options])
+        conversation_id = header_or_value(
+            "conversation_id",
+            "X-Guyan-Conversation-Id",
+            "X-Ombre-Conversation-Id",
+        )
+        context_revision = header_or_value(
+            "context_revision",
+            "X-Guyan-Context-Revision",
+        )
+        prompt_revision_parts = [
+            header_or_value("prompt_preset_id", "X-Guyan-Prompt-Preset-Id"),
+            header_or_value(
+                "prompt_preset_revision",
+                "X-Guyan-Prompt-Preset-Revision",
+            ),
+            header_or_value("prompt_plan_sha256", "X-Guyan-Prompt-Plan-Sha256"),
+            header_or_value(
+                "prompt_binding_revision",
+                "X-Guyan-Prompt-Binding-Revision",
+            ),
+            context_revision,
+        ]
+        prompt_context_revision = "|".join(prompt_revision_parts)
+        key_material = {
+            "h1": h1,
+            "h2": h2,
+            "conversation_id": conversation_id,
+            "session_id": str(session_id or "").strip(),
+            "model": str(payload.get("model") or "").strip(),
+            "prompt_context_revision": prompt_context_revision,
+            "input_baseline_sha256": baseline_sha,
+            "input_options_sha256": payload_options_sha,
+            "include_favorite_memory": bool(include_favorite_memory),
+            "include_debug": bool(include_debug),
+            "debug_detail": str(debug_detail or "full").strip().lower(),
+            "stream": payload.get("stream") is True,
+        }
+        key_hash = hashlib.sha256(
+            json.dumps(
+                key_material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        return {
+            **key_material,
+            "key_hash": key_hash,
+            "baseline_messages": baseline_messages,
+            "tool_tail": tool_tail,
+            "source_phase": "continuation" if continuation_phase else "initial",
+        }
+
+    def _prepare_snapshot_get(self, key_hash: str) -> dict[str, Any] | None:
+        cache = getattr(self, "_prepare_snapshots", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._prepare_snapshots = cache
+        now = time.monotonic()
+        for key, entry in list(cache.items()):
+            if not isinstance(entry, dict) or float(entry.get("expires_at", 0.0)) <= now:
+                cache.pop(key, None)
+        entry = cache.get(key_hash)
+        return entry if isinstance(entry, dict) else None
+
+    def _prepare_snapshot_store(
+        self,
+        identity: dict[str, Any],
+        *,
+        prepared_payload: dict[str, Any],
+        base_forward_messages: list[dict[str, Any]],
+        stable_context: str,
+        dynamic_context: str,
+        injected_ids: list[str] | None,
+        debug_payload: dict[str, Any] | None,
+    ) -> None:
+        ttl = float(getattr(
+            self,
+            "prepare_snapshot_ttl_seconds",
+            DEFAULT_PREPARE_SNAPSHOT_TTL_SECONDS,
+        ) or 0.0)
+        if ttl <= 0:
+            return
+        cache = getattr(self, "_prepare_snapshots", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._prepare_snapshots = cache
+        now = time.monotonic()
+        key_hash = str(identity.get("key_hash") or "")
+        if not key_hash:
+            return
+        cache[key_hash] = {
+            "created_at": now,
+            "expires_at": now + ttl,
+            "source_phase": identity.get("source_phase"),
+            "input_baseline_sha256": identity.get("input_baseline_sha256"),
+            "prepared_payload": deepcopy(prepared_payload),
+            "base_forward_messages": deepcopy(base_forward_messages),
+            "stable_context": str(stable_context or ""),
+            "dynamic_context": str(dynamic_context or ""),
+            "injected_ids": list(injected_ids or []),
+            "debug_payload": deepcopy(debug_payload) if debug_payload is not None else None,
+        }
+        max_entries = max(
+            8,
+            min(
+                256,
+                int(getattr(
+                    self,
+                    "prepare_snapshot_max_entries",
+                    DEFAULT_PREPARE_SNAPSHOT_MAX_ENTRIES,
+                )),
+            ),
+        )
+        while len(cache) > max_entries:
+            oldest_key = min(
+                cache,
+                key=lambda item: float(cache[item].get("created_at", 0.0)),
+            )
+            cache.pop(oldest_key, None)
+
+    def _prepare_snapshot_cache_debug(
+        self,
+        *,
+        status: str,
+        key_hash: str,
+        duration_ms: int,
+        age_ms: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "status": str(status),
+            "key_hash": str(key_hash),
+            "prepare_duration_ms": max(0, int(duration_ms)),
+            "age_ms": None if age_ms is None else max(0, int(age_ms)),
+            "ttl_seconds": float(getattr(
+                self,
+                "prepare_snapshot_ttl_seconds",
+                DEFAULT_PREPARE_SNAPSHOT_TTL_SECONDS,
+            )),
+        }
+
+    def _prepare_snapshot_replay(
+        self,
+        entry: dict[str, Any],
+        identity: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        continuation_phase: bool,
+        started_at: float,
+        include_debug: bool,
+    ) -> tuple[dict[str, Any], list[str] | None] | tuple[
+        dict[str, Any], list[str] | None, dict[str, Any]
+    ] | None:
+        prepared_payload = entry.get("prepared_payload")
+        base_forward_messages = entry.get("base_forward_messages")
+        stable_context = entry.get("stable_context")
+        dynamic_context = entry.get("dynamic_context")
+        injected_ids = entry.get("injected_ids")
+        debug_payload = entry.get("debug_payload")
+        if (
+            not isinstance(prepared_payload, dict)
+            or not isinstance(base_forward_messages, list)
+            or not isinstance(stable_context, str)
+            or not isinstance(dynamic_context, str)
+            or not isinstance(injected_ids, list)
+            or (include_debug and not isinstance(debug_payload, dict))
+        ):
+            return None
+
+        source_phase = str(entry.get("source_phase") or "")
+        if not continuation_phase:
+            if source_phase != "initial":
+                return None
+            forward_payload = deepcopy(prepared_payload)
+        else:
+            tool_tail = identity.get("tool_tail")
+            if (
+                not isinstance(identity.get("baseline_messages"), list)
+                or not isinstance(tool_tail, list)
+                or not tool_tail
+            ):
+                return None
+            if entry.get("input_baseline_sha256") != identity.get("input_baseline_sha256"):
+                return None
+            forward_payload = deepcopy(payload)
+            forward_messages = [*deepcopy(base_forward_messages), *deepcopy(tool_tail)]
+            self._restore_cached_reasoning_content(
+                str(identity.get("session_id") or ""),
+                forward_messages,
+            )
+            forward_payload["messages"] = self._inject_context_messages(
+                forward_messages,
+                stable_context,
+                dynamic_context,
+            )
+            self._apply_prompt_cache_hints(forward_payload, str(
+                identity.get("session_id") or ""))
+            forward_payload["stream"] = payload.get("stream") is True
+
+        duration_ms = max(0, int((time.perf_counter() - started_at) * 1000))
+        age_ms = max(
+            0,
+            int((time.monotonic() - float(entry.get("created_at") or 0.0)) * 1000),
+        )
+        cache_debug = self._prepare_snapshot_cache_debug(
+            status="hit",
+            key_hash=str(identity.get("key_hash") or ""),
+            duration_ms=duration_ms,
+            age_ms=age_ms,
+        )
+        if not include_debug:
+            return forward_payload, list(injected_ids)
+        debug = deepcopy(debug_payload)
+        debug["prepare_snapshot_cache"] = cache_debug
+        timing = debug.get("prepare_timing_debug")
+        if isinstance(timing, dict):
+            timing["total_ms"] = cache_debug["prepare_duration_ms"]
+            timing["steps_ms"] = {"prepare_snapshot_lookup": cache_debug["prepare_duration_ms"]}
+            timing["prepare_snapshot_cache"] = cache_debug
+        return forward_payload, list(injected_ids), debug
+
     async def prepare_payload(
         self,
         payload: dict,
@@ -2734,6 +3107,8 @@ class GatewayService:
         include_debug: bool = False,
         debug_detail: str = "full",
         continuation_phase: bool = False,
+        request: Request | None = None,
+        snapshot_identity: dict[str, Any] | None = None,
     ) -> tuple[dict, list[str] | None] | tuple[dict, list[str] | None, dict[str, Any]]:
         prepare_started_at = time.perf_counter()
         prepare_steps_ms: dict[str, int] = {}
@@ -2752,6 +3127,45 @@ class GatewayService:
             raise ValueError("model is required when gateway.upstream_default_model is empty")
         self._get_upstream_for_model(model)
         mark_step("resolve_model", stage_started_at)
+
+        snapshot_meta = self._prepare_snapshot_identity(
+            payload,
+            session_id,
+            continuation_phase=continuation_phase,
+            request=request,
+            snapshot_identity=snapshot_identity,
+            include_favorite_memory=include_favorite_memory,
+            include_debug=include_debug,
+            debug_detail=debug_detail,
+        )
+        if snapshot_meta is not None:
+            snapshot_entry = self._prepare_snapshot_get(
+                str(snapshot_meta.get("key_hash") or ""))
+            if snapshot_entry is not None:
+                replay_started_at = time.perf_counter()
+                replay = self._prepare_snapshot_replay(
+                    snapshot_entry,
+                    snapshot_meta,
+                    payload,
+                    continuation_phase=continuation_phase,
+                    started_at=replay_started_at,
+                    include_debug=include_debug,
+                )
+                if replay is not None:
+                    replay_debug = replay[2] if len(replay) > 2 else {}
+                    logger.info(
+                        "Gateway prepare snapshot hit | session=%s model=%s "
+                        "continuation=%s key_hash=%s duration_ms=%s",
+                        session_id,
+                        model,
+                        continuation_phase,
+                        snapshot_meta.get("key_hash"),
+                        replay_debug.get("prepare_duration_ms"),
+                    )
+                    return replay
+                cache = getattr(self, "_prepare_snapshots", None)
+                if isinstance(cache, dict):
+                    cache.pop(str(snapshot_meta.get("key_hash") or ""), None)
 
         stage_started_at = time.perf_counter()
         all_buckets = await self._list_gateway_buckets(include_archive=False)
@@ -3393,9 +3807,36 @@ class GatewayService:
             prepare_timing_debug["total_ms"] = max(0, int((time.perf_counter() - prepare_started_at) * 1000))
             prepare_timing_debug["steps_ms"] = dict(prepare_steps_ms)
             debug_payload["prepare_timing_debug"] = prepare_timing_debug
+            if snapshot_meta is not None:
+                snapshot_debug = self._prepare_snapshot_cache_debug(
+                    status="miss",
+                    key_hash=str(snapshot_meta.get("key_hash") or ""),
+                    duration_ms=prepare_timing_debug["total_ms"],
+                )
+                prepare_timing_debug["prepare_snapshot_cache"] = snapshot_debug
+                debug_payload["prepare_snapshot_cache"] = snapshot_debug
+                self._prepare_snapshot_store(
+                    snapshot_meta,
+                    prepared_payload=forward_payload,
+                    base_forward_messages=messages_for_forward,
+                    stable_context=stable_context,
+                    dynamic_context=dynamic_context,
+                    injected_ids=injected_ids,
+                    debug_payload=debug_payload,
+                )
             log_prepare_timing()
             return forward_payload, injected_ids, debug_payload
         log_prepare_timing()
+        if snapshot_meta is not None:
+            self._prepare_snapshot_store(
+                snapshot_meta,
+                prepared_payload=forward_payload,
+                base_forward_messages=messages_for_forward,
+                stable_context=stable_context,
+                dynamic_context=dynamic_context,
+                injected_ids=injected_ids,
+                debug_payload=None,
+            )
         return forward_payload, injected_ids
 
     def _apply_prompt_cache_hints(self, payload: dict[str, Any], session_id: str) -> None:
@@ -3802,7 +4243,9 @@ class GatewayService:
             await upstream_response.aclose()
             logger.info(
                 "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
-                "status=%s error_response=true header_ms=%s body_read_ms=%s total_ms=%s",
+                "status=%s error_response=true header_ms=%s body_read_ms=%s total_ms=%s "
+                "first_byte_ms=%s stream_stall_ms=%s cancel_propagated=%s "
+                "upstream_timeout_category=%s",
                 session_id,
                 "/v1/chat/completions",
                 upstream.get("name"),
@@ -3812,17 +4255,27 @@ class GatewayService:
                 upstream_headers_ms,
                 max(0, int((time.perf_counter() - body_read_started_at) * 1000)),
                 max(0, int((time.perf_counter() - stream_started_at) * 1000)),
+                None,
+                None,
+                False,
+                self._header_value(
+                    upstream_response.headers,
+                    UPSTREAM_TIMEOUT_CATEGORY_HEADER,
+                ),
             )
-            return Response(
-                content=body,
-                status_code=upstream_response.status_code,
-                media_type=content_type,
+            return self._proxy_response(
+                httpx.Response(
+                    status_code=upstream_response.status_code,
+                    content=body,
+                    headers=upstream_response.headers,
+                )
             )
 
         async def stream_body():
             finalized = False
             stream_state = self._new_stream_capture_state()
             body_started_at = time.perf_counter()
+            stream_timing = self._new_stream_timing_state()
             first_chunk_ms: int | None = None
             header_to_first_chunk_ms: int | None = None
             chunk_count = 0
@@ -3833,6 +4286,10 @@ class GatewayService:
                 if finalized:
                     return
                 finalized = True
+                self._record_stream_timing_debug(
+                    injection_debug,
+                    stream_timing,
+                )
                 await self._finalize_stream_turn(
                     session_id=session_id,
                     model=model,
@@ -3845,7 +4302,12 @@ class GatewayService:
                 )
 
             try:
-                async for chunk in upstream_response.aiter_bytes():
+                async for chunk in self._iter_upstream_bytes(
+                    upstream_response,
+                    stream_timing,
+                    stream_started_at=stream_started_at,
+                    body_started_at=body_started_at,
+                ):
                     if chunk:
                         chunk_count += 1
                         byte_count += len(chunk)
@@ -3873,11 +4335,16 @@ class GatewayService:
                         yield chunk
                 self._consume_stream_capture_chunk(stream_state, b"", final=True)
                 await finalize_once()
+            except asyncio.CancelledError:
+                stream_timing["cancel_propagated"] = True
+                raise
             finally:
                 logger.info(
                     "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
-                    "status=%s header_ms=%s first_chunk_ms=%s header_to_first_chunk_ms=%s "
-                    "body_ms=%s total_ms=%s chunks=%s bytes=%s finalized=%s seen_done=%s",
+                    "status=%s header_ms=%s first_chunk_ms=%s first_byte_ms=%s "
+                    "header_to_first_chunk_ms=%s stream_stall_ms=%s cancel_propagated=%s "
+                    "upstream_timeout_category=%s body_ms=%s total_ms=%s chunks=%s "
+                    "bytes=%s finalized=%s seen_done=%s",
                     session_id,
                     "/v1/chat/completions",
                     upstream.get("name"),
@@ -3886,7 +4353,11 @@ class GatewayService:
                     upstream_response.status_code,
                     upstream_headers_ms,
                     first_chunk_ms,
+                    stream_timing.get("first_byte_ms"),
                     header_to_first_chunk_ms,
+                    stream_timing.get("stream_stall_ms"),
+                    bool(stream_timing.get("cancel_propagated")),
+                    stream_timing.get("upstream_timeout_category"),
                     max(0, int((time.perf_counter() - body_started_at) * 1000)),
                     max(0, int((time.perf_counter() - stream_started_at) * 1000)),
                     chunk_count,
@@ -5247,7 +5718,129 @@ class GatewayService:
             cache_creation_tokens,
         )
 
+    @staticmethod
+    def _header_value(headers: Any, header_name: str) -> Any:
+        if not headers:
+            return None
+        try:
+            value = headers.get(header_name)
+        except (AttributeError, TypeError):
+            value = None
+        if value is not None:
+            return value
+        try:
+            items = headers.items()
+        except (AttributeError, TypeError):
+            return None
+        lowered = str(header_name).lower()
+        for key, value in items:
+            if str(key).lower() == lowered:
+                return value
+        return None
+
+    @staticmethod
+    def _upstream_error_category(
+        status_code: int,
+        error: BaseException | None = None,
+    ) -> str:
+        status = int(status_code or 0)
+        if status in {401, 403}:
+            return "auth"
+        if status == 429:
+            return "rate_limit"
+        if error is not None:
+            name = type(error).__name__.lower()
+            message = str(error).lower()
+            if "connect" in name or "connection" in message:
+                return "connect"
+            if "timeout" in name or "timeout" in message:
+                return "timeout"
+        if status >= 500:
+            return "server_error"
+        return "upstream_error"
+
+    @classmethod
+    def _safe_upstream_error_headers(
+        cls,
+        upstream_response: httpx.Response,
+        *,
+        category: str,
+        timeout_category: str = "",
+    ) -> dict[str, str]:
+        status = int(upstream_response.status_code or 0)
+        upstream_status = str(cls._header_value(
+            upstream_response.headers,
+            UPSTREAM_STATUS_HEADER,
+        ) or "").strip()
+        try:
+            parsed_upstream_status = int(upstream_status)
+        except (TypeError, ValueError):
+            parsed_upstream_status = None
+        if parsed_upstream_status is None or not 100 <= parsed_upstream_status <= 599:
+            parsed_upstream_status = status
+        headers = {
+            UPSTREAM_ERROR_CATEGORY_HEADER: str(category),
+            UPSTREAM_STATUS_HEADER: str(parsed_upstream_status),
+        }
+        if timeout_category:
+            headers[UPSTREAM_TIMEOUT_CATEGORY_HEADER] = str(timeout_category)
+        retry_after = cls._header_value(upstream_response.headers, "retry-after")
+        if retry_after and len(str(retry_after)) <= 64:
+            headers["Retry-After"] = str(retry_after)
+        return headers
+
+    def _safe_upstream_error_response(
+        self,
+        upstream_response: httpx.Response,
+        *,
+        category: str | None = None,
+        timeout_category: str = "",
+    ) -> JSONResponse:
+        existing_category = str(self._header_value(
+            upstream_response.headers,
+            UPSTREAM_ERROR_CATEGORY_HEADER,
+        ) or "").strip().lower()
+        if existing_category not in {
+            "auth", "rate_limit", "timeout", "connect",
+            "server_error", "upstream_error",
+        }:
+            existing_category = ""
+        category = category or existing_category or self._upstream_error_category(
+            upstream_response.status_code)
+        timeout_category = timeout_category or str(
+            self._header_value(
+                upstream_response.headers,
+                UPSTREAM_TIMEOUT_CATEGORY_HEADER,
+            ) or "").strip()
+        messages = {
+            "auth": "Upstream authentication failed",
+            "rate_limit": "Upstream rate limit reached",
+            "timeout": "Upstream response timed out",
+            "connect": "Upstream connection failed",
+            "server_error": "Upstream server failed",
+            "upstream_error": "Upstream request failed",
+        }
+        error_type = "authentication_error" if category == "auth" else "upstream_error"
+        return JSONResponse(
+            {
+                "error": {
+                    "message": messages.get(category, messages["upstream_error"]),
+                    "type": error_type,
+                    "code": f"upstream_{category}",
+                    "status": int(upstream_response.status_code or 0),
+                }
+            },
+            status_code=int(upstream_response.status_code or 502),
+            headers=self._safe_upstream_error_headers(
+                upstream_response,
+                category=category,
+                timeout_category=timeout_category,
+            ),
+        )
+
     def _proxy_response(self, upstream_response: httpx.Response) -> Response:
+        if int(upstream_response.status_code or 0) >= 400:
+            return self._safe_upstream_error_response(upstream_response)
         content_type = upstream_response.headers.get("content-type", "application/json")
         try:
             body = upstream_response.json()
@@ -6082,7 +6675,9 @@ class GatewayService:
             await upstream_response.aclose()
             logger.info(
                 "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
-                "status=%s error_response=true header_ms=%s body_read_ms=%s total_ms=%s",
+                "status=%s error_response=true header_ms=%s body_read_ms=%s total_ms=%s "
+                "first_byte_ms=%s stream_stall_ms=%s cancel_propagated=%s "
+                "upstream_timeout_category=%s",
                 session_id,
                 "/v1/messages",
                 upstream.get("name"),
@@ -6092,6 +6687,13 @@ class GatewayService:
                 upstream_headers_ms,
                 max(0, int((time.perf_counter() - body_read_started_at) * 1000)),
                 max(0, int((time.perf_counter() - stream_started_at) * 1000)),
+                None,
+                None,
+                False,
+                self._header_value(
+                    upstream_response.headers,
+                    UPSTREAM_TIMEOUT_CATEGORY_HEADER,
+                ),
             )
             return self._proxy_anthropic_error_response(
                 httpx.Response(
@@ -6105,6 +6707,7 @@ class GatewayService:
             finalized = False
             stream_state = self._new_stream_capture_state()
             body_started_at = time.perf_counter()
+            stream_timing = self._new_stream_timing_state()
             first_chunk_ms: int | None = None
             header_to_first_chunk_ms: int | None = None
             chunk_count = 0
@@ -6121,6 +6724,10 @@ class GatewayService:
                 if finalized:
                     return
                 finalized = True
+                self._record_stream_timing_debug(
+                    injection_debug,
+                    stream_timing,
+                )
                 await self._finalize_stream_turn(
                     session_id=session_id,
                     model=model,
@@ -6151,7 +6758,12 @@ class GatewayService:
                     },
                 )
 
-                async for chunk in upstream_response.aiter_bytes():
+                async for chunk in self._iter_upstream_bytes(
+                    upstream_response,
+                    stream_timing,
+                    stream_started_at=stream_started_at,
+                    body_started_at=body_started_at,
+                ):
                     if not chunk:
                         continue
                     chunk_count += 1
@@ -6287,11 +6899,16 @@ class GatewayService:
                     "message_stop",
                     {"type": "message_stop"},
                 )
+            except asyncio.CancelledError:
+                stream_timing["cancel_propagated"] = True
+                raise
             finally:
                 logger.info(
                     "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
-                    "status=%s header_ms=%s first_chunk_ms=%s header_to_first_chunk_ms=%s "
-                    "body_ms=%s total_ms=%s chunks=%s bytes=%s finalized=%s seen_done=%s",
+                    "status=%s header_ms=%s first_chunk_ms=%s first_byte_ms=%s "
+                    "header_to_first_chunk_ms=%s stream_stall_ms=%s cancel_propagated=%s "
+                    "upstream_timeout_category=%s body_ms=%s total_ms=%s chunks=%s "
+                    "bytes=%s finalized=%s seen_done=%s",
                     session_id,
                     "/v1/messages",
                     upstream.get("name"),
@@ -6300,7 +6917,11 @@ class GatewayService:
                     upstream_response.status_code,
                     upstream_headers_ms,
                     first_chunk_ms,
+                    stream_timing.get("first_byte_ms"),
                     header_to_first_chunk_ms,
+                    stream_timing.get("stream_stall_ms"),
+                    bool(stream_timing.get("cancel_propagated")),
+                    stream_timing.get("upstream_timeout_category"),
                     max(0, int((time.perf_counter() - body_started_at) * 1000)),
                     max(0, int((time.perf_counter() - stream_started_at) * 1000)),
                     chunk_count,
@@ -6342,20 +6963,11 @@ class GatewayService:
             body_read_started_at = time.perf_counter()
             body = await upstream_response.aread()
             await upstream_response.aclose()
-            error_preview = self._clip_text(body.decode("utf-8", errors="replace"), 600)
-            if error_preview:
-                logger.info(
-                    "Gateway Anthropic upstream error body | upstream=%s model=%s upstream_model=%s "
-                    "status=%s body=%s",
-                    upstream.get("name"),
-                    model,
-                    route["upstream_model"],
-                    upstream_response.status_code,
-                    error_preview,
-                )
             logger.info(
                 "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
-                "status=%s error_response=true header_ms=%s body_read_ms=%s total_ms=%s",
+                "status=%s error_response=true header_ms=%s body_read_ms=%s total_ms=%s "
+                "first_byte_ms=%s stream_stall_ms=%s cancel_propagated=%s "
+                "upstream_timeout_category=%s",
                 session_id,
                 "/v1/chat/completions",
                 upstream.get("name"),
@@ -6365,11 +6977,20 @@ class GatewayService:
                 upstream_headers_ms,
                 max(0, int((time.perf_counter() - body_read_started_at) * 1000)),
                 max(0, int((time.perf_counter() - stream_started_at) * 1000)),
+                None,
+                None,
+                False,
+                self._header_value(
+                    upstream_response.headers,
+                    UPSTREAM_TIMEOUT_CATEGORY_HEADER,
+                ),
             )
-            return Response(
-                content=body,
-                status_code=upstream_response.status_code,
-                media_type=upstream_response.headers.get("content-type", "application/json"),
+            return self._proxy_response(
+                httpx.Response(
+                    status_code=upstream_response.status_code,
+                    content=body,
+                    headers=upstream_response.headers,
+                )
             )
 
         async def stream_body():
@@ -6377,6 +6998,7 @@ class GatewayService:
             stream_state = self._new_stream_capture_state()
             parser_state = self._new_sse_parse_state()
             body_started_at = time.perf_counter()
+            stream_timing = self._new_stream_timing_state()
             first_chunk_ms: int | None = None
             header_to_first_chunk_ms: int | None = None
             chunk_count = 0
@@ -6391,6 +7013,10 @@ class GatewayService:
                 if finalized:
                     return
                 finalized = True
+                self._record_stream_timing_debug(
+                    injection_debug,
+                    stream_timing,
+                )
                 await self._finalize_stream_turn(
                     session_id=session_id,
                     model=model,
@@ -6440,7 +7066,12 @@ class GatewayService:
 
             try:
                 yield openai_chunk({"role": "assistant"})
-                async for chunk in upstream_response.aiter_bytes():
+                async for chunk in self._iter_upstream_bytes(
+                    upstream_response,
+                    stream_timing,
+                    stream_started_at=stream_started_at,
+                    body_started_at=body_started_at,
+                ):
                     if not chunk:
                         continue
                     chunk_count += 1
@@ -6506,11 +7137,16 @@ class GatewayService:
                 if not final_sent:
                     yield final_openai_chunk()
                     yield b"data: [DONE]\n\n"
+            except asyncio.CancelledError:
+                stream_timing["cancel_propagated"] = True
+                raise
             finally:
                 logger.info(
                     "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
-                    "status=%s header_ms=%s first_chunk_ms=%s header_to_first_chunk_ms=%s "
-                    "body_ms=%s total_ms=%s chunks=%s bytes=%s finalized=%s seen_done=%s",
+                    "status=%s header_ms=%s first_chunk_ms=%s first_byte_ms=%s "
+                    "header_to_first_chunk_ms=%s stream_stall_ms=%s cancel_propagated=%s "
+                    "upstream_timeout_category=%s body_ms=%s total_ms=%s chunks=%s "
+                    "bytes=%s finalized=%s seen_done=%s",
                     session_id,
                     "/v1/chat/completions",
                     upstream.get("name"),
@@ -6519,7 +7155,11 @@ class GatewayService:
                     upstream_response.status_code,
                     upstream_headers_ms,
                     first_chunk_ms,
+                    stream_timing.get("first_byte_ms"),
                     header_to_first_chunk_ms,
+                    stream_timing.get("stream_stall_ms"),
+                    bool(stream_timing.get("cancel_propagated")),
+                    stream_timing.get("upstream_timeout_category"),
                     max(0, int((time.perf_counter() - body_started_at) * 1000)),
                     max(0, int((time.perf_counter() - stream_started_at) * 1000)),
                     chunk_count,
@@ -6563,7 +7203,9 @@ class GatewayService:
             await upstream_response.aclose()
             logger.info(
                 "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
-                "status=%s error_response=true header_ms=%s body_read_ms=%s total_ms=%s",
+                "status=%s error_response=true header_ms=%s body_read_ms=%s total_ms=%s "
+                "first_byte_ms=%s stream_stall_ms=%s cancel_propagated=%s "
+                "upstream_timeout_category=%s",
                 session_id,
                 "/v1/messages",
                 upstream.get("name"),
@@ -6573,6 +7215,13 @@ class GatewayService:
                 upstream_headers_ms,
                 max(0, int((time.perf_counter() - body_read_started_at) * 1000)),
                 max(0, int((time.perf_counter() - stream_started_at) * 1000)),
+                None,
+                None,
+                False,
+                self._header_value(
+                    upstream_response.headers,
+                    UPSTREAM_TIMEOUT_CATEGORY_HEADER,
+                ),
             )
             return self._proxy_anthropic_error_response(
                 httpx.Response(
@@ -6586,6 +7235,7 @@ class GatewayService:
             finalized = False
             stream_state = self._new_stream_capture_state()
             body_started_at = time.perf_counter()
+            stream_timing = self._new_stream_timing_state()
             first_chunk_ms: int | None = None
             header_to_first_chunk_ms: int | None = None
             chunk_count = 0
@@ -6596,6 +7246,10 @@ class GatewayService:
                 if finalized:
                     return
                 finalized = True
+                self._record_stream_timing_debug(
+                    injection_debug,
+                    stream_timing,
+                )
                 await self._finalize_stream_turn(
                     session_id=session_id,
                     model=model,
@@ -6609,7 +7263,12 @@ class GatewayService:
                 )
 
             try:
-                async for chunk in upstream_response.aiter_bytes():
+                async for chunk in self._iter_upstream_bytes(
+                    upstream_response,
+                    stream_timing,
+                    stream_started_at=stream_started_at,
+                    body_started_at=body_started_at,
+                ):
                     if chunk:
                         chunk_count += 1
                         byte_count += len(chunk)
@@ -6637,11 +7296,16 @@ class GatewayService:
                         yield chunk
                 self._consume_anthropic_stream_capture_chunk(stream_state, b"", final=True)
                 await finalize_once()
+            except asyncio.CancelledError:
+                stream_timing["cancel_propagated"] = True
+                raise
             finally:
                 logger.info(
                     "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
-                    "status=%s header_ms=%s first_chunk_ms=%s header_to_first_chunk_ms=%s "
-                    "body_ms=%s total_ms=%s chunks=%s bytes=%s finalized=%s seen_done=%s",
+                    "status=%s header_ms=%s first_chunk_ms=%s first_byte_ms=%s "
+                    "header_to_first_chunk_ms=%s stream_stall_ms=%s cancel_propagated=%s "
+                    "upstream_timeout_category=%s body_ms=%s total_ms=%s chunks=%s "
+                    "bytes=%s finalized=%s seen_done=%s",
                     session_id,
                     "/v1/messages",
                     upstream.get("name"),
@@ -6650,7 +7314,11 @@ class GatewayService:
                     upstream_response.status_code,
                     upstream_headers_ms,
                     first_chunk_ms,
+                    stream_timing.get("first_byte_ms"),
                     header_to_first_chunk_ms,
+                    stream_timing.get("stream_stall_ms"),
+                    bool(stream_timing.get("cancel_propagated")),
+                    stream_timing.get("upstream_timeout_category"),
                     max(0, int((time.perf_counter() - body_started_at) * 1000)),
                     max(0, int((time.perf_counter() - stream_started_at) * 1000)),
                     chunk_count,
@@ -6932,23 +7600,39 @@ class GatewayService:
         return mapping.get(str(stop_reason or ""), "stop")
 
     def _proxy_anthropic_error_response(self, upstream_response: httpx.Response) -> JSONResponse:
-        message = upstream_response.text or "Upstream request failed"
-        error_type = "api_error"
-        try:
-            body = upstream_response.json()
-        except ValueError:
-            body = None
-        if isinstance(body, dict):
-            error = body.get("error")
-            if isinstance(error, dict):
-                message = str(error.get("message") or message)
-                error_type = str(error.get("type") or error_type)
-            elif body.get("message"):
-                message = str(body["message"])
+        existing_category = str(self._header_value(
+            upstream_response.headers,
+            UPSTREAM_ERROR_CATEGORY_HEADER,
+        ) or "").strip().lower()
+        if existing_category not in {
+            "auth", "rate_limit", "timeout", "connect",
+            "server_error", "upstream_error",
+        }:
+            existing_category = ""
+        category = existing_category or self._upstream_error_category(
+            upstream_response.status_code)
+        messages = {
+            "auth": "Upstream authentication failed",
+            "rate_limit": "Upstream rate limit reached",
+            "timeout": "Upstream response timed out",
+            "connect": "Upstream connection failed",
+            "server_error": "Upstream server failed",
+            "upstream_error": "Upstream request failed",
+        }
+        error_type = "authentication_error" if category == "auth" else "api_error"
+        timeout_category = str(self._header_value(
+            upstream_response.headers,
+            UPSTREAM_TIMEOUT_CATEGORY_HEADER,
+        ) or "").strip()
         return self._anthropic_error(
-            message,
+            messages.get(category, messages["upstream_error"]),
             status_code=upstream_response.status_code,
             error_type=error_type,
+            headers=self._safe_upstream_error_headers(
+                upstream_response,
+                category=category,
+                timeout_category=timeout_category,
+            ),
         )
 
     def _anthropic_error(
@@ -6957,6 +7641,7 @@ class GatewayService:
         *,
         status_code: int,
         error_type: str = "invalid_request_error",
+        headers: dict[str, str] | None = None,
     ) -> JSONResponse:
         return JSONResponse(
             {
@@ -6967,6 +7652,7 @@ class GatewayService:
                 },
             },
             status_code=status_code,
+            headers=headers,
         )
 
     def _extract_last_user_query(self, messages: list[dict[str, Any]]) -> str:
@@ -20091,6 +20777,68 @@ class GatewayService:
             return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return str(arguments)
 
+    @staticmethod
+    def _new_stream_timing_state() -> dict[str, Any]:
+        return {
+            "first_byte_ms": None,
+            "stream_stall_ms": None,
+            "cancel_propagated": False,
+            "upstream_timeout_category": None,
+            "last_byte_at": None,
+        }
+
+    @staticmethod
+    def _stream_timing_metadata(timing: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "first_byte_ms": timing.get("first_byte_ms"),
+            "stream_stall_ms": timing.get("stream_stall_ms"),
+            "cancel_propagated": bool(timing.get("cancel_propagated")),
+            "upstream_timeout_category": timing.get(
+                "upstream_timeout_category"),
+        }
+
+    def _record_stream_timing_debug(
+        self,
+        injection_debug: dict[str, Any] | None,
+        timing: dict[str, Any],
+    ) -> None:
+        if isinstance(injection_debug, dict):
+            injection_debug["stream_timing"] = self._stream_timing_metadata(
+                timing)
+
+    async def _iter_upstream_bytes(
+        self,
+        upstream_response: httpx.Response,
+        timing: dict[str, Any],
+        *,
+        stream_started_at: float,
+        body_started_at: float,
+    ):
+        try:
+            async for chunk in upstream_response.aiter_bytes():
+                if chunk:
+                    now = time.perf_counter()
+                    if timing.get("first_byte_ms") is None:
+                        timing["first_byte_ms"] = max(
+                            0, int((now - stream_started_at) * 1000))
+                    timing["last_byte_at"] = now
+                yield chunk
+        except asyncio.CancelledError:
+            timing["cancel_propagated"] = True
+            raise
+        except httpx.TimeoutException as exc:
+            now = time.perf_counter()
+            last_byte_at = timing.get("last_byte_at") or body_started_at
+            timing["stream_stall_ms"] = max(
+                0, int((now - last_byte_at) * 1000))
+            timing["upstream_timeout_category"] = (
+                "stream_stall"
+                if timing.get("first_byte_ms") is not None
+                else "first_byte"
+            )
+            timing["timeout_exception_type"] = type(exc).__name__
+            raise
+
     def _new_stream_capture_state(self) -> dict[str, Any]:
         return {
             "decoder": codecs.getincrementaldecoder("utf-8")(),
@@ -20646,22 +21394,34 @@ class GatewayService:
         model: str,
         error: Exception | None,
     ) -> httpx.Response:
-        detail = str(error) if error else "all upstream keys failed"
+        category = self._upstream_error_category(502, error)
+        timeout_category = "first_byte" if category == "timeout" else ""
+        safe_headers = {
+            UPSTREAM_ERROR_CATEGORY_HEADER: category,
+            UPSTREAM_STATUS_HEADER: "502",
+        }
+        if timeout_category:
+            safe_headers[UPSTREAM_TIMEOUT_CATEGORY_HEADER] = timeout_category
         logger.error(
-            "Gateway upstream unavailable | upstream=%s model=%s error=%s",
+            "Gateway upstream unavailable | upstream=%s model=%s "
+            "error_type=%s category=%s",
             upstream.get("name"),
             model,
-            detail,
+            type(error).__name__ if error is not None else "NoResponse",
+            category,
         )
         return httpx.Response(
             502,
             json={
                 "error": {
                     "message": f'Upstream "{upstream.get("name")}" request failed',
-                    "type": "upstream_error",
-                    "detail": detail,
+                    "type": "authentication_error"
+                    if category == "auth" else "upstream_error",
+                    "code": f"upstream_{category}",
+                    "status": 502,
                 }
             },
+            headers=safe_headers,
         )
 
     def _load_upstreams(self) -> list[dict[str, Any]]:

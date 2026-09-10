@@ -13,6 +13,9 @@ SQLite file, and the actual production methods under test are executed:
 Coverage maps to the 18 required gateway tests (task book section IV).
 """
 import asyncio
+import httpx
+import json
+import logging
 import sqlite3
 import tempfile
 from datetime import datetime, timezone
@@ -27,7 +30,14 @@ from gateway import (
     CANONICAL_SOURCE_EVENT_ID_HEADER,
     CANONICAL_TURN_PHASE_CONTINUATION,
     CANONICAL_TURN_PHASE_HEADER,
+    DEFAULT_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_GATEWAY_UPSTREAM_READ_TIMEOUT_SECONDS,
+    DEFAULT_GATEWAY_UPSTREAM_WRITE_TIMEOUT_SECONDS,
     GatewayService,
+    UPSTREAM_ERROR_CATEGORY_HEADER,
+    UPSTREAM_TIMEOUT_CATEGORY_HEADER,
+    UPSTREAM_STATUS_HEADER,
+    _default_gateway_upstream_timeout,
 )
 from gateway_state import GatewayStateStore
 
@@ -608,3 +618,420 @@ def test_canonical_keys_are_per_session(tmp_path):
     k_a2 = item._canonical_turn_key(
         make_request({PHASE: PHASE_CONT, H1: "app:da:c1", H2: "turn:ua1:assistant"}))
     assert k_a2 == k_a1
+
+
+# ---------------------------------------------------------------------------
+# CHAT-RUNTIME-R4 latency/prepare snapshot characterization
+# ---------------------------------------------------------------------------
+
+def _latency_service(tmp_path):
+    item = minimal_service(tmp_path)
+    item.persona_engine.enabled = False
+    item._route_memory_sentinel = async_return({"route": "skip"})
+    item._route_domain_sentinel = async_return({"route": "skip"})
+    item._domain_sentinel_should_skip_recall = lambda *args, **kwargs: False
+    item.prepare_snapshot_ttl_seconds = 60.0
+    item.prepare_snapshot_max_entries = 8
+    return item
+
+
+def _snapshot_identity(**updates):
+    identity = {
+        "h1": "app:r4:user",
+        "h2": "turn:r4:assistant",
+        "conversation_id": "conv-r4",
+        "context_revision": "7",
+        "prompt_preset_id": "talk",
+        "prompt_preset_revision": "3",
+        "prompt_plan_sha256": "plan-r4",
+        "prompt_binding_revision": "9",
+    }
+    identity.update(updates)
+    return identity
+
+
+def _prepare_call(item, payload, *, continuation=False, identity=None):
+    return asyncio.run(item.prepare_payload(
+        payload,
+        "jiajia",
+        include_debug=True,
+        continuation_phase=continuation,
+        snapshot_identity=identity or _snapshot_identity(),
+    ))
+
+
+def test_prepare_snapshot_exact_retry_is_a_hit_and_keeps_prepare_once(tmp_path):
+    item = _latency_service(tmp_path)
+    bucket_calls = []
+
+    async def list_buckets(*args, **kwargs):
+        bucket_calls.append(True)
+        return []
+
+    item._list_gateway_buckets = list_buckets
+    payload = {
+        "model": "guyan",
+        "stream": True,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    first_payload, first_ids, first_debug = _prepare_call(item, payload)
+    second_payload, second_ids, second_debug = _prepare_call(item, payload)
+
+    assert len(bucket_calls) == 1
+    assert second_payload == first_payload
+    assert second_ids == first_ids
+    assert first_debug["prepare_snapshot_cache"]["status"] == "miss"
+    assert second_debug["prepare_snapshot_cache"]["status"] == "hit"
+    assert len(second_debug["prepare_snapshot_cache"]["key_hash"]) == 32
+    assert "hello" not in second_debug["prepare_snapshot_cache"]["key_hash"]
+
+
+def test_prepare_snapshot_without_debug_still_replays_complete_payload(tmp_path):
+    item = _latency_service(tmp_path)
+    bucket_calls = []
+
+    async def list_buckets(*args, **kwargs):
+        bucket_calls.append(True)
+        return []
+
+    item._list_gateway_buckets = list_buckets
+    payload = {
+        "model": "guyan",
+        "stream": False,
+        "messages": [{"role": "user", "content": "no debug"}],
+    }
+    first = asyncio.run(item.prepare_payload(
+        payload,
+        "jiajia",
+        snapshot_identity=_snapshot_identity(),
+    ))
+    second = asyncio.run(item.prepare_payload(
+        payload,
+        "jiajia",
+        snapshot_identity=_snapshot_identity(),
+    ))
+
+    assert len(bucket_calls) == 1
+    assert first == second
+
+
+def test_prepare_snapshot_continuation_reuses_stable_context_and_keeps_new_tool_tail(tmp_path):
+    item = _latency_service(tmp_path)
+    bucket_calls = []
+
+    async def list_buckets(*args, **kwargs):
+        bucket_calls.append(True)
+        return []
+
+    item._list_gateway_buckets = list_buckets
+    item._build_injected_context_messages = lambda **kwargs: (
+        "STABLE PERSONA EMOTION MEMORY",
+        "DYNAMIC MEMORY",
+    )
+    item._inject_context_messages = GatewayService._inject_context_messages.__get__(
+        item, GatewayService)
+    base = [
+        {"role": "system", "content": "role card"},
+        {"role": "user", "content": "查一下天气"},
+    ]
+    initial_payload = {
+        "model": "guyan",
+        "stream": True,
+        "messages": base,
+    }
+    _prepare_call(item, initial_payload)
+
+    def continuation(tool_id, result):
+        return {
+            "model": "guyan",
+            "stream": True,
+            "messages": [
+                *base,
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": tool_id,
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": "{}"},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": tool_id, "content": result},
+            ],
+        }
+
+    _, _, first_cont_debug = _prepare_call(
+        item,
+        continuation("call-old", "old tool result"),
+        continuation=True,
+    )
+    second_cont_payload, _, second_cont_debug = _prepare_call(
+        item,
+        continuation("call-new", "new tool result"),
+        continuation=True,
+    )
+    text = json.dumps(second_cont_payload, ensure_ascii=False)
+
+    assert len(bucket_calls) == 1
+    assert first_cont_debug["prepare_snapshot_cache"]["status"] == "hit"
+    assert second_cont_debug["prepare_snapshot_cache"]["status"] == "hit"
+    assert "STABLE PERSONA EMOTION MEMORY" in text
+    assert "DYNAMIC MEMORY" in text
+    assert "new tool result" in text
+    assert "old tool result" not in text
+    assert any(
+        message.get("role") == "tool"
+        and message.get("content") == "new tool result"
+        for message in second_cont_payload["messages"]
+    )
+    assert not any(
+        message.get("role") == "tool"
+        and message.get("content") == "old tool result"
+        for message in second_cont_payload["messages"]
+    )
+
+
+def test_prepare_snapshot_revision_change_misses_and_two_turns_do_not_cross(tmp_path):
+    item = _latency_service(tmp_path)
+    bucket_calls = []
+
+    async def list_buckets(*args, **kwargs):
+        bucket_calls.append(True)
+        await asyncio.sleep(0)
+        return []
+
+    item._list_gateway_buckets = list_buckets
+    payload = {
+        "model": "guyan",
+        "stream": True,
+        "messages": [{"role": "user", "content": "same shape"}],
+    }
+    _, _, first_debug = _prepare_call(item, payload)
+    _, _, revision_debug = _prepare_call(
+        item,
+        payload,
+        identity=_snapshot_identity(context_revision="8"),
+    )
+
+    async def concurrent_calls():
+        return await asyncio.gather(
+            item.prepare_payload(
+                {**payload, "messages": [{"role": "user", "content": "turn a"}]},
+                "jiajia",
+                include_debug=True,
+                snapshot_identity=_snapshot_identity(h1="app:turn-a"),
+            ),
+            item.prepare_payload(
+                {**payload, "messages": [{"role": "user", "content": "turn b"}]},
+                "jiajia",
+                include_debug=True,
+                snapshot_identity=_snapshot_identity(h1="app:turn-b"),
+            ),
+        )
+
+    concurrent = asyncio.run(concurrent_calls())
+    assert first_debug["prepare_snapshot_cache"]["status"] == "miss"
+    assert revision_debug["prepare_snapshot_cache"]["status"] == "miss"
+    assert len(bucket_calls) == 4
+    assert (
+        concurrent[0][2]["prepare_snapshot_cache"]["key_hash"]
+        != concurrent[1][2]["prepare_snapshot_cache"]["key_hash"]
+    )
+
+
+def test_prepare_snapshot_cached_context_matches_uncached_baseline(tmp_path):
+    payload = {
+        "model": "guyan",
+        "stream": True,
+        "messages": [{"role": "user", "content": "保持完整注入"}],
+    }
+
+    cached = _latency_service(tmp_path / "cached")
+    cached._build_injected_context_messages = lambda **kwargs: (
+        "PERSONA EMOTION MEMORY WORLDBOOK",
+        "STABLE DYNAMIC CONTEXT",
+    )
+    cached._inject_context_messages = GatewayService._inject_context_messages.__get__(
+        cached, GatewayService)
+    cached_payload, _, _ = _prepare_call(cached, payload)
+
+    baseline = _latency_service(tmp_path / "baseline")
+    baseline.prepare_snapshot_ttl_seconds = 0.0
+    baseline._build_injected_context_messages = cached._build_injected_context_messages
+    baseline._inject_context_messages = GatewayService._inject_context_messages.__get__(
+        baseline, GatewayService)
+    baseline_payload, _, baseline_debug = _prepare_call(baseline, payload)
+
+    assert cached_payload == baseline_payload
+    assert baseline_debug["prepare_snapshot_cache"]["status"] == "miss"
+
+
+def test_gateway_upstream_timeout_budget_is_below_aiz_bound():
+    timeout = _default_gateway_upstream_timeout()
+    assert timeout.read == DEFAULT_GATEWAY_UPSTREAM_READ_TIMEOUT_SECONDS == 32.0
+    assert timeout.connect == DEFAULT_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_SECONDS == 8.0
+    assert timeout.write == DEFAULT_GATEWAY_UPSTREAM_WRITE_TIMEOUT_SECONDS == 15.0
+    assert timeout.pool == DEFAULT_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_SECONDS == 8.0
+
+
+def test_gateway_upstream_auth_error_is_safe_and_preserves_coarse_status():
+    item = GatewayService.__new__(GatewayService)
+    upstream = httpx.Response(
+        403,
+        json={"error": {"message": "provider secret must not escape"}},
+    )
+    response = item._proxy_response(upstream)
+    body = json.loads(response.body.decode("utf-8"))
+
+    assert response.status_code == 403
+    assert response.headers[UPSTREAM_ERROR_CATEGORY_HEADER] == "auth"
+    assert response.headers[UPSTREAM_STATUS_HEADER] == "403"
+    assert body["error"]["type"] == "authentication_error"
+    assert body["error"]["status"] == 403
+    assert "provider secret" not in response.body.decode("utf-8")
+
+    wrapped = httpx.Response(
+        500,
+        json={"error": {"message": "discarded provider body"}},
+        headers={
+            UPSTREAM_ERROR_CATEGORY_HEADER: "auth",
+            UPSTREAM_STATUS_HEADER: "403",
+        },
+    )
+    wrapped_response = item._proxy_response(wrapped)
+    assert wrapped_response.headers[UPSTREAM_ERROR_CATEGORY_HEADER] == "auth"
+    assert wrapped_response.headers[UPSTREAM_STATUS_HEADER] == "403"
+
+
+def test_gateway_transport_error_is_safe_and_marks_first_byte_timeout():
+    item = GatewayService.__new__(GatewayService)
+    response = item._upstream_request_error_response(
+        {"name": "guyan"},
+        "guyan",
+        httpx.ReadTimeout("provider body must not escape"),
+    )
+    body = json.loads(response.content.decode("utf-8"))
+
+    assert response.status_code == 502
+    assert response.headers[UPSTREAM_ERROR_CATEGORY_HEADER] == "timeout"
+    assert response.headers[UPSTREAM_TIMEOUT_CATEGORY_HEADER] == "first_byte"
+    assert "provider body" not in response.content.decode("utf-8")
+    assert body["error"]["code"] == "upstream_timeout"
+
+
+def test_gateway_stream_cancel_closes_upstream_and_records_cancel(caplog, tmp_path):
+    item = _latency_service(tmp_path)
+    item._upstream_uses_anthropic_protocol = lambda upstream: False
+    item._finalize_stream_turn = async_return(None)
+
+    class HangingResponse:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        def __init__(self):
+            self.closed = False
+            self.iterator_closed = False
+
+        async def aiter_bytes(self):
+            yield b'data: {"choices":[{"delta":{"content":"x"}}]}\\n\\n'
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.iterator_closed = True
+
+        async def aclose(self):
+            self.closed = True
+
+    upstream = HangingResponse()
+    item._open_upstream_stream = async_return(upstream)
+    response = asyncio.run(item._stream_upstream(
+        {"model": "guyan", "stream": True, "messages": []},
+        "jiajia",
+        [],
+        "hello",
+    ))
+
+    async def consume_then_cancel():
+        iterator = response.body_iterator
+        await iterator.__anext__()
+        task = asyncio.create_task(iterator.__anext__())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+
+    caplog.set_level(logging.INFO, logger="ombre_brain.gateway")
+    asyncio.run(consume_then_cancel())
+
+    assert upstream.closed is True
+    assert upstream.iterator_closed is True
+    assert any(
+        "cancel_propagated=True" in record.getMessage()
+        and "first_byte_ms=" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_gateway_stream_timeout_records_first_byte_and_stall_categories(caplog, tmp_path):
+    item = _latency_service(tmp_path)
+    item._upstream_uses_anthropic_protocol = lambda upstream: False
+    item._finalize_stream_turn = async_return(None)
+
+    class TimeoutResponse:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        def __init__(self, after_first_byte):
+            self.after_first_byte = after_first_byte
+            self.closed = False
+
+        async def aiter_bytes(self):
+            if self.after_first_byte:
+                yield b'data: {"choices":[{"delta":{"content":"x"}}]}\\n\\n'
+            raise httpx.ReadTimeout("upstream read timeout")
+
+        async def aclose(self):
+            self.closed = True
+
+    async def consume(response):
+        iterator = response.body_iterator
+        with pytest.raises(httpx.ReadTimeout):
+            while True:
+                await iterator.__anext__()
+
+    caplog.set_level(logging.INFO, logger="ombre_brain.gateway")
+    first_byte = TimeoutResponse(after_first_byte=False)
+    item._open_upstream_stream = async_return(first_byte)
+    first_response = asyncio.run(item._stream_upstream(
+        {"model": "guyan", "stream": True, "messages": []},
+        "jiajia",
+        [],
+        "hello",
+    ))
+    asyncio.run(consume(first_response))
+
+    stall = TimeoutResponse(after_first_byte=True)
+    item._open_upstream_stream = async_return(stall)
+    stall_response = asyncio.run(item._stream_upstream(
+        {"model": "guyan", "stream": True, "messages": []},
+        "jiajia",
+        [],
+        "hello",
+    ))
+    asyncio.run(consume(stall_response))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "first_byte_ms=None" in message
+        and "stream_stall_ms=" in message
+        and "upstream_timeout_category=first_byte" in message
+        for message in messages
+    )
+    assert any(
+        "first_byte_ms=" in message
+        and "upstream_timeout_category=stream_stall" in message
+        for message in messages
+    )
+    assert first_byte.closed is True
+    assert stall.closed is True
