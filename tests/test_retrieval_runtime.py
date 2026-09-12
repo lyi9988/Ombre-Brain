@@ -1,4 +1,5 @@
 import asyncio
+import time
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -20,10 +21,20 @@ def test_embedding_runtime_debug_records_success_without_body_or_credentials(tmp
         },
     })
 
+    class ConnectClient:
+        is_closed = False
+
+        async def post(self, *args, **kwargs):
+            raise httpx.ConnectError("connection unavailable")
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(engine, "_new_client", lambda: ConnectClient())
     monkeypatch.setattr(
         engine,
         "_request_embedding_sync",
-        lambda endpoint, api_key, model, input_value: (200, {"data": [{"embedding": [0.1, 0.2, 0.3]}]}),
+        lambda *args, **kwargs: (200, {"data": [{"embedding": [0.1, 0.2, 0.3]}]}),
     )
     vector = asyncio.run(engine._generate_embedding("private query", kind="query"))
 
@@ -43,10 +54,20 @@ def test_embedding_runtime_debug_records_failure_type(tmp_path, monkeypatch):
         "embedding": {"enabled": True, "api_key": "k", "base_url": "https://example/v1"},
     })
 
+    class ConnectClient:
+        is_closed = False
+
+        async def post(self, *args, **kwargs):
+            raise httpx.ConnectError("connection unavailable")
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(engine, "_new_client", lambda: ConnectClient())
     monkeypatch.setattr(
         engine,
         "_request_embedding_sync",
-        lambda endpoint, api_key, model, input_value: (_ for _ in ()).throw(
+        lambda *args, **kwargs: (_ for _ in ()).throw(
             TimeoutError("provider timed out")
         ),
     )
@@ -63,10 +84,20 @@ def test_embedding_runtime_debug_records_cancellation(tmp_path, monkeypatch):
         "embedding": {"enabled": True, "api_key": "k", "base_url": "https://example/v1"},
     })
 
+    class ConnectClient:
+        is_closed = False
+
+        async def post(self, *args, **kwargs):
+            raise httpx.ConnectError("connection unavailable")
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(engine, "_new_client", lambda: ConnectClient())
     monkeypatch.setattr(
         engine,
         "_request_embedding_sync",
-        lambda endpoint, api_key, model, input_value: (_ for _ in ()).throw(
+        lambda *args, **kwargs: (_ for _ in ()).throw(
             asyncio.CancelledError()
         ),
     )
@@ -105,6 +136,7 @@ def test_reranker_runtime_debug_records_success_without_documents(monkeypatch):
             return self
 
         async def __aexit__(self, *args):
+            await self.aclose()
             return False
 
         async def post(self, *args, **kwargs):
@@ -143,6 +175,12 @@ def test_retrieval_clients_are_reused_and_closed(monkeypatch, tmp_path):
             self.closed = False
             created.append(self)
 
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
         async def post(self, *args, **kwargs):
             self.calls += 1
             return FakeResponse()
@@ -167,7 +205,96 @@ def test_retrieval_clients_are_reused_and_closed(monkeypatch, tmp_path):
     assert created[0].closed is True
 
 
-def test_reranker_client_is_reused_and_closed(monkeypatch):
+def test_embedding_fallback_only_retries_connection_setup_failures(monkeypatch, tmp_path):
+    calls = {"fallback": 0}
+
+    class FakeClient:
+        is_closed = False
+
+        def __init__(self, error):
+            self.error = error
+
+        async def post(self, *args, **kwargs):
+            raise self.error
+
+        async def aclose(self):
+            return None
+
+    async def run_case(error):
+        engine = EmbeddingEngine({
+            "buckets_dir": str(tmp_path / type(error).__name__),
+            "embedding": {"enabled": True, "api_key": "secret", "base_url": "https://example/v1"},
+        })
+        client = FakeClient(error)
+        engine._new_client = lambda: client
+
+        def fallback(*args, **kwargs):
+            calls["fallback"] += 1
+            return 200, {"data": [{"embedding": [0.4, 0.5]}]}
+
+        engine._request_embedding_sync = fallback
+        vector = await engine._generate_embedding("query", kind="query")
+        debug = engine.runtime_debug()
+        await engine.close()
+        return vector, debug
+
+    vector, connect_debug = asyncio.run(run_case(httpx.ConnectError("connect")))
+    assert vector == [0.4, 0.5]
+    assert connect_debug["last_error_category"] == "connect"
+    assert connect_debug["connection_fallback_count"] == 1
+
+    vector, pool_debug = asyncio.run(run_case(httpx.PoolTimeout("pool unavailable")))
+    assert vector == [0.4, 0.5]
+    assert pool_debug["last_error_category"] == "pool"
+    assert pool_debug["connection_fallback_count"] == 1
+
+    for error, category in (
+        (httpx.ReadTimeout("read stalled"), "read"),
+        (httpx.WriteTimeout("write stalled"), "write"),
+        (httpx.RemoteProtocolError("response interrupted"), "remote_protocol"),
+    ):
+        vector, debug = asyncio.run(run_case(error))
+        assert vector == []
+        assert debug["last_error_category"] == category
+        assert debug["connection_fallback_count"] == 0
+    assert calls["fallback"] == 2
+
+
+def test_embedding_does_not_fallback_after_total_budget_is_exhausted(monkeypatch, tmp_path):
+    fallback_calls = []
+
+    class FakeClient:
+        is_closed = False
+
+        async def post(self, *args, **kwargs):
+            raise httpx.ConnectError("connect")
+
+        async def aclose(self):
+            return None
+
+    engine = EmbeddingEngine({
+        "buckets_dir": str(tmp_path),
+        "embedding": {"enabled": True, "api_key": "secret", "base_url": "https://example/v1"},
+    })
+    engine._new_client = lambda: FakeClient()
+    engine._request_embedding_sync = lambda *args, **kwargs: fallback_calls.append(True)
+
+    async def scenario():
+        try:
+            await engine._request_embedding(
+                "https://example/v1/embeddings", "secret", "model", "query",
+                deadline=time.monotonic() - 1,
+            )
+        except httpx.ConnectError:
+            return
+        raise AssertionError("an exhausted budget must not start urllib fallback")
+
+    asyncio.run(scenario())
+    assert fallback_calls == []
+    assert engine.runtime_debug()["connection_fallback_count"] == 0
+
+
+def test_reranker_keeps_per_call_transport_after_live_provider_downgrade(monkeypatch):
     created = []
 
     class FakeResponse:
@@ -184,6 +311,13 @@ def test_reranker_client_is_reused_and_closed(monkeypatch):
             self.calls = 0
             self.closed = False
             created.append(self)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            await self.aclose()
+            return False
 
         async def post(self, *args, **kwargs):
             self.calls += 1
@@ -205,12 +339,11 @@ def test_reranker_client_is_reused_and_closed(monkeypatch):
     async def scenario():
         assert await engine.rerank("one", ["document"], top_n=1)
         assert await engine.rerank("two", ["document"], top_n=1)
-        await engine.close()
 
     asyncio.run(scenario())
-    assert len(created) == 1
-    assert created[0].calls == 2
-    assert created[0].closed is True
+    assert len(created) == 2
+    assert [client.calls for client in created] == [1, 1]
+    assert all(client.closed for client in created)
 
 
 def test_gateway_reloads_runtime_overlay_without_rebuilding_brain(tmp_path):

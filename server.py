@@ -12144,14 +12144,7 @@ async def api_config_update(request):
             os.environ["OMBRE_RERANKER_BASE_URL"] = reranker_cfg.get("base_url", "")
         if "model" in r:
             os.environ["OMBRE_RERANKER_MODEL"] = reranker_cfg.get("model", "")
-        previous_reranker_engine = reranker_engine
         reranker_engine = RerankerEngine(config)
-        close_previous = getattr(previous_reranker_engine, "close", None)
-        if callable(close_previous):
-            try:
-                await close_previous()
-            except Exception:
-                logger.debug("Previous reranker HTTP client close failed", exc_info=True)
         if reranker_gateway_payload:
             gateway_hot_update_payload["reranker"] = reranker_gateway_payload
 

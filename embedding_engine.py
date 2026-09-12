@@ -34,6 +34,9 @@ class EmbeddingEngine:
     向量生成 + SQLite 向量存储 + 余弦搜索。
     """
 
+    REQUEST_BUDGET_SECONDS = 30.0
+    MIN_FALLBACK_REMAINING_SECONDS = 0.25
+
     def __init__(self, config: dict):
         dehy_cfg = config.get("dehydration", {})
         embed_cfg = config.get("embedding", {})
@@ -56,11 +59,13 @@ class EmbeddingEngine:
             "last_operation": "none",
             "last_status": "not_requested",
             "last_error_type": "",
+            "last_error_category": "",
             "last_http_status": None,
             "last_latency_ms": None,
             "last_vector_dimension": None,
             "last_result_count": None,
             "transport": "persistent_httpx",
+            "last_transport": "persistent_httpx",
             "connection_fallback_count": 0,
         }
 
@@ -138,10 +143,12 @@ class EmbeddingEngine:
             "last_operation": str(kind or "document"),
             "last_status": "disabled" if not self.enabled else "started",
             "last_error_type": "",
+            "last_error_category": "",
             "last_http_status": None,
             "last_latency_ms": None,
             "last_vector_dimension": None,
             "last_result_count": None,
+            "last_transport": "persistent_httpx",
         })
         if not self.enabled:
             return []
@@ -151,7 +158,9 @@ class EmbeddingEngine:
         try:
             endpoint = f"{self.base_url.rstrip('/')}/embeddings"
             http_status, body = await self._request_embedding(
-                endpoint, self.api_key, self.model, truncated)
+                endpoint, self.api_key, self.model, truncated,
+                deadline=started + self.REQUEST_BUDGET_SECONDS,
+            )
             self._runtime["last_http_status"] = http_status
             data = body.get("data") if isinstance(body, dict) else None
             first = data[0] if isinstance(data, list) and data else None
@@ -177,6 +186,7 @@ class EmbeddingEngine:
             self._runtime.update({
                 "last_status": "error",
                 "last_error_type": type(e).__name__,
+                "last_error_category": "http_status",
                 "last_http_status": status,
                 "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
             })
@@ -186,6 +196,7 @@ class EmbeddingEngine:
             self._runtime.update({
                 "last_status": "cancelled",
                 "last_error_type": "CancelledError",
+                "last_error_category": "cancelled",
                 "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
             })
             raise
@@ -193,6 +204,7 @@ class EmbeddingEngine:
             self._runtime.update({
                 "last_status": "error",
                 "last_error_type": type(e).__name__,
+                "last_error_category": self._error_category(e),
                 "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
             })
             logger.warning(f"Embedding API call failed: {e}")
@@ -211,6 +223,34 @@ class EmbeddingEngine:
     def _client_signature_value(self):
         return (bool(self.enabled), str(self.base_url or "").rstrip("/"),
                 str(self.api_key or ""))
+
+    @staticmethod
+    def _error_category(error: BaseException | None) -> str:
+        if isinstance(error, httpx.ConnectTimeout):
+            return "connect"
+        if isinstance(error, httpx.ConnectError):
+            return "connect"
+        if isinstance(error, httpx.PoolTimeout):
+            return "pool"
+        if isinstance(error, httpx.ReadTimeout):
+            return "read"
+        if isinstance(error, httpx.WriteTimeout):
+            return "write"
+        if isinstance(error, httpx.RemoteProtocolError):
+            return "remote_protocol"
+        if isinstance(error, httpx.TimeoutException):
+            return "timeout"
+        if isinstance(error, httpx.RequestError):
+            return "request_error"
+        if isinstance(error, (urllib.error.HTTPError, httpx.HTTPStatusError)):
+            return "http_status"
+        if isinstance(error, (json.JSONDecodeError, ValueError)):
+            return "response_decode"
+        if isinstance(error, asyncio.CancelledError):
+            return "cancelled"
+        if isinstance(error, TimeoutError):
+            return "timeout"
+        return type(error).__name__.lower() if error is not None else "unknown"
 
     def _new_client(self):
         return httpx.AsyncClient(
@@ -245,11 +285,15 @@ class EmbeddingEngine:
 
     async def _request_embedding(
         self, endpoint: str, api_key: str, model: str, input_value: str,
+        *, deadline: float | None = None,
     ) -> tuple[int, dict]:
-        """Use the persistent pool, then preserve the old transport fallback."""
+        """Use the persistent pool with a bounded, connection-only fallback."""
         client = await self._ensure_client()
         if client is None:
             raise RuntimeError("embedding client unavailable")
+        if deadline is None:
+            deadline = time.monotonic() + self.REQUEST_BUDGET_SECONDS
+        remaining = max(0.1, deadline - time.monotonic())
         try:
             response = await client.post(
                 endpoint,
@@ -258,20 +302,34 @@ class EmbeddingEngine:
                     "Content-Type": "application/json",
                 },
                 json={"model": model, "input": input_value},
+                timeout=remaining,
             )
             response.raise_for_status()
             body = response.json()
             return int(response.status_code), body if isinstance(body, dict) else {}
-        except httpx.RequestError:
+        except httpx.RequestError as exc:
+            category = self._error_category(exc)
+            self._runtime["last_error_category"] = category
+            # Only connection establishment and pool acquisition are known to
+            # happen before the request body reaches the provider.  A read,
+            # write, protocol, or ambiguous transport error must not be sent
+            # again through urllib and doubled.
+            if category not in {"connect", "pool"}:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= self.MIN_FALLBACK_REMAINING_SECONDS:
+                raise
             self._runtime["connection_fallback_count"] = int(
                 self._runtime.get("connection_fallback_count") or 0
             ) + 1
+            self._runtime["last_transport"] = "urllib_fallback"
             return await asyncio.to_thread(
                 self._request_embedding_sync,
                 endpoint,
                 api_key,
                 model,
                 input_value,
+                timeout_seconds=max(0.1, remaining),
             )
 
     async def reconfigure(self, config: dict) -> None:
@@ -315,6 +373,7 @@ class EmbeddingEngine:
         api_key: str,
         model: str,
         input_value: str,
+        timeout_seconds: float = REQUEST_BUDGET_SECONDS,
     ) -> tuple[int, dict]:
         request = urllib.request.Request(
             endpoint,
@@ -325,7 +384,9 @@ class EmbeddingEngine:
                 "Content-Type": "application/json",
             },
         )
-        with urllib.request.urlopen(request, timeout=30.0) as response:
+        with urllib.request.urlopen(
+            request, timeout=max(0.1, float(timeout_seconds))
+        ) as response:
             body = json.loads(response.read())
             return int(response.status), body if isinstance(body, dict) else {}
 

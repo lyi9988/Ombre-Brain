@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -52,12 +51,9 @@ class RerankerEngine:
             "last_http_status": None,
             "last_latency_ms": None,
             "last_result_count": None,
-            "transport": "persistent_httpx",
+            "transport": "per_call_httpx",
             "connection_fallback_count": 0,
         }
-        self._client_lock = threading.RLock()
-        self._client_signature = None
-        self.client = None
 
     def runtime_debug(self) -> dict:
         """Return owner-safe rerank health without credentials or documents."""
@@ -66,10 +62,6 @@ class RerankerEngine:
             "configured": bool(self.api_key and self.base_url),
             "model": self.model,
             "base_url": self.base_url,
-            "client_open": bool(
-                self.client is not None
-                and not getattr(self.client, "is_closed", False)
-            ),
             "timeout_seconds": self.timeout,
             "candidate_limit": self.candidate_limit,
             **dict(self._runtime),
@@ -104,10 +96,21 @@ class RerankerEngine:
             "last_result_count": None,
         })
         try:
-            response = await self._post(endpoint, payload)
-            self._runtime["last_http_status"] = response.status_code
-            response.raise_for_status()
-            body = response.json()
+            # The persistent transport was measured against the live provider
+            # and returned stable 500s.  Keep the known-good per-call client
+            # until that provider behavior is separately explained.
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    endpoint,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                self._runtime["last_http_status"] = response.status_code
+                response.raise_for_status()
+                body = response.json()
         except asyncio.CancelledError:
             self._runtime.update({
                 "last_status": "cancelled",
@@ -142,106 +145,6 @@ class RerankerEngine:
             "last_result_count": len(results),
         })
         return results
-
-    def _client_signature_value(self):
-        return (bool(self.enabled), str(self.base_url or "").rstrip("/"),
-                str(self.api_key or ""))
-
-    def _new_client(self):
-        return httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                self.timeout,
-                connect=min(8.0, self.timeout),
-                write=min(15.0, self.timeout),
-                pool=min(8.0, self.timeout),
-                read=self.timeout,
-            ),
-            limits=httpx.Limits(
-                max_connections=8,
-                max_keepalive_connections=4,
-                keepalive_expiry=30.0,
-            ),
-        )
-
-    async def _ensure_client(self):
-        signature = self._client_signature_value()
-        old = None
-        with self._client_lock:
-            if (
-                self.client is not None
-                and not getattr(self.client, "is_closed", False)
-                and self._client_signature == signature
-            ):
-                return self.client
-            old = self.client
-            self.client = self._new_client() if signature[0] else None
-            self._client_signature = signature
-            client = self.client
-        if old is not None and not getattr(old, "is_closed", False):
-            try:
-                await old.aclose()
-            except Exception:
-                logger.debug("Reranker previous HTTP client close failed", exc_info=True)
-        return client
-
-    async def _post(self, endpoint: str, payload: dict[str, Any]):
-        client = await self._ensure_client()
-        if client is None:
-            raise RuntimeError("reranker client unavailable")
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        try:
-            return await client.post(endpoint, headers=headers, json=payload,
-                                     timeout=self.timeout)
-        except httpx.PoolTimeout:
-            self._runtime["connection_fallback_count"] = int(
-                self._runtime.get("connection_fallback_count") or 0
-            ) + 1
-            async with httpx.AsyncClient(timeout=self.timeout) as fallback:
-                return await fallback.post(endpoint, headers=headers, json=payload)
-
-    async def reconfigure(self, config: dict) -> None:
-        config = config or {}
-        embed_cfg = config.get("embedding", {}) or {}
-        rerank_cfg = config.get("reranker", {}) or {}
-        dehy_cfg = config.get("dehydration", {}) or {}
-        self.model = str(rerank_cfg.get("model") or self.model)
-        self.base_url = str(
-            rerank_cfg.get("base_url")
-            or embed_cfg.get("base_url")
-            or dehy_cfg.get("base_url")
-            or self.base_url
-        ).rstrip("/")
-        self.api_key = str(
-            rerank_cfg.get("api_key")
-            or embed_cfg.get("api_key")
-            or dehy_cfg.get("api_key")
-            or self.api_key
-        )
-        self.enabled = bool(self.api_key and self.base_url) and _bool_value(
-            rerank_cfg.get("enabled", True)
-        )
-        self.timeout = _float_between(
-            rerank_cfg.get("timeout_seconds", self.timeout), self.timeout, 1, 120
-        )
-        self.candidate_limit = _int_between(
-            rerank_cfg.get("candidate_limit", self.candidate_limit),
-            self.candidate_limit, 1, 100,
-        )
-        self.score_weight = _float_between(
-            rerank_cfg.get("score_weight", self.score_weight), self.score_weight, 0.0, 1.0
-        )
-        await self._ensure_client()
-
-    async def close(self) -> None:
-        with self._client_lock:
-            client = self.client
-            self.client = None
-            self._client_signature = None
-        if client is not None and not getattr(client, "is_closed", False):
-            await client.aclose()
 
 
 def _bool_value(value: Any, default: bool = True) -> bool:
