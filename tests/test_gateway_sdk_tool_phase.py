@@ -748,6 +748,41 @@ def test_prepare_snapshot_hits_exact_request_and_refreshes_trace_context(tmp_pat
     assert len(item._prepare_snapshots) == 1
 
 
+def test_prepare_snapshot_hits_first_continuation_with_phase_layout_and_duplicate_user(tmp_path):
+    item = _snapshot_service(tmp_path)
+    baseline = [
+        {"role": "system", "content": "role card"},
+        {"role": "user", "content": "查一下今天的天气"},
+    ]
+    asyncio.run(item.prepare_payload(
+        _snapshot_payload(baseline),
+        "jiajia",
+        include_debug=True,
+        request=make_request(_snapshot_headers(scope="talk.initial")),
+    ))
+    child = [
+        *baseline,
+        {"role": "user", "content": "查一下今天的天气"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call-child", "type": "function",
+            "function": {"name": "weather", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call-child", "content": "晴"},
+    ]
+    _, _, debug = asyncio.run(item.prepare_payload(
+        _snapshot_payload(child),
+        "jiajia",
+        continuation_phase=True,
+        include_debug=True,
+        request=make_request({
+            **_snapshot_headers(scope="talk.continuation"),
+            PHASE: PHASE_CONT,
+        }),
+    ))
+    assert debug["prepare_snapshot_cache"]["status"] == "hit"
+    assert debug["prepare_snapshot_cache"]["prepare_duration_ms"] == 0
+
+
 def test_prepare_snapshot_reuses_only_legal_tool_tail_and_keeps_new_tail(tmp_path):
     item = _snapshot_service(tmp_path)
     baseline = [

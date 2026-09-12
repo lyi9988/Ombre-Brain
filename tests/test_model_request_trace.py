@@ -134,6 +134,24 @@ class ModelRequestTraceStoreTest(unittest.TestCase):
         self.assertEqual(completed[0]["payload"]["outcome"], "final_answer")
         self.assertEqual(len(usage), 2)
 
+    def test_owner_safe_provider_timing_is_persisted_per_attempt(self):
+        trace_id = self._logical("trace-timing")
+        attempt_id = self.store.record_attempt(
+            trace_id=trace_id, ordinal=1, provider="bing", upstream="bing",
+            model="m", retry_reason="candidate_fallback",
+            timing={"header_ms": 8, "first_byte_ms": 12, "total_ms": 30},
+        )
+        self.store.update_attempt(
+            attempt_id, duration_ms=30, http_status=200,
+            result_status="stream_completed", outcome="final_answer",
+            timing={"header_ms": 8, "first_byte_ms": 12, "total_ms": 30,
+                    "timeout_category": ""},
+        )
+        item = self.store.get(trace_id, view="metadata")
+        self.assertEqual(item["attempts"][0]["retry_reason"], "candidate_fallback")
+        self.assertEqual(item["attempts"][0]["timing"]["first_byte_ms"], 12)
+        self.assertEqual(item["attempts"][0]["timing"]["total_ms"], 30)
+
     def test_sanitizer_does_not_mutate_input(self):
         value = {"thinking": False, "reasoning_effort": "low", "token": "secret"}
         safe = sanitize_for_owner(value)

@@ -17,12 +17,13 @@ import math
 import sqlite3
 import logging
 import asyncio
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from openai import AsyncOpenAI
+import httpx
 
 logger = logging.getLogger("ombre_brain.embedding")
 
@@ -59,21 +60,22 @@ class EmbeddingEngine:
             "last_latency_ms": None,
             "last_vector_dimension": None,
             "last_result_count": None,
+            "transport": "persistent_httpx",
+            "connection_fallback_count": 0,
         }
 
         # --- SQLite path: buckets_dir/embeddings.db ---
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
         self.db_path = db_path
 
-        # --- Initialize client ---
-        if self.enabled:
-            self.client = AsyncOpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url,
-                timeout=30.0,
-            )
-        else:
-            self.client = None
+        # --- Initialize a reusable async client ---
+        # ``AsyncClient`` is safe for concurrent tasks and keeps the TCP/TLS
+        # pool alive across query embeddings.  The client is recreated only
+        # when the effective endpoint/key/enabled state changes and is closed
+        # by ``close`` during service shutdown.
+        self._client_lock = threading.RLock()
+        self._client_signature = None
+        self.client = None
 
         # --- Initialize SQLite ---
         self._init_db()
@@ -85,6 +87,10 @@ class EmbeddingEngine:
             "configured": bool(self.api_key and self.base_url),
             "model": self.model,
             "base_url": self.base_url,
+            "client_open": bool(
+                self.client is not None
+                and not getattr(self.client, "is_closed", False)
+            ),
             **dict(self._runtime),
         }
 
@@ -143,19 +149,9 @@ class EmbeddingEngine:
         prepared = self._prepare_embedding_input(text, kind=kind)
         truncated = prepared[: self.max_chars]
         try:
-            # The provider is a compatible proxy rather than the OpenAI API.
-            # Its standard-library HTTP path is fast in the Gateway container,
-            # while the optional SDK/httpx2 path can stall during TLS setup and
-            # hit the Gateway's small semantic-query budget. Run that blocking
-            # transport off the event loop so chat/streaming stays responsive.
             endpoint = f"{self.base_url.rstrip('/')}/embeddings"
-            http_status, body = await asyncio.to_thread(
-                self._request_embedding_sync,
-                endpoint,
-                self.api_key,
-                self.model,
-                truncated,
-            )
+            http_status, body = await self._request_embedding(
+                endpoint, self.api_key, self.model, truncated)
             self._runtime["last_http_status"] = http_status
             data = body.get("data") if isinstance(body, dict) else None
             first = data[0] if isinstance(data, list) and data else None
@@ -174,11 +170,14 @@ class EmbeddingEngine:
                 "last_result_count": 0,
             })
             return []
-        except urllib.error.HTTPError as e:
+        except (urllib.error.HTTPError, httpx.HTTPStatusError) as e:
+            status = getattr(e, "code", None)
+            if status is None:
+                status = getattr(getattr(e, "response", None), "status_code", None)
             self._runtime.update({
                 "last_status": "error",
                 "last_error_type": type(e).__name__,
-                "last_http_status": e.code,
+                "last_http_status": status,
                 "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
             })
             logger.warning(f"Embedding API call failed: {e}")
@@ -198,6 +197,117 @@ class EmbeddingEngine:
             })
             logger.warning(f"Embedding API call failed: {e}")
             return []
+
+    @staticmethod
+    def _client_timeout() -> httpx.Timeout:
+        return httpx.Timeout(
+            30.0,
+            connect=8.0,
+            write=15.0,
+            pool=8.0,
+            read=30.0,
+        )
+
+    def _client_signature_value(self):
+        return (bool(self.enabled), str(self.base_url or "").rstrip("/"),
+                str(self.api_key or ""))
+
+    def _new_client(self):
+        return httpx.AsyncClient(
+            timeout=self._client_timeout(),
+            limits=httpx.Limits(
+                max_connections=8,
+                max_keepalive_connections=4,
+                keepalive_expiry=30.0,
+            ),
+        )
+
+    async def _ensure_client(self):
+        signature = self._client_signature_value()
+        old = None
+        with self._client_lock:
+            if (
+                self.client is not None
+                and not getattr(self.client, "is_closed", False)
+                and self._client_signature == signature
+            ):
+                return self.client
+            old = self.client
+            self.client = self._new_client() if signature[0] else None
+            self._client_signature = signature
+            client = self.client
+        if old is not None and not getattr(old, "is_closed", False):
+            try:
+                await old.aclose()
+            except Exception:
+                logger.debug("Embedding previous HTTP client close failed", exc_info=True)
+        return client
+
+    async def _request_embedding(
+        self, endpoint: str, api_key: str, model: str, input_value: str,
+    ) -> tuple[int, dict]:
+        """Use the persistent pool, then preserve the old transport fallback."""
+        client = await self._ensure_client()
+        if client is None:
+            raise RuntimeError("embedding client unavailable")
+        try:
+            response = await client.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"model": model, "input": input_value},
+            )
+            response.raise_for_status()
+            body = response.json()
+            return int(response.status_code), body if isinstance(body, dict) else {}
+        except httpx.RequestError:
+            self._runtime["connection_fallback_count"] = int(
+                self._runtime.get("connection_fallback_count") or 0
+            ) + 1
+            return await asyncio.to_thread(
+                self._request_embedding_sync,
+                endpoint,
+                api_key,
+                model,
+                input_value,
+            )
+
+    async def reconfigure(self, config: dict) -> None:
+        """Apply hot-reloaded config and rotate the pooled client safely."""
+        config = config or {}
+        embed_cfg = config.get("embedding", {}) or {}
+        dehy_cfg = config.get("dehydration", {}) or {}
+        self.api_key = embed_cfg.get("api_key") or dehy_cfg.get("api_key", "")
+        self.base_url = (
+            embed_cfg.get("base_url")
+            or dehy_cfg.get("base_url")
+            or "https://generativelanguage.googleapis.com/v1beta/openai/"
+        )
+        self.model = embed_cfg.get("model", "gemini-embedding-001")
+        self.enabled = bool(self.api_key) and _bool_value(
+            embed_cfg.get("enabled", True)
+        )
+        self.max_chars = self._int_between(
+            embed_cfg.get("max_chars", self.max_chars), self.max_chars, 500, 32000
+        )
+        self.query_instruction = str(
+            embed_cfg.get("query_instruction") or self.query_instruction
+        ).strip()
+        self.document_instruction = str(
+            embed_cfg.get("document_instruction") or self.document_instruction
+        ).strip()
+        await self._ensure_client()
+
+    async def close(self) -> None:
+        """Close the pooled client exactly once during service shutdown."""
+        with self._client_lock:
+            client = self.client
+            self.client = None
+            self._client_signature = None
+        if client is not None and not getattr(client, "is_closed", False):
+            await client.aclose()
 
     @staticmethod
     def _request_embedding_sync(
@@ -375,3 +485,13 @@ class EmbeddingEngine:
         if norm_a == 0 or norm_b == 0:
             return 0.0
         return dot / (norm_a * norm_b)
+
+
+def _bool_value(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)

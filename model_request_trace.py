@@ -163,8 +163,18 @@ class ModelRequestTraceStore:
                 started_at_ms INTEGER NOT NULL, duration_ms INTEGER,
                 http_status INTEGER, result_status TEXT NOT NULL DEFAULT '',
                 outcome TEXT NOT NULL DEFAULT '', usage_json TEXT NOT NULL DEFAULT '{}',
-                raw_id TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL
+                raw_id TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL,
+                timing_json TEXT NOT NULL DEFAULT '{}'
             )""")
+            attempt_columns = {
+                row[1] for row in db.execute(
+                    "PRAGMA table_info(physical_attempts)"
+                ).fetchall()
+            }
+            if "timing_json" not in attempt_columns:
+                db.execute(
+                    "ALTER TABLE physical_attempts ADD COLUMN timing_json TEXT NOT NULL DEFAULT '{}'"
+                )
             db.execute("""CREATE TABLE IF NOT EXISTS raw_requests (
                 raw_id TEXT PRIMARY KEY, trace_id TEXT NOT NULL,
                 attempt_id TEXT NOT NULL, view_mode TEXT NOT NULL,
@@ -272,7 +282,8 @@ class ModelRequestTraceStore:
                        retry_reason: str = "", started_at_ms: int | None = None,
                        duration_ms: int | None = None, http_status: int | None = None,
                        result_status: str = "", outcome: str = "",
-                       usage: dict | None = None, payload: dict | None = None) -> str | None:
+                       usage: dict | None = None, timing: dict | None = None,
+                       payload: dict | None = None) -> str | None:
         try:
             settings = self.settings()
             attempt_id = f"attempt-{uuid.uuid4().hex}"
@@ -314,13 +325,15 @@ class ModelRequestTraceStore:
                 db.execute("""INSERT INTO physical_attempts(
                     attempt_id, trace_id, attempt_ordinal, provider, upstream, model,
                     alias, retry_reason, started_at_ms, duration_ms, http_status,
-                    result_status, outcome, usage_json, raw_id, created_at_ms)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    result_status, outcome, usage_json, raw_id, created_at_ms,
+                    timing_json)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                     attempt_id, trace_id, int(ordinal), str(provider or "")[:120],
                     str(upstream or "")[:160], str(model or "")[:160], str(alias or "")[:160],
                     str(retry_reason or "")[:200], int(started_at_ms or _now_ms()),
                     duration_ms, http_status, str(result_status or "")[:80],
-                    str(outcome or "")[:40], _json(usage or {}), raw_id, _now_ms()))
+                    str(outcome or "")[:40], _json(usage or {}), raw_id, _now_ms(),
+                    _json(timing or {})))
                 self._event(db, trace_id, "payload.ready", {
                     "attempt_id": attempt_id, "ordinal": ordinal,
                     "raw_available": bool(raw_id),
@@ -336,7 +349,8 @@ class ModelRequestTraceStore:
 
     def update_attempt(self, attempt_id: str, *, duration_ms: int | None = None,
                        http_status: int | None = None, result_status: str | None = None,
-                       outcome: str | None = None, usage: dict | None = None):
+                       outcome: str | None = None, usage: dict | None = None,
+                       timing: dict | None = None):
         try:
             fields, values = [], []
             for name, value in (("duration_ms", duration_ms), ("http_status", http_status),
@@ -345,6 +359,8 @@ class ModelRequestTraceStore:
                     fields.append(f"{name}=?"); values.append(value)
             if usage is not None:
                 fields.append("usage_json=?"); values.append(_json(usage))
+            if timing is not None:
+                fields.append("timing_json=?"); values.append(_json(timing))
             if not fields:
                 return
             values.append(attempt_id)
@@ -453,7 +469,8 @@ class ModelRequestTraceStore:
 
     def update_latest_attempt(self, trace_id: str, *, duration_ms: int | None = None,
                               http_status: int | None = None, result_status: str | None = None,
-                              outcome: str | None = None, usage: dict | None = None) -> None:
+                              outcome: str | None = None, usage: dict | None = None,
+                              timing: dict | None = None) -> None:
         try:
             with self._connect() as db:
                 row = db.execute(
@@ -463,7 +480,7 @@ class ModelRequestTraceStore:
             if row:
                 self.update_attempt(row["attempt_id"], duration_ms=duration_ms,
                                     http_status=http_status, result_status=result_status,
-                                    outcome=outcome, usage=usage)
+                                    outcome=outcome, usage=usage, timing=timing)
         except Exception:
             return
 
@@ -474,7 +491,9 @@ class ModelRequestTraceStore:
                 "retry_reason": row["retry_reason"], "started_at_ms": int(row["started_at_ms"]),
                 "duration_ms": row["duration_ms"], "http_status": row["http_status"],
                 "result_status": row["result_status"], "outcome": row["outcome"],
-                "usage": json.loads(row["usage_json"] or "{}"), "raw_available": bool(row["raw_id"])}
+                "usage": json.loads(row["usage_json"] or "{}"),
+                "timing": json.loads(row["timing_json"] or "{}"),
+                "raw_available": bool(row["raw_id"])}
         if include_raw and row["raw_id"]:
             with self._connect() as db:
                 raw = db.execute(
@@ -598,6 +617,7 @@ class ModelRequestTraceStore:
             ("raw_requests", "payload_json"),
             ("logical_requests", "metadata_json"),
             ("physical_attempts", "usage_json"),
+            ("physical_attempts", "timing_json"),
             ("trace_events", "payload_json"),
         ):
             value = db.execute(

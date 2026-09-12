@@ -12095,24 +12095,10 @@ async def api_config_update(request):
             env_updates["OMBRE_EMBEDDING_API_KEY"] = str(e["api_key"])
             updated.append("embedding.api_key")
 
-        # Hot-reload embedding client; falls back to dehydration key/base_url when unset.
-        embedding_engine.api_key = emb.get("api_key") or config.get("dehydration", {}).get("api_key", "")
-        embedding_engine.base_url = (
-            emb.get("base_url")
-            or config.get("dehydration", {}).get("base_url", "")
-            or "https://generativelanguage.googleapis.com/v1beta/openai/"
-        )
-        embedding_engine.model = emb.get("model", "gemini-embedding-001")
-        embedding_engine.enabled = bool(embedding_engine.api_key) and emb.get("enabled", True)
-        if embedding_engine.enabled:
-            from openai import AsyncOpenAI
-            embedding_engine.client = AsyncOpenAI(
-                api_key=embedding_engine.api_key,
-                base_url=embedding_engine.base_url,
-                timeout=30.0,
-            )
-        else:
-            embedding_engine.client = None
+        # Hot-reload the persistent embedding pool.  The engine owns the
+        # lifecycle so an old client is closed before a changed endpoint/key
+        # becomes active.
+        await embedding_engine.reconfigure(config)
 
     # --- Merge threshold ---
     if "merge_threshold" in body:
@@ -12158,7 +12144,14 @@ async def api_config_update(request):
             os.environ["OMBRE_RERANKER_BASE_URL"] = reranker_cfg.get("base_url", "")
         if "model" in r:
             os.environ["OMBRE_RERANKER_MODEL"] = reranker_cfg.get("model", "")
+        previous_reranker_engine = reranker_engine
         reranker_engine = RerankerEngine(config)
+        close_previous = getattr(previous_reranker_engine, "close", None)
+        if callable(close_previous):
+            try:
+                await close_previous()
+            except Exception:
+                logger.debug("Previous reranker HTTP client close failed", exc_info=True)
         if reranker_gateway_payload:
             gateway_hot_update_payload["reranker"] = reranker_gateway_payload
 
@@ -13576,6 +13569,17 @@ if __name__ == "__main__":
                 await _ensure_decay_engine_started_for_transport(transport)
 
             _app.add_event_handler("startup", _start_decay_engine_on_app_startup)
+
+            async def _close_retrieval_clients_on_app_shutdown():
+                for engine in (embedding_engine, reranker_engine):
+                    close = getattr(engine, "close", None)
+                    if callable(close):
+                        try:
+                            await close()
+                        except Exception:
+                            logger.debug("Retrieval client shutdown close failed", exc_info=True)
+
+            _app.add_event_handler("shutdown", _close_retrieval_clients_on_app_shutdown)
         _app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],

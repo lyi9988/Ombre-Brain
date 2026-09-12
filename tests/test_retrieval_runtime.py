@@ -97,6 +97,10 @@ def test_reranker_runtime_debug_records_success_without_documents(monkeypatch):
             return {"results": [{"index": 0, "relevance_score": 0.91}]}
 
     class FakeClient:
+        def __init__(self):
+            self.calls = 0
+            self.closed = False
+
         async def __aenter__(self):
             return self
 
@@ -104,7 +108,11 @@ def test_reranker_runtime_debug_records_success_without_documents(monkeypatch):
             return False
 
         async def post(self, *args, **kwargs):
+            self.calls += 1
             return FakeResponse()
+
+        async def aclose(self):
+            self.closed = True
 
     monkeypatch.setattr("reranker_engine.httpx.AsyncClient", lambda **kwargs: FakeClient())
     result = asyncio.run(engine.rerank("query", ["document"], top_n=1))
@@ -115,6 +123,94 @@ def test_reranker_runtime_debug_records_success_without_documents(monkeypatch):
     assert debug["last_http_status"] == 200
     assert debug["last_result_count"] == 1
     assert "embedding-secret" not in str(debug)
+
+
+def test_retrieval_clients_are_reused_and_closed(monkeypatch, tmp_path):
+    created = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.calls = 0
+            self.closed = False
+            created.append(self)
+
+        async def post(self, *args, **kwargs):
+            self.calls += 1
+            return FakeResponse()
+
+        async def aclose(self):
+            self.closed = True
+
+    monkeypatch.setattr("embedding_engine.httpx.AsyncClient", FakeClient)
+    engine = EmbeddingEngine({
+        "buckets_dir": str(tmp_path / "embedding"),
+        "embedding": {"enabled": True, "api_key": "secret", "base_url": "https://example/v1"},
+    })
+
+    async def scenario():
+        assert await engine._generate_embedding("one", kind="query") == [0.1, 0.2, 0.3]
+        assert await engine._generate_embedding("two", kind="query") == [0.1, 0.2, 0.3]
+        await engine.close()
+
+    asyncio.run(scenario())
+    assert len(created) == 1
+    assert created[0].calls == 2
+    assert created[0].closed is True
+
+
+def test_reranker_client_is_reused_and_closed(monkeypatch):
+    created = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": [{"index": 0, "relevance_score": 0.8}]}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.calls = 0
+            self.closed = False
+            created.append(self)
+
+        async def post(self, *args, **kwargs):
+            self.calls += 1
+            return FakeResponse()
+
+        async def aclose(self):
+            self.closed = True
+
+    monkeypatch.setattr("reranker_engine.httpx.AsyncClient", FakeClient)
+    engine = RerankerEngine({
+        "reranker": {
+            "enabled": True,
+            "api_key": "secret",
+            "base_url": "https://example/v1",
+            "model": "reranker",
+        },
+    })
+
+    async def scenario():
+        assert await engine.rerank("one", ["document"], top_n=1)
+        assert await engine.rerank("two", ["document"], top_n=1)
+        await engine.close()
+
+    asyncio.run(scenario())
+    assert len(created) == 1
+    assert created[0].calls == 2
+    assert created[0].closed is True
 
 
 def test_gateway_reloads_runtime_overlay_without_rebuilding_brain(tmp_path):
