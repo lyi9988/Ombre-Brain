@@ -265,30 +265,85 @@ class MemoryMomentStore:
             ON memory_retrieval_aliases(bucket_id)
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_moment_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
         conn.close()
+
+    def source_signature(self) -> str:
+        """Return the source identity committed with the derived index.
+
+        The value contains only a hash of bucket/edge structure. It lets a
+        freshly started Gateway reuse an already-current derived index instead
+        of deleting and rebuilding every moment on its first chat request.
+        """
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT value FROM memory_moment_meta WHERE key = 'source_signature_v1'"
+        ).fetchone()
+        conn.close()
+        return str(row["value"] or "") if row else ""
+
+    @staticmethod
+    def _set_source_signature(conn: sqlite3.Connection, value: str) -> None:
+        value = str(value or "").strip()
+        if not value:
+            conn.execute(
+                "DELETE FROM memory_moment_meta WHERE key = 'source_signature_v1'"
+            )
+            return
+        conn.execute(
+            """
+            INSERT INTO memory_moment_meta (key, value, updated_at)
+            VALUES ('source_signature_v1', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (value, datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        )
 
     def upsert_bucket(self, bucket: dict) -> list[dict]:
         moments = parse_bucket_moments(bucket, self.relevance_options, self.annotation_options)
         bucket_id = _bucket_id(bucket)
         conn = self._connect()
         self._replace_bucket(conn, bucket_id, moments, _bucket_title(bucket))
+        self._set_source_signature(conn, "")
         conn.commit()
         conn.close()
         return [dict(moment) for moment in moments]
 
-    def bulk_upsert(self, buckets: list[dict]) -> dict:
+    def bulk_upsert(self, buckets: list[dict], *, source_signature: str = "") -> dict:
         conn = self._connect()
         indexed_buckets = 0
         indexed_moments = 0
-        for bucket in buckets:
-            bucket_id = _bucket_id(bucket)
-            moments = parse_bucket_moments(bucket, self.relevance_options, self.annotation_options)
-            self._replace_bucket(conn, bucket_id, moments, _bucket_title(bucket))
-            indexed_buckets += 1
-            indexed_moments += len(moments)
-        conn.commit()
-        conn.close()
+        try:
+            for bucket in buckets:
+                bucket_id = _bucket_id(bucket)
+                moments = parse_bucket_moments(
+                    bucket,
+                    self.relevance_options,
+                    self.annotation_options,
+                )
+                self._replace_bucket(conn, bucket_id, moments, _bucket_title(bucket))
+                indexed_buckets += 1
+                indexed_moments += len(moments)
+            # The identity and the derived rows form one transaction. A failed
+            # rebuild must leave the last known-good signature reusable.
+            self._set_source_signature(conn, source_signature)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
         return {"buckets": indexed_buckets, "moments": indexed_moments}
 
     def list_for_bucket(self, bucket_id: str, limit: int = 100) -> list[dict]:
@@ -449,6 +504,10 @@ class MemoryMomentStore:
             "DELETE FROM memory_retrieval_aliases WHERE bucket_id = ?",
             (bucket_id,),
         )
+        if any(int(cursor.rowcount or 0) > 0 for cursor in (
+            edge_cursor, moment_cursor, alias_cursor,
+        )):
+            self._set_source_signature(conn, "")
         conn.commit()
         conn.close()
         return {

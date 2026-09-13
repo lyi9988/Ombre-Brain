@@ -562,6 +562,7 @@ class GatewayService:
         self.entity_edge_store = EntityEdgeStore(config)
         self.memory_node_store = memory_node_store or MemoryNodeStore(config)
         self.memory_moment_store = MemoryMomentStore(config)
+        self._moment_graph_refresh_lock = threading.RLock()
         self._moment_graph_cache_signature = ""
         self._moment_graph_cache_value: tuple[list[dict], dict[str, list[dict]], list[dict]] | None = None
         self._moment_graph_cache_bucket_list_id = 0
@@ -11471,6 +11472,17 @@ class GatewayService:
         self,
         all_buckets: list[dict],
     ) -> tuple[list[dict], dict[str, list[dict]], list[dict]]:
+        # The refresh path performs a derived SQLite rebuild and must have one
+        # writer even if Gateway request handling later moves across threads.
+        # The persistent source signature below also makes process restarts a
+        # cache warm-up, not an automatic full delete/reinsert cycle.
+        with self._moment_graph_refresh_lock:
+            return self._refresh_moment_graph_locked(all_buckets)
+
+    def _refresh_moment_graph_locked(
+        self,
+        all_buckets: list[dict],
+    ) -> tuple[list[dict], dict[str, list[dict]], list[dict]]:
         self._prune_self_anchor_moment_index(all_buckets)
         bucket_list_id = id(all_buckets)
         edge_stamp = self._memory_edge_store_stamp()
@@ -11497,7 +11509,12 @@ class GatewayService:
             and store_stamp == self._moment_graph_cache_store_stamp
         ):
             return self._moment_graph_cache_value
-        self.memory_moment_store.bulk_upsert(recallable_buckets)
+        persistent_signature = self.memory_moment_store.source_signature()
+        if not signature or persistent_signature != signature:
+            self.memory_moment_store.bulk_upsert(
+                recallable_buckets,
+                source_signature=signature,
+            )
         moments = [
             moment
             for moment in self._recallable_moments(self.memory_moment_store.list_all())
@@ -12664,6 +12681,42 @@ class GatewayService:
             bucket_id = str((bucket or {}).get("id") or "")
             if bucket_id:
                 candidate_bucket_signals.setdefault(bucket_id, self._bucket_candidate_recall_signal(item))
+        # Moment admission is intentionally subordinate to an admitted source
+        # bucket: _admit_moment_for_recall(..., admitted_bucket_ids=set())
+        # rejects every moment as bucket_not_admitted.  Continuing into search
+        # and provider rerank in that state used to spend several seconds on a
+        # result that was structurally guaranteed to be empty. Preserve the
+        # recall decision and make that boundary explicit in owner telemetry.
+        if not selected_bucket_ids:
+            query_planner_debug["moment_skip_reason"] = "no_admitted_buckets"
+            moment_input_count = len(all_moments) if all_moments is not None else len(eligible_ids)
+            self._record_candidate_stage(
+                candidate_stages,
+                "moment.search_0",
+                moment_input_count,
+                0,
+                skipped=True,
+                reason="no admitted source buckets",
+            )
+            for stage_name, reason in (
+                ("moment.filter_relevance", "moment search skipped"),
+                ("moment_rerank", "no moment candidates"),
+                ("moment.admit_candidates", "no admitted source buckets"),
+                ("moment.final_output", "no admitted source buckets"),
+                ("moment.fallback_output", "no admitted source buckets"),
+            ):
+                self._record_candidate_stage(
+                    candidate_stages,
+                    stage_name,
+                    0,
+                    0,
+                    skipped=True,
+                    reason=reason,
+                )
+            result = ([], [], [], suppressed_buckets)
+            if include_query_planner_debug:
+                return (*result, query_planner_debug)
+            return result
         bucket_boosts = {bucket_id: 1.0 for bucket_id in selected_bucket_ids}
         for item in suppressed_buckets or []:
             bucket = item.get("bucket") if isinstance(item, dict) else None
