@@ -31,6 +31,7 @@ import logging
 import re
 import shutil
 import json
+import tempfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,6 +109,45 @@ class BucketManager:
             str,
             tuple[tuple, Counter[str], float, tuple[str, str, str, str]],
         ] = {}
+
+    @staticmethod
+    def _atomic_write_text(file_path: str, text: str) -> None:
+        """Durably replace one Bucket-side text artifact on the same filesystem."""
+        parent = os.path.dirname(os.path.abspath(file_path))
+        os.makedirs(parent, exist_ok=True)
+        previous_mode = None
+        try:
+            previous_mode = os.stat(file_path).st_mode & 0o777
+        except FileNotFoundError:
+            pass
+        temp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n", dir=parent,
+                prefix=f".{os.path.basename(file_path)}.", suffix=".tmp", delete=False,
+            ) as handle:
+                temp_path = handle.name
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if previous_mode is not None:
+                os.chmod(temp_path, previous_mode)
+            os.replace(temp_path, file_path)
+            temp_path = ""
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except FileNotFoundError:
+                    pass
+
+    @classmethod
+    def _write_post_atomic(cls, file_path: str, post) -> None:
+        cls._atomic_write_text(file_path, frontmatter.dumps(post))
+
+    @classmethod
+    def _write_json_atomic(cls, file_path: str, payload: dict) -> None:
+        cls._atomic_write_text(file_path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -232,8 +272,7 @@ class BucketManager:
         file_path = safe_path(target_dir, filename)
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            self._write_post_atomic(file_path, post)
         except OSError as e:
             logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
             raise
@@ -276,7 +315,7 @@ class BucketManager:
         filename = os.path.basename(file_path)
         new_path = safe_path(target_dir, filename)
         if os.path.normpath(file_path) != os.path.normpath(new_path):
-            os.rename(file_path, new_path)
+            os.replace(file_path, new_path)
             logger.info(f"Moved bucket / 移动记忆桶: {filename} → {target_dir}/")
         return new_path
 
@@ -384,8 +423,7 @@ class BucketManager:
         post["last_active"] = kwargs.get("last_active") or now_iso()
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            self._write_post_atomic(file_path, post)
         except OSError as e:
             logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
             return False
@@ -395,8 +433,7 @@ class BucketManager:
         domain = post.get("domain", ["未分类"])
         if kwargs.get("pinned") and post.get("type") != "permanent":
             post["type"] = "permanent"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            self._write_post_atomic(file_path, post)
             self._move_bucket(file_path, self.permanent_dir, domain)
         elif "domain" in kwargs and post.get("type") != "feel":
             bucket_type = str(post.get("type") or "dynamic")
@@ -423,6 +460,7 @@ class BucketManager:
         source: str | None = None,
         created: str | None = None,
         touch: bool = True,
+        comment_id: str | None = None,
     ) -> Optional[dict]:
         """
         Append a ring/comment to an existing bucket without changing its body.
@@ -442,11 +480,17 @@ class BucketManager:
         if not isinstance(comments, list):
             comments = []
 
+        requested_comment_id = str(comment_id or "").strip()
+        if requested_comment_id:
+            for existing in comments:
+                if isinstance(existing, dict) and str(existing.get("id") or "") == requested_comment_id:
+                    return existing
+
         now = now_iso()
         created_at = str(created or now).strip() or now
         default_author = identity_names(self.config).get("ai_name") or "AI"
         entry = {
-            "id": generate_bucket_id(),
+            "id": requested_comment_id or generate_bucket_id(),
             "created": created_at,
             "author": str(author or default_author),
             "kind": str(kind or "comment"),
@@ -470,8 +514,7 @@ class BucketManager:
             post["activation_count"] = post.get("activation_count", 0) + 1
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            self._write_post_atomic(file_path, post)
         except OSError as e:
             logger.error(f"Failed to write bucket comment / 写入桶评论失败: {file_path}: {e}")
             return None
@@ -527,8 +570,7 @@ class BucketManager:
         post["updated_at"] = now_iso()
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            self._write_post_atomic(file_path, post)
         except OSError as e:
             logger.error(f"Failed to delete bucket comment / 删除桶评论失败: {file_path}: {e}")
             return {"status": "failed", "comment": target}
@@ -610,8 +652,7 @@ class BucketManager:
     def _write_tombstone(self, tombstone: dict) -> None:
         os.makedirs(self.tombstone_dir, exist_ok=True)
         path = safe_path(self.tombstone_dir, f"{tombstone['id']}.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(tombstone, f, ensure_ascii=False, indent=2)
+        self._write_json_atomic(path, tombstone)
 
     # ---------------------------------------------------------
     # Touch bucket (refresh activation time + increment count)
@@ -635,8 +676,7 @@ class BucketManager:
             post["last_active"] = now_iso()
             post["activation_count"] = post.get("activation_count", 0) + 1
 
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            self._write_post_atomic(file_path, post)
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
@@ -686,8 +726,7 @@ class BucketManager:
                     current_count = post.get("activation_count", 1)
                     # Store as float for fractional increments; calculate_score handles it
                     post["activation_count"] = round(current_count + 0.3, 1)
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(frontmatter.dumps(post))
+                    self._write_post_atomic(file_path, post)
                     rippled += 1
                 except Exception:
                     continue
@@ -1354,8 +1393,7 @@ class BucketManager:
 
             # Update type marker then move file / 更新类型标记后移动文件
             post["type"] = "archived"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            self._write_post_atomic(file_path, post)
 
             # Use shutil.move for cross-filesystem safety
             # 使用 shutil.move 保证跨文件系统安全
@@ -1394,8 +1432,7 @@ class BucketManager:
             post["resolved"] = False
             post["updated_at"] = now_iso()
             post["last_active"] = post.get("last_active") or post["updated_at"]
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            self._write_post_atomic(file_path, post)
 
             if os.path.normpath(file_path) != os.path.normpath(str(dest)):
                 shutil.move(file_path, str(dest))

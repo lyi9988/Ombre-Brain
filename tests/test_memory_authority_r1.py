@@ -1,15 +1,20 @@
 import hashlib
+import asyncio
 
 import pytest
+import frontmatter
 
+from bucket_manager import BucketManager
 from memory_authority import (
     BodyHashMismatch,
+    CommitStateError,
     IdempotencyConflict,
     MemoryAuthorityStore,
     MemoryIngestionPolicy,
     MemoryProposal,
     RevisionConflict,
 )
+from memory_commit_service import BucketProjectionResult, MemoryCommitService, ProjectionNotApplied
 
 
 def proposal(**overrides):
@@ -196,6 +201,24 @@ def test_second_revision_checks_current_pointer(tmp_path):
         )
 
 
+def test_only_one_open_revision_commit_per_memory(tmp_path):
+    authority = store(tmp_path)
+    first = authority.prepare_memory_commit(
+        memory_id="memory-1", bucket_id="bucket-1", expected_revision=0,
+        body_sha256="sha-1", snapshot_path="revision-1.md", metadata={},
+        source_refs=["evt-1"], decision_source="owner",
+        idempotency_key="commit-open-1", actor="owner",
+    )
+    assert first["status"] == "prepared"
+    with pytest.raises(CommitStateError):
+        authority.prepare_memory_commit(
+            memory_id="memory-1", bucket_id="bucket-1", expected_revision=0,
+            body_sha256="sha-2", snapshot_path="revision-2.md", metadata={},
+            source_refs=["evt-2"], decision_source="owner",
+            idempotency_key="commit-open-2", actor="owner",
+        )
+
+
 def test_ring_is_child_event_and_does_not_change_body_revision(tmp_path):
     authority = store(tmp_path)
     commit_first_memory(authority)
@@ -235,3 +258,111 @@ def test_owner_alias_cannot_be_downgraded_by_automatic_rebuild(tmp_path):
     )
     assert owner["trust"] == rebuilt["trust"] == "owner"
     assert set(rebuilt["source_refs"]) == {"owner-confirmation-1", "rebuild-1"}
+
+
+def test_bucket_writes_are_atomic_and_ring_id_can_follow_authority_id(tmp_path):
+    if not hasattr(frontmatter, "Post"):
+        pytest.skip("local environment has incompatible 'frontmatter' package")
+    manager = BucketManager({"buckets_dir": str(tmp_path / "buckets")})
+    bucket_id = asyncio.run(manager.create(
+        "原始正文", bucket_id="bucket-1", name="测试记忆", domain=["测试"],
+    ))
+    assert bucket_id == "bucket-1"
+
+    assert asyncio.run(manager.update(bucket_id, content="修订正文")) is True
+    ring = asyncio.run(manager.add_comment(
+        bucket_id,
+        "后来产生的新感受。",
+        kind="feel",
+        comment_id="ring-authority-1",
+        touch=False,
+    ))
+    assert ring["id"] == "ring-authority-1"
+
+    path = manager._find_bucket_file(bucket_id)
+    post = frontmatter.load(path)
+    assert post.content == "修订正文"
+    assert post["comments"][0]["id"] == "ring-authority-1"
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+class FakeProjection:
+    def __init__(self):
+        self.revisions = []
+        self.rings = []
+        self.fail_revision = False
+        self.fail_ring = False
+
+    async def write_revision(self, **kwargs):
+        if self.fail_revision:
+            raise ProjectionNotApplied("not written")
+        self.revisions.append(dict(kwargs))
+        return BucketProjectionResult(
+            bucket_id=kwargs["bucket_id"], revision=kwargs["revision"],
+            operation_id=kwargs["operation_id"],
+            body_sha256=hashlib.sha256(kwargs["body"].encode("utf-8")).hexdigest(),
+            snapshot_path=kwargs["snapshot_path"],
+        )
+
+    async def append_ring(self, **kwargs):
+        if self.fail_ring:
+            raise RuntimeError("ring projection failed")
+        if not any(item["ring_id"] == kwargs["ring_id"] for item in self.rings):
+            self.rings.append(dict(kwargs))
+
+
+def test_commit_service_projects_once_and_idempotent_retry_returns_same_revision(tmp_path):
+    authority = store(tmp_path)
+    projection = FakeProjection()
+    service = MemoryCommitService(authority, projection)
+    kwargs = dict(
+        memory_id="memory-1", bucket_id="bucket-1", expected_revision=0,
+        body="正文", metadata={}, source_refs=["evt-1"], decision_source="owner",
+        idempotency_key="service-commit-1", actor="owner",
+    )
+    first = asyncio.run(service.commit_memory(**kwargs))
+    second = asyncio.run(service.commit_memory(**kwargs))
+    assert first == second
+    assert first["revision"] == 1
+    assert len(projection.revisions) == 1
+
+
+def test_definite_projection_failure_aborts_and_releases_open_commit(tmp_path):
+    authority = store(tmp_path)
+    projection = FakeProjection()
+    projection.fail_revision = True
+    service = MemoryCommitService(authority, projection)
+    with pytest.raises(ProjectionNotApplied):
+        asyncio.run(service.commit_memory(
+            memory_id="memory-1", bucket_id="bucket-1", expected_revision=0,
+            body="正文", metadata={}, source_refs=["evt-1"], decision_source="owner",
+            idempotency_key="failed-service-1", actor="owner",
+        ))
+    assert authority.list_open_commits() == []
+
+
+def test_ring_projection_failure_is_visible_as_degraded_and_not_a_second_ring(tmp_path):
+    authority = store(tmp_path)
+    projection = FakeProjection()
+    service = MemoryCommitService(authority, projection)
+    asyncio.run(service.commit_memory(
+        memory_id="memory-1", bucket_id="bucket-1", expected_revision=0,
+        body="正文", metadata={}, source_refs=["evt-1"], decision_source="owner",
+        idempotency_key="service-commit-1", actor="owner",
+    ))
+    projection.fail_ring = True
+    with pytest.raises(RuntimeError):
+        asyncio.run(service.append_ring(
+            memory_id="memory-1", content="年轮", kind="feel", source_refs=["evt-2"],
+            idempotency_key="service-ring-1", actor="guyan",
+        ))
+    degraded = authority.pending_outbox()
+    assert any(item["event_type"] == "MemoryRingAppended" and item["status"] == "degraded" for item in degraded)
+
+    projection.fail_ring = False
+    result = asyncio.run(service.append_ring(
+        memory_id="memory-1", content="年轮", kind="feel", source_refs=["evt-2"],
+        idempotency_key="service-ring-1", actor="guyan",
+    ))
+    assert len(projection.rings) == 1
+    assert projection.rings[0]["ring_id"] == result["ring_id"]

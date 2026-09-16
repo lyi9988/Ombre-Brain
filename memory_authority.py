@@ -362,6 +362,9 @@ class MemoryAuthorityStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_memory_revision
+                ON commit_log(aggregate_id)
+                WHERE operation_kind='memory_revision' AND status IN ('prepared','body_written');
             CREATE TABLE IF NOT EXISTS outbox (
                 event_id TEXT PRIMARY KEY,
                 operation_id TEXT NOT NULL UNIQUE,
@@ -590,12 +593,24 @@ class MemoryAuthorityStore:
             if current_revision != int(expected_revision):
                 raise RevisionConflict(f"expected {expected_revision}, current {current_revision}")
             payload["revision"] = current_revision + 1
-            conn.execute(
-                "INSERT INTO commit_log(operation_id,idempotency_key,fingerprint,operation_kind,aggregate_id,status,"
-                "payload_json,result_json,error_code,created_at,updated_at) VALUES(?,?,?,?,?,'prepared',?,'{}','',?,?)",
-                (operation_id, str(idempotency_key), fingerprint, "memory_revision", memory_id,
-                 _json(payload), now, now),
-            )
+            try:
+                conn.execute(
+                    "INSERT INTO commit_log(operation_id,idempotency_key,fingerprint,operation_kind,aggregate_id,status,"
+                    "payload_json,result_json,error_code,created_at,updated_at) VALUES(?,?,?,?,?,'prepared',?,'{}','',?,?)",
+                    (operation_id, str(idempotency_key), fingerprint, "memory_revision", memory_id,
+                     _json(payload), now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                open_commit = conn.execute(
+                    "SELECT operation_id FROM commit_log WHERE aggregate_id=? AND operation_kind='memory_revision' "
+                    "AND status IN ('prepared','body_written')",
+                    (memory_id,),
+                ).fetchone()
+                if open_commit:
+                    raise CommitStateError(
+                        f"memory {memory_id} already has open commit {open_commit['operation_id']}"
+                    ) from exc
+                raise
             conn.commit()
             return {"operation_id": operation_id, "status": "prepared", "payload": payload, "result": {}}
         except Exception:
@@ -689,6 +704,83 @@ class MemoryAuthorityStore:
             )
             conn.commit()
             return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_commit(self, operation_id: str) -> dict[str, Any] | None:
+        conn = self._connect()
+        row = conn.execute("SELECT * FROM commit_log WHERE operation_id=?", (operation_id,)).fetchone()
+        conn.close()
+        if not row:
+            return None
+        value = dict(row)
+        value["payload"] = _loads(value.pop("payload_json"), {})
+        value["result"] = _loads(value.pop("result_json"), {})
+        return value
+
+    def list_open_commits(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT * FROM commit_log WHERE operation_kind='memory_revision' "
+            "AND status IN ('prepared','body_written') ORDER BY created_at LIMIT ?",
+            (max(1, min(1000, int(limit))),),
+        ).fetchall()
+        conn.close()
+        result = []
+        for row in rows:
+            value = dict(row)
+            value["payload"] = _loads(value.pop("payload_json"), {})
+            value["result"] = _loads(value.pop("result_json"), {})
+            result.append(value)
+        return result
+
+    def abort_memory_commit(self, operation_id: str, *, error_code: str) -> dict[str, Any]:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM commit_log WHERE operation_id=?", (operation_id,)).fetchone()
+            if not row:
+                raise CommitStateError("operation not found")
+            if row["status"] == "aborted":
+                conn.commit()
+                return self.get_commit(operation_id) or {}
+            if row["status"] != "prepared":
+                raise CommitStateError(f"cannot abort from {row['status']}")
+            conn.execute(
+                "UPDATE commit_log SET status='aborted',error_code=?,updated_at=? WHERE operation_id=?",
+                (str(error_code or "projection_not_applied")[:120], _now(), operation_id),
+            )
+            conn.commit()
+            return self.get_commit(operation_id) or {}
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def set_outbox_status(self, event_id: str, *, status: str, error: str = "") -> dict[str, Any]:
+        safe_status = str(status or "").strip().lower()
+        if safe_status not in {"pending", "projected", "degraded"}:
+            raise ValueError("invalid outbox status")
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM outbox WHERE event_id=?", (event_id,)).fetchone()
+            if not row:
+                raise CommitStateError("outbox event not found")
+            attempts = int(row["attempts"] or 0) + (1 if safe_status in {"projected", "degraded"} else 0)
+            conn.execute(
+                "UPDATE outbox SET status=?,attempts=?,last_error=?,updated_at=? WHERE event_id=?",
+                (safe_status, attempts, str(error or "")[:500], _now(), event_id),
+            )
+            conn.commit()
+            updated = conn.execute("SELECT * FROM outbox WHERE event_id=?", (event_id,)).fetchone()
+            value = dict(updated)
+            value["payload"] = _loads(value.pop("payload_json"), {})
+            return value
         except Exception:
             conn.rollback()
             raise
