@@ -16,6 +16,7 @@ from memory_authority import (
 )
 from memory_commit_service import BucketProjectionResult, MemoryCommitService, ProjectionNotApplied
 from memory_migration_audit import MemoryMigrationAuditor
+from memory_authority_migrate import MemoryAuthorityMigrator, MigrationBlocked
 from reflection_engine import ReflectionEngine
 
 
@@ -541,3 +542,65 @@ def test_daily_mode_conflict_fails_closed_when_authority_is_enabled(tmp_path):
     }
     with pytest.raises(ValueError, match="daily_chat_memory_mode"):
         ReflectionEngine(config)
+
+
+def test_apply_migration_preserves_bucket_bytes_and_imports_revision_ring_and_candidate(tmp_path):
+    candidates = tmp_path / "daily_chat_memory_candidates.json"
+    candidates.write_text(
+        """{
+  "items": [
+    {"status":"confirmed","bucket_id":"memory-1","candidate":{"id":"memory-1","mode":"review","proposed_memory":"正文一","original_excerpt":"原文","source_verification":"verified","source_event_ids":["evt-1"]}},
+    {"status":"pending","candidate":{"id":"memory-2","mode":"review","proposed_memory":"正文二","original_excerpt":"原文二","source_verification":"verified","source_event_ids":["evt-2"]}}
+  ],
+  "cursor": {"raw_events": {"default": {"last_raw_event_id": 99}}}
+}""",
+        encoding="utf-8",
+    )
+    bucket_dir = tmp_path / "buckets" / "dynamic" / "测试"
+    bucket_dir.mkdir(parents=True)
+    bucket = bucket_dir / "memory-1.md"
+    bucket.write_text(
+        "---\nid: memory-1\ncomments:\n  - id: ring-1\n    kind: feel\n    author: 顾衍\n    created: '2026-09-16T01:00:00+00:00'\n    content: 后来的感受\n---\n正文一\n",
+        encoding="utf-8",
+    )
+    before_bucket = bucket.read_bytes()
+    migrator = MemoryAuthorityMigrator(
+        candidates_path=candidates,
+        buckets_dir=tmp_path / "buckets",
+        state_dir=tmp_path / "state",
+        authority_db_path=tmp_path / "state" / "memory_authority.sqlite3",
+        backup_dir=tmp_path / "backup",
+    )
+    result = migrator.apply(expected_candidates=2, expected_buckets=1)
+    authority = MemoryAuthorityStore(str(tmp_path / "state" / "memory_authority.sqlite3"))
+
+    assert result["imported_memories"] == 1
+    assert result["imported_rings"] == 1
+    assert result["candidate_status_counts"] == {"committed": 1, "pending": 1}
+    assert bucket.read_bytes() == before_bucket
+    assert authority.get_memory("memory-1")["active_revision"] == 1
+    assert authority.get_candidate("memory-1")["status"] == "committed"
+    assert authority.get_candidate("memory-2")["status"] == "pending"
+    assert authority.get_meta("daily_chat_memory_cursor")["raw_events"]["default"]["last_raw_event_id"] == 99
+    assert (tmp_path / "backup" / "MANIFEST.json").exists()
+    assert (tmp_path / "state" / "memory_revisions" / "memory-1" / "revision-00000001.md").exists()
+
+
+def test_apply_migration_requires_explicit_counts_and_blocks_missing_confirmed_bucket(tmp_path):
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text(
+        '{"items":[{"status":"confirmed","candidate":{"id":"missing","proposed_memory":"正文"}}]}',
+        encoding="utf-8",
+    )
+    (tmp_path / "buckets").mkdir()
+    migrator = MemoryAuthorityMigrator(
+        candidates_path=candidates,
+        buckets_dir=tmp_path / "buckets",
+        state_dir=tmp_path / "state",
+        authority_db_path=tmp_path / "state" / "memory_authority.sqlite3",
+        backup_dir=tmp_path / "backup",
+    )
+    with pytest.raises(MigrationBlocked, match="accepted_missing_bucket"):
+        migrator.apply(expected_candidates=1, expected_buckets=0)
+    assert not (tmp_path / "backup").exists()
+    assert not (tmp_path / "state" / "memory_authority.sqlite3").exists()

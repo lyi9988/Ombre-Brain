@@ -1019,6 +1019,178 @@ class MemoryAuthorityStore:
         finally:
             conn.close()
 
+    def import_legacy_memory(
+        self,
+        *,
+        memory_id: str,
+        bucket_id: str,
+        body_sha256: str,
+        snapshot_path: str,
+        metadata: Mapping[str, Any],
+        source_refs: Sequence[str],
+        state: str = "active",
+        recall_policy: str = "enabled",
+    ) -> dict[str, Any]:
+        """Register an existing Bucket without changing or regenerating it."""
+        memory_id = str(memory_id or "").strip()
+        bucket_id = str(bucket_id or "").strip()
+        if not memory_id or not bucket_id or not body_sha256 or not snapshot_path:
+            raise ValueError("legacy memory identity, hash, and snapshot are required")
+        state = str(state or "active").strip().lower()
+        recall_policy = str(recall_policy or "enabled").strip().lower()
+        if state not in {"active", "archived", "tombstoned"}:
+            raise ValueError("invalid memory state")
+        if recall_policy not in {"enabled", "manual_only", "disabled"}:
+            raise ValueError("invalid recall policy")
+        operation_id = f"legacy-memory-import:{memory_id}:1"
+        idempotency_key = operation_id
+        payload = {
+            "memory_id": memory_id,
+            "bucket_id": bucket_id,
+            "revision": 1,
+            "body_sha256": str(body_sha256),
+            "snapshot_path": str(snapshot_path),
+            "metadata": dict(metadata or {}),
+            "source_refs": [str(item) for item in source_refs if str(item).strip()],
+            "state": state,
+            "recall_policy": recall_policy,
+        }
+        fingerprint = self.fingerprint(payload)
+        now = _now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            prior = conn.execute(
+                "SELECT * FROM commit_log WHERE idempotency_key=?", (idempotency_key,)
+            ).fetchone()
+            if prior:
+                if str(prior["fingerprint"]) != fingerprint:
+                    raise IdempotencyConflict("legacy memory changed after import")
+                conn.commit()
+                return _loads(prior["result_json"], {})
+            existing = conn.execute("SELECT * FROM memories WHERE memory_id=?", (memory_id,)).fetchone()
+            if existing:
+                if (
+                    str(existing["bucket_id"]) != bucket_id
+                    or str(existing["body_sha256"]) != str(body_sha256)
+                    or int(existing["active_revision"]) != 1
+                ):
+                    raise IdempotencyConflict("memory authority already contains a different legacy record")
+                result = dict(existing)
+                conn.commit()
+                return result
+            conn.execute(
+                "INSERT INTO commit_log(operation_id,idempotency_key,fingerprint,operation_kind,aggregate_id,status,"
+                "payload_json,result_json,error_code,created_at,updated_at) VALUES(?,?,?,?,?,'committed',?,'{}','',?,?)",
+                (operation_id, idempotency_key, fingerprint, "legacy_memory_import", memory_id,
+                 _json(payload), now, now),
+            )
+            conn.execute(
+                "INSERT INTO memories(memory_id,bucket_id,active_revision,state,recall_policy,body_sha256,updated_at) "
+                "VALUES(?,?,1,?,?,?,?)",
+                (memory_id, bucket_id, state, recall_policy, str(body_sha256), now),
+            )
+            conn.execute(
+                "INSERT INTO memory_revisions(memory_id,revision,body_sha256,snapshot_path,metadata_json,"
+                "source_refs_json,decision_source,operation_id,created_at,created_by) VALUES(?,1,?,?,?,?,?,?,?,?)",
+                (memory_id, str(body_sha256), str(snapshot_path), _json(dict(metadata or {})),
+                 _json(payload["source_refs"]), "migration", operation_id, now, "migration"),
+            )
+            event_id = f"memory:{memory_id}:legacy-import:1"
+            event_payload = {
+                "memory_id": memory_id,
+                "bucket_id": bucket_id,
+                "revision": 1,
+                "body_sha256": str(body_sha256),
+                "legacy_index_state": "unverified",
+            }
+            conn.execute(
+                "INSERT INTO outbox(event_id,operation_id,event_type,aggregate_id,aggregate_revision,payload_json,"
+                "status,attempts,last_error,created_at,updated_at) VALUES(?,?,?,?,1,?,'degraded',0,?,?,?)",
+                (event_id, operation_id, "LegacyMemoryImported", memory_id, _json(event_payload),
+                 "legacy_index_state_unverified", now, now),
+            )
+            result = {
+                "memory_id": memory_id,
+                "bucket_id": bucket_id,
+                "revision": 1,
+                "body_sha256": str(body_sha256),
+                "outbox_event_id": event_id,
+            }
+            conn.execute(
+                "UPDATE commit_log SET result_json=? WHERE operation_id=?",
+                (_json(result), operation_id),
+            )
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def import_legacy_ring(
+        self,
+        *,
+        memory_id: str,
+        ring_id: str,
+        content: str,
+        kind: str,
+        source_refs: Sequence[str],
+        actor: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        body = str(content or "").strip()
+        ring_id = str(ring_id or "").strip()
+        if not ring_id or not body:
+            raise ValueError("legacy ring id and content are required")
+        operation_id = f"legacy-ring-import:{memory_id}:{ring_id}"
+        payload = {
+            "memory_id": memory_id,
+            "ring_id": ring_id,
+            "content_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "kind": str(kind or "comment"),
+            "source_refs": [str(item) for item in source_refs if str(item).strip()],
+            "actor": str(actor or "legacy"),
+            "created_at": str(created_at or _now()),
+        }
+        fingerprint = self.fingerprint(payload)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            memory = conn.execute("SELECT * FROM memories WHERE memory_id=?", (memory_id,)).fetchone()
+            if not memory:
+                raise MemoryNotFound(memory_id)
+            prior = conn.execute("SELECT * FROM commit_log WHERE operation_id=?", (operation_id,)).fetchone()
+            if prior:
+                if str(prior["fingerprint"]) != fingerprint:
+                    raise IdempotencyConflict("legacy ring changed after import")
+                conn.commit()
+                return _loads(prior["result_json"], {})
+            conn.execute(
+                "INSERT INTO commit_log(operation_id,idempotency_key,fingerprint,operation_kind,aggregate_id,status,"
+                "payload_json,result_json,error_code,created_at,updated_at) VALUES(?,?,?,?,?,'committed',?,'{}','',?,?)",
+                (operation_id, operation_id, fingerprint, "legacy_ring_import", memory_id,
+                 _json(payload), payload["created_at"], payload["created_at"]),
+            )
+            conn.execute(
+                "INSERT INTO memory_rings(ring_id,memory_id,content_sha256,content,kind,state,source_refs_json,"
+                "operation_id,created_at,created_by) VALUES(?,?,?,?,?,'active',?,?,?,?)",
+                (ring_id, memory_id, payload["content_sha256"], body, payload["kind"],
+                 _json(payload["source_refs"]), operation_id, payload["created_at"], payload["actor"]),
+            )
+            result = {"memory_id": memory_id, "ring_id": ring_id}
+            conn.execute(
+                "UPDATE commit_log SET result_json=? WHERE operation_id=?", (_json(result), operation_id)
+            )
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def get_memory(self, memory_id: str) -> dict[str, Any] | None:
         conn = self._connect()
         row = conn.execute("SELECT * FROM memories WHERE memory_id=?", (memory_id,)).fetchone()
