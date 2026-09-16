@@ -251,6 +251,8 @@ class MemoryCommitService:
         decision_source: str,
         idempotency_key: str,
         actor: str,
+        memory_state: str = "active",
+        recall_policy: str = "enabled",
     ) -> dict[str, Any]:
         canonical_body = canonical_memory_body(body)
         expected_hash = body_sha256(canonical_body)
@@ -270,6 +272,8 @@ class MemoryCommitService:
             decision_source=decision_source,
             idempotency_key=idempotency_key,
             actor=actor,
+            memory_state=memory_state,
+            recall_policy=recall_policy,
         )
         if prepared.get("status") == "committed":
             return dict(prepared.get("result") or {})

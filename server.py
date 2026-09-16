@@ -114,6 +114,7 @@ from memory_layers import (
     moment_runtime_gate_debug,
     normalize_write_classification,
 )
+from memory_authority import MemoryProposal, PolicyDecision
 from memory_commit_service import BucketMemoryProjection, MemoryCommitService
 from memory_metadata import domain_options, normalize_domain_key, normalize_memory_metadata
 from recall_policy import RecallPolicy, diffusion_seed_topic_term_has_specific_residue
@@ -141,6 +142,7 @@ from utils import (
     bucket_content_for_recall,
     bucket_text_for_embedding,
     count_tokens_approx,
+    generate_bucket_id,
     LOCAL_TZ,
     local_date_key,
     load_config,
@@ -3936,6 +3938,118 @@ async def _ensure_decay_engine_started_for_transport(transport_name: str) -> Non
         await decay_engine.ensure_started()
     except Exception as e:
         logger.warning("Decay engine startup failed / 衰减引擎启动失败: %s", e)
+
+
+async def _commit_tool_memory(
+    *,
+    content: str,
+    metadata: dict,
+    memory_type: str,
+    source: str,
+    actor: str,
+    idempotency_key: str = "",
+    recall_policy: str = "enabled",
+    bucket_id: str = "",
+) -> str:
+    """Commit one explicit memory tool write through the shared authority."""
+    if memory_commit_service is None or memory_authority_store is None:
+        raise RuntimeError("memory authority is not enabled")
+    operation_key = _memory_operation_key(f"memory:{source}", idempotency_key)
+    memory_id = str(bucket_id or "").strip()
+    if not memory_id:
+        memory_id = (
+            f"memory_{hashlib.sha256(operation_key.encode('utf-8')).hexdigest()[:16]}"
+            if idempotency_key
+            else generate_bucket_id()
+        )
+    source_ref = f"tool_operation:{operation_key}"
+    proposal = MemoryProposal.from_mapping({
+        "proposal_id": memory_id,
+        "source_type": source,
+        "proposed_body": content,
+        "original_excerpt": "",
+        "source_refs": [source_ref],
+        "source_status": "verified",
+        "memory_type": memory_type or "durable_fact",
+        "confidence": metadata.get("confidence", 1.0),
+        "requested_mode": "auto",
+        "owner_explicit": True,
+        "metadata": {
+            "legacy_candidate": {
+                "id": memory_id,
+                "content": content,
+                "proposed_memory": content,
+                "kind": memory_type or "durable_fact",
+                "mode": "auto",
+                "source_verification": "verified",
+                "source_event_ids": [source_ref],
+                "source_hash": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16],
+            },
+            "tool_source": source,
+        },
+    })
+    policy = PolicyDecision(
+        action="auto_accept",
+        reason_codes=("ACCEPT_EXPLICIT_MEMORY_TOOL",),
+        decision_policy="explicit_tool",
+        alias_trust="weak",
+        requires_owner_confirmation=False,
+    )
+    candidate = memory_authority_store.get_candidate(memory_id)
+    if not candidate:
+        candidate = memory_authority_store.put_candidate(proposal, policy)
+    if candidate.get("status") == "committed":
+        return memory_id
+    if candidate.get("status") == "commit_failed":
+        candidate = memory_authority_store.decide_candidate(
+            memory_id,
+            action="accept",
+            expected_revision=int(candidate.get("revision") or 1),
+            request_id=f"{operation_key}:retry-accept",
+            actor=actor,
+            reason_codes=["RETRY_COMMIT"],
+        )
+    if candidate.get("status") != "accepted":
+        raise RuntimeError(f"memory tool candidate is {candidate.get('status')}")
+    try:
+        committed = await memory_commit_service.commit_memory(
+            memory_id=memory_id,
+            bucket_id=memory_id,
+            expected_revision=0,
+            body=content,
+            metadata={**metadata, "source": source},
+            source_refs=[source_ref],
+            decision_source="tool",
+            idempotency_key=f"{operation_key}:revision",
+            actor=actor,
+            recall_policy=recall_policy,
+        )
+        current = memory_authority_store.get_candidate(memory_id) or candidate
+        if current.get("status") == "accepted":
+            memory_authority_store.decide_candidate(
+                memory_id,
+                action="commit",
+                expected_revision=int(current.get("revision") or 1),
+                request_id=f"{operation_key}:committed:{committed.get('revision')}",
+                actor="commit_service",
+                reason_codes=["MEMORY_REVISION_COMMITTED"],
+            )
+        return memory_id
+    except Exception as exc:
+        current = memory_authority_store.get_candidate(memory_id)
+        if current and current.get("status") == "accepted":
+            try:
+                memory_authority_store.decide_candidate(
+                    memory_id,
+                    action="commit_failed",
+                    expected_revision=int(current.get("revision") or 1),
+                    request_id=f"{operation_key}:commit-failed:{type(exc).__name__}",
+                    actor="commit_service",
+                    reason_codes=[f"COMMIT_FAILED_{type(exc).__name__.upper()}"],
+                )
+            except Exception:
+                logger.exception("Memory tool failure state recording failed")
+        raise
 
 
 async def _merge_or_create(
@@ -8305,17 +8419,36 @@ async def hold(
         whisper_valence = requested_valence if requested_valence is not None else 0.5
         whisper_arousal = requested_arousal if requested_arousal is not None else 0.3
         whisper_tags = list(dict.fromkeys(extra_tags + ["whisper"]))
-        bucket_id = await bucket_mgr.create(
-            content=content,
-            tags=whisper_tags,
-            importance=5,
-            domain=requested_domain,
-            valence=whisper_valence,
-            arousal=whisper_arousal,
-            name=None,
-            bucket_type="feel",
-            date=event_date or None,
-        )
+        if memory_commit_service is not None:
+            bucket_id = await _commit_tool_memory(
+                content=content,
+                metadata={
+                    "tags": whisper_tags,
+                    "importance": 5,
+                    "domain": requested_domain,
+                    "valence": whisper_valence,
+                    "arousal": whisper_arousal,
+                    "bucket_type": "feel",
+                    "date": event_date or None,
+                },
+                memory_type="whisper",
+                source="hold_whisper",
+                actor=_ai_author_name(),
+                idempotency_key=idempotency_key,
+                recall_policy="manual_only",
+            )
+        else:
+            bucket_id = await bucket_mgr.create(
+                content=content,
+                tags=whisper_tags,
+                importance=5,
+                domain=requested_domain,
+                valence=whisper_valence,
+                arousal=whisper_arousal,
+                name=None,
+                bucket_type="feel",
+                date=event_date or None,
+            )
         _queue_embedding_refresh(bucket_id)
         return f"🫧whisper→{bucket_id}"
 
@@ -8392,43 +8525,89 @@ async def hold(
     # --- 钉选桶跳过合并，直接新建到 permanent 目录 ---
     if pinned:
         related_bucket = await _find_readonly_related_bucket(content)
-        bucket_id = await bucket_mgr.create(
-            content=content,
-            tags=all_tags,
-            importance=10,
-            domain=domain,
-            valence=valence,
-            arousal=arousal,
-            name=suggested_name or None,
-            bucket_type="permanent",
-            pinned=True,
-            date=event_date or None,
-            extra_metadata=_memory_classification_metadata(
+        metadata = {
+            "tags": all_tags,
+            "importance": 10,
+            "domain": domain,
+            "valence": valence,
+            "arousal": arousal,
+            "name": suggested_name or None,
+            "bucket_type": "permanent",
+            "pinned": True,
+            "date": event_date or None,
+            **_memory_classification_metadata(
                 classification["memory_subject"],
                 classification["memory_layer"],
                 classification["memory_classification_source"],
             ),
-        )
+        }
+        if memory_commit_service is not None:
+            bucket_id = await _commit_tool_memory(
+                content=content,
+                metadata=metadata,
+                memory_type="durable_fact",
+                source="hold",
+                actor=_ai_author_name(),
+                idempotency_key=idempotency_key,
+            )
+        else:
+            extra_metadata = _memory_classification_metadata(
+                classification["memory_subject"],
+                classification["memory_layer"],
+                classification["memory_classification_source"],
+            )
+            bucket_id = await bucket_mgr.create(
+                content=content, tags=all_tags, importance=10, domain=domain,
+                valence=valence, arousal=arousal, name=suggested_name or None,
+                bucket_type="permanent", pinned=True, date=event_date or None,
+                extra_metadata=extra_metadata,
+            )
         _queue_embedding_refresh(bucket_id)
         _queue_memory_enrichment(bucket_id)
         related_note = _format_readonly_related_memory(related_bucket) if related_bucket else ""
         return f"📌钉选→{bucket_id} {','.join(domain)}{related_note}"
 
     # --- Step 2: merge or create / 合并或新建 ---
-    bucket_id, result_name, is_merged, related_bucket = await _merge_or_create(
-        content=content,
-        tags=all_tags,
-        importance=importance,
-        domain=domain,
-        valence=valence,
-        arousal=arousal,
-        name=suggested_name,
-        allow_merge=False,
-        memory_subject=classification["memory_subject"],
-        memory_layer=classification["memory_layer"],
-        memory_classification_source=classification["memory_classification_source"],
-        date=event_date,
-    )
+    if memory_commit_service is not None:
+        related_bucket = await _find_readonly_related_bucket(content)
+        bucket_id = await _commit_tool_memory(
+            content=content,
+            metadata={
+                "tags": all_tags,
+                "importance": importance,
+                "domain": domain,
+                "valence": valence,
+                "arousal": arousal,
+                "name": suggested_name or None,
+                "date": event_date or None,
+                **_memory_classification_metadata(
+                    classification["memory_subject"],
+                    classification["memory_layer"],
+                    classification["memory_classification_source"],
+                ),
+            },
+            memory_type="durable_fact",
+            source="hold",
+            actor=_ai_author_name(),
+            idempotency_key=idempotency_key,
+        )
+        result_name = suggested_name or bucket_id
+        is_merged = False
+    else:
+        bucket_id, result_name, is_merged, related_bucket = await _merge_or_create(
+            content=content,
+            tags=all_tags,
+            importance=importance,
+            domain=domain,
+            valence=valence,
+            arousal=arousal,
+            name=suggested_name,
+            allow_merge=False,
+            memory_subject=classification["memory_subject"],
+            memory_layer=classification["memory_layer"],
+            memory_classification_source=classification["memory_classification_source"],
+            date=event_date,
+        )
     _queue_memory_enrichment(bucket_id)
 
     action = "合并→" if is_merged else "新建→"

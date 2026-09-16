@@ -1,6 +1,8 @@
 import asyncio
 
 import server
+from memory_authority import MemoryAuthorityStore
+from memory_commit_service import BucketProjectionResult, MemoryCommitService
 
 
 class FakeAuthority:
@@ -24,6 +26,9 @@ class FakeBucketManager:
 
     async def delete_comment(self, *args, **kwargs):
         raise AssertionError("authority-enabled server must not call BucketManager.delete_comment directly")
+
+    async def search(self, *args, **kwargs):
+        return []
 
 
 class FakeCommitService:
@@ -105,3 +110,68 @@ def test_hold_feel_uses_same_ring_authority(monkeypatch):
     assert result == "年轮→memory-1#ring-authority-1"
     assert service.append_calls[0]["kind"] == "feel"
     assert service.append_calls[0]["metadata"]["source"] == "hold(feel=True)"
+
+
+class ToolMemoryProjection:
+    def __init__(self):
+        self.revisions = []
+
+    async def write_revision(self, **kwargs):
+        self.revisions.append(dict(kwargs))
+        return BucketProjectionResult(
+            bucket_id=kwargs["bucket_id"], revision=kwargs["revision"],
+            operation_id=kwargs["operation_id"],
+            body_sha256=server.hashlib.sha256(kwargs["body"].encode("utf-8")).hexdigest(),
+            snapshot_path=kwargs["snapshot_path"],
+        )
+
+    async def append_ring(self, **kwargs):
+        raise AssertionError("not used")
+
+    async def retract_ring(self, **kwargs):
+        raise AssertionError("not used")
+
+
+def test_normal_hold_commits_new_memory_through_authority(monkeypatch, tmp_path):
+    authority = MemoryAuthorityStore(str(tmp_path / "memory-authority.sqlite3"))
+    projection = ToolMemoryProjection()
+    service = MemoryCommitService(authority, projection)
+    bucket_manager = FakeBucketManager()
+    monkeypatch.setattr(server, "bucket_mgr", bucket_manager)
+    monkeypatch.setattr(server, "memory_authority_store", authority)
+    monkeypatch.setattr(server, "memory_commit_service", service)
+
+    async def analyze(_content):
+        return {
+            "domain": ["生活"], "valence": 0.5, "arousal": 0.3,
+            "tags": ["preference"], "suggested_name": "咖啡偏好",
+            "memory_subject": "user", "memory_layer": "relationship",
+        }
+
+    async def unchanged(content, *_args, **_kwargs):
+        return content
+
+    async def no_related(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server.dehydrator, "analyze", analyze)
+    monkeypatch.setattr(server, "_auto_generate_write_moment_if_needed", unchanged)
+    monkeypatch.setattr(server, "_find_readonly_related_bucket", no_related)
+    monkeypatch.setattr(server, "_queue_memory_enrichment", lambda _bucket_id: True)
+
+    result = asyncio.run(server.hold(
+        content="主人不喜欢纯黑咖啡。",
+        idempotency_key="hold-tool-call-1",
+    ))
+    assert result.startswith("新建→")
+    assert len(projection.revisions) == 1
+    memory_id = projection.revisions[0]["memory_id"]
+    assert authority.get_memory(memory_id)["active_revision"] == 1
+    assert authority.get_candidate(memory_id)["status"] == "committed"
+
+    repeated = asyncio.run(server.hold(
+        content="主人不喜欢纯黑咖啡。",
+        idempotency_key="hold-tool-call-1",
+    ))
+    assert repeated.startswith("新建→")
+    assert len(projection.revisions) == 1

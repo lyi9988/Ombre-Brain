@@ -664,13 +664,23 @@ class MemoryAuthorityStore:
         decision_source: str,
         idempotency_key: str,
         actor: str,
+        memory_state: str = "active",
+        recall_policy: str = "enabled",
     ) -> dict[str, Any]:
+        memory_state = str(memory_state or "active").strip().lower()
+        recall_policy = str(recall_policy or "enabled").strip().lower()
+        if memory_state not in {"active", "archived", "tombstoned"}:
+            raise ValueError("invalid memory state")
+        if recall_policy not in {"enabled", "manual_only", "disabled"}:
+            raise ValueError("invalid recall policy")
         payload = {
             "memory_id": str(memory_id), "bucket_id": str(bucket_id),
             "expected_revision": int(expected_revision), "body_sha256": str(body_sha256),
             "snapshot_path": str(snapshot_path), "metadata": dict(metadata or {}),
             "source_refs": [str(item) for item in source_refs if str(item).strip()],
             "decision_source": str(decision_source), "actor": str(actor),
+            "memory_state": memory_state,
+            "recall_policy": recall_policy,
         }
         fingerprint = self.fingerprint(payload)
         operation_id = f"memory-revision:{uuid.uuid4().hex}"
@@ -775,8 +785,9 @@ class MemoryAuthorityStore:
             else:
                 conn.execute(
                     "INSERT INTO memories(memory_id,bucket_id,active_revision,state,recall_policy,body_sha256,updated_at) "
-                    "VALUES(?,?,?,'active','enabled',?,?)",
-                    (memory_id, payload["bucket_id"], revision, payload["body_sha256"], now),
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (memory_id, payload["bucket_id"], revision, payload["memory_state"],
+                     payload["recall_policy"], payload["body_sha256"], now),
                 )
             conn.execute(
                 "INSERT INTO memory_revisions(memory_id,revision,body_sha256,snapshot_path,metadata_json,"

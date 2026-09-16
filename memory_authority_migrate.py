@@ -161,7 +161,13 @@ class MemoryAuthorityMigrator:
     @staticmethod
     def _bucket_state(path: Path, metadata: dict[str, Any]) -> tuple[str, str]:
         state = "archived" if "archive" in path.parts or str(metadata.get("type")) == "archived" else "active"
-        recall_policy = "disabled" if metadata.get("active") is False or metadata.get("deprecated") else "enabled"
+        tags = {str(item) for item in (metadata.get("tags") or [])}
+        if metadata.get("active") is False or metadata.get("deprecated"):
+            recall_policy = "disabled"
+        elif str(metadata.get("type") or "") == "feel" or tags & {"whisper", "daily_impression"}:
+            recall_policy = "manual_only"
+        else:
+            recall_policy = "enabled"
         return state, recall_policy
 
     @staticmethod
