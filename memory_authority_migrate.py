@@ -234,6 +234,11 @@ class MemoryAuthorityMigrator:
                     source_refs=source_refs,
                     actor=str(comment.get("author") or "legacy"),
                     created_at=str(comment.get("created") or ""),
+                    metadata={
+                        key: comment.get(key)
+                        for key in ("valence", "arousal", "source")
+                        if comment.get(key) is not None
+                    },
                 )
                 imported_rings += 1
 

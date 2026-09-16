@@ -341,6 +341,7 @@ class FakeProjection:
         self.rings = []
         self.fail_revision = False
         self.fail_ring = False
+        self.retracted_rings = []
 
     async def write_revision(self, **kwargs):
         if self.fail_revision:
@@ -358,6 +359,10 @@ class FakeProjection:
             raise RuntimeError("ring projection failed")
         if not any(item["ring_id"] == kwargs["ring_id"] for item in self.rings):
             self.rings.append(dict(kwargs))
+
+    async def retract_ring(self, **kwargs):
+        if kwargs["ring_id"] not in self.retracted_rings:
+            self.retracted_rings.append(kwargs["ring_id"])
 
 
 def test_commit_service_projects_once_and_idempotent_retry_returns_same_revision(tmp_path):
@@ -415,6 +420,33 @@ def test_ring_projection_failure_is_visible_as_degraded_and_not_a_second_ring(tm
     ))
     assert len(projection.rings) == 1
     assert projection.rings[0]["ring_id"] == result["ring_id"]
+
+
+def test_ring_retract_is_audited_and_idempotent(tmp_path):
+    authority = store(tmp_path)
+    projection = FakeProjection()
+    service = MemoryCommitService(authority, projection)
+    asyncio.run(service.commit_memory(
+        memory_id="memory-1", bucket_id="bucket-1", expected_revision=0,
+        body="正文", metadata={}, source_refs=["evt-1"], decision_source="owner",
+        idempotency_key="commit-for-ring-retract", actor="owner",
+    ))
+    ring = asyncio.run(service.append_ring(
+        memory_id="memory-1", content="年轮", kind="feel", source_refs=["evt-2"],
+        idempotency_key="ring-before-retract", actor="guyan",
+        metadata={"valence": 0.8, "source": "comment_bucket"},
+    ))
+    first = asyncio.run(service.retract_ring(
+        memory_id="memory-1", ring_id=ring["ring_id"],
+        idempotency_key="ring-retract-1", actor="guyan",
+    ))
+    second = asyncio.run(service.retract_ring(
+        memory_id="memory-1", ring_id=ring["ring_id"],
+        idempotency_key="ring-retract-1", actor="guyan",
+    ))
+    assert first == second
+    assert first["status"] == "retracted"
+    assert projection.retracted_rings == [ring["ring_id"]]
 
 
 def test_migration_audit_is_read_only_and_preserves_legacy_status_counts(tmp_path):

@@ -59,6 +59,17 @@ class MemoryProjection(Protocol):
         kind: str,
         source_refs: Sequence[str],
         actor: str,
+        metadata: Mapping[str, Any],
+    ) -> None: ...
+
+    async def retract_ring(
+        self,
+        *,
+        memory_id: str,
+        bucket_id: str,
+        ring_id: str,
+        allowed_author: str | None,
+        allowed_source: str | None,
     ) -> None: ...
 
 
@@ -188,17 +199,39 @@ class BucketMemoryProjection:
         kind: str,
         source_refs: Sequence[str],
         actor: str,
+        metadata: Mapping[str, Any],
     ) -> None:
         entry = await self.bucket_manager.add_comment(
             bucket_id,
             canonical_memory_body(content),
             author=actor,
             kind=kind,
-            source=(str(source_refs[0]) if source_refs else None),
+            source=(str(metadata.get("source") or "") or (str(source_refs[0]) if source_refs else None)),
             comment_id=ring_id,
+            valence=metadata.get("valence"),
+            arousal=metadata.get("arousal"),
+            touch=bool(metadata.get("touch", True)),
         )
         if not entry or str(entry.get("id") or "") != ring_id:
             raise ProjectionNotApplied("Bucket ring projection failed")
+
+    async def retract_ring(
+        self,
+        *,
+        memory_id: str,
+        bucket_id: str,
+        ring_id: str,
+        allowed_author: str | None,
+        allowed_source: str | None,
+    ) -> None:
+        result = await self.bucket_manager.delete_comment(
+            bucket_id,
+            ring_id,
+            allowed_author=allowed_author,
+            allowed_source=allowed_source,
+        )
+        if result.get("status") not in {"deleted", "not_found"}:
+            raise ProjectionNotApplied(f"Bucket ring retract failed: {result.get('status')}")
 
 
 class MemoryCommitService:
@@ -274,6 +307,7 @@ class MemoryCommitService:
         source_refs: Sequence[str],
         idempotency_key: str,
         actor: str,
+        metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         memory = self.authority.get_memory(memory_id)
         if not memory:
@@ -285,6 +319,7 @@ class MemoryCommitService:
             source_refs=source_refs,
             idempotency_key=idempotency_key,
             actor=actor,
+            metadata=metadata,
         )
         try:
             await self.projection.append_ring(
@@ -295,6 +330,44 @@ class MemoryCommitService:
                 kind=kind,
                 source_refs=source_refs,
                 actor=actor,
+                metadata=dict(metadata or {}),
+            )
+        except Exception as exc:
+            self.authority.set_outbox_status(
+                str(result["outbox_event_id"]), status="degraded", error=type(exc).__name__
+            )
+            raise
+        self.authority.set_outbox_status(str(result["outbox_event_id"]), status="projected")
+        return result
+
+    async def retract_ring(
+        self,
+        *,
+        memory_id: str,
+        ring_id: str,
+        idempotency_key: str,
+        actor: str,
+        allowed_author: str | None = None,
+        allowed_source: str | None = None,
+    ) -> dict[str, Any]:
+        memory = self.authority.get_memory(memory_id)
+        if not memory:
+            raise MemoryNotFound(memory_id)
+        result = self.authority.retract_ring(
+            memory_id=memory_id,
+            ring_id=ring_id,
+            idempotency_key=idempotency_key,
+            actor=actor,
+        )
+        if not result.get("outbox_event_id"):
+            return result
+        try:
+            await self.projection.retract_ring(
+                memory_id=memory_id,
+                bucket_id=str(memory["bucket_id"]),
+                ring_id=ring_id,
+                allowed_author=allowed_author,
+                allowed_source=allowed_source,
             )
         except Exception as exc:
             self.authority.set_outbox_status(

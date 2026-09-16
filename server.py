@@ -114,6 +114,7 @@ from memory_layers import (
     moment_runtime_gate_debug,
     normalize_write_classification,
 )
+from memory_commit_service import BucketMemoryProjection, MemoryCommitService
 from memory_metadata import domain_options, normalize_domain_key, normalize_memory_metadata
 from recall_policy import RecallPolicy, diffusion_seed_topic_term_has_specific_residue
 from memory_write_gate import MemoryWriteGate, WriteGateDecision
@@ -188,6 +189,15 @@ memory_node_store = MemoryNodeStore(config)            # Computable memory node 
 memory_moment_store = MemoryMomentStore(config)        # Structured bucket body/comment moment index / 记忆片段索引
 memory_write_gate = MemoryWriteGate(config)            # Automatic grow gate / 自动写入门卫
 reflection_engine = ReflectionEngine(config, prompt_plan_mirror)  # Reflection worker / 关系天气与关系整理
+memory_authority_store = reflection_engine.memory_authority_store
+memory_commit_service = (
+    MemoryCommitService(
+        memory_authority_store,
+        BucketMemoryProjection(config, bucket_manager=bucket_mgr),
+    )
+    if memory_authority_store is not None
+    else None
+)
 portrait_engine = DailyPortraitMaintainer(config, prompt_plan_mirror)  # Daily portrait state / 每日画像状态
 dream_engine = DreamEngine(config, prompt_plan_mirror) # Night dream worker / 夜梦
 identity_semantic_store = IdentitySemanticStore(config) # Private relationship alias index / 私有关系语义索引
@@ -7979,6 +7989,88 @@ async def persona_projection(session_id: str = "") -> dict:
 # Tool 1.6: comment_bucket — add a ring/comment to a memory
 # 工具 1.6：comment_bucket — 给记忆追加年轮
 # =============================================================
+def _memory_operation_key(prefix: str, supplied: str = "") -> str:
+    value = str(supplied or "").strip()
+    return value[:180] if value else f"{prefix}:{secrets.token_hex(16)}"
+
+
+async def _append_memory_ring(
+    *,
+    bucket_id: str,
+    content: str,
+    kind: str,
+    valence: float | None,
+    arousal: float | None,
+    source: str,
+    actor: str,
+    idempotency_key: str = "",
+) -> dict:
+    if memory_commit_service is None:
+        entry = await bucket_mgr.add_comment(
+            bucket_id,
+            content,
+            author=actor,
+            kind=kind,
+            valence=valence,
+            arousal=arousal,
+            source=source,
+            touch=True,
+        )
+        return {"entry": entry, "authority": "legacy"}
+    if not memory_authority_store or not memory_authority_store.get_memory(bucket_id):
+        return {"error": "memory_authority_missing", "id": bucket_id}
+    committed = await memory_commit_service.append_ring(
+        memory_id=bucket_id,
+        content=content,
+        kind=kind,
+        source_refs=[source] if source else [],
+        idempotency_key=_memory_operation_key(f"ring:{bucket_id}", idempotency_key),
+        actor=actor,
+        metadata={
+            "valence": valence,
+            "arousal": arousal,
+            "source": source,
+            "touch": True,
+        },
+    )
+    bucket = await bucket_mgr.get(bucket_id)
+    comments = ((bucket or {}).get("metadata") or {}).get("comments") or []
+    entry = next(
+        (item for item in comments if isinstance(item, dict) and str(item.get("id") or "") == committed["ring_id"]),
+        None,
+    )
+    return {"entry": entry, "authority": "memory_authority", **committed}
+
+
+async def _retract_memory_ring(
+    *,
+    bucket_id: str,
+    comment_id: str,
+    actor: str,
+    allowed_author: str | None,
+    allowed_source: str | None,
+    idempotency_key: str = "",
+) -> dict:
+    if memory_commit_service is None:
+        return await bucket_mgr.delete_comment(
+            bucket_id,
+            comment_id,
+            allowed_author=allowed_author,
+            allowed_source=allowed_source,
+        )
+    if not memory_authority_store or not memory_authority_store.get_memory(bucket_id):
+        return {"status": "not_found", "reason": "memory_authority_missing"}
+    result = await memory_commit_service.retract_ring(
+        memory_id=bucket_id,
+        ring_id=comment_id,
+        idempotency_key=_memory_operation_key(f"ring-retract:{bucket_id}:{comment_id}", idempotency_key),
+        actor=actor,
+        allowed_author=allowed_author,
+        allowed_source=allowed_source,
+    )
+    return {**result, "status": "deleted"}
+
+
 @mcp.tool()
 async def comment_bucket(
     bucket_id: str,
@@ -7986,6 +8078,7 @@ async def comment_bucket(
     kind: str = "comment",
     valence: float = -1,
     arousal: float = -1,
+    idempotency_key: str = "",
 ) -> dict:
     """给已有 bucket 追加年轮/补充感受；会 touch，不改正文。kind=feel 时 content 只写第一人称感受，不写分段标题。"""
     bucket_id = _coerce_memory_id(bucket_id)
@@ -7996,16 +8089,19 @@ async def comment_bucket(
     if not await bucket_mgr.get(bucket_id):
         return {"error": "not found", "id": bucket_id}
 
-    entry = await bucket_mgr.add_comment(
-        bucket_id,
-        content,
-        author=_ai_author_name(),
+    committed = await _append_memory_ring(
+        bucket_id=bucket_id,
+        content=content,
+        actor=_ai_author_name(),
         kind=kind or "comment",
         valence=valence if 0 <= valence <= 1 else None,
         arousal=arousal if 0 <= arousal <= 1 else None,
         source="comment_bucket",
-        touch=True,
+        idempotency_key=idempotency_key,
     )
+    if committed.get("error"):
+        return committed
+    entry = committed.get("entry")
     if not entry:
         return {"error": "write failed", "id": bucket_id}
     bucket = await bucket_mgr.get(bucket_id)
@@ -8025,7 +8121,7 @@ async def comment_bucket(
 # 工具 1.7：delete_bucket_comment — 删除一条自己写的年轮
 # =============================================================
 @mcp.tool()
-async def delete_bucket_comment(bucket_id: str, comment_id: str) -> dict:
+async def delete_bucket_comment(bucket_id: str, comment_id: str, idempotency_key: str = "") -> dict:
     """删除自己通过 comment_bucket 写入的一条年轮；不会删除 bucket，也不会删除小雨/dashboard 写的年轮。"""
     bucket_id = _coerce_memory_id(bucket_id)
     comment_id = _coerce_memory_id(comment_id)
@@ -8036,11 +8132,13 @@ async def delete_bucket_comment(bucket_id: str, comment_id: str) -> dict:
     if not await bucket_mgr.get(bucket_id):
         return {"error": "not found", "id": bucket_id}
 
-    result = await bucket_mgr.delete_comment(
-        bucket_id,
-        comment_id,
+    result = await _retract_memory_ring(
+        bucket_id=bucket_id,
+        comment_id=comment_id,
+        actor=_ai_author_name(),
         allowed_author=_ai_author_name(),
         allowed_source="comment_bucket",
+        idempotency_key=idempotency_key,
     )
     if result.get("status") == "not_found":
         return {"error": "comment not found", "id": bucket_id, "comment_id": comment_id}
@@ -8094,16 +8192,19 @@ async def api_bucket_comment(request):
 
     valence = _float_between(body.get("valence"), -1.0)
     arousal = _float_between(body.get("arousal"), -1.0)
-    entry = await bucket_mgr.add_comment(
-        bucket_id,
-        content,
-        author=_dashboard_author_name(),
+    committed = await _append_memory_ring(
+        bucket_id=bucket_id,
+        content=content,
+        actor=_dashboard_author_name(),
         kind=str(body.get("kind") or "comment"),
         valence=valence if 0 <= valence <= 1 else None,
         arousal=arousal if 0 <= arousal <= 1 else None,
         source="dashboard",
-        touch=True,
+        idempotency_key=str(body.get("idempotency_key") or request.headers.get("X-Idempotency-Key") or ""),
     )
+    if committed.get("error"):
+        return JSONResponse(committed, status_code=409)
+    entry = committed.get("entry")
     if not entry:
         return JSONResponse({"error": "write failed", "id": bucket_id}, status_code=500)
 
@@ -8138,11 +8239,13 @@ async def api_bucket_comment_delete(request):
     if not await bucket_mgr.get(bucket_id):
         return JSONResponse({"error": "not found", "id": bucket_id}, status_code=404)
 
-    result = await bucket_mgr.delete_comment(
-        bucket_id,
-        comment_id,
+    result = await _retract_memory_ring(
+        bucket_id=bucket_id,
+        comment_id=comment_id,
+        actor=_dashboard_author_name(),
         allowed_author=_dashboard_author_name(),
         allowed_source="dashboard",
+        idempotency_key=str(request.headers.get("X-Idempotency-Key") or ""),
     )
     if result.get("status") == "not_found":
         return JSONResponse({"error": "comment not found"}, status_code=404)
@@ -8182,6 +8285,7 @@ async def hold(
     title: str = "",
     date: str = "",
     domain: str = "",
+    idempotency_key: str = "",
 ) -> str:
     """写一条长期记忆。单个事实/承诺/偏好用 hold；旧记忆的新感受用 comment_bucket；悄悄话用 whisper=True。date 可传事件日期；title 可选，传了就用给定标题，不传则自动生成。普通记忆不用填写 domain，系统会自动判断；维护自我锚点等特殊桶时可显式传 domain。显式 valence/arousal 会覆盖自动情绪。普通记忆 content 的最小写入就是正文；只有确实需要结构化时才按需使用 ### moment、### original、### reflection。需要之后轻轻提醒/照顾备忘的事项用 reminder_create，不写进长期记忆。feel=True/whisper=True 时 content 只写第一人称感受，不写分段标题。"""
     await decay_engine.ensure_started()
@@ -8233,16 +8337,19 @@ async def hold(
             source = await bucket_mgr.get(source_id)
             if not source:
                 return f"源记忆不存在: {source_id}"
-            entry = await bucket_mgr.add_comment(
-                source_id,
-                content,
-                author=_ai_author_name(),
+            committed = await _append_memory_ring(
+                bucket_id=source_id,
+                content=content,
+                actor=_ai_author_name(),
                 kind="feel",
                 valence=feel_valence,
                 arousal=feel_arousal,
                 source="hold(feel=True)",
-                touch=True,
+                idempotency_key=idempotency_key,
             )
+            if committed.get("error"):
+                return f"年轮写入失败: {committed.get('error')}"
+            entry = committed.get("entry")
             if not entry:
                 return "年轮写入失败。"
             _queue_embedding_refresh(source_id)
@@ -11992,6 +12099,7 @@ async def api_config_update(request):
     from starlette.responses import JSONResponse
     import yaml
     global dream_engine, persona_engine, portrait_engine, reflection_engine, reranker_engine
+    global memory_authority_store, memory_commit_service
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -12519,6 +12627,15 @@ async def api_config_update(request):
         if "model" in r and reflection_cfg.get("model"):
             os.environ["OMBRE_REFLECTION_MODEL"] = reflection_cfg["model"]
         reflection_engine = ReflectionEngine(config, prompt_plan_mirror)
+        memory_authority_store = reflection_engine.memory_authority_store
+        memory_commit_service = (
+            MemoryCommitService(
+                memory_authority_store,
+                BucketMemoryProjection(config, bucket_manager=bucket_mgr),
+            )
+            if memory_authority_store is not None
+            else None
+        )
 
     # --- Portrait maintainer config ---
     if "portrait" in body:

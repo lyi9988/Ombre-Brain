@@ -323,6 +323,7 @@ class MemoryAuthorityStore:
                 kind TEXT NOT NULL DEFAULT 'comment',
                 state TEXT NOT NULL DEFAULT 'active',
                 source_refs_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
                 operation_id TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL,
                 created_by TEXT NOT NULL,
@@ -396,6 +397,14 @@ class MemoryAuthorityStore:
         if "result_json" not in decision_columns:
             conn.execute(
                 "ALTER TABLE candidate_decisions ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        ring_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(memory_rings)").fetchall()
+        }
+        if "metadata_json" not in ring_columns:
+            conn.execute(
+                "ALTER TABLE memory_rings ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
             )
         conn.execute(
             "INSERT INTO authority_meta(key,value) VALUES('schema_version','memory-authority-v1') "
@@ -888,6 +897,7 @@ class MemoryAuthorityStore:
         source_refs: Sequence[str],
         idempotency_key: str,
         actor: str,
+        metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         body = str(content or "").strip()
         if not body:
@@ -895,7 +905,7 @@ class MemoryAuthorityStore:
         payload = {
             "memory_id": str(memory_id), "content_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
             "kind": str(kind or "comment"), "source_refs": [str(item) for item in source_refs if str(item).strip()],
-            "actor": str(actor),
+            "actor": str(actor), "metadata": dict(metadata or {}),
         }
         fingerprint = self.fingerprint(payload)
         operation_id = f"memory-ring:{uuid.uuid4().hex}"
@@ -920,9 +930,9 @@ class MemoryAuthorityStore:
             )
             conn.execute(
                 "INSERT INTO memory_rings(ring_id,memory_id,content_sha256,content,kind,state,source_refs_json,"
-                "operation_id,created_at,created_by) VALUES(?,?,?,?,?,'active',?,?,?,?)",
+                "metadata_json,operation_id,created_at,created_by) VALUES(?,?,?,?,?,'active',?,?,?,?,?)",
                 (ring_id, memory_id, payload["content_sha256"], body, payload["kind"],
-                 _json(payload["source_refs"]), operation_id, now, actor),
+                 _json(payload["source_refs"]), _json(payload["metadata"]), operation_id, now, actor),
             )
             event_id = f"memory:{memory_id}:ring:{ring_id}"
             event_payload = {"memory_id": memory_id, "ring_id": ring_id, "kind": payload["kind"],
@@ -934,6 +944,66 @@ class MemoryAuthorityStore:
                  _json(event_payload), now, now),
             )
             result = {"memory_id": memory_id, "ring_id": ring_id, "outbox_event_id": event_id}
+            conn.execute(
+                "UPDATE commit_log SET result_json=? WHERE operation_id=?", (_json(result), operation_id)
+            )
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def retract_ring(
+        self,
+        *,
+        memory_id: str,
+        ring_id: str,
+        idempotency_key: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        payload = {"memory_id": memory_id, "ring_id": ring_id, "actor": actor}
+        fingerprint = self.fingerprint(payload)
+        operation_id = f"memory-ring-retract:{uuid.uuid4().hex}"
+        now = _now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            prior = conn.execute("SELECT * FROM commit_log WHERE idempotency_key=?", (idempotency_key,)).fetchone()
+            if prior:
+                if str(prior["fingerprint"]) != fingerprint:
+                    raise IdempotencyConflict("idempotency_key payload differs")
+                conn.commit()
+                return _loads(prior["result_json"], {})
+            ring = conn.execute(
+                "SELECT * FROM memory_rings WHERE memory_id=? AND ring_id=?", (memory_id, ring_id)
+            ).fetchone()
+            if not ring:
+                raise MemoryNotFound(f"ring {memory_id}/{ring_id}")
+            if ring["state"] == "retracted":
+                return {"memory_id": memory_id, "ring_id": ring_id, "status": "retracted"}
+            conn.execute(
+                "INSERT INTO commit_log(operation_id,idempotency_key,fingerprint,operation_kind,aggregate_id,status,"
+                "payload_json,result_json,error_code,created_at,updated_at) VALUES(?,?,?,?,?,'committed',?,'{}','',?,?)",
+                (operation_id, idempotency_key, fingerprint, "memory_ring_retract", memory_id,
+                 _json(payload), now, now),
+            )
+            conn.execute(
+                "UPDATE memory_rings SET state='retracted' WHERE memory_id=? AND ring_id=?",
+                (memory_id, ring_id),
+            )
+            event_id = f"memory:{memory_id}:ring:{ring_id}:retracted"
+            event_payload = {"memory_id": memory_id, "ring_id": ring_id}
+            memory = conn.execute("SELECT active_revision FROM memories WHERE memory_id=?", (memory_id,)).fetchone()
+            conn.execute(
+                "INSERT INTO outbox(event_id,operation_id,event_type,aggregate_id,aggregate_revision,payload_json,"
+                "status,attempts,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,'pending',0,'',?,?)",
+                (event_id, operation_id, "MemoryRingRetracted", memory_id,
+                 int(memory["active_revision"] if memory else 0), _json(event_payload), now, now),
+            )
+            result = {"memory_id": memory_id, "ring_id": ring_id, "status": "retracted",
+                      "outbox_event_id": event_id}
             conn.execute(
                 "UPDATE commit_log SET result_json=? WHERE operation_id=?", (_json(result), operation_id)
             )
@@ -1139,6 +1209,7 @@ class MemoryAuthorityStore:
         source_refs: Sequence[str],
         actor: str,
         created_at: str,
+        metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         body = str(content or "").strip()
         ring_id = str(ring_id or "").strip()
@@ -1153,6 +1224,7 @@ class MemoryAuthorityStore:
             "source_refs": [str(item) for item in source_refs if str(item).strip()],
             "actor": str(actor or "legacy"),
             "created_at": str(created_at or _now()),
+            "metadata": dict(metadata or {}),
         }
         fingerprint = self.fingerprint(payload)
         conn = self._connect()
@@ -1175,9 +1247,10 @@ class MemoryAuthorityStore:
             )
             conn.execute(
                 "INSERT INTO memory_rings(ring_id,memory_id,content_sha256,content,kind,state,source_refs_json,"
-                "operation_id,created_at,created_by) VALUES(?,?,?,?,?,'active',?,?,?,?)",
+                "metadata_json,operation_id,created_at,created_by) VALUES(?,?,?,?,?,'active',?,?,?,?,?)",
                 (ring_id, memory_id, payload["content_sha256"], body, payload["kind"],
-                 _json(payload["source_refs"]), operation_id, payload["created_at"], payload["actor"]),
+                 _json(payload["source_refs"]), _json(payload["metadata"]), operation_id,
+                 payload["created_at"], payload["actor"]),
             )
             result = {"memory_id": memory_id, "ring_id": ring_id}
             conn.execute(
