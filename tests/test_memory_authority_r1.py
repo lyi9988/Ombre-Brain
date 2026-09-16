@@ -15,6 +15,7 @@ from memory_authority import (
     RevisionConflict,
 )
 from memory_commit_service import BucketProjectionResult, MemoryCommitService, ProjectionNotApplied
+from memory_migration_audit import MemoryMigrationAuditor
 
 
 def proposal(**overrides):
@@ -366,3 +367,38 @@ def test_ring_projection_failure_is_visible_as_degraded_and_not_a_second_ring(tm
     ))
     assert len(projection.rings) == 1
     assert projection.rings[0]["ring_id"] == result["ring_id"]
+
+
+def test_migration_audit_is_read_only_and_preserves_legacy_status_counts(tmp_path):
+    candidates = tmp_path / "daily_chat_memory_candidates.json"
+    candidates.write_text(
+        """{
+  "items": [
+    {"status":"confirmed","bucket_id":"memory-1","candidate":{"id":"memory-1","proposed_memory":"正文一","source_verification":"verified","source_event_ids":["evt-1"]}},
+    {"status":"pending","candidate":{"id":"memory-2","proposed_memory":"正文二","source_verification":"verified","source_event_ids":["evt-2"]}},
+    {"status":"rejected","candidate":{"id":"memory-3","proposed_memory":"正文三","source_verification":"verified","source_event_ids":["evt-3"]}}
+  ]
+}""",
+        encoding="utf-8",
+    )
+    bucket_dir = tmp_path / "buckets" / "dynamic" / "测试"
+    bucket_dir.mkdir(parents=True)
+    (bucket_dir / "memory-1.md").write_text(
+        "---\nid: memory-1\ncomments:\n  - id: ring-1\n    content: 后来的感受\n---\n正文一\n",
+        encoding="utf-8",
+    )
+
+    before = candidates.read_bytes()
+    report = MemoryMigrationAuditor(
+        candidates_path=candidates,
+        buckets_dir=tmp_path / "buckets",
+    ).run()
+    assert report["mode"] == "read_only_dry_run"
+    assert report["candidates"]["scanned"] == 3
+    assert report["candidates"]["target_status_counts"] == {
+        "accepted": 1, "pending": 1, "rejected": 1,
+    }
+    assert report["candidates"]["accepted_missing_bucket"] == []
+    assert report["buckets"]["ring_count"] == 1
+    assert all(value == 0 for value in report["side_effects"].values())
+    assert candidates.read_bytes() == before
