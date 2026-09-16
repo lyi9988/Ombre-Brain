@@ -9,6 +9,20 @@ removing the current Bucket Markdown/YAML format or changing unrelated tool,
 Dream, Darkroom, Reminder, Emotion, Needs, Goal, or canonical-conversation
 authorities.
 
+### Terminology: runtime data writes are not deployment
+
+RECALL-R1 uses same-filesystem temporary files and atomic replacement when a
+live Memory Bucket or immutable revision snapshot changes.  This protects one
+runtime data commit from a crash; it is **not** the production deployment
+strategy.
+
+Production releases must come from clean, exact commits as complete immutable
+release directories/images with manifests, revision labels, deployment-ledger
+entries, and a `current` pointer (or container-image switch).  Per-file upload
+and replacement is emergency repair only.  Git refs, release trees, host
+checkouts, images, running containers, service health, owner acceptance, and
+`production/current` remain separate evidence surfaces.
+
 The product outcome is a natural Auto/Review memory experience backed by one
 auditable commit path, owner-confirmed entity aliases, revision history,
 rebuildable derived indexes, and an explainable Fast/Deep recall route.
@@ -152,7 +166,57 @@ at most one provider rerank. Deterministic admission owns the final decision.
 Planner failure degrades to the original query within the same bounded recall
 budget. It never fails the chat turn or recursively invokes itself.
 
-## 10. Model routing and prompts
+The current R5 optimization that skips a guaranteed-empty Moment rerank is not
+Recall-quality closure.  RECALL-R1 is not accepted until real owner queries
+prove that strong candidates survive admission and every rejected candidate
+has a stable reason code.  A trace that still only shows `N -> 0` without
+rejection reasons fails acceptance.
+
+## 10. Revision-aware cache contract
+
+Caches are performance projections, never facts.  Every entry is keyed by the
+authoritative revisions that can change its answer and is invalidated by the
+same outbox/watermark stream used for derived indexes.
+
+### Cache layers
+
+1. **Prepare snapshot reuse**: preserve the current R5 parent-request snapshot
+   so tool continuations do not rebuild Recall, Persona, Worldbook, and other
+   stable request projections.
+2. **Bucket/authority hot metadata**: in-process LRU keyed by memory ID plus
+   active revision/body hash.  It contains metadata and bounded excerpts, not
+   an alternate memory body authority.
+3. **Query embedding exact cache**: normalized-query hash + embedding provider,
+   model revision, dimensions, normalization revision.  Raw private query text
+   is not required in the cache key.
+4. **Planner exact cache**: current-query hash + bounded recent-context hashes +
+   Fast-evidence hash + planner route revision + planner prompt revision.
+5. **Rerank exact cache**: query hash + ordered candidate IDs/revision hashes +
+   reranker provider/model revision + scoring/prompt revision.
+6. **Final retrieval-plan cache**: identity scope + query hash + Memory authority
+   watermark + Alias/Entity watermark + derived-index watermark + Recall policy
+   revision.  It has a short TTL and never stores the final assistant answer.
+
+Same-key concurrent misses use single-flight so one provider request populates
+the cache while peers await the same result.  Cache hits/misses, age, key
+version, and invalidation reason are owner-safe Inspector metadata.
+
+### What must not be cached as a reusable answer
+
+- final companion responses;
+- owner-visible emotional wording;
+- live Emotion/Needs state as Recall evidence;
+- uncommitted candidates;
+- Darkroom body;
+- Reminder state without its own revision;
+- Dream surfacing claims;
+- any result whose authority/index watermark is unknown.
+
+Semantic caching of final LLM replies is intentionally excluded: a similar
+sentence can occur under different relationship, Memory, tool, or emotional
+state.  Semantic similarity remains retrieval evidence, not response reuse.
+
+## 11. Model routing and prompts
 
 Prompt scopes:
 
@@ -173,7 +237,7 @@ verified route mirror identified by route revision/hash; provider secrets remain
 in runtime configuration. Prompt Composer controls prompt text and placement,
 not model choice or memory facts.
 
-## 11. Owner UI contract
+## 12. Owner UI contract
 
 Reality exposes separate, collapsible sections under `更多 -> 中枢`:
 
@@ -187,7 +251,32 @@ Repeated items, revisions, rings, raw Markdown/YAML, and advanced index details
 are collapsed by default. Mobile layouts show one primary editor at a time and
 must remain usable at 320/390/430px.
 
-## 12. Migration acceptance
+## 13. Performance and quality acceptance
+
+RECALL-R1 must compare the same owner query before/after with Inspector and
+Gateway timing evidence.  It reports at minimum:
+
+- routing decision (`skip`, `fast`, `deep`);
+- prepare/snapshot time;
+- embedding/planner/rerank request count and time;
+- cache hit/miss by layer;
+- candidates found/admitted/rejected and reason codes;
+- Memory block actually injected;
+- model first-byte and total time.
+
+Expected direction, not an invented fixed SLA:
+
+- ordinary non-memory chat skips remote Recall work;
+- exact identity/date/anchor questions use local Fast Recall;
+- ambiguous past-context questions pay one bounded Planner/Deep path;
+- a tool continuation reuses the parent prepare snapshot;
+- no query performs repeated provider embedding/rerank for the same revisioned
+  evidence within one logical turn.
+
+Upstream model or browse latency remains visible and separate; RECALL-R1 must
+not claim to fix provider latency it does not control.
+
+## 14. Migration acceptance
 
 Dry-run must preserve the semantic active-memory set, existing Bucket IDs and
 bodies, candidate counts/statuses, and source references. It must produce no
@@ -198,3 +287,18 @@ The experience release is not complete until the owner has exercised Auto,
 Review, alias confirmation, body revision, ring append, exact Fast Recall, and
 ambiguous Deep Recall; then the exact immutable artifacts may advance
 `production/current` with documentation and rollback evidence.
+
+## 15. External design references (patterns only)
+
+RECALL-R1 borrows patterns, not new runtime authorities or mandatory
+dependencies:
+
+- Graphiti: immutable episodes, provenance, valid/invalid temporal facts, and
+  incremental watermarks.
+- Letta/MemFS: compact in-context blocks versus discoverable archival memory,
+  Markdown projections, and append-safe concurrent memory operations.
+- LangGraph: thread state versus cross-thread long-term namespaces, explicit
+  persistence migrations, and store-level semantic search.
+- GPTCache: L1 exact plus optional L2 semantic cache layering.  Ombre applies
+  exact revision-aware caching only to internal structured stages; it does not
+  semantic-cache final companion replies.
