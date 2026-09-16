@@ -730,6 +730,34 @@ reflection:
   #   OMBRE_DIARY_MCP_URL
   #   OMBRE_DIARY_MCP_TOKEN_ENV
 
+# --- RECALL-R1 Memory authority / 统一记忆提交权威 ---
+# Keep disabled until the read-only migration audit maps every legacy candidate
+# and Bucket. Enabling switches Daily Chat Memory candidate/decision/commit state
+# to SQLite while preserving Bucket Markdown as the visible body format.
+memory_authority:
+  enabled: false
+  db_path: ""                      # default = <state_dir>/memory_authority.sqlite3
+  ingestion_policy:
+    auto_confidence: 0.68
+    # daily_chat is derived from reflection.daily_chat_memory_mode. Setting a
+    # conflicting value here fails closed instead of silently choosing one.
+    source_modes: {}
+    auto_types:
+      - durable_fact
+      - preference
+      - stable_preference
+      - relationship_event
+      - shared_experience
+      - key_event
+      - boundary
+      - signal
+      - commitment
+      - project_state
+      - relationship_anchor
+    owner_review_types:
+      - identity
+      - alias
+
 # --- Daily Portrait Maintainer / 每日画像维护 ---
 # Writes only an inspectable state/portrait_state.json. It does not edit
 # pinned/protected/Core Memory, and profile_fact/anchor changes stay as

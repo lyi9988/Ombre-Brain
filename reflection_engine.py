@@ -13,6 +13,8 @@ from openai import AsyncOpenAI
 from identity import generic_identity_names, identity_names, render_identity_template
 from memory_edges import RELATION_TYPES, MemoryEdgeStore
 from memory_metadata import domain_prompt_options_text, normalize_domain_key
+from memory_authority import MemoryAuthorityStore, MemoryIngestionPolicy, MemoryProposal
+from memory_commit_service import BucketMemoryProjection, MemoryCommitService
 from persona_event_selection import select_persona_events
 from prompt_plan_mirror import PromptPlanMirrorStore
 from prompt_source_registry import (
@@ -570,6 +572,31 @@ class ReflectionEngine:
             os.path.dirname(os.path.abspath(config.get("buckets_dir", "buckets"))),
             "state",
         )
+        authority_cfg = config.get("memory_authority", {}) if isinstance(
+            config.get("memory_authority", {}), dict) else {}
+        self.memory_authority_enabled = bool(authority_cfg.get("enabled", False))
+        self.memory_authority_store = None
+        self.memory_ingestion_policy = None
+        if self.memory_authority_enabled:
+            authority_config = {
+                **config,
+                "state_dir": state_dir,
+                "memory_authority_db_path": authority_cfg.get("db_path")
+                or os.path.join(state_dir, "memory_authority.sqlite3"),
+            }
+            self.memory_authority_store = MemoryAuthorityStore(authority_config)
+            policy_cfg = dict(authority_cfg.get("ingestion_policy") or {}) if isinstance(
+                authority_cfg.get("ingestion_policy"), dict) else {}
+            source_modes = dict(policy_cfg.get("source_modes") or {})
+            configured_daily_mode = str(source_modes.get("daily_chat") or "").strip().lower()
+            if configured_daily_mode and configured_daily_mode != self.daily_chat_memory_mode:
+                raise ValueError(
+                    "memory_authority ingestion_policy.daily_chat conflicts with "
+                    "reflection.daily_chat_memory_mode"
+                )
+            source_modes["daily_chat"] = self.daily_chat_memory_mode
+            policy_cfg["source_modes"] = source_modes
+            self.memory_ingestion_policy = MemoryIngestionPolicy(policy_cfg)
         self.daily_chat_memory_pending_path = str(
             cfg.get("daily_chat_memory_pending_path")
             or os.path.join(state_dir, "daily_chat_memory_candidates.json")
@@ -654,6 +681,92 @@ class ReflectionEngine:
             )
         self.daily_activity_summary_dehydration_client = self.dehydration_client
 
+    def _memory_authority_service(self, bucket_mgr) -> MemoryCommitService:
+        if not self.memory_authority_store:
+            raise RuntimeError("memory authority is not enabled")
+        return MemoryCommitService(
+            self.memory_authority_store,
+            BucketMemoryProjection(self.config, bucket_manager=bucket_mgr),
+        )
+
+    @staticmethod
+    def _daily_chat_memory_source_refs(candidate: dict) -> list[str]:
+        refs = []
+        for value in candidate.get("source_event_ids") or []:
+            text = str(value or "").strip()
+            if text:
+                refs.append(f"raw_event:{text}")
+        for value in candidate.get("source_turn_ids") or []:
+            text = str(value or "").strip()
+            if text:
+                refs.append(f"conversation_turn:{text}")
+        return list(dict.fromkeys(refs))
+
+    def _daily_chat_memory_proposal(
+        self,
+        candidate: dict,
+        *,
+        mode: str,
+        owner_explicit: bool = False,
+    ) -> MemoryProposal:
+        soft_flags = set(candidate.get("soft_flags") or [])
+        source_status = str(candidate.get("source_verification") or "unverified")
+        return MemoryProposal.from_mapping({
+            "proposal_id": str(candidate.get("id") or ""),
+            "source_type": "daily_chat",
+            "proposed_body": str(candidate.get("proposed_memory") or candidate.get("content") or ""),
+            "original_excerpt": str(candidate.get("original_excerpt") or ""),
+            "source_refs": self._daily_chat_memory_source_refs(candidate),
+            "source_status": source_status,
+            "memory_type": str(candidate.get("kind") or "key_event"),
+            "confidence": self._clamp(candidate.get("confidence", 0.0)),
+            "requested_mode": self._normalize_daily_chat_memory_mode(mode),
+            "owner_explicit": owner_explicit,
+            # Auto candidates have already passed the stricter V4.2 gates.
+            # Review keeps soft flags visible for the owner instead of silently
+            # converting them into a different product policy.
+            "transient": bool(mode == "review" and "possibly_transient" in soft_flags),
+            "generic": bool(mode == "review" and "possibly_generic" in soft_flags),
+            "duplicate_of": str(candidate.get("duplicate_of") or ""),
+            "metadata": {"legacy_candidate": dict(candidate)},
+        })
+
+    @staticmethod
+    def _authority_candidate_legacy_item(row: dict) -> dict:
+        proposal = row.get("proposal") if isinstance(row.get("proposal"), dict) else {}
+        metadata = proposal.get("metadata") if isinstance(proposal.get("metadata"), dict) else {}
+        candidate = dict(metadata.get("legacy_candidate") or {})
+        candidate_id = str(row.get("candidate_id") or proposal.get("proposal_id") or "")
+        mode = str(proposal.get("requested_mode") or candidate.get("mode") or "review")
+        authority_status = str(row.get("status") or "pending")
+        if authority_status == "committed":
+            status = "applied" if mode == "auto" else "confirmed"
+        elif authority_status == "accepted":
+            status = "applying"
+        elif authority_status == "commit_failed":
+            status = "apply_failed"
+        else:
+            status = authority_status
+        candidate.update({
+            "id": candidate_id,
+            "content": proposal.get("proposed_body") or candidate.get("content") or "",
+            "proposed_memory": proposal.get("proposed_body") or candidate.get("proposed_memory") or "",
+            "original_excerpt": proposal.get("original_excerpt") or candidate.get("original_excerpt") or "",
+            "confidence": proposal.get("confidence", candidate.get("confidence", 0.0)),
+            "mode": mode,
+            "status": status,
+            "authority_revision": int(row.get("revision") or 1),
+        })
+        return {
+            "id": candidate_id,
+            "date": candidate.get("date") or "",
+            "status": status,
+            "created_at": row.get("created_at") or "",
+            "updated_at": row.get("updated_at") or "",
+            "candidate": candidate,
+            "authority_revision": int(row.get("revision") or 1),
+        }
+
     def _load_daily_chat_memory_payload(self) -> dict:
         try:
             with open(self.daily_chat_memory_pending_path, "r", encoding="utf-8") as handle:
@@ -673,6 +786,13 @@ class ReflectionEngine:
         return {"items": [item for item in (data or []) if isinstance(item, dict)], "cursor": {}}
 
     def _load_daily_chat_memory_cursor(self) -> dict:
+        if self.memory_authority_enabled and self.memory_authority_store:
+            cursor = self.memory_authority_store.get_meta("daily_chat_memory_cursor", None)
+            if isinstance(cursor, dict):
+                return cursor
+            # Read-only compatibility until the migration imports the legacy
+            # cursor. The first successful advance stores it in the authority DB
+            # without rewriting the legacy candidate JSON.
         cursor = self._load_daily_chat_memory_payload().get("cursor")
         return cursor if isinstance(cursor, dict) else {}
 
@@ -715,7 +835,10 @@ class ReflectionEngine:
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         cursor["raw_events"] = raw_events
-        self._save_daily_chat_memory_pending(payload.get("items") or [], cursor=cursor)
+        if self.memory_authority_enabled and self.memory_authority_store:
+            self.memory_authority_store.set_meta("daily_chat_memory_cursor", cursor)
+        else:
+            self._save_daily_chat_memory_pending(payload.get("items") or [], cursor=cursor)
         return True
 
     def _resolve_background_prompt(
@@ -3076,6 +3199,18 @@ class ReflectionEngine:
         reject_note: str | None = None,
         now: datetime | None = None,
     ) -> dict:
+        if self.memory_authority_enabled and self.memory_authority_store:
+            return await self._confirm_daily_chat_memory_authority(
+                candidate_ids,
+                bucket_mgr,
+                embedding_engine=embedding_engine,
+                action=action,
+                edits=edits,
+                request_id=request_id,
+                reject_reason=reject_reason,
+                reject_note=reject_note,
+                now=now,
+            )
         ids = {str(candidate_id or "").strip() for candidate_id in candidate_ids if str(candidate_id or "").strip()}
         if not ids:
             return {
@@ -3222,6 +3357,141 @@ class ReflectionEngine:
             "request_id": rid,
             "candidate_ids": sorted(ids),
             "results": results,
+        }
+        self._request_ledger_record(rid, result)
+        return result
+
+    async def _confirm_daily_chat_memory_authority(
+        self,
+        candidate_ids: list[str],
+        bucket_mgr,
+        *,
+        embedding_engine=None,
+        action: str = "confirm",
+        edits: dict[str, dict] | None = None,
+        request_id: str | None = None,
+        reject_reason: str | None = None,
+        reject_note: str | None = None,
+        now: datetime | None = None,
+    ) -> dict:
+        ids = {str(value or "").strip() for value in candidate_ids if str(value or "").strip()}
+        if not ids:
+            return {"status": "skipped", "reason": "no_candidate_ids", "request_id": ""}
+        safe_action_raw = str(action or "").strip().lower()
+        safe_action = safe_action_raw if safe_action_raw in {"defer", "reject"} else "confirm"
+        safe_edits = edits if isinstance(edits, dict) else {}
+        rid = str(request_id or "").strip() or hashlib.sha1(
+            f"{safe_action}|{sorted(ids)}|{datetime.now(timezone.utc).isoformat(timespec='seconds')}".encode("utf-8")
+        ).hexdigest()[:24]
+        prior = self._request_ledger_lookup(rid)
+        if prior:
+            return {**prior, "idempotent_replay": True, "request_id": rid}
+        action_time = now or datetime.now(timezone.utc)
+        if not self._confirm_rate_limit_ok(action_time):
+            return {
+                "status": "rate_limited", "reason": "confirm_rate_limit_exceeded",
+                "action": safe_action, "request_id": rid, "created": 0,
+                "rejected": 0, "deferred": 0, "missing": 0, "results": [],
+            }
+
+        created = rejected = deferred = missing = 0
+        results: list[dict] = []
+        for candidate_id in sorted(ids):
+            row = self.memory_authority_store.get_candidate(candidate_id)
+            if not row:
+                missing += 1
+                continue
+            item = self._authority_candidate_legacy_item(row)
+            candidate = dict(item.get("candidate") or {})
+            if safe_action in {"defer", "reject"}:
+                if row.get("status") not in {"pending", "deferred", "rejected"}:
+                    results.append({"id": candidate_id, "status": row.get("status") or "skipped"})
+                    continue
+                target_action = "defer" if safe_action == "defer" else "reject"
+                if row.get("status") == ("deferred" if target_action == "defer" else "rejected"):
+                    results.append({"id": candidate_id, "status": row.get("status")})
+                    continue
+                reason_codes = []
+                if target_action == "reject":
+                    reason_codes.append(
+                        f"OWNER_REJECTED_{self._normalize_daily_chat_memory_reject_reason(reject_reason).upper()}"
+                    )
+                    if reject_note:
+                        reason_codes.append("OWNER_REJECT_NOTE_RECORDED")
+                decided = self.memory_authority_store.decide_candidate(
+                    candidate_id,
+                    action=target_action,
+                    expected_revision=int(row.get("revision") or 1),
+                    request_id=f"{rid}:{candidate_id}:{target_action}",
+                    actor="owner",
+                    reason_codes=reason_codes,
+                )
+                if decided.get("status") == "deferred":
+                    deferred += 1
+                else:
+                    rejected += 1
+                results.append({"id": candidate_id, "status": decided.get("status")})
+                continue
+
+            candidate = self._apply_daily_chat_memory_candidate_edit(
+                candidate,
+                safe_edits.get(candidate_id),
+            )
+            candidate.update({"mode": "review", "status": "pending"})
+            if not self._daily_chat_memory_candidate_source_ok(candidate):
+                reason = (
+                    "legacy_candidate_missing_source"
+                    if str(candidate.get("source_verification") or "").strip() != "verified"
+                    else "candidate_source_invalid"
+                )
+                results.append({"id": candidate_id, "status": "invalid_source", "reason": reason})
+                continue
+            soft_flags = set(candidate.get("soft_flags") or [])
+            if "needs_owner_edit" in soft_flags and not safe_edits.get(candidate_id):
+                results.append({
+                    "id": candidate_id,
+                    "status": "needs_owner_edit",
+                    "reason": "candidate_requires_edit",
+                })
+                continue
+
+            proposal = self._daily_chat_memory_proposal(
+                candidate,
+                mode="review",
+                owner_explicit=True,
+            )
+            proposal_sha = self.memory_authority_store.fingerprint(proposal.payload())
+            if row.get("proposal_sha256") != proposal_sha:
+                row = self.memory_authority_store.revise_candidate(
+                    candidate_id,
+                    expected_revision=int(row.get("revision") or 1),
+                    proposal=proposal,
+                    request_id=f"{rid}:{candidate_id}:edit:{proposal_sha[:16]}",
+                    actor="owner",
+                )
+            if row.get("status") in {"pending", "deferred", "commit_failed"}:
+                row = self.memory_authority_store.decide_candidate(
+                    candidate_id,
+                    action="accept",
+                    expected_revision=int(row.get("revision") or 1),
+                    request_id=f"{rid}:{candidate_id}:accept",
+                    actor="owner",
+                    reason_codes=["OWNER_ACCEPTED"],
+                )
+            write_result = await self._write_daily_chat_memory_candidates(
+                [{**candidate, "mode": "review", "status": row.get("status")}],
+                bucket_mgr,
+                embedding_engine=embedding_engine,
+            )
+            candidate_result = (write_result.get("results") or [{}])[0]
+            if candidate_result.get("status") in {"created", "exists"}:
+                created += 1 if candidate_result.get("status") == "created" else 0
+            results.append(candidate_result)
+
+        result = {
+            "status": "ok", "action": safe_action, "created": created,
+            "rejected": rejected, "deferred": deferred, "missing": missing,
+            "request_id": rid, "candidate_ids": sorted(ids), "results": results,
         }
         self._request_ledger_record(rid, result)
         return result
@@ -4813,6 +5083,12 @@ class ReflectionEngine:
         *,
         embedding_engine=None,
     ) -> dict:
+        if self.memory_authority_enabled and self.memory_authority_store and self.memory_ingestion_policy:
+            return await self._write_daily_chat_memory_candidates_authority(
+                candidates,
+                bucket_mgr,
+                embedding_engine=embedding_engine,
+            )
         results = []
         created = exists = failed = 0
         for candidate in candidates:
@@ -4891,7 +5167,168 @@ class ReflectionEngine:
                 results.append({"id": bucket_id, "status": "failed", "reason": type(exc).__name__})
         return {"created": created, "exists": exists, "failed": failed, "results": results}
 
+    async def _write_daily_chat_memory_candidates_authority(
+        self,
+        candidates: list[dict],
+        bucket_mgr,
+        *,
+        embedding_engine=None,
+    ) -> dict:
+        results = []
+        created = exists = failed = 0
+        service = self._memory_authority_service(bucket_mgr)
+        for candidate in candidates:
+            candidate_id = str(candidate.get("id") or "").strip()
+            mode = self._normalize_daily_chat_memory_mode(candidate.get("mode") or "auto")
+            if not candidate_id:
+                failed += 1
+                results.append({"id": "", "status": "failed", "reason": "missing_candidate_id"})
+                continue
+            if not self._daily_chat_memory_candidate_source_ok(candidate):
+                failed += 1
+                results.append({"id": candidate_id, "status": "invalid_source", "reason": "candidate_source_invalid"})
+                continue
+            proposal = self._daily_chat_memory_proposal(candidate, mode=mode)
+            decision = self.memory_ingestion_policy.evaluate(proposal)
+            row = self.memory_authority_store.get_candidate(candidate_id)
+            if not row:
+                row = self.memory_authority_store.put_candidate(proposal, decision)
+            if row.get("status") == "committed":
+                exists += 1
+                results.append({"id": candidate_id, "status": "exists"})
+                continue
+            if row.get("status") == "pending":
+                results.append({"id": candidate_id, "status": "pending"})
+                continue
+            if row.get("status") == "rejected":
+                failed += 1
+                results.append({"id": candidate_id, "status": "rejected", "reason": "policy_rejected"})
+                continue
+            if row.get("status") == "commit_failed":
+                row = self.memory_authority_store.decide_candidate(
+                    candidate_id,
+                    action="accept",
+                    expected_revision=int(row.get("revision") or 1),
+                    request_id=f"daily-chat:{candidate_id}:retry-accept:{row.get('revision')}",
+                    actor="commit_service",
+                    reason_codes=["RETRY_COMMIT"],
+                )
+            if row.get("status") != "accepted":
+                failed += 1
+                results.append({"id": candidate_id, "status": "failed", "reason": f"candidate_{row.get('status')}"})
+                continue
+
+            key = str(candidate.get("date") or datetime.now(self.tz).date().isoformat())
+            created_at = self._daily_chat_memory_created_at(key)
+            metadata = {
+                "tags": list(candidate.get("tags") or []),
+                "importance": int(candidate.get("importance") or 5),
+                "domain": list(candidate.get("domain") or self._diary_memory_domain(str(candidate.get("kind") or ""))),
+                "valence": self._clamp(candidate.get("valence", 0.55)),
+                "arousal": self._clamp(candidate.get("arousal", 0.3)),
+                "name": str(candidate.get("title") or f"{key} 自动记忆")[:40],
+                "source": "daily_chat_memory",
+                "created": created_at,
+                "last_active": created_at,
+                "updated_at": created_at,
+                "confidence": self._clamp(candidate.get("confidence", 0.7)),
+                "date": key,
+                "from_daily_chat": True,
+                "event_date": key,
+                "source_conversation_turn_ids": candidate.get("source_turn_ids") or [],
+                "source_raw_event_ids": candidate.get("source_event_ids") or [],
+                "source_hash": str(candidate.get("source_hash") or "")[:16],
+                "source_verification": "verified",
+                "keywords": candidate.get("keywords") or [],
+                "daily_chat_memory_candidate_id": candidate_id,
+                "daily_chat_memory_reason": str(candidate.get("reason") or "")[:160],
+            }
+            existing_memory = self.memory_authority_store.get_memory(candidate_id)
+            was_existing = existing_memory is not None
+            expected_revision = int(existing_memory.get("active_revision") or 0) if existing_memory else 0
+            try:
+                commit = await service.commit_memory(
+                    memory_id=candidate_id,
+                    bucket_id=candidate_id,
+                    expected_revision=expected_revision,
+                    body=str(candidate.get("content") or candidate.get("proposed_memory") or ""),
+                    metadata=metadata,
+                    source_refs=self._daily_chat_memory_source_refs(candidate),
+                    decision_source=("owner" if mode == "review" else "auto"),
+                    idempotency_key=f"daily-chat:{candidate_id}:candidate-revision:{row.get('revision')}",
+                    actor=("owner" if mode == "review" else "daily_chat_memory"),
+                )
+                current = self.memory_authority_store.get_candidate(candidate_id) or row
+                if current.get("status") == "accepted":
+                    self.memory_authority_store.decide_candidate(
+                        candidate_id,
+                        action="commit",
+                        expected_revision=int(current.get("revision") or 1),
+                        request_id=f"daily-chat:{candidate_id}:committed:{commit.get('revision')}",
+                        actor="commit_service",
+                        reason_codes=["MEMORY_REVISION_COMMITTED"],
+                    )
+                if embedding_engine and getattr(embedding_engine, "enabled", False):
+                    try:
+                        bucket = await bucket_mgr.get(candidate_id)
+                        if bucket:
+                            await embedding_engine.generate_and_store(
+                                candidate_id,
+                                bucket_text_for_embedding(bucket),
+                            )
+                    except Exception as exc:
+                        logger.warning("Daily chat memory embedding failed for %s: %s", candidate_id, exc)
+                if was_existing:
+                    exists += 1
+                    results.append({"id": candidate_id, "status": "exists", "revision": commit.get("revision")})
+                else:
+                    created += 1
+                    results.append({"id": candidate_id, "status": "created", "revision": commit.get("revision")})
+            except Exception as exc:
+                current = self.memory_authority_store.get_candidate(candidate_id)
+                if current and current.get("status") == "accepted":
+                    try:
+                        self.memory_authority_store.decide_candidate(
+                            candidate_id,
+                            action="commit_failed",
+                            expected_revision=int(current.get("revision") or 1),
+                            request_id=f"daily-chat:{candidate_id}:commit-failed:{type(exc).__name__}",
+                            actor="commit_service",
+                            reason_codes=[f"COMMIT_FAILED_{type(exc).__name__.upper()}"],
+                        )
+                    except Exception:
+                        logger.exception("Daily chat candidate failure state recording failed")
+                failed += 1
+                logger.warning("Daily chat memory authority write failed for %s: %s", candidate_id, exc)
+                results.append({"id": candidate_id, "status": "failed", "reason": type(exc).__name__})
+        return {"created": created, "exists": exists, "failed": failed, "results": results}
+
     def _store_daily_chat_memory_pending(self, candidates: list[dict], *, force: bool = False) -> dict:
+        if self.memory_authority_enabled and self.memory_authority_store and self.memory_ingestion_policy:
+            added = updated = existing = 0
+            for candidate in candidates:
+                proposal = self._daily_chat_memory_proposal(candidate, mode="review")
+                decision = self.memory_ingestion_policy.evaluate(proposal)
+                before = self.memory_authority_store.get_candidate(proposal.proposal_id)
+                if before:
+                    if force and before.get("status") in {"pending", "deferred", "commit_failed"}:
+                        if before.get("proposal_sha256") != self.memory_authority_store.fingerprint(proposal.payload()):
+                            self.memory_authority_store.revise_candidate(
+                                proposal.proposal_id,
+                                expected_revision=int(before.get("revision") or 1),
+                                proposal=proposal,
+                                request_id=f"scheduler-refresh:{proposal.proposal_id}:{self.memory_authority_store.fingerprint(proposal.payload())[:16]}",
+                                actor="daily_chat_memory",
+                            )
+                            updated += 1
+                        else:
+                            existing += 1
+                    else:
+                        existing += 1
+                    continue
+                self.memory_authority_store.put_candidate(proposal, decision)
+                added += 1
+            return {"added": added, "updated": updated, "existing": existing, "candidates": candidates}
         items = self._load_daily_chat_memory_pending()
         by_id = {str(item.get("id") or ""): item for item in items}
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -4921,9 +5358,18 @@ class ReflectionEngine:
         return {"added": added, "updated": updated, "existing": existing, "candidates": candidates}
 
     def _load_daily_chat_memory_pending(self) -> list[dict]:
+        if self.memory_authority_enabled and self.memory_authority_store:
+            return [
+                self._authority_candidate_legacy_item(row)
+                for row in self.memory_authority_store.list_candidates(status="all", limit=1000)
+            ]
         return list(self._load_daily_chat_memory_payload().get("items") or [])
 
     def _save_daily_chat_memory_pending(self, items: list[dict], *, cursor: dict | None = None) -> None:
+        if self.memory_authority_enabled and self.memory_authority_store:
+            if cursor is not None:
+                self.memory_authority_store.set_meta("daily_chat_memory_cursor", cursor)
+            return
         os.makedirs(os.path.dirname(self.daily_chat_memory_pending_path), exist_ok=True)
         if cursor is None:
             cursor = self._load_daily_chat_memory_cursor()

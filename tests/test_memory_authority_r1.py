@@ -16,6 +16,7 @@ from memory_authority import (
 )
 from memory_commit_service import BucketProjectionResult, MemoryCommitService, ProjectionNotApplied
 from memory_migration_audit import MemoryMigrationAuditor
+from reflection_engine import ReflectionEngine
 
 
 def proposal(**overrides):
@@ -69,6 +70,9 @@ def test_policy_preserves_auto_and_routes_sensitive_types_to_review():
     assert alias.action == "queue_review"
     assert alias.alias_trust == "weak"
     assert alias.requires_owner_confirmation is True
+
+    commitment = policy.evaluate(proposal(memory_type="commitment"))
+    assert commitment.action == "auto_accept"
 
 
 def test_explicit_owner_is_accepted_but_unverified_model_source_is_rejected():
@@ -155,6 +159,49 @@ def test_idempotent_decision_returns_original_result_after_later_transition(tmp_
     assert rejected["status"] == "rejected"
     assert reopened["status"] == "pending"
     assert repeated == rejected
+
+
+def test_owner_edit_creates_candidate_revision_before_acceptance(tmp_path):
+    authority = store(tmp_path)
+    original = proposal(requested_mode="review", confidence=0.4)
+    authority.put_candidate(original, MemoryIngestionPolicy().evaluate(original))
+    edited = proposal(
+        requested_mode="review", confidence=0.4,
+        proposed_body="主人不喜欢纯黑咖啡，但可以接受加奶咖啡。",
+    )
+    revised = authority.revise_candidate(
+        original.proposal_id,
+        expected_revision=1,
+        proposal=edited,
+        request_id="edit-1",
+        actor="owner",
+    )
+    accepted = authority.decide_candidate(
+        original.proposal_id,
+        action="accept",
+        expected_revision=2,
+        request_id="accept-after-edit",
+        actor="owner",
+    )
+    assert revised["revision"] == 2
+    assert revised["proposal"]["proposed_body"] == edited.proposed_body
+    assert accepted["revision"] == 3
+
+
+def test_candidate_acceptance_and_memory_commit_are_distinct_states(tmp_path):
+    authority = store(tmp_path)
+    item = proposal(requested_mode="review", confidence=0.4)
+    authority.put_candidate(item, MemoryIngestionPolicy().evaluate(item))
+    accepted = authority.decide_candidate(
+        item.proposal_id, action="accept", expected_revision=1,
+        request_id="accept-1", actor="owner",
+    )
+    committed = authority.decide_candidate(
+        item.proposal_id, action="commit", expected_revision=2,
+        request_id="candidate-commit-1", actor="commit_service",
+    )
+    assert accepted["status"] == "accepted"
+    assert committed["status"] == "committed"
 
 
 def test_memory_commit_requires_observed_hash_then_activates_one_revision_and_outbox(tmp_path):
@@ -402,3 +449,95 @@ def test_migration_audit_is_read_only_and_preserves_legacy_status_counts(tmp_pat
     assert report["buckets"]["ring_count"] == 1
     assert all(value == 0 for value in report["side_effects"].values())
     assert candidates.read_bytes() == before
+
+
+def reflection_config(tmp_path, *, mode):
+    return {
+        "buckets_dir": str(tmp_path / "buckets"),
+        "state_dir": str(tmp_path / "state"),
+        "gateway": {"prompt_plan_mirror_path": str(tmp_path / "prompt-plan.sqlite3")},
+        "reflection": {
+            "enabled": False,
+            "daily_chat_memory_mode": mode,
+            "daily_chat_memory_pending_path": str(tmp_path / "legacy-candidates.json"),
+            "daily_chat_memory_requests_path": str(tmp_path / "requests.json"),
+        },
+        "memory_authority": {
+            "enabled": True,
+            "db_path": str(tmp_path / "memory-authority.sqlite3"),
+        },
+    }
+
+
+def daily_candidate(candidate_id="daily-1"):
+    return {
+        "id": candidate_id,
+        "date": "2026-09-16",
+        "kind": "stable_preference",
+        "title": "咖啡偏好",
+        "content": "主人不喜欢纯黑咖啡。",
+        "proposed_memory": "主人不喜欢纯黑咖啡。",
+        "original_excerpt": "我不喜欢纯黑咖啡。",
+        "source_verification": "verified",
+        "source_hash": "abc123",
+        "source_event_ids": [101],
+        "source_turn_ids": [51],
+        "confidence": 0.91,
+        "tags": ["from_daily_chat", "stable_preference"],
+        "domain": ["日常"],
+        "importance": 6,
+        "valence": 0.5,
+        "arousal": 0.3,
+        "soft_flags": [],
+    }
+
+
+def attach_fake_commit_service(engine):
+    projection = FakeProjection()
+    service = MemoryCommitService(engine.memory_authority_store, projection)
+    engine._memory_authority_service = lambda _bucket_mgr: service
+    return projection
+
+
+def test_daily_auto_uses_authority_and_commits_without_legacy_json(tmp_path):
+    engine = ReflectionEngine(reflection_config(tmp_path, mode="auto"))
+    projection = attach_fake_commit_service(engine)
+    result = asyncio.run(engine._write_daily_chat_memory_candidates(
+        [daily_candidate()], object(), embedding_engine=None,
+    ))
+    row = engine.memory_authority_store.get_candidate("daily-1")
+    assert result["created"] == 1
+    assert row["status"] == "committed"
+    assert len(projection.revisions) == 1
+    assert not (tmp_path / "legacy-candidates.json").exists()
+
+
+def test_daily_review_lists_and_confirms_through_same_authority(tmp_path):
+    engine = ReflectionEngine(reflection_config(tmp_path, mode="review"))
+    projection = attach_fake_commit_service(engine)
+    pending = engine._store_daily_chat_memory_pending([{
+        **daily_candidate(), "mode": "review", "status": "pending",
+    }])
+    listed = engine.list_daily_chat_memory_pending(status="pending")
+    assert pending["added"] == 1
+    assert listed[0]["id"] == "daily-1"
+    assert listed[0]["status"] == "pending"
+
+    result = asyncio.run(engine.confirm_daily_chat_memory(
+        ["daily-1"], object(), action="confirm", request_id="owner-confirm-1",
+    ))
+    row = engine.memory_authority_store.get_candidate("daily-1")
+    confirmed = engine.list_daily_chat_memory_pending(status="confirmed")
+    assert result["created"] == 1
+    assert row["status"] == "committed"
+    assert confirmed[0]["id"] == "daily-1"
+    assert len(projection.revisions) == 1
+
+
+def test_daily_mode_conflict_fails_closed_when_authority_is_enabled(tmp_path):
+    config = reflection_config(tmp_path, mode="review")
+    config["memory_authority"]["ingestion_policy"] = {
+        "source_modes": {"daily_chat": "auto"}
+    }
+    with pytest.raises(ValueError, match="daily_chat_memory_mode"):
+        ReflectionEngine(config)

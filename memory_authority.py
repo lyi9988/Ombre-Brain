@@ -149,10 +149,12 @@ class MemoryIngestionPolicy:
     """Pure policy: proposal/config in, deterministic decision out."""
 
     DEFAULT_AUTO_TYPES = frozenset({
-        "durable_fact", "preference", "relationship_event", "shared_experience",
+        "durable_fact", "preference", "stable_preference", "relationship_event",
+        "shared_experience", "key_event", "boundary", "signal", "commitment",
+        "project_state", "relationship_anchor",
     })
     OWNER_REVIEW_TYPES = frozenset({
-        "identity", "alias", "boundary", "commitment",
+        "identity", "alias",
     })
 
     def __init__(self, config: Mapping[str, Any] | None = None):
@@ -222,7 +224,9 @@ class MemoryAuthorityStore:
     CANDIDATE_TRANSITIONS = {
         "pending": {"accepted", "rejected", "deferred"},
         "deferred": {"pending", "accepted", "rejected"},
-        "accepted": set(),
+        "accepted": {"committed", "commit_failed"},
+        "commit_failed": {"accepted", "pending"},
+        "committed": set(),
         "rejected": {"pending"},
     }
 
@@ -474,6 +478,91 @@ class MemoryAuthorityStore:
         conn.close()
         return self._candidate_row(row)
 
+    def list_candidates(self, *, status: str = "pending", limit: int = 100) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status and status != "all":
+            clauses.append("status=?")
+            params.append(str(status))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        conn = self._connect()
+        rows = conn.execute(
+            f"SELECT * FROM candidates{where} ORDER BY created_at DESC LIMIT ?",
+            [*params, max(1, min(1000, int(limit)))],
+        ).fetchall()
+        conn.close()
+        return [self._candidate_row(row) or {} for row in rows]
+
+    def revise_candidate(
+        self,
+        candidate_id: str,
+        *,
+        expected_revision: int,
+        proposal: MemoryProposal,
+        request_id: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        payload = {
+            "candidate_id": candidate_id,
+            "expected_revision": int(expected_revision),
+            "proposal": proposal.payload(),
+        }
+        fingerprint = self.fingerprint(payload)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if request_id:
+                prior = conn.execute(
+                    "SELECT * FROM candidate_decisions WHERE request_id=?", (request_id,)
+                ).fetchone()
+                if prior:
+                    if str(prior["fingerprint"]) != fingerprint:
+                        raise IdempotencyConflict("request_id payload differs")
+                    conn.commit()
+                    return _loads(prior["result_json"], {})
+            row = conn.execute("SELECT * FROM candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
+            if not row:
+                raise CandidateNotFound(candidate_id)
+            current = self._candidate_row(row) or {}
+            if int(current["revision"]) != int(expected_revision):
+                raise RevisionConflict(f"expected {expected_revision}, current {current['revision']}")
+            if current["status"] not in {"pending", "deferred", "commit_failed"}:
+                raise InvalidTransition(f"cannot revise candidate in {current['status']}")
+            proposal_payload = proposal.payload()
+            proposal_sha = _sha(proposal_payload)
+            next_revision = int(current["revision"]) + 1
+            now = _now()
+            result = {
+                **current,
+                "revision": next_revision,
+                "proposal_sha256": proposal_sha,
+                "proposal": proposal_payload,
+                "updated_at": now,
+            }
+            conn.execute(
+                "UPDATE candidates SET revision=?,proposal_sha256=?,proposal_json=?,updated_at=? WHERE candidate_id=?",
+                (next_revision, proposal_sha, _json(proposal_payload), now, candidate_id),
+            )
+            conn.execute(
+                "INSERT INTO candidate_revisions(candidate_id,revision,status,proposal_sha256,proposal_json,"
+                "policy_json,actor,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (candidate_id, next_revision, current["status"], proposal_sha,
+                 _json(proposal_payload), _json(current["policy"]), actor, now),
+            )
+            conn.execute(
+                "INSERT INTO candidate_decisions(decision_id,candidate_id,from_status,to_status,candidate_revision,"
+                "request_id,fingerprint,actor,reason_codes_json,result_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), candidate_id, current["status"], current["status"], next_revision,
+                 request_id, fingerprint, actor, _json(["OWNER_EDITED_PROPOSAL"]), _json(result), now),
+            )
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def decide_candidate(
         self,
         candidate_id: str,
@@ -484,7 +573,10 @@ class MemoryAuthorityStore:
         actor: str,
         reason_codes: Sequence[str] = (),
     ) -> dict[str, Any]:
-        target = {"accept": "accepted", "reject": "rejected", "defer": "deferred", "reopen": "pending"}.get(
+        target = {
+            "accept": "accepted", "reject": "rejected", "defer": "deferred", "reopen": "pending",
+            "commit": "committed", "commit_failed": "commit_failed",
+        }.get(
             str(action or "").strip().lower()
         )
         if not target:
@@ -946,3 +1038,25 @@ class MemoryAuthorityStore:
             value["payload"] = _loads(value.pop("payload_json"), {})
             result.append(value)
         return result
+
+    def get_meta(self, key: str, default: Any = None) -> Any:
+        conn = self._connect()
+        row = conn.execute("SELECT value FROM authority_meta WHERE key=?", (str(key),)).fetchone()
+        conn.close()
+        return _loads(row["value"], default) if row else default
+
+    def set_meta(self, key: str, value: Any) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO authority_meta(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(key), _json(value)),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
