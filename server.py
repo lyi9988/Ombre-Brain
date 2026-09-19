@@ -3950,6 +3950,7 @@ async def _commit_tool_memory(
     idempotency_key: str = "",
     recall_policy: str = "enabled",
     bucket_id: str = "",
+    additional_source_refs: list[str] | None = None,
 ) -> str:
     """Commit one explicit memory tool write through the shared authority."""
     if memory_commit_service is None or memory_authority_store is None:
@@ -3963,12 +3964,16 @@ async def _commit_tool_memory(
             else generate_bucket_id()
         )
     source_ref = f"tool_operation:{operation_key}"
+    source_refs = [source_ref, *[
+        str(item) for item in (additional_source_refs or []) if str(item).strip()
+    ]]
+    source_refs = list(dict.fromkeys(source_refs))
     proposal = MemoryProposal.from_mapping({
         "proposal_id": memory_id,
         "source_type": source,
         "proposed_body": content,
         "original_excerpt": "",
-        "source_refs": [source_ref],
+        "source_refs": source_refs,
         "source_status": "verified",
         "memory_type": memory_type or "durable_fact",
         "confidence": metadata.get("confidence", 1.0),
@@ -4018,7 +4023,7 @@ async def _commit_tool_memory(
             expected_revision=0,
             body=content,
             metadata={**metadata, "source": source},
-            source_refs=[source_ref],
+            source_refs=source_refs,
             decision_source="tool",
             idempotency_key=f"{operation_key}:revision",
             actor=actor,
@@ -4050,6 +4055,42 @@ async def _commit_tool_memory(
             except Exception:
                 logger.exception("Memory tool failure state recording failed")
         raise
+
+
+async def _revise_tool_memory(
+    *,
+    bucket_id: str,
+    bucket: dict,
+    updates: dict,
+    idempotency_key: str,
+    actor: str,
+) -> dict:
+    if memory_commit_service is None or memory_authority_store is None:
+        raise RuntimeError("memory authority is not enabled")
+    memory = memory_authority_store.get_memory(bucket_id)
+    if not memory:
+        raise RuntimeError("memory_authority_missing")
+    metadata = dict(bucket.get("metadata") or {})
+    body = str(bucket.get("content") or "")
+    if "content" in updates:
+        body = str(updates["content"])
+    for key, value in updates.items():
+        if key != "content":
+            metadata[key] = value
+    operation_key = _memory_operation_key(f"trace:{bucket_id}", idempotency_key)
+    return await memory_commit_service.commit_memory(
+        memory_id=bucket_id,
+        bucket_id=str(memory["bucket_id"]),
+        expected_revision=int(memory["active_revision"]),
+        body=body,
+        metadata=metadata,
+        source_refs=[f"tool_operation:{operation_key}", f"memory_revision:{memory['active_revision']}"],
+        decision_source="tool",
+        idempotency_key=f"{operation_key}:revision",
+        actor=actor,
+        memory_state=str(memory.get("state") or "active"),
+        recall_policy=str(memory.get("recall_policy") or "enabled"),
+    )
 
 
 async def _merge_or_create(
@@ -8760,7 +8801,12 @@ def _looks_like_operit_auto_grow_content(content: str) -> bool:
     return bool(re.match(r"^【\d{4}-\d{2}-\d{2} \d{2}:\d{2}】\s*\n", str(content or "")))
 
 
-async def _grow_direct_structured_content(content: str, title: str = "", gate_prefix: str = "") -> str:
+async def _grow_direct_structured_content(
+    content: str,
+    title: str = "",
+    gate_prefix: str = "",
+    idempotency_key: str = "",
+) -> str:
     direct_content = str(content or "").strip()
     try:
         analysis = await dehydrator.analyze(direct_content)
@@ -8791,20 +8837,42 @@ async def _grow_direct_structured_content(content: str, title: str = "", gate_pr
     name = title.strip() or _title_from_memory_heading(direct_content) or analysis.get("suggested_name", "")
     related_bucket = await _find_readonly_related_bucket(direct_content)
 
-    bucket_id = await bucket_mgr.create(
-        content=direct_content,
-        tags=tags,
-        importance=importance,
-        domain=domain,
-        valence=analysis.get("valence", 0.5),
-        arousal=analysis.get("arousal", 0.3),
-        name=name or None,
-        extra_metadata=_memory_classification_metadata(
-            classification["memory_subject"],
-            classification["memory_layer"],
-            classification["memory_classification_source"],
-        ),
-    )
+    if memory_commit_service is not None:
+        bucket_id = await _commit_tool_memory(
+            content=direct_content,
+            metadata={
+                "tags": tags,
+                "importance": importance,
+                "domain": domain,
+                "valence": analysis.get("valence", 0.5),
+                "arousal": analysis.get("arousal", 0.3),
+                "name": name or None,
+                **_memory_classification_metadata(
+                    classification["memory_subject"],
+                    classification["memory_layer"],
+                    classification["memory_classification_source"],
+                ),
+            },
+            memory_type="durable_fact",
+            source="grow",
+            actor=_ai_author_name(),
+            idempotency_key=idempotency_key,
+        )
+    else:
+        bucket_id = await bucket_mgr.create(
+            content=direct_content,
+            tags=tags,
+            importance=importance,
+            domain=domain,
+            valence=analysis.get("valence", 0.5),
+            arousal=analysis.get("arousal", 0.3),
+            name=name or None,
+            extra_metadata=_memory_classification_metadata(
+                classification["memory_subject"],
+                classification["memory_layer"],
+                classification["memory_classification_source"],
+            ),
+        )
     _queue_embedding_refresh(bucket_id)
     _queue_memory_enrichment(bucket_id)
     related_note = _format_readonly_related_memory(related_bucket) if related_bucket else ""
@@ -8812,7 +8880,14 @@ async def _grow_direct_structured_content(content: str, title: str = "", gate_pr
 
 
 @mcp.tool()
-async def grow(content: str, auto: bool = False, source: str = "", title: str = "", context: Context | None = None) -> str:
+async def grow(
+    content: str,
+    auto: bool = False,
+    source: str = "",
+    title: str = "",
+    context: Context | None = None,
+    idempotency_key: str = "",
+) -> str:
     """把筛过的长片段拆成少量长期记忆；单条事实/承诺/偏好优先 hold，旧记忆补感受优先 comment_bucket。只有多个已筛选长期记忆点才用 grow，别塞整段流水账。保留原文称呼、昵称、互称、自称和原话，不要把临时称呼推成稳定画像事实。title 可选，短内容时传了就用你给的标题。普通记忆 content 的最小写入就是正文；只有确实需要结构化时才按需使用 ### moment、### original、### reflection。需要之后轻轻提醒/照顾备忘的事项用 reminder_create，不写进长期记忆。feel 年轮只写第一人称感受，不写分段标题。"""
     await decay_engine.ensure_started()
 
@@ -8834,9 +8909,15 @@ async def grow(content: str, auto: bool = False, source: str = "", title: str = 
         if not gate_decision.allow:
             return _format_write_gate_result(gate_decision)
     gate_prefix = f"{_format_write_gate_result(gate_decision)}\n" if gate_decision else ""
+    grow_operation_key = _memory_operation_key("grow", idempotency_key)
     content = str(content or "").strip()
     if _is_grow_direct_content(content):
-        return await _grow_direct_structured_content(content, title=title, gate_prefix=gate_prefix)
+        return await _grow_direct_structured_content(
+            content,
+            title=title,
+            gate_prefix=gate_prefix,
+            idempotency_key=f"{grow_operation_key}:direct",
+        )
 
     content = _normalize_memory_sections_for_write(content)
 
@@ -8869,19 +8950,45 @@ async def grow(content: str, auto: bool = False, source: str = "", title: str = 
         )
         if _has_favorite_tag(fast_tags) and not _has_favorite_reason(content):
             return _favorite_reason_error()
-        bucket_id, result_name, is_merged, related_bucket = await _merge_or_create(
-            content=content.strip(),
-            tags=fast_tags,
-            importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
-            domain=analysis.get("domain", ["general"]),
-            valence=analysis.get("valence", 0.5),
-            arousal=analysis.get("arousal", 0.3),
-            name=title.strip() or analysis.get("suggested_name", ""),
-            allow_merge=False,
-            memory_subject=fast_classification["memory_subject"],
-            memory_layer=fast_classification["memory_layer"],
-            memory_classification_source=fast_classification["memory_classification_source"],
-        )
+        if memory_commit_service is not None:
+            related_bucket = await _find_readonly_related_bucket(content)
+            result_name = title.strip() or analysis.get("suggested_name", "")
+            bucket_id = await _commit_tool_memory(
+                content=content.strip(),
+                metadata={
+                    "tags": fast_tags,
+                    "importance": analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
+                    "domain": analysis.get("domain", ["general"]),
+                    "valence": analysis.get("valence", 0.5),
+                    "arousal": analysis.get("arousal", 0.3),
+                    "name": result_name or None,
+                    **_memory_classification_metadata(
+                        fast_classification["memory_subject"],
+                        fast_classification["memory_layer"],
+                        fast_classification["memory_classification_source"],
+                    ),
+                },
+                memory_type="durable_fact",
+                source="grow",
+                actor=_ai_author_name(),
+                idempotency_key=f"{grow_operation_key}:short",
+            )
+            result_name = result_name or bucket_id
+            is_merged = False
+        else:
+            bucket_id, result_name, is_merged, related_bucket = await _merge_or_create(
+                content=content.strip(),
+                tags=fast_tags,
+                importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
+                domain=analysis.get("domain", ["general"]),
+                valence=analysis.get("valence", 0.5),
+                arousal=analysis.get("arousal", 0.3),
+                name=title.strip() or analysis.get("suggested_name", ""),
+                allow_merge=False,
+                memory_subject=fast_classification["memory_subject"],
+                memory_layer=fast_classification["memory_layer"],
+                memory_classification_source=fast_classification["memory_classification_source"],
+            )
         _queue_memory_enrichment(bucket_id)
         action = "合并" if is_merged else "新建"
         related_note = _format_readonly_related_memory(related_bucket) if related_bucket else ""
@@ -8903,7 +9010,7 @@ async def grow(content: str, auto: bool = False, source: str = "", title: str = 
 
     # --- Step 2: create each item (with per-item error handling) ---
     # --- 逐条新建（单条失败不影响其他）；grow 不自动揉写旧桶 ---
-    for item in items:
+    for item_index, item in enumerate(items):
         try:
             item_tags = item.get("tags", [])
             item_content = _normalize_memory_sections_for_write(item.get("content", ""))
@@ -8921,19 +9028,46 @@ async def grow(content: str, auto: bool = False, source: str = "", title: str = 
             if _has_favorite_tag(item_tags) and not _has_favorite_reason(item_content):
                 results.append("⚠️favorite 缺少 reflection")
                 continue
-            bucket_id, result_name, is_merged, related_bucket = await _merge_or_create(
-                content=item_content,
-                tags=item_tags,
-                importance=item.get("importance", 5),
-                domain=item.get("domain", ["general"]),
-                valence=item.get("valence", 0.5),
-                arousal=item.get("arousal", 0.3),
-                name=item.get("name", ""),
-                allow_merge=False,
-                memory_subject=item_classification["memory_subject"],
-                memory_layer=item_classification["memory_layer"],
-                memory_classification_source=item_classification["memory_classification_source"],
-            )
+            if memory_commit_service is not None:
+                related_bucket = await _find_readonly_related_bucket(item_content)
+                result_name = item.get("name", "")
+                item_hash = hashlib.sha256(item_content.encode("utf-8")).hexdigest()[:12]
+                bucket_id = await _commit_tool_memory(
+                    content=item_content,
+                    metadata={
+                        "tags": item_tags,
+                        "importance": item.get("importance", 5),
+                        "domain": item.get("domain", ["general"]),
+                        "valence": item.get("valence", 0.5),
+                        "arousal": item.get("arousal", 0.3),
+                        "name": result_name or None,
+                        **_memory_classification_metadata(
+                            item_classification["memory_subject"],
+                            item_classification["memory_layer"],
+                            item_classification["memory_classification_source"],
+                        ),
+                    },
+                    memory_type="durable_fact",
+                    source="grow",
+                    actor=_ai_author_name(),
+                    idempotency_key=f"{grow_operation_key}:item:{item_index}:{item_hash}",
+                )
+                result_name = result_name or bucket_id
+                is_merged = False
+            else:
+                bucket_id, result_name, is_merged, related_bucket = await _merge_or_create(
+                    content=item_content,
+                    tags=item_tags,
+                    importance=item.get("importance", 5),
+                    domain=item.get("domain", ["general"]),
+                    valence=item.get("valence", 0.5),
+                    arousal=item.get("arousal", 0.3),
+                    name=item.get("name", ""),
+                    allow_merge=False,
+                    memory_subject=item_classification["memory_subject"],
+                    memory_layer=item_classification["memory_layer"],
+                    memory_classification_source=item_classification["memory_classification_source"],
+                )
             _queue_memory_enrichment(bucket_id)
 
             if is_merged:
@@ -8969,6 +9103,7 @@ async def profile_fact(
     reflection: str = "",
     followup: str = "",
     confidence: float = 0.9,
+    idempotency_key: str = "",
 ) -> str:
     """手动写入一条画像事实，并强制关联证据桶。先有事件桶，再用这个工具固化稳定偏好/事实。"""
     fact = str(fact or "").strip()
@@ -9012,25 +9147,53 @@ async def profile_fact(
     if evidence_moment_id:
         evidence["moment_id"] = evidence_moment_id
 
-    bucket_id = await bucket_mgr.create(
-        content=body,
-        tags=list(dict.fromkeys(tags)),
-        importance=8,
-        domain=list(dict.fromkeys(["profile", kind])),
-        valence=0.5,
-        arousal=0.3,
-        name=_profile_fact_name(fact),
-        bucket_type="permanent",
-        confidence=confidence,
-        source="profile_fact",
-        extra_metadata={
-            "profile_kind": kind,
-            "subject": subject_key,
-            "predicate": predicate_key,
-            "object": object_text,
-            "evidence": [evidence],
-        },
-    )
+    if memory_commit_service is not None:
+        source_refs = [f"bucket:{evidence_bucket_id}"]
+        if evidence_moment_id:
+            source_refs.append(f"moment:{evidence_moment_id}")
+        bucket_id = await _commit_tool_memory(
+            content=body,
+            metadata={
+                "tags": list(dict.fromkeys(tags)),
+                "importance": 8,
+                "domain": list(dict.fromkeys(["profile", kind])),
+                "valence": 0.5,
+                "arousal": 0.3,
+                "name": _profile_fact_name(fact),
+                "bucket_type": "permanent",
+                "confidence": confidence,
+                "profile_kind": kind,
+                "subject": subject_key,
+                "predicate": predicate_key,
+                "object": object_text,
+                "evidence": [evidence],
+            },
+            memory_type="identity",
+            source="profile_fact",
+            actor=_ai_author_name(),
+            idempotency_key=idempotency_key,
+            additional_source_refs=source_refs,
+        )
+    else:
+        bucket_id = await bucket_mgr.create(
+            content=body,
+            tags=list(dict.fromkeys(tags)),
+            importance=8,
+            domain=list(dict.fromkeys(["profile", kind])),
+            valence=0.5,
+            arousal=0.3,
+            name=_profile_fact_name(fact),
+            bucket_type="permanent",
+            confidence=confidence,
+            source="profile_fact",
+            extra_metadata={
+                "profile_kind": kind,
+                "subject": subject_key,
+                "predicate": predicate_key,
+                "object": object_text,
+                "evidence": [evidence],
+            },
+        )
     edge = memory_edge_store.add_edge(
         bucket_id,
         evidence_bucket_id,
@@ -9104,6 +9267,7 @@ async def trace(
     content: str = "",
     date: str = "",
     delete: bool = False,
+    idempotency_key: str = "",
 ) -> str:
     """修改已有记忆，不创建新桶。tags/domain/content 是替换；date 可改事件日期；改前先 read_bucket。resolved/digested 让旧事沉底。只改元数据/date 不重建 embedding，改 content/name 才重建。"""
 
@@ -9113,7 +9277,25 @@ async def trace(
 
     # --- Delete mode / 删除模式 ---
     if delete:
-        result = await _delete_bucket_and_indexes(bucket_id)
+        if memory_commit_service is not None:
+            try:
+                await memory_commit_service.tombstone_memory(
+                    memory_id=bucket_id,
+                    idempotency_key=_memory_operation_key(f"trace-delete:{bucket_id}", idempotency_key),
+                    actor=_ai_author_name(),
+                )
+                cleanup, errors = _delete_bucket_indexes(bucket_id)
+                result = {
+                    "status": "deleted",
+                    "id": bucket_id,
+                    "cleanup": cleanup,
+                    "cleanup_errors": errors,
+                }
+            except Exception as exc:
+                logger.warning("Memory authority tombstone failed for %s: %s", bucket_id, exc)
+                result = {"status": "failed", "reason": type(exc).__name__}
+        else:
+            result = await _delete_bucket_and_indexes(bucket_id)
         return (
             f"已遗忘记忆桶: {bucket_id}"
             if result.get("status") == "deleted"
@@ -9167,7 +9349,21 @@ async def trace(
         return _favorite_reason_error()
 
     before_bucket = bucket
-    success = await bucket_mgr.update(bucket_id, **updates)
+    if memory_commit_service is not None:
+        try:
+            await _revise_tool_memory(
+                bucket_id=bucket_id,
+                bucket=bucket,
+                updates=updates,
+                idempotency_key=idempotency_key,
+                actor=_ai_author_name(),
+            )
+            success = True
+        except Exception as exc:
+            logger.warning("Memory authority revision failed for %s: %s", bucket_id, exc)
+            success = False
+    else:
+        success = await bucket_mgr.update(bucket_id, **updates)
     if not success:
         return f"修改失败: {bucket_id}"
 

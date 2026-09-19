@@ -115,6 +115,7 @@ def test_hold_feel_uses_same_ring_authority(monkeypatch):
 class ToolMemoryProjection:
     def __init__(self):
         self.revisions = []
+        self.deleted = []
 
     async def write_revision(self, **kwargs):
         self.revisions.append(dict(kwargs))
@@ -130,6 +131,9 @@ class ToolMemoryProjection:
 
     async def retract_ring(self, **kwargs):
         raise AssertionError("not used")
+
+    async def delete_memory(self, **kwargs):
+        self.deleted.append(kwargs["memory_id"])
 
 
 def test_normal_hold_commits_new_memory_through_authority(monkeypatch, tmp_path):
@@ -175,3 +179,77 @@ def test_normal_hold_commits_new_memory_through_authority(monkeypatch, tmp_path)
     ))
     assert repeated.startswith("新建→")
     assert len(projection.revisions) == 1
+
+
+def test_trace_creates_revision_then_tombstones_without_direct_bucket_update(monkeypatch, tmp_path):
+    authority = MemoryAuthorityStore(str(tmp_path / "memory-authority.sqlite3"))
+    projection = ToolMemoryProjection()
+    service = MemoryCommitService(authority, projection)
+    bucket_manager = FakeBucketManager()
+    monkeypatch.setattr(server, "bucket_mgr", bucket_manager)
+    monkeypatch.setattr(server, "memory_authority_store", authority)
+    monkeypatch.setattr(server, "memory_commit_service", service)
+    monkeypatch.setattr(server, "_queue_embedding_refresh_if_changed", lambda *_args: True)
+    monkeypatch.setattr(server, "_delete_bucket_indexes", lambda _bucket_id: ({"embedding": True}, []))
+
+    memory_id = asyncio.run(server._commit_tool_memory(
+        content="旧正文",
+        metadata={"name": "旧记忆", "domain": ["测试"], "tags": []},
+        memory_type="durable_fact",
+        source="hold",
+        actor="guyan",
+        idempotency_key="trace-seed",
+    ))
+    revised = asyncio.run(server.trace(
+        bucket_id=memory_id,
+        content="新正文",
+        idempotency_key="trace-revision-1",
+    ))
+    assert "content=已替换" in revised
+    assert authority.get_memory(memory_id)["active_revision"] == 2
+    assert len(projection.revisions) == 2
+
+    deleted = asyncio.run(server.trace(
+        bucket_id=memory_id,
+        delete=True,
+        idempotency_key="trace-delete-1",
+    ))
+    assert deleted == f"已遗忘记忆桶: {memory_id}"
+    memory = authority.get_memory(memory_id)
+    assert memory["state"] == "tombstoned"
+    assert memory["recall_policy"] == "disabled"
+    assert projection.deleted == [memory_id]
+
+
+def test_profile_fact_commits_evidence_refs_through_authority(monkeypatch, tmp_path):
+    authority = MemoryAuthorityStore(str(tmp_path / "memory-authority.sqlite3"))
+    projection = ToolMemoryProjection()
+    service = MemoryCommitService(authority, projection)
+    bucket_manager = FakeBucketManager()
+    monkeypatch.setattr(server, "bucket_mgr", bucket_manager)
+    monkeypatch.setattr(server, "memory_authority_store", authority)
+    monkeypatch.setattr(server, "memory_commit_service", service)
+    monkeypatch.setattr(
+        server.memory_moment_store,
+        "upsert_bucket",
+        lambda _bucket: [{"moment_id": "moment-evidence-1"}],
+    )
+    monkeypatch.setattr(server.memory_edge_store, "add_edge", lambda *_args, **_kwargs: {"ok": True})
+    monkeypatch.setattr(server, "_refresh_entity_edges_for_bucket", lambda _bucket: 0)
+    monkeypatch.setattr(server, "_queue_embedding_refresh", lambda _bucket_id: True)
+
+    result = asyncio.run(server.profile_fact(
+        fact="主人不喜欢纯黑咖啡。",
+        evidence_bucket_id="evidence-1",
+        profile_kind="preference",
+        idempotency_key="profile-fact-1",
+    ))
+    assert result.startswith("profile_fact→")
+    memory_id = projection.revisions[0]["memory_id"]
+    revision = authority.get_memory_revision(memory_id, 1)
+    assert set(revision["source_refs"]) == {
+        "tool_operation:profile-fact-1",
+        "bucket:evidence-1",
+        "moment:moment-evidence-1",
+    }
+    assert authority.get_candidate(memory_id)["status"] == "committed"

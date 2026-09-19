@@ -72,6 +72,8 @@ class MemoryProjection(Protocol):
         allowed_source: str | None,
     ) -> None: ...
 
+    async def delete_memory(self, *, memory_id: str, bucket_id: str) -> None: ...
+
 
 class ProjectionNotApplied(Exception):
     """A safe failure proving that the Bucket was not changed."""
@@ -233,6 +235,13 @@ class BucketMemoryProjection:
         if result.get("status") not in {"deleted", "not_found"}:
             raise ProjectionNotApplied(f"Bucket ring retract failed: {result.get('status')}")
 
+    async def delete_memory(self, *, memory_id: str, bucket_id: str) -> None:
+        deleted = await self.bucket_manager.delete(bucket_id)
+        if not deleted:
+            # A retry after a successful projection is idempotent.
+            if await self.bucket_manager.get(bucket_id):
+                raise ProjectionNotApplied("Bucket delete returned false")
+
 
 class MemoryCommitService:
     def __init__(self, authority: MemoryAuthorityStore, projection: MemoryProjection):
@@ -372,6 +381,38 @@ class MemoryCommitService:
                 ring_id=ring_id,
                 allowed_author=allowed_author,
                 allowed_source=allowed_source,
+            )
+        except Exception as exc:
+            self.authority.set_outbox_status(
+                str(result["outbox_event_id"]), status="degraded", error=type(exc).__name__
+            )
+            raise
+        self.authority.set_outbox_status(str(result["outbox_event_id"]), status="projected")
+        return result
+
+    async def tombstone_memory(
+        self,
+        *,
+        memory_id: str,
+        idempotency_key: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        memory = self.authority.get_memory(memory_id)
+        if not memory:
+            raise MemoryNotFound(memory_id)
+        result = self.authority.change_memory_state(
+            memory_id=memory_id,
+            state="tombstoned",
+            recall_policy="disabled",
+            idempotency_key=idempotency_key,
+            actor=actor,
+        )
+        if not result.get("outbox_event_id"):
+            return result
+        try:
+            await self.projection.delete_memory(
+                memory_id=memory_id,
+                bucket_id=str(memory["bucket_id"]),
             )
         except Exception as exc:
             self.authority.set_outbox_status(

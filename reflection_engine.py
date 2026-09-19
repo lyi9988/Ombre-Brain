@@ -689,6 +689,101 @@ class ReflectionEngine:
             BucketMemoryProjection(self.config, bucket_manager=bucket_mgr),
         )
 
+    async def _commit_background_memory(
+        self,
+        *,
+        bucket_mgr,
+        memory_id: str,
+        body: str,
+        metadata: dict,
+        source_type: str,
+        memory_type: str,
+        source_refs: list[str],
+        recall_policy: str = "enabled",
+    ) -> dict:
+        if not self.memory_authority_enabled or not self.memory_authority_store or not self.memory_ingestion_policy:
+            raise RuntimeError("memory authority is not enabled")
+        body_hash = hashlib.sha256(str(body or "").encode("utf-8")).hexdigest()
+        proposal_id = f"{memory_id}:proposal:{body_hash[:16]}"
+        refs = list(dict.fromkeys([
+            f"background_source:{source_type}:{memory_id}",
+            *[str(item) for item in source_refs if str(item).strip()],
+        ]))
+        proposal = MemoryProposal.from_mapping({
+            "proposal_id": proposal_id,
+            "source_type": source_type,
+            "proposed_body": body,
+            "source_refs": refs,
+            "source_status": "verified",
+            "memory_type": memory_type,
+            "confidence": metadata.get("confidence", 0.8),
+            "requested_mode": "auto",
+            "metadata": {"legacy_candidate": {
+                "id": proposal_id,
+                "content": body,
+                "proposed_memory": body,
+                "kind": memory_type,
+                "mode": "auto",
+                "source_verification": "verified",
+                "source_event_ids": refs,
+                "source_hash": body_hash[:16],
+            }},
+        })
+        decision = self.memory_ingestion_policy.evaluate(proposal)
+        candidate = self.memory_authority_store.get_candidate(proposal_id)
+        if not candidate:
+            candidate = self.memory_authority_store.put_candidate(proposal, decision)
+        if candidate.get("status") == "committed":
+            memory = self.memory_authority_store.get_memory(memory_id)
+            return {
+                "memory_id": memory_id,
+                "revision": int((memory or {}).get("active_revision") or 0),
+                "status": "exists",
+            }
+        if candidate.get("status") != "accepted":
+            return {"memory_id": memory_id, "status": candidate.get("status") or "rejected"}
+        memory = self.memory_authority_store.get_memory(memory_id)
+        expected_revision = int((memory or {}).get("active_revision") or 0)
+        try:
+            committed = await self._memory_authority_service(bucket_mgr).commit_memory(
+                memory_id=memory_id,
+                bucket_id=memory_id,
+                expected_revision=expected_revision,
+                body=body,
+                metadata=metadata,
+                source_refs=refs,
+                decision_source="system",
+                idempotency_key=f"{proposal_id}:revision:{expected_revision + 1}",
+                actor=source_type,
+                recall_policy=recall_policy,
+            )
+            current = self.memory_authority_store.get_candidate(proposal_id) or candidate
+            if current.get("status") == "accepted":
+                self.memory_authority_store.decide_candidate(
+                    proposal_id,
+                    action="commit",
+                    expected_revision=int(current.get("revision") or 1),
+                    request_id=f"{proposal_id}:committed:{committed.get('revision')}",
+                    actor="commit_service",
+                    reason_codes=["MEMORY_REVISION_COMMITTED"],
+                )
+            return {**committed, "status": "created" if expected_revision == 0 else "updated"}
+        except Exception as exc:
+            current = self.memory_authority_store.get_candidate(proposal_id)
+            if current and current.get("status") == "accepted":
+                try:
+                    self.memory_authority_store.decide_candidate(
+                        proposal_id,
+                        action="commit_failed",
+                        expected_revision=int(current.get("revision") or 1),
+                        request_id=f"{proposal_id}:commit-failed:{type(exc).__name__}",
+                        actor="commit_service",
+                        reason_codes=[f"COMMIT_FAILED_{type(exc).__name__.upper()}"],
+                    )
+                except Exception:
+                    logger.exception("Background memory failure state recording failed")
+            raise
+
     @staticmethod
     def _daily_chat_memory_source_refs(candidate: dict) -> list[str]:
         refs = []
@@ -1174,7 +1269,51 @@ class ReflectionEngine:
             ][:40],
         }
 
-        if existing:
+        reflection_metadata = {
+            "tags": tags,
+            "importance": 6 if period == "daily" else 7,
+            "domain": ["自省", "恋爱"],
+            "valence": valence,
+            "arousal": arousal,
+            "bucket_type": "feel",
+            "name": title,
+            "source": "reflection",
+            "created": created,
+            "last_active": (
+                existing.get("metadata", {}).get("last_active")
+                or existing.get("metadata", {}).get("created")
+                or created
+            ) if existing else created,
+            "updated_at": created,
+            "confidence": confidence,
+            "period": period,
+            "date": key,
+            **source_metadata,
+        }
+        reflection_source_refs = [
+            *[f"bucket:{value}" for value in source_bucket_ids],
+            *[f"persona_event:{value}" for value in source_persona_event_ids],
+            *[f"conversation_turn:{value}" for value in source_conversation_turn_ids],
+            *[
+                f"candidate:{item.get('id')}"
+                for item in materials.get("daily_chat_memories", [])
+                if item.get("id")
+            ],
+        ]
+
+        if self.memory_authority_enabled:
+            committed = await self._commit_background_memory(
+                bucket_mgr=bucket_mgr,
+                memory_id=bucket_id,
+                body=content,
+                metadata=reflection_metadata,
+                source_type="reflection",
+                memory_type="daily_impression" if period == "daily" else "reflection",
+                source_refs=reflection_source_refs,
+                recall_policy="manual_only",
+            )
+            status = str(committed.get("status") or "failed")
+        elif existing:
             await bucket_mgr.update(
                 bucket_id,
                 content=content,
@@ -5529,27 +5668,57 @@ class ReflectionEngine:
         )[:12]
         importance = max(5, min(6, self._int_between(candidate.get("importance"), 5)))
         created = now_local.isoformat(timespec="seconds")
-        new_id = await bucket_mgr.create(
-            bucket_id=bucket_id,
-            content=content,
-            tags=tags,
-            importance=importance,
-            domain=domain,
-            valence=self._clamp(candidate.get("valence", 0.55)),
-            arousal=self._clamp(candidate.get("arousal", 0.3)),
-            name=title[:40],
-            source="from_diary",
-            created=created,
-            last_active=created,
-            updated_at=created,
-            confidence=confidence,
-            date=key,
-            extra_metadata={
-                "from_diary": True,
-                "event_date": key,
-                "diary_id": diary.get("id"),
-            },
-        )
+        diary_metadata = {
+            "tags": tags,
+            "importance": importance,
+            "domain": domain,
+            "valence": self._clamp(candidate.get("valence", 0.55)),
+            "arousal": self._clamp(candidate.get("arousal", 0.3)),
+            "name": title[:40],
+            "source": "from_diary",
+            "created": created,
+            "last_active": created,
+            "updated_at": created,
+            "confidence": confidence,
+            "date": key,
+            "from_diary": True,
+            "event_date": key,
+            "diary_id": diary.get("id"),
+        }
+        if self.memory_authority_enabled:
+            committed = await self._commit_background_memory(
+                bucket_mgr=bucket_mgr,
+                memory_id=bucket_id,
+                body=content,
+                metadata=diary_metadata,
+                source_type="diary",
+                memory_type="diary_memory",
+                source_refs=[f"diary:{diary.get('id') or key}"],
+                recall_policy="enabled",
+            )
+            new_id = str(committed.get("memory_id") or bucket_id)
+        else:
+            new_id = await bucket_mgr.create(
+                bucket_id=bucket_id,
+                content=content,
+                tags=tags,
+                importance=importance,
+                domain=domain,
+                valence=self._clamp(candidate.get("valence", 0.55)),
+                arousal=self._clamp(candidate.get("arousal", 0.3)),
+                name=title[:40],
+                source="from_diary",
+                created=created,
+                last_active=created,
+                updated_at=created,
+                confidence=confidence,
+                date=key,
+                extra_metadata={
+                    "from_diary": True,
+                    "event_date": key,
+                    "diary_id": diary.get("id"),
+                },
+            )
         if embedding_engine and getattr(embedding_engine, "enabled", False):
             try:
                 bucket = await bucket_mgr.get(new_id)

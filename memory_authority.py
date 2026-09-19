@@ -151,7 +151,8 @@ class MemoryIngestionPolicy:
     DEFAULT_AUTO_TYPES = frozenset({
         "durable_fact", "preference", "stable_preference", "relationship_event",
         "shared_experience", "key_event", "boundary", "signal", "commitment",
-        "project_state", "relationship_anchor",
+        "project_state", "relationship_anchor", "daily_impression", "reflection",
+        "diary_memory",
     })
     OWNER_REVIEW_TYPES = frozenset({
         "identity", "alias",
@@ -1275,11 +1276,91 @@ class MemoryAuthorityStore:
         finally:
             conn.close()
 
+    def change_memory_state(
+        self,
+        *,
+        memory_id: str,
+        state: str,
+        recall_policy: str,
+        idempotency_key: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        state = str(state or "").strip().lower()
+        recall_policy = str(recall_policy or "").strip().lower()
+        if state not in {"active", "archived", "tombstoned"}:
+            raise ValueError("invalid memory state")
+        if recall_policy not in {"enabled", "manual_only", "disabled"}:
+            raise ValueError("invalid recall policy")
+        payload = {
+            "memory_id": memory_id,
+            "state": state,
+            "recall_policy": recall_policy,
+            "actor": actor,
+        }
+        fingerprint = self.fingerprint(payload)
+        operation_id = f"memory-state:{uuid.uuid4().hex}"
+        now = _now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            prior = conn.execute("SELECT * FROM commit_log WHERE idempotency_key=?", (idempotency_key,)).fetchone()
+            if prior:
+                if str(prior["fingerprint"]) != fingerprint:
+                    raise IdempotencyConflict("idempotency_key payload differs")
+                conn.commit()
+                return _loads(prior["result_json"], {})
+            memory = conn.execute("SELECT * FROM memories WHERE memory_id=?", (memory_id,)).fetchone()
+            if not memory:
+                raise MemoryNotFound(memory_id)
+            conn.execute(
+                "INSERT INTO commit_log(operation_id,idempotency_key,fingerprint,operation_kind,aggregate_id,status,"
+                "payload_json,result_json,error_code,created_at,updated_at) VALUES(?,?,?,?,?,'committed',?,'{}','',?,?)",
+                (operation_id, idempotency_key, fingerprint, "memory_state", memory_id,
+                 _json(payload), now, now),
+            )
+            conn.execute(
+                "UPDATE memories SET state=?,recall_policy=?,updated_at=? WHERE memory_id=?",
+                (state, recall_policy, now, memory_id),
+            )
+            event_id = f"memory:{memory_id}:state:{operation_id}"
+            event_payload = {"memory_id": memory_id, "state": state, "recall_policy": recall_policy}
+            conn.execute(
+                "INSERT INTO outbox(event_id,operation_id,event_type,aggregate_id,aggregate_revision,payload_json,"
+                "status,attempts,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,'pending',0,'',?,?)",
+                (event_id, operation_id, "MemoryStateChanged", memory_id,
+                 int(memory["active_revision"]), _json(event_payload), now, now),
+            )
+            result = {**event_payload, "outbox_event_id": event_id}
+            conn.execute(
+                "UPDATE commit_log SET result_json=? WHERE operation_id=?", (_json(result), operation_id)
+            )
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def get_memory(self, memory_id: str) -> dict[str, Any] | None:
         conn = self._connect()
         row = conn.execute("SELECT * FROM memories WHERE memory_id=?", (memory_id,)).fetchone()
         conn.close()
         return dict(row) if row else None
+
+    def get_memory_revision(self, memory_id: str, revision: int) -> dict[str, Any] | None:
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT * FROM memory_revisions WHERE memory_id=? AND revision=?",
+            (memory_id, int(revision)),
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        value = dict(row)
+        value["metadata"] = _loads(value.pop("metadata_json"), {})
+        value["source_refs"] = _loads(value.pop("source_refs_json"), [])
+        return value
 
     def pending_outbox(self, *, limit: int = 100) -> list[dict[str, Any]]:
         conn = self._connect()

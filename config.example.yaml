@@ -754,6 +754,9 @@ memory_authority:
       - commitment
       - project_state
       - relationship_anchor
+      - daily_impression
+      - reflection
+      - diary_memory
     owner_review_types:
       - identity
       - alias

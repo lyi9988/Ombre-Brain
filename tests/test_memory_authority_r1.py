@@ -576,6 +576,37 @@ def test_daily_mode_conflict_fails_closed_when_authority_is_enabled(tmp_path):
         ReflectionEngine(config)
 
 
+def test_background_reflection_uses_revisioned_memory_and_manual_recall_policy(tmp_path):
+    engine = ReflectionEngine(reflection_config(tmp_path, mode="review"))
+    projection = attach_fake_commit_service(engine)
+    first = asyncio.run(engine._commit_background_memory(
+        bucket_mgr=object(),
+        memory_id="reflection_daily_2026-09-16",
+        body="第一版日印象",
+        metadata={"confidence": 0.9, "bucket_type": "feel"},
+        source_type="reflection",
+        memory_type="daily_impression",
+        source_refs=["conversation_turn:1"],
+        recall_policy="manual_only",
+    ))
+    second = asyncio.run(engine._commit_background_memory(
+        bucket_mgr=object(),
+        memory_id="reflection_daily_2026-09-16",
+        body="修订后的日印象",
+        metadata={"confidence": 0.9, "bucket_type": "feel"},
+        source_type="reflection",
+        memory_type="daily_impression",
+        source_refs=["conversation_turn:1", "conversation_turn:2"],
+        recall_policy="manual_only",
+    ))
+    memory = engine.memory_authority_store.get_memory("reflection_daily_2026-09-16")
+    assert first["status"] == "created"
+    assert second["status"] == "updated"
+    assert memory["active_revision"] == 2
+    assert memory["recall_policy"] == "manual_only"
+    assert len(projection.revisions) == 2
+
+
 def test_apply_migration_preserves_bucket_bytes_and_imports_revision_ring_and_candidate(tmp_path):
     candidates = tmp_path / "daily_chat_memory_candidates.json"
     candidates.write_text(
