@@ -757,6 +757,7 @@ memory_authority:
       - daily_impression
       - reflection
       - diary_memory
+      - import_memory
     owner_review_types:
       - identity
       - alias

@@ -784,6 +784,53 @@ class ReflectionEngine:
                     logger.exception("Background memory failure state recording failed")
             raise
 
+    async def _commit_existing_memory_revision(
+        self,
+        *,
+        bucket_mgr,
+        bucket: dict,
+        updates: dict,
+        source_type: str,
+    ) -> dict:
+        if not self.memory_authority_enabled or not self.memory_authority_store:
+            raise RuntimeError("memory authority is not enabled")
+        memory_id = str(bucket.get("id") or "").strip()
+        memory = self.memory_authority_store.get_memory(memory_id)
+        if not memory:
+            raise RuntimeError("memory_authority_missing")
+        body = str(updates.get("content", bucket.get("content") or ""))
+        metadata = dict(bucket.get("metadata") or {})
+        for key, value in updates.items():
+            if key != "content":
+                metadata[key] = value
+        update_fingerprint = hashlib.sha256(
+            json.dumps(
+                {"body": body, "metadata": metadata},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        return await self._memory_authority_service(bucket_mgr).commit_memory(
+            memory_id=memory_id,
+            bucket_id=str(memory["bucket_id"]),
+            expected_revision=int(memory["active_revision"]),
+            body=body,
+            metadata=metadata,
+            source_refs=[
+                f"memory_revision:{memory['active_revision']}",
+                f"system_operation:{source_type}:{update_fingerprint[:16]}",
+            ],
+            decision_source="system",
+            idempotency_key=(
+                f"{source_type}:{memory_id}:revision:{memory['active_revision']}:"
+                f"{update_fingerprint[:20]}"
+            ),
+            actor=source_type,
+            memory_state=str(memory.get("state") or "active"),
+            recall_policy=str(memory.get("recall_policy") or "enabled"),
+        )
+
     @staticmethod
     def _daily_chat_memory_source_refs(candidate: dict) -> list[str]:
         refs = []
@@ -1047,7 +1094,15 @@ class ReflectionEngine:
 
         if updates:
             updates["last_active"] = meta.get("last_active") or meta.get("created")
-            await bucket_mgr.update(bucket_id, **updates)
+            if self.memory_authority_enabled:
+                await self._commit_existing_memory_revision(
+                    bucket_mgr=bucket_mgr,
+                    bucket=bucket,
+                    updates=updates,
+                    source_type="memory_enrichment",
+                )
+            else:
+                await bucket_mgr.update(bucket_id, **updates)
             if "content" in updates and embedding_engine and getattr(embedding_engine, "enabled", False):
                 try:
                     updated_bucket = await bucket_mgr.get(bucket_id)

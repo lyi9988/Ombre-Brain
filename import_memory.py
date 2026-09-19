@@ -29,6 +29,8 @@ import jieba
 from rapidfuzz import fuzz
 
 from prompt_plan_mirror import PromptPlanMirrorStore
+from memory_authority import MemoryAuthorityStore, MemoryProposal, PolicyDecision
+from memory_commit_service import BucketMemoryProjection, MemoryCommitService
 from prompt_source_registry import (
     fixed_prompt_source,
     render_factory_body,
@@ -749,6 +751,137 @@ class ImportEngine:
         self._running = False
         self._chunks: list[dict] = []
         self._seen_import_hashes: set[str] = set()
+        authority_cfg = config.get("memory_authority", {}) if isinstance(
+            config.get("memory_authority", {}), dict) else {}
+        self.memory_authority_store = None
+        self.memory_commit_service = None
+        if bool(authority_cfg.get("enabled", False)):
+            state_dir = config.get("state_dir") or config["buckets_dir"]
+            self.memory_authority_store = MemoryAuthorityStore({
+                **config,
+                "state_dir": state_dir,
+                "memory_authority_db_path": authority_cfg.get("db_path")
+                or os.path.join(state_dir, "memory_authority.sqlite3"),
+            })
+            self.memory_commit_service = MemoryCommitService(
+                self.memory_authority_store,
+                BucketMemoryProjection(config, bucket_manager=bucket_mgr),
+            )
+
+    @staticmethod
+    def _import_source_refs(extra_metadata: dict) -> list[str]:
+        refs = []
+        for ref in extra_metadata.get("source_refs") or []:
+            if not isinstance(ref, dict):
+                continue
+            chunk_id = str(ref.get("chunk_id") or "").strip()
+            source_hash = str(ref.get("source_hash") or "").strip()
+            if chunk_id:
+                refs.append(f"import_chunk:{chunk_id}")
+            if source_hash:
+                refs.append(f"import_source:{source_hash}")
+        for value in extra_metadata.get("source_chunk_ids") or []:
+            if str(value).strip():
+                refs.append(f"import_chunk:{value}")
+        return list(dict.fromkeys(refs))
+
+    async def _commit_import_memory(
+        self,
+        *,
+        memory_id: str,
+        body: str,
+        metadata: dict,
+        extra_metadata: dict,
+        expected_revision: int,
+    ) -> dict:
+        if not self.memory_authority_store or not self.memory_commit_service:
+            raise RuntimeError("memory authority is not enabled")
+        source_refs = self._import_source_refs(extra_metadata)
+        source_seed = "|".join(source_refs) or str(extra_metadata.get("import_source_hash") or "unknown")
+        body_hash = _import_content_hash(body)
+        candidate_id = f"import_candidate_{hashlib.sha256(f'{source_seed}|{body_hash}|{memory_id}'.encode()).hexdigest()[:20]}"
+        proposal = MemoryProposal.from_mapping({
+            "proposal_id": candidate_id,
+            "source_type": "import",
+            "proposed_body": body,
+            "source_refs": source_refs or [f"import_operation:{candidate_id}"],
+            "source_status": "verified",
+            "memory_type": "import_memory",
+            "confidence": 1.0,
+            "requested_mode": "auto",
+            "metadata": {"legacy_candidate": {
+                "id": candidate_id,
+                "content": body,
+                "proposed_memory": body,
+                "kind": "import_memory",
+                "mode": "auto",
+                "source_verification": "verified",
+                "source_event_ids": source_refs,
+                "source_hash": body_hash[:16],
+            }},
+        })
+        policy = PolicyDecision(
+            action="auto_accept",
+            reason_codes=("ACCEPT_IMPORT",),
+            decision_policy="import",
+            alias_trust="weak",
+            requires_owner_confirmation=False,
+        )
+        candidate = self.memory_authority_store.get_candidate(candidate_id)
+        if not candidate:
+            candidate = self.memory_authority_store.put_candidate(proposal, policy)
+        if candidate.get("status") == "committed":
+            memory = self.memory_authority_store.get_memory(memory_id)
+            return {"memory_id": memory_id, "revision": int((memory or {}).get("active_revision") or 0)}
+        if candidate.get("status") == "commit_failed":
+            candidate = self.memory_authority_store.decide_candidate(
+                candidate_id,
+                action="accept",
+                expected_revision=int(candidate.get("revision") or 1),
+                request_id=f"{candidate_id}:retry-accept",
+                actor="import",
+                reason_codes=["RETRY_COMMIT"],
+            )
+        if candidate.get("status") != "accepted":
+            raise RuntimeError(f"import candidate is {candidate.get('status')}")
+        try:
+            committed = await self.memory_commit_service.commit_memory(
+                memory_id=memory_id,
+                bucket_id=memory_id,
+                expected_revision=expected_revision,
+                body=body,
+                metadata={**metadata, **extra_metadata, "source": "import"},
+                source_refs=source_refs or [f"import_operation:{candidate_id}"],
+                decision_source="import",
+                idempotency_key=f"{candidate_id}:revision:{expected_revision + 1}",
+                actor="import",
+            )
+            current = self.memory_authority_store.get_candidate(candidate_id) or candidate
+            if current.get("status") == "accepted":
+                self.memory_authority_store.decide_candidate(
+                    candidate_id,
+                    action="commit",
+                    expected_revision=int(current.get("revision") or 1),
+                    request_id=f"{candidate_id}:committed:{committed.get('revision')}",
+                    actor="commit_service",
+                    reason_codes=["MEMORY_REVISION_COMMITTED"],
+                )
+            return committed
+        except Exception as exc:
+            current = self.memory_authority_store.get_candidate(candidate_id)
+            if current and current.get("status") == "accepted":
+                try:
+                    self.memory_authority_store.decide_candidate(
+                        candidate_id,
+                        action="commit_failed",
+                        expected_revision=int(current.get("revision") or 1),
+                        request_id=f"{candidate_id}:commit-failed:{type(exc).__name__}",
+                        actor="commit_service",
+                        reason_codes=[f"COMMIT_FAILED_{type(exc).__name__.upper()}"],
+                    )
+                except Exception:
+                    logger.exception("Import candidate failure state recording failed")
+            raise
 
     def _prompt_identity_id(self) -> str:
         persona_cfg = self.config.get("persona", {})
@@ -1061,6 +1194,18 @@ class ImportEngine:
         arousal = item.get("arousal", 0.3)
         name = item.get("name", "")
         extra_metadata = self._extra_metadata_for_item(item)
+        import_identity = "|".join(self._import_source_refs(extra_metadata)) or str(
+            extra_metadata.get("import_source_hash") or "import"
+        )
+        deterministic_id = f"import_{hashlib.sha256(f'{import_identity}|{_import_content_hash(content)}'.encode()).hexdigest()[:16]}"
+        create_metadata = {
+            "tags": tags,
+            "importance": importance,
+            "domain": domain,
+            "valence": valence,
+            "arousal": arousal,
+            "name": name or None,
+        }
 
         duplicate = await self._find_duplicate_bucket(content)
         if duplicate:
@@ -1072,17 +1217,27 @@ class ImportEngine:
             return "duplicate"
 
         if preserve_raw:
-            bucket_id = await self.bucket_mgr.create(
-                content=content,
-                tags=tags,
-                importance=importance,
-                domain=domain,
-                valence=valence,
-                arousal=arousal,
-                name=name or None,
-                source="import",
-                extra_metadata=extra_metadata,
-            )
+            if self.memory_commit_service is not None:
+                bucket_id = deterministic_id
+                await self._commit_import_memory(
+                    memory_id=bucket_id,
+                    body=content,
+                    metadata=create_metadata,
+                    extra_metadata=extra_metadata,
+                    expected_revision=0,
+                )
+            else:
+                bucket_id = await self.bucket_mgr.create(
+                    content=content,
+                    tags=tags,
+                    importance=importance,
+                    domain=domain,
+                    valence=valence,
+                    arousal=arousal,
+                    name=name or None,
+                    source="import",
+                    extra_metadata=extra_metadata,
+                )
             if self.embedding_engine:
                 try:
                     await self.embedding_engine.generate_and_store(
@@ -1112,17 +1267,37 @@ class ImportEngine:
                     old_v = bucket["metadata"].get("valence", 0.5)
                     old_a = bucket["metadata"].get("arousal", 0.3)
                     merged_metadata = self._merged_source_metadata(bucket.get("metadata", {}), extra_metadata)
-                    await self.bucket_mgr.update(
-                        bucket["id"],
-                        content=merged,
-                        tags=list(set(bucket["metadata"].get("tags", []) + tags)),
-                        importance=max(bucket["metadata"].get("importance", 5), importance),
-                        domain=list(set(bucket["metadata"].get("domain", []) + domain)),
-                        valence=round((old_v + valence) / 2, 2),
-                        arousal=round((old_a + arousal) / 2, 2),
-                        source="import",
-                        extra_metadata=merged_metadata,
-                    )
+                    merged_fields = {
+                        "tags": list(set(bucket["metadata"].get("tags", []) + tags)),
+                        "importance": max(bucket["metadata"].get("importance", 5), importance),
+                        "domain": list(set(bucket["metadata"].get("domain", []) + domain)),
+                        "valence": round((old_v + valence) / 2, 2),
+                        "arousal": round((old_a + arousal) / 2, 2),
+                        "name": bucket["metadata"].get("name") or bucket["id"],
+                    }
+                    if self.memory_commit_service is not None:
+                        authority_memory = self.memory_authority_store.get_memory(bucket["id"])
+                        if not authority_memory:
+                            raise RuntimeError("import merge target missing from memory authority")
+                        await self._commit_import_memory(
+                            memory_id=bucket["id"],
+                            body=merged,
+                            metadata=merged_fields,
+                            extra_metadata=merged_metadata,
+                            expected_revision=int(authority_memory["active_revision"]),
+                        )
+                    else:
+                        await self.bucket_mgr.update(
+                            bucket["id"],
+                            content=merged,
+                            tags=merged_fields["tags"],
+                            importance=merged_fields["importance"],
+                            domain=merged_fields["domain"],
+                            valence=merged_fields["valence"],
+                            arousal=merged_fields["arousal"],
+                            source="import",
+                            extra_metadata=merged_metadata,
+                        )
                     if self.embedding_engine:
                         try:
                             await self.embedding_engine.generate_and_store(
@@ -1137,17 +1312,27 @@ class ImportEngine:
                     self.state.data["api_calls"] += 1
 
         # Create new
-        bucket_id = await self.bucket_mgr.create(
-            content=content,
-            tags=tags,
-            importance=importance,
-            domain=domain,
-            valence=valence,
-            arousal=arousal,
-            name=name or None,
-            source="import",
-            extra_metadata=extra_metadata,
-        )
+        if self.memory_commit_service is not None:
+            bucket_id = deterministic_id
+            await self._commit_import_memory(
+                memory_id=bucket_id,
+                body=content,
+                metadata=create_metadata,
+                extra_metadata=extra_metadata,
+                expected_revision=0,
+            )
+        else:
+            bucket_id = await self.bucket_mgr.create(
+                content=content,
+                tags=tags,
+                importance=importance,
+                domain=domain,
+                valence=valence,
+                arousal=arousal,
+                name=name or None,
+                source="import",
+                extra_metadata=extra_metadata,
+            )
         if self.embedding_engine:
             try:
                 await self.embedding_engine.generate_and_store(

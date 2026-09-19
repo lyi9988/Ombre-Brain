@@ -152,7 +152,7 @@ class MemoryIngestionPolicy:
         "durable_fact", "preference", "stable_preference", "relationship_event",
         "shared_experience", "key_event", "boundary", "signal", "commitment",
         "project_state", "relationship_anchor", "daily_impression", "reflection",
-        "diary_memory",
+        "diary_memory", "import_memory",
     })
     OWNER_REVIEW_TYPES = frozenset({
         "identity", "alias",
