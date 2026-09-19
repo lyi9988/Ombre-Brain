@@ -237,6 +237,52 @@ verified route mirror identified by route revision/hash; provider secrets remain
 in runtime configuration. Prompt Composer controls prompt text and placement,
 not model choice or memory facts.
 
+### Prompt Composer compatibility contract
+
+RECALL-R1 exposes exactly one main-chat dynamic source adapter:
+
+```text
+source_id: ombre.memory_recall
+authority: Ombre Memory/Recall
+body_mode: dynamic
+```
+
+The adapter returns a request-local `MemoryRecallProjection` containing:
+
+- authority watermark and Recall policy revision;
+- selected memory IDs and exact active revisions;
+- selected ring IDs, if any;
+- route (`fast` or `deep`) and stable reason codes;
+- bounded owner-safe body plus token estimate;
+- source/body hashes for Inspector provenance;
+- cache/snapshot identity.
+
+Ombre owns which committed Memory evidence qualifies and the projection body.
+Prompt Composer owns whether the block is included and its role, lane, anchor,
+depth, wrapper, priority, and token budget. Reality owns neither.
+
+The dynamic adapter preserves existing Prompt Composer preset/binding
+contracts. A Memory schema upgrade cannot create a second prompt insertion,
+move the block implicitly, overwrite an owner wrapper, or change protected
+protocol/history/tool nodes. Missing/degraded Recall produces an explicit
+empty/degraded source result; it must not inject a stale cached body under a new
+authority watermark.
+
+`talk.continuation` reuses the exact parent `MemoryRecallProjection` through the
+prepare snapshot unless a deliberate new Recall round is requested. It cannot
+silently recall a different Memory set between a tool call and the final answer.
+
+Internal requests remain separate Composer scopes:
+
+- `memory.query_planner`
+- `memory.domain_sentinel`
+- `memory.semantic_rescue`
+
+Their prompts and outputs never appear as main-chat history or as extra
+`ombre.memory_recall` blocks. Model Request Trace/Inspector must show the final
+physical order and prove that the Composer preview, compiled projection, and
+raw request agree on source ID, revision/hash, role, position, and token count.
+
 ## 12. Owner UI contract
 
 Reality exposes separate, collapsible sections under `更多 -> 中枢`:
