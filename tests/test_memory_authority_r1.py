@@ -342,6 +342,8 @@ class FakeProjection:
         self.fail_revision = False
         self.fail_ring = False
         self.retracted_rings = []
+        self.states = []
+        self.deleted_memories = []
 
     async def write_revision(self, **kwargs):
         if self.fail_revision:
@@ -363,6 +365,12 @@ class FakeProjection:
     async def retract_ring(self, **kwargs):
         if kwargs["ring_id"] not in self.retracted_rings:
             self.retracted_rings.append(kwargs["ring_id"])
+
+    async def delete_memory(self, **kwargs):
+        self.deleted_memories.append(kwargs["memory_id"])
+
+    async def set_memory_state(self, **kwargs):
+        self.states.append((kwargs["memory_id"], kwargs["state"]))
 
 
 def test_commit_service_projects_once_and_idempotent_retry_returns_same_revision(tmp_path):
@@ -447,6 +455,24 @@ def test_ring_retract_is_audited_and_idempotent(tmp_path):
     assert first == second
     assert first["status"] == "retracted"
     assert projection.retracted_rings == [ring["ring_id"]]
+
+
+def test_memory_state_change_updates_authority_and_projection(tmp_path):
+    authority = store(tmp_path)
+    projection = FakeProjection()
+    service = MemoryCommitService(authority, projection)
+    asyncio.run(service.commit_memory(
+        memory_id="memory-1", bucket_id="bucket-1", expected_revision=0,
+        body="正文", metadata={}, source_refs=["evt-1"], decision_source="owner",
+        idempotency_key="state-seed", actor="owner",
+    ))
+    archived = asyncio.run(service.change_memory_state(
+        memory_id="memory-1", state="archived", recall_policy="disabled",
+        idempotency_key="state-archive", actor="owner",
+    ))
+    assert archived["state"] == "archived"
+    assert authority.get_memory("memory-1")["recall_policy"] == "disabled"
+    assert projection.states == [("memory-1", "archived")]
 
 
 def test_migration_audit_is_read_only_and_preserves_legacy_status_counts(tmp_path):

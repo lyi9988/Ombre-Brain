@@ -737,6 +737,9 @@ reflection:
 memory_authority:
   enabled: false
   db_path: ""                      # default = <state_dir>/memory_authority.sqlite3
+  projection_enabled: true
+  projection_interval_seconds: 5
+  projection_batch_size: 20
   ingestion_policy:
     auto_confidence: 0.68
     # daily_chat is derived from reflection.daily_chat_memory_mode. Setting a

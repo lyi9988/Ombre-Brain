@@ -114,8 +114,9 @@ from memory_layers import (
     moment_runtime_gate_debug,
     normalize_write_classification,
 )
-from memory_authority import MemoryProposal, PolicyDecision
+from memory_authority import MemoryAuthorityStore, MemoryProposal, PolicyDecision
 from memory_commit_service import BucketMemoryProjection, MemoryCommitService
+from memory_projection_worker import MemoryProjectionWorker
 from memory_metadata import domain_options, normalize_domain_key, normalize_memory_metadata
 from recall_policy import RecallPolicy, diffusion_seed_topic_term_has_specific_residue
 from memory_write_gate import MemoryWriteGate, WriteGateDecision
@@ -208,6 +209,21 @@ darkroom_store = DarkroomStore(config)                  # Private reflection roo
 gateway_state_store = GatewayStateStore(os.path.join(config["buckets_dir"], "gateway_state.db"))
 raw_event_store = RawEventStore(config)                  # Raw dialogue archive / 原文保险箱
 reminder_store = ReminderStore(config)                    # Standalone care memos / 独立照顾备忘
+memory_projection_worker = (
+    MemoryProjectionWorker(
+        config=config,
+        authority=memory_authority_store,
+        bucket_manager=bucket_mgr,
+        embedding_engine=embedding_engine,
+        moment_store=memory_moment_store,
+        node_store=memory_node_store,
+        entity_edge_store=entity_edge_store,
+        word_map_store=word_map_store,
+        identity_semantic_store=identity_semantic_store,
+    )
+    if memory_authority_store is not None
+    else None
+)
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -3483,7 +3499,12 @@ def _delete_bucket_indexes(bucket_id: str) -> tuple[dict, list[str]]:
     return cleanup, errors
 
 
-async def _delete_bucket_and_indexes(bucket_id: str) -> dict:
+async def _delete_bucket_and_indexes(
+    bucket_id: str,
+    *,
+    idempotency_key: str = "",
+    actor: str = "system",
+) -> dict:
     bucket_id = str(bucket_id or "").strip()
     if not bucket_id or not MEMORY_ID_RE.fullmatch(bucket_id):
         return {"id": bucket_id, "status": "invalid", "reason": "invalid_bucket_id"}
@@ -3492,9 +3513,20 @@ async def _delete_bucket_and_indexes(bucket_id: str) -> dict:
     if not bucket:
         return {"id": bucket_id, "status": "not_found", "reason": "not_found"}
 
-    success = await bucket_mgr.delete(bucket_id)
-    if not success:
-        return {"id": bucket_id, "status": "failed", "reason": "delete_failed"}
+    if memory_commit_service is not None:
+        try:
+            await memory_commit_service.tombstone_memory(
+                memory_id=bucket_id,
+                idempotency_key=_memory_operation_key(f"delete:{bucket_id}", idempotency_key),
+                actor=actor,
+            )
+            success = True
+        except Exception as exc:
+            return {"id": bucket_id, "status": "failed", "reason": type(exc).__name__}
+    else:
+        success = await bucket_mgr.delete(bucket_id)
+        if not success:
+            return {"id": bucket_id, "status": "failed", "reason": "delete_failed"}
 
     cleanup, errors = _delete_bucket_indexes(bucket_id)
     return {
@@ -4075,21 +4107,47 @@ async def _revise_tool_memory(
     if "content" in updates:
         body = str(updates["content"])
     for key, value in updates.items():
-        if key != "content":
+        if key == "extra_metadata" and isinstance(value, dict):
+            metadata.update(value)
+        elif key != "content":
             metadata[key] = value
     operation_key = _memory_operation_key(f"trace:{bucket_id}", idempotency_key)
+    commit_idempotency_key = f"{operation_key}:revision"
+    prior_commit = memory_authority_store.get_commit_by_idempotency(commit_idempotency_key)
+    if prior_commit and prior_commit.get("status") == "committed":
+        return dict(prior_commit.get("result") or {})
+    prior_payload = (prior_commit or {}).get("payload") or {}
+    if prior_commit:
+        desired_hash = hashlib.sha256(
+            str(body or "").replace("\r\n", "\n").replace("\r", "\n").strip().encode("utf-8")
+        ).hexdigest()
+        if desired_hash != str(prior_payload.get("body_sha256") or ""):
+            raise RuntimeError("idempotency_key payload differs")
+        metadata = dict(prior_payload.get("metadata") or {})
+        source_refs = list(prior_payload.get("source_refs") or [])
+        expected_revision = int(prior_payload.get("expected_revision") or 0)
+        memory_state = str(prior_payload.get("memory_state") or memory.get("state") or "active")
+        recall_policy = str(prior_payload.get("recall_policy") or memory.get("recall_policy") or "enabled")
+    else:
+        source_refs = [
+            f"tool_operation:{operation_key}",
+            f"memory_revision:{memory['active_revision']}",
+        ]
+        expected_revision = int(memory["active_revision"])
+        memory_state = str(memory.get("state") or "active")
+        recall_policy = str(memory.get("recall_policy") or "enabled")
     return await memory_commit_service.commit_memory(
         memory_id=bucket_id,
         bucket_id=str(memory["bucket_id"]),
-        expected_revision=int(memory["active_revision"]),
+        expected_revision=expected_revision,
         body=body,
         metadata=metadata,
-        source_refs=[f"tool_operation:{operation_key}", f"memory_revision:{memory['active_revision']}"],
+        source_refs=source_refs,
         decision_source="tool",
-        idempotency_key=f"{operation_key}:revision",
+        idempotency_key=commit_idempotency_key,
         actor=actor,
-        memory_state=str(memory.get("state") or "active"),
-        recall_policy=str(memory.get("recall_policy") or "enabled"),
+        memory_state=memory_state,
+        recall_policy=recall_policy,
     )
 
 
@@ -8260,7 +8318,7 @@ async def comment_bucket(
     if not entry:
         return {"error": "write failed", "id": bucket_id}
     bucket = await bucket_mgr.get(bucket_id)
-    embedding_queued = _queue_embedding_refresh(bucket_id)
+    embedding_queued = _queue_embedding_refresh(bucket_id) if memory_commit_service is None else False
     return {
         "status": "commented",
         "id": bucket_id,
@@ -8307,7 +8365,7 @@ async def delete_bucket_comment(bucket_id: str, comment_id: str, idempotency_key
     if result.get("status") != "deleted":
         return {"error": "delete failed", "id": bucket_id, "comment_id": comment_id}
 
-    embedding_queued = _queue_embedding_refresh(bucket_id)
+    embedding_queued = _queue_embedding_refresh(bucket_id) if memory_commit_service is None else False
     bucket = await bucket_mgr.get(bucket_id)
     return {
         "status": "deleted",
@@ -8363,7 +8421,7 @@ async def api_bucket_comment(request):
     if not entry:
         return JSONResponse({"error": "write failed", "id": bucket_id}, status_code=500)
 
-    embedding_queued = _queue_embedding_refresh(bucket_id)
+    embedding_queued = _queue_embedding_refresh(bucket_id) if memory_commit_service is None else False
 
     bucket = await bucket_mgr.get(bucket_id)
     return JSONResponse({
@@ -8409,7 +8467,7 @@ async def api_bucket_comment_delete(request):
     if result.get("status") != "deleted":
         return JSONResponse({"error": "delete failed"}, status_code=500)
 
-    embedding_queued = _queue_embedding_refresh(bucket_id)
+    embedding_queued = _queue_embedding_refresh(bucket_id) if memory_commit_service is None else False
 
     bucket = await bucket_mgr.get(bucket_id)
     return JSONResponse({
@@ -8490,7 +8548,8 @@ async def hold(
                 bucket_type="feel",
                 date=event_date or None,
             )
-        _queue_embedding_refresh(bucket_id)
+        if memory_commit_service is None:
+            _queue_embedding_refresh(bucket_id)
         return f"🫧whisper→{bucket_id}"
 
     if whisper:
@@ -8526,7 +8585,8 @@ async def hold(
             entry = committed.get("entry")
             if not entry:
                 return "年轮写入失败。"
-            _queue_embedding_refresh(source_id)
+            if memory_commit_service is None:
+                _queue_embedding_refresh(source_id)
             return f"年轮→{source_id}#{entry['id']}"
 
         # No source bucket: keep a standalone feel for compatibility.
@@ -8603,8 +8663,9 @@ async def hold(
                 bucket_type="permanent", pinned=True, date=event_date or None,
                 extra_metadata=extra_metadata,
             )
-        _queue_embedding_refresh(bucket_id)
-        _queue_memory_enrichment(bucket_id)
+        if memory_commit_service is None:
+            _queue_embedding_refresh(bucket_id)
+            _queue_memory_enrichment(bucket_id)
         related_note = _format_readonly_related_memory(related_bucket) if related_bucket else ""
         return f"📌钉选→{bucket_id} {','.join(domain)}{related_note}"
 
@@ -8649,7 +8710,8 @@ async def hold(
             memory_classification_source=classification["memory_classification_source"],
             date=event_date,
         )
-    _queue_memory_enrichment(bucket_id)
+    if memory_commit_service is None:
+        _queue_memory_enrichment(bucket_id)
 
     action = "合并→" if is_merged else "新建→"
     related_note = _format_readonly_related_memory(related_bucket) if related_bucket else ""
@@ -8873,8 +8935,9 @@ async def _grow_direct_structured_content(
                 classification["memory_classification_source"],
             ),
         )
-    _queue_embedding_refresh(bucket_id)
-    _queue_memory_enrichment(bucket_id)
+    if memory_commit_service is None:
+        _queue_embedding_refresh(bucket_id)
+        _queue_memory_enrichment(bucket_id)
     related_note = _format_readonly_related_memory(related_bucket) if related_bucket else ""
     return f"{gate_prefix}1条|新1合0\n📝{name or bucket_id}{related_note}"
 
@@ -8989,7 +9052,8 @@ async def grow(
                 memory_layer=fast_classification["memory_layer"],
                 memory_classification_source=fast_classification["memory_classification_source"],
             )
-        _queue_memory_enrichment(bucket_id)
+        if memory_commit_service is None:
+            _queue_memory_enrichment(bucket_id)
         action = "合并" if is_merged else "新建"
         related_note = _format_readonly_related_memory(related_bucket) if related_bucket else ""
         return f"{gate_prefix}{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}{related_note}"
@@ -9068,7 +9132,8 @@ async def grow(
                     memory_layer=item_classification["memory_layer"],
                     memory_classification_source=item_classification["memory_classification_source"],
                 )
-            _queue_memory_enrichment(bucket_id)
+            if memory_commit_service is None:
+                _queue_memory_enrichment(bucket_id)
 
             if is_merged:
                 results.append(f"📎{result_name}")
@@ -9201,14 +9266,15 @@ async def profile_fact(
         confidence=confidence,
         reason="profile fact evidence",
     )
-    _queue_embedding_refresh(bucket_id)
-    try:
-        created_bucket = await bucket_mgr.get(bucket_id)
-        if created_bucket:
-            memory_moment_store.upsert_bucket(created_bucket)
-            _refresh_entity_edges_for_bucket(created_bucket)
-    except Exception as e:
-        logger.warning("Profile fact moment indexing failed: %s", e)
+    if memory_commit_service is None:
+        _queue_embedding_refresh(bucket_id)
+        try:
+            created_bucket = await bucket_mgr.get(bucket_id)
+            if created_bucket:
+                memory_moment_store.upsert_bucket(created_bucket)
+                _refresh_entity_edges_for_bucket(created_bucket)
+        except Exception as e:
+            logger.warning("Profile fact moment indexing failed: %s", e)
 
     edge_note = " + evidenced_by" if edge else ""
     moment_note = f" moment={evidence_moment_id}" if evidence_moment_id else ""
@@ -9967,6 +10033,7 @@ async def api_create_memory(request):
     resolved = _bool_value(body.get("resolved"), False)
     digested = _bool_value(body.get("digested"), False)
     event_date = str(body.get("date") or body.get("event_date") or "").strip()
+    operation_key = str(body.get("idempotency_key") or request.headers.get("X-Idempotency-Key") or "")
 
     existing = await bucket_mgr.get(bucket_id) if bucket_id else None
     if existing:
@@ -9992,51 +10059,99 @@ async def api_create_memory(request):
             update_kwargs["extra_metadata"] = {"self_anchor": self_anchor}
         if event_date:
             update_kwargs["date"] = event_date
-        ok = await bucket_mgr.update(
-            bucket_id,
-            **update_kwargs,
-        )
+        if memory_commit_service is not None:
+            try:
+                await _revise_tool_memory(
+                    bucket_id=bucket_id,
+                    bucket=existing,
+                    updates=update_kwargs,
+                    idempotency_key=operation_key,
+                    actor="trusted_memory_api",
+                )
+                ok = True
+            except Exception:
+                ok = False
+        else:
+            ok = await bucket_mgr.update(
+                bucket_id,
+                **update_kwargs,
+            )
         if not ok:
             return JSONResponse({"error": "update failed"}, status_code=500)
         status = "updated"
         updated_bucket = await bucket_mgr.get(bucket_id)
-        if embedding_engine.enabled:
+        if embedding_engine.enabled and memory_commit_service is None:
             embedding_status = (
                 "queued" if _queue_embedding_refresh_if_changed(bucket_id, before_bucket, updated_bucket) else "skipped"
             )
         else:
             embedding_status = "disabled"
     else:
-        bucket_id = await bucket_mgr.create(
-            content=content,
-            tags=tags,
-            importance=importance,
-            domain=domain,
-            valence=valence,
-            arousal=arousal,
-            bucket_type=bucket_type,
-            name=title,
-            pinned=pinned,
-            protected=protected,
-            anchor=anchor,
-            resolved=resolved,
-            digested=digested,
-            confidence=confidence,
-            bucket_id=bucket_id,
-            source="chatgpt",
-            created=str(body.get("created") or now),
-            last_active=str(body.get("last_active") or now),
-            updated_at=str(body.get("updated_at") or now),
-            date=event_date or None,
-            extra_metadata={"self_anchor": True} if self_anchor else None,
-        )
+        if memory_commit_service is not None:
+            bucket_id = await _commit_tool_memory(
+                content=content,
+                metadata={
+                    "tags": tags,
+                    "importance": importance,
+                    "domain": domain,
+                    "valence": valence,
+                    "arousal": arousal,
+                    "bucket_type": bucket_type,
+                    "name": title,
+                    "pinned": pinned,
+                    "protected": protected,
+                    "anchor": anchor,
+                    "resolved": resolved,
+                    "digested": digested,
+                    "confidence": confidence,
+                    "created": str(body.get("created") or now),
+                    "last_active": str(body.get("last_active") or now),
+                    "updated_at": str(body.get("updated_at") or now),
+                    "date": event_date or None,
+                    "self_anchor": True if self_anchor else None,
+                },
+                memory_type="self_anchor" if self_anchor else "durable_fact",
+                source="trusted_memory_api",
+                actor="trusted_memory_api",
+                idempotency_key=operation_key,
+                recall_policy="manual_only" if bucket_type == "feel" or self_anchor else "enabled",
+                bucket_id=bucket_id or "",
+            )
+        else:
+            bucket_id = await bucket_mgr.create(
+                content=content,
+                tags=tags,
+                importance=importance,
+                domain=domain,
+                valence=valence,
+                arousal=arousal,
+                bucket_type=bucket_type,
+                name=title,
+                pinned=pinned,
+                protected=protected,
+                anchor=anchor,
+                resolved=resolved,
+                digested=digested,
+                confidence=confidence,
+                bucket_id=bucket_id,
+                source="chatgpt",
+                created=str(body.get("created") or now),
+                last_active=str(body.get("last_active") or now),
+                updated_at=str(body.get("updated_at") or now),
+                date=event_date or None,
+                extra_metadata={"self_anchor": True} if self_anchor else None,
+            )
         status = "created"
         if embedding_engine.enabled:
             embedding_status = "queued" if _queue_embedding_refresh(bucket_id) else "failed"
         else:
             embedding_status = "disabled"
 
-    if bucket_type != "feel" and not is_self_anchor_metadata({"self_anchor": self_anchor, "domain": domain}):
+    if (
+        memory_commit_service is None
+        and bucket_type != "feel"
+        and not is_self_anchor_metadata({"self_anchor": self_anchor, "domain": domain})
+    ):
         _queue_memory_enrichment(bucket_id)
 
     return JSONResponse({
@@ -10444,12 +10559,26 @@ async def api_profile_fact_update(request):
         })
 
     before_bucket = bucket
-    ok = await bucket_mgr.update(bucket_id, **updates)
+    operation_key = str(body.get("idempotency_key") or request.headers.get("X-Idempotency-Key") or "")
+    if memory_commit_service is not None:
+        try:
+            await _revise_tool_memory(
+                bucket_id=bucket_id,
+                bucket=bucket,
+                updates=updates,
+                idempotency_key=operation_key,
+                actor="profile_fact_api",
+            )
+            ok = True
+        except Exception:
+            ok = False
+    else:
+        ok = await bucket_mgr.update(bucket_id, **updates)
     if not ok:
         return JSONResponse({"error": "update failed"}, status_code=500)
 
     updated_bucket = await bucket_mgr.get(bucket_id)
-    if action == "edit":
+    if action == "edit" and memory_commit_service is None:
         _queue_embedding_refresh_if_changed(bucket_id, before_bucket, updated_bucket)
         try:
             if updated_bucket:
@@ -10996,6 +11125,7 @@ async def api_buckets_bulk_update(request):
 
     if not any([domain_key, tags_add, tags_remove, facets_add, facets_remove, status]):
         return JSONResponse({"error": "no bulk operation requested"}, status_code=400)
+    bulk_operation_key = str(body.get("idempotency_key") or request.headers.get("X-Idempotency-Key") or "")
 
     summary = {"matched": 0, "changed": 0, "unchanged": 0, "not_found": 0, "invalid": 0, "failed": 0}
     changed_ids: list[str] = []
@@ -11033,11 +11163,21 @@ async def api_buckets_bulk_update(request):
             changed = True
 
         if update_kwargs:
-            ok = await bucket_mgr.update(
-                bucket_id,
-                **update_kwargs,
-                last_active=meta.get("last_active") or meta.get("created"),
-            )
+            update_kwargs["last_active"] = meta.get("last_active") or meta.get("created")
+            if memory_commit_service is not None:
+                try:
+                    await _revise_tool_memory(
+                        bucket_id=bucket_id,
+                        bucket=bucket,
+                        updates=update_kwargs,
+                        idempotency_key=f"{bulk_operation_key}:{bucket_id}:metadata" if bulk_operation_key else "",
+                        actor="bulk_bucket_api",
+                    )
+                    ok = True
+                except Exception:
+                    ok = False
+            else:
+                ok = await bucket_mgr.update(bucket_id, **update_kwargs)
             if not ok:
                 summary["failed"] += 1
                 results.append({"id": bucket_id, "status": "failed", "reason": "update_failed"})
@@ -11047,7 +11187,23 @@ async def api_buckets_bulk_update(request):
             current = await bucket_mgr.get(bucket_id)
             current_type = ((current or {}).get("metadata") or {}).get("type")
             if current_type != "archived":
-                ok = await bucket_mgr.archive(bucket_id)
+                if memory_commit_service is not None:
+                    try:
+                        await memory_commit_service.change_memory_state(
+                            memory_id=bucket_id,
+                            state="archived",
+                            recall_policy="disabled",
+                            idempotency_key=_memory_operation_key(
+                                f"bulk-archive:{bucket_id}",
+                                f"{bulk_operation_key}:{bucket_id}:archive" if bulk_operation_key else "",
+                            ),
+                            actor="bulk_bucket_api",
+                        )
+                        ok = True
+                    except Exception:
+                        ok = False
+                else:
+                    ok = await bucket_mgr.archive(bucket_id)
                 if not ok:
                     summary["failed"] += 1
                     results.append({"id": bucket_id, "status": "failed", "reason": "archive_failed"})
@@ -11057,20 +11213,67 @@ async def api_buckets_bulk_update(request):
             current = await bucket_mgr.get(bucket_id)
             current_meta = (current or {}).get("metadata") or {}
             if current_meta.get("type") == "archived":
-                ok = await bucket_mgr.activate(bucket_id)
+                if memory_commit_service is not None:
+                    try:
+                        await memory_commit_service.change_memory_state(
+                            memory_id=bucket_id,
+                            state="active",
+                            recall_policy="enabled",
+                            idempotency_key=_memory_operation_key(
+                                f"bulk-activate:{bucket_id}",
+                                f"{bulk_operation_key}:{bucket_id}:active" if bulk_operation_key else "",
+                            ),
+                            actor="bulk_bucket_api",
+                        )
+                        ok = True
+                    except Exception:
+                        ok = False
+                else:
+                    ok = await bucket_mgr.activate(bucket_id)
                 if not ok:
                     summary["failed"] += 1
                     results.append({"id": bucket_id, "status": "failed", "reason": "activate_failed"})
                     continue
                 changed = True
             elif current_meta.get("active") is False or current_meta.get("resolved") or current_meta.get("deprecated"):
-                ok = await bucket_mgr.update(
-                    bucket_id,
-                    active=True,
-                    deprecated=False,
-                    resolved=False,
-                    last_active=current_meta.get("last_active") or current_meta.get("created"),
-                )
+                if memory_commit_service is not None:
+                    try:
+                        await _revise_tool_memory(
+                            bucket_id=bucket_id,
+                            bucket=current,
+                            updates={
+                                "active": True,
+                                "deprecated": False,
+                                "resolved": False,
+                                "last_active": current_meta.get("last_active") or current_meta.get("created"),
+                            },
+                            idempotency_key=(
+                                f"{bulk_operation_key}:{bucket_id}:reactivate-metadata"
+                                if bulk_operation_key else ""
+                            ),
+                            actor="bulk_bucket_api",
+                        )
+                        await memory_commit_service.change_memory_state(
+                            memory_id=bucket_id,
+                            state="active",
+                            recall_policy="enabled",
+                            idempotency_key=_memory_operation_key(
+                                f"bulk-reactivate:{bucket_id}",
+                                f"{bulk_operation_key}:{bucket_id}:reactivate" if bulk_operation_key else "",
+                            ),
+                            actor="bulk_bucket_api",
+                        )
+                        ok = True
+                    except Exception:
+                        ok = False
+                else:
+                    ok = await bucket_mgr.update(
+                        bucket_id,
+                        active=True,
+                        deprecated=False,
+                        resolved=False,
+                        last_active=current_meta.get("last_active") or current_meta.get("created"),
+                    )
                 if not ok:
                     summary["failed"] += 1
                     results.append({"id": bucket_id, "status": "failed", "reason": "activate_failed"})
@@ -11342,7 +11545,21 @@ async def api_bucket_update(request):
     update_kwargs["last_active"] = meta.get("last_active") or meta.get("created")
 
     before_bucket = bucket
-    ok = await bucket_mgr.update(bucket_id, **update_kwargs)
+    operation_key = str(body.get("idempotency_key") or request.headers.get("X-Idempotency-Key") or "")
+    if memory_commit_service is not None:
+        try:
+            await _revise_tool_memory(
+                bucket_id=bucket_id,
+                bucket=bucket,
+                updates=update_kwargs,
+                idempotency_key=operation_key,
+                actor="dashboard",
+            )
+            ok = True
+        except Exception:
+            ok = False
+    else:
+        ok = await bucket_mgr.update(bucket_id, **update_kwargs)
     if not ok:
         return JSONResponse({"error": "update failed"}, status_code=500)
 
@@ -13735,30 +13952,51 @@ async def api_import_review(request):
 
     applied = 0
     errors = 0
+    review_operation_key = str(body.get("idempotency_key") or request.headers.get("X-Idempotency-Key") or "")
     for d in decisions:
         bid = d.get("bucket_id", "")
         action = d.get("action", "")
         if not bid or not action:
             continue
         try:
+            bucket = await bucket_mgr.get(bid)
+            if not bucket:
+                raise ValueError("bucket not found")
+            updates = {}
             if action == "important":
-                await bucket_mgr.update(bid, importance=9)
+                updates = {"importance": 9}
             elif action == "pin":
-                await bucket_mgr.update(bid, pinned=True)
+                updates = {"pinned": True, "importance": 10}
             elif action == "anchor":
-                bucket = await bucket_mgr.get(bid)
-                if not bucket:
-                    raise ValueError("bucket not found")
                 ok, message = await _can_mark_anchor(bid, bucket)
                 if not ok:
                     raise ValueError(message)
-                await bucket_mgr.update(bid, anchor=True)
+                updates = {"anchor": True}
             elif action == "noise":
-                await bucket_mgr.update(bid, resolved=True, importance=1)
+                updates = {"resolved": True, "importance": 1}
             elif action == "delete":
-                result = await _delete_bucket_and_indexes(bid)
+                result = await _delete_bucket_and_indexes(
+                    bid,
+                    idempotency_key=(
+                        f"{review_operation_key}:{bid}:delete" if review_operation_key else ""
+                    ),
+                    actor="import_review",
+                )
                 if result.get("status") != "deleted":
                     raise ValueError(result.get("reason") or "bucket not found")
+            if updates:
+                if memory_commit_service is not None:
+                    await _revise_tool_memory(
+                        bucket_id=bid,
+                        bucket=bucket,
+                        updates=updates,
+                        idempotency_key=(
+                            f"{review_operation_key}:{bid}:{action}" if review_operation_key else ""
+                        ),
+                        actor="import_review",
+                    )
+                else:
+                    await bucket_mgr.update(bid, **updates)
             applied += 1
         except Exception as e:
             logger.warning(f"Review action failed for {bid}: {e}")
@@ -13953,6 +14191,52 @@ if __name__ == "__main__":
             rt = threading.Thread(target=_start_reflection_scheduler, daemon=True)
             rt.start()
             logger.info("Reflection scheduler enabled / 反思定时器已启用")
+
+        async def _memory_projection_loop():
+            authority_cfg = config.get("memory_authority", {}) if isinstance(
+                config.get("memory_authority", {}), dict) else {}
+            interval = max(1, min(300, int(authority_cfg.get("projection_interval_seconds", 5))))
+            batch_size = max(1, min(100, int(authority_cfg.get("projection_batch_size", 20))))
+            await asyncio.sleep(min(10, interval))
+            local_bucket_mgr = BucketManager(config)
+            local_embedding_engine = EmbeddingEngine(config)
+            local_worker = MemoryProjectionWorker(
+                config=config,
+                authority=MemoryAuthorityStore({
+                    **config,
+                    "memory_authority_db_path": authority_cfg.get("db_path")
+                    or os.path.join(config.get("state_dir") or config["buckets_dir"], "memory_authority.sqlite3"),
+                }),
+                bucket_manager=local_bucket_mgr,
+                embedding_engine=local_embedding_engine,
+                moment_store=MemoryMomentStore(config),
+                node_store=MemoryNodeStore(config),
+                entity_edge_store=EntityEdgeStore(config),
+                word_map_store=WordMapStore(config),
+                identity_semantic_store=IdentitySemanticStore(config),
+            )
+            while True:
+                try:
+                    result = await local_worker.run_once(limit=batch_size)
+                    if result.get("claimed") or result.get("recovered_stale"):
+                        logger.info("Memory projection run / 记忆派生投影: %s", result)
+                except Exception as exc:
+                    logger.warning("Memory projection worker failed / 记忆派生投影失败: %s", exc)
+                await asyncio.sleep(interval)
+
+        def _start_memory_projection_scheduler():
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(_memory_projection_loop())
+
+        authority_cfg = config.get("memory_authority", {}) if isinstance(
+            config.get("memory_authority", {}), dict) else {}
+        if (
+            memory_authority_store is not None
+            and bool(authority_cfg.get("projection_enabled", True))
+        ):
+            mt = threading.Thread(target=_start_memory_projection_scheduler, daemon=True)
+            mt.start()
+            logger.info("Memory projection scheduler started / 记忆派生投影已启动")
 
         async def _portrait_loop():
             await asyncio.sleep(25)

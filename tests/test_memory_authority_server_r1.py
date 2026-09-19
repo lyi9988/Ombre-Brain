@@ -116,6 +116,7 @@ class ToolMemoryProjection:
     def __init__(self):
         self.revisions = []
         self.deleted = []
+        self.states = []
 
     async def write_revision(self, **kwargs):
         self.revisions.append(dict(kwargs))
@@ -134,6 +135,9 @@ class ToolMemoryProjection:
 
     async def delete_memory(self, **kwargs):
         self.deleted.append(kwargs["memory_id"])
+
+    async def set_memory_state(self, **kwargs):
+        self.states.append((kwargs["memory_id"], kwargs["state"]))
 
 
 def test_normal_hold_commits_new_memory_through_authority(monkeypatch, tmp_path):

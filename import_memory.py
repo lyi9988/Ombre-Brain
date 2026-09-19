@@ -1238,7 +1238,7 @@ class ImportEngine:
                     source="import",
                     extra_metadata=extra_metadata,
                 )
-            if self.embedding_engine:
+            if self.embedding_engine and self.memory_commit_service is None:
                 try:
                     await self.embedding_engine.generate_and_store(
                         bucket_id,
@@ -1298,7 +1298,7 @@ class ImportEngine:
                             source="import",
                             extra_metadata=merged_metadata,
                         )
-                    if self.embedding_engine:
+                    if self.embedding_engine and self.memory_commit_service is None:
                         try:
                             await self.embedding_engine.generate_and_store(
                                 bucket["id"],
@@ -1333,7 +1333,7 @@ class ImportEngine:
                 source="import",
                 extra_metadata=extra_metadata,
             )
-        if self.embedding_engine:
+        if self.embedding_engine and self.memory_commit_service is None:
             try:
                 await self.embedding_engine.generate_and_store(
                     bucket_id,

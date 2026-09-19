@@ -1103,7 +1103,12 @@ class ReflectionEngine:
                 )
             else:
                 await bucket_mgr.update(bucket_id, **updates)
-            if "content" in updates and embedding_engine and getattr(embedding_engine, "enabled", False):
+            if (
+                not self.memory_authority_enabled
+                and "content" in updates
+                and embedding_engine
+                and getattr(embedding_engine, "enabled", False)
+            ):
                 try:
                     updated_bucket = await bucket_mgr.get(bucket_id)
                     if updated_bucket:
@@ -1408,7 +1413,11 @@ class ReflectionEngine:
             )
             status = "created"
 
-        if embedding_engine and getattr(embedding_engine, "enabled", False):
+        if (
+            not self.memory_authority_enabled
+            and embedding_engine
+            and getattr(embedding_engine, "enabled", False)
+        ):
             try:
                 bucket = await bucket_mgr.get(bucket_id)
                 if bucket:
@@ -5344,7 +5353,11 @@ class ReflectionEngine:
                     },
                 )
                 created += 1
-                if embedding_engine and getattr(embedding_engine, "enabled", False):
+                if (
+                    not self.memory_authority_enabled
+                    and embedding_engine
+                    and getattr(embedding_engine, "enabled", False)
+                ):
                     try:
                         bucket = await bucket_mgr.get(new_id)
                         if bucket:
@@ -5774,7 +5787,11 @@ class ReflectionEngine:
                     "diary_id": diary.get("id"),
                 },
             )
-        if embedding_engine and getattr(embedding_engine, "enabled", False):
+        if (
+            not self.memory_authority_enabled
+            and embedding_engine
+            and getattr(embedding_engine, "enabled", False)
+        ):
             try:
                 bucket = await bucket_mgr.get(new_id)
                 if bucket:

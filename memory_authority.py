@@ -385,6 +385,16 @@ class MemoryAuthorityStore:
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(operation_id) REFERENCES commit_log(operation_id)
             );
+            CREATE TABLE IF NOT EXISTS memory_projection_status (
+                memory_id TEXT NOT NULL,
+                memory_revision INTEGER NOT NULL,
+                projector TEXT NOT NULL,
+                status TEXT NOT NULL,
+                source_sha256 TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(memory_id, memory_revision, projector)
+            );
             CREATE TABLE IF NOT EXISTS authority_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -834,6 +844,19 @@ class MemoryAuthorityStore:
         value["result"] = _loads(value.pop("result_json"), {})
         return value
 
+    def get_commit_by_idempotency(self, idempotency_key: str) -> dict[str, Any] | None:
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT * FROM commit_log WHERE idempotency_key=?", (str(idempotency_key),)
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        value = dict(row)
+        value["payload"] = _loads(value.pop("payload_json"), {})
+        value["result"] = _loads(value.pop("result_json"), {})
+        return value
+
     def list_open_commits(self, *, limit: int = 100) -> list[dict[str, Any]]:
         conn = self._connect()
         rows = conn.execute(
@@ -876,7 +899,7 @@ class MemoryAuthorityStore:
 
     def set_outbox_status(self, event_id: str, *, status: str, error: str = "") -> dict[str, Any]:
         safe_status = str(status or "").strip().lower()
-        if safe_status not in {"pending", "projected", "degraded"}:
+        if safe_status not in {"pending", "processing", "projected", "degraded"}:
             raise ValueError("invalid outbox status")
         conn = self._connect()
         try:
@@ -899,6 +922,130 @@ class MemoryAuthorityStore:
             raise
         finally:
             conn.close()
+
+    def claim_outbox(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(100, int(limit)))
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT * FROM outbox WHERE status IN ('pending','degraded') "
+                "ORDER BY created_at,event_id LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+            now = _now()
+            for row in rows:
+                conn.execute(
+                    "UPDATE outbox SET status='processing',updated_at=? WHERE event_id=?",
+                    (now, row["event_id"]),
+                )
+            conn.commit()
+            result = []
+            for row in rows:
+                value = dict(row)
+                value["status"] = "processing"
+                value["payload"] = _loads(value.pop("payload_json"), {})
+                result.append(value)
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def recover_stale_outbox(self, *, older_than_seconds: int = 300) -> int:
+        cutoff = datetime.now(timezone.utc).timestamp() - max(30, int(older_than_seconds))
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("SELECT event_id,updated_at FROM outbox WHERE status='processing'").fetchall()
+            stale_ids = []
+            for row in rows:
+                try:
+                    updated = datetime.fromisoformat(str(row["updated_at"]).replace("Z", "+00:00"))
+                    if updated.tzinfo is None:
+                        updated = updated.replace(tzinfo=timezone.utc)
+                    if updated.timestamp() <= cutoff:
+                        stale_ids.append(str(row["event_id"]))
+                except (TypeError, ValueError):
+                    stale_ids.append(str(row["event_id"]))
+            for event_id in stale_ids:
+                conn.execute(
+                    "UPDATE outbox SET status='degraded',last_error='stale_processing_recovered',updated_at=? "
+                    "WHERE event_id=?",
+                    (_now(), event_id),
+                )
+            conn.commit()
+            return len(stale_ids)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def set_projection_status(
+        self,
+        *,
+        memory_id: str,
+        memory_revision: int,
+        projector: str,
+        status: str,
+        source_sha256: str = "",
+        details: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        safe_status = str(status or "").strip().lower()
+        if safe_status not in {"projected", "degraded", "disabled", "deleted", "pending_rebuild"}:
+            raise ValueError("invalid projection status")
+        conn = self._connect()
+        now = _now()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO memory_projection_status(memory_id,memory_revision,projector,status,source_sha256,"
+                "details_json,updated_at) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(memory_id,memory_revision,projector) DO UPDATE SET "
+                "status=excluded.status,source_sha256=excluded.source_sha256,"
+                "details_json=excluded.details_json,updated_at=excluded.updated_at",
+                (memory_id, int(memory_revision), str(projector), safe_status,
+                 str(source_sha256 or ""), _json(dict(details or {})), now),
+            )
+            conn.commit()
+            return {
+                "memory_id": memory_id,
+                "memory_revision": int(memory_revision),
+                "projector": str(projector),
+                "status": safe_status,
+                "source_sha256": str(source_sha256 or ""),
+                "details": dict(details or {}),
+                "updated_at": now,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def list_projection_status(self, memory_id: str, *, revision: int | None = None) -> list[dict[str, Any]]:
+        conn = self._connect()
+        if revision is None:
+            rows = conn.execute(
+                "SELECT * FROM memory_projection_status WHERE memory_id=? "
+                "ORDER BY memory_revision DESC,projector",
+                (memory_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM memory_projection_status WHERE memory_id=? AND memory_revision=? "
+                "ORDER BY projector",
+                (memory_id, int(revision)),
+            ).fetchall()
+        conn.close()
+        result = []
+        for row in rows:
+            value = dict(row)
+            value["details"] = _loads(value.pop("details_json"), {})
+            result.append(value)
+        return result
 
     def append_ring(
         self,

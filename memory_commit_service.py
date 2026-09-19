@@ -74,6 +74,10 @@ class MemoryProjection(Protocol):
 
     async def delete_memory(self, *, memory_id: str, bucket_id: str) -> None: ...
 
+    async def set_memory_state(
+        self, *, memory_id: str, bucket_id: str, state: str
+    ) -> None: ...
+
 
 class ProjectionNotApplied(Exception):
     """A safe failure proving that the Bucket was not changed."""
@@ -241,6 +245,28 @@ class BucketMemoryProjection:
             # A retry after a successful projection is idempotent.
             if await self.bucket_manager.get(bucket_id):
                 raise ProjectionNotApplied("Bucket delete returned false")
+
+    async def set_memory_state(self, *, memory_id: str, bucket_id: str, state: str) -> None:
+        if state == "archived":
+            ok = await self.bucket_manager.archive(bucket_id)
+        elif state == "active":
+            bucket = await self.bucket_manager.get(bucket_id)
+            if bucket and str((bucket.get("metadata") or {}).get("type") or "") == "archived":
+                ok = await self.bucket_manager.activate(bucket_id)
+            else:
+                ok = await self.bucket_manager.update(
+                    bucket_id,
+                    active=True,
+                    deprecated=False,
+                    resolved=False,
+                )
+        elif state == "tombstoned":
+            await self.delete_memory(memory_id=memory_id, bucket_id=bucket_id)
+            return
+        else:
+            raise ValueError("invalid memory state")
+        if not ok:
+            raise ProjectionNotApplied(f"Bucket state projection failed: {state}")
 
 
 class MemoryCommitService:
@@ -413,6 +439,41 @@ class MemoryCommitService:
             await self.projection.delete_memory(
                 memory_id=memory_id,
                 bucket_id=str(memory["bucket_id"]),
+            )
+        except Exception as exc:
+            self.authority.set_outbox_status(
+                str(result["outbox_event_id"]), status="degraded", error=type(exc).__name__
+            )
+            raise
+        self.authority.set_outbox_status(str(result["outbox_event_id"]), status="projected")
+        return result
+
+    async def change_memory_state(
+        self,
+        *,
+        memory_id: str,
+        state: str,
+        recall_policy: str,
+        idempotency_key: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        memory = self.authority.get_memory(memory_id)
+        if not memory:
+            raise MemoryNotFound(memory_id)
+        result = self.authority.change_memory_state(
+            memory_id=memory_id,
+            state=state,
+            recall_policy=recall_policy,
+            idempotency_key=idempotency_key,
+            actor=actor,
+        )
+        if not result.get("outbox_event_id"):
+            return result
+        try:
+            await self.projection.set_memory_state(
+                memory_id=memory_id,
+                bucket_id=str(memory["bucket_id"]),
+                state=state,
             )
         except Exception as exc:
             self.authority.set_outbox_status(
