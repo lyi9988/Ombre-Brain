@@ -322,6 +322,63 @@ Expected direction, not an invented fixed SLA:
 Upstream model or browse latency remains visible and separate; RECALL-R1 must
 not claim to fix provider latency it does not control.
 
+### Request critical path and bounded parallelism
+
+Prepare timing is measured as a dependency graph, not as a misleading sum of
+independent stage durations.
+
+At request start, one immutable request snapshot captures configuration,
+Composer binding, Memory authority/index watermarks, and identity scope.  The
+following independent reads may then run concurrently under one cancellation
+and deadline budget:
+
+- Persona/relationship projection;
+- Worldbook selection;
+- active Reminder projection;
+- eligible Dream lookup;
+- local Fast Recall evidence (keyword, exact anchor/date, owner alias, entity);
+- other owner-safe request metadata that does not depend on Recall output.
+
+Ordinary no-memory queries finish the local route and cancel/avoid Deep work.
+Exact Fast evidence finishes without remote Planner, embedding, or rerank.
+
+For an ambiguous Deep query, the original-query embedding/search and the
+bounded Query Planner request may run concurrently.  Planner supplemental
+queries join afterward; candidates are normalized and deduplicated once before
+one final rerank/admission stage.  The same query/model/revision miss uses
+single-flight rather than launching duplicate provider requests.
+
+These stages remain dependency-ordered and are not speculatively duplicated:
+
+- final candidate admission waits for the candidate union;
+- Prompt compilation waits for the final Memory projection;
+- the main talk-model call waits for the compiled context;
+- tool execution waits for the model's tool call;
+- a tool continuation reuses the parent prepare snapshot.
+
+Moment/WordMap/Entity/Embedding index refresh is outbox/background work.  A
+normal chat request must not rebuild an index or refresh a graph on its critical
+path.  It uses the last verified revision, reports staleness, and falls back to
+bounded direct evidence where allowed.
+
+When the request deadline expires, unfinished optional sources return explicit
+degraded metadata and are cancelled.  Cancellation propagates to provider HTTP
+requests; late results cannot mutate the completed request snapshot or trigger
+a second model answer.
+
+Inspector renders both the dependency DAG and its wall-clock critical path:
+
+- stage start/end/duration and parent dependencies;
+- parallel overlap;
+- cache/snapshot/single-flight status;
+- cancelled/degraded stages;
+- time to compiled context;
+- model header/first byte/stream total.
+
+Acceptance requires lower same-query wall-clock prepare and first-visible-token
+time for ordinary, Fast, Deep, and tool-continuation fixtures.  Removing work
+without reducing the measured critical path is not counted as a latency win.
+
 ## 14. Migration acceptance
 
 Dry-run must preserve the semantic active-memory set, existing Bucket IDs and
