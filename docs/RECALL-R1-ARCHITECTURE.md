@@ -340,6 +340,38 @@ and deadline budget:
 - other owner-safe request metadata that does not depend on Recall output.
 
 Ordinary no-memory queries finish the local route and cancel/avoid Deep work.
+
+### Implemented feature milestones (not production release state)
+
+The feature branch currently contains these implementation milestones:
+
+- Memory authority, revision/ring commit coordination, migration audit/apply,
+  unified Auto/Review commits, legacy writer convergence, and outbox-derived
+  projections (`8f65b3b` through `f5e7360`).
+- Local `skip / fast / deep` routing with stable reason codes; normal prepare
+  does not call the remote Domain Sentinel (`0fffa13`).
+- Exact-key Query Planner, semantic-query, rerank, and query-vector caches with
+  singleflight.  Cache keys include the relevant model/prompt/index identity;
+  final LLM replies are never cached (`0fffa13`, `352f36b`).
+- Authority mode no longer rebuilds the full Moment graph in a chat request.
+  The outbox projection worker owns incremental derived-index updates
+  (`0fffa13`).
+- Owner-confirmed aliases may force only their explicitly linked committed
+  Memory IDs into Fast Recall.  Auto aliases remain non-authoritative and do
+  not receive that privilege (`6bac6f4`).
+- Composer receives one canonical request-local `ombre.memory_recall`
+  projection.  When that source is present, the three legacy direct/targeted/
+  diffused blocks are suppressed to prevent duplicate injection (`0fffa13`).
+- Fast/tone routes keep Dream cue checks local.  Deep Recall and Dream share
+  one exact query vector so Dream cannot trigger a second identical embedding
+  request (`352f36b`).
+
+These commits are feature evidence only.  They do not mean live activation,
+owner acceptance, `production/current` advancement, migration apply, or
+latency/recall-quality closure.  M5 still needs owner-safe authority APIs,
+collapsible Reality management/diagnostics, immutable release construction,
+synthetic migration rehearsal, owner-device experience acceptance, and then
+ordinary production cutover.
 Exact Fast evidence finishes without remote Planner, embedding, or rerank.
 
 For an ambiguous Deep query, the original-query embedding/search and the
