@@ -1052,6 +1052,18 @@ def _authorized_memory_write(request) -> bool:
     return any(hmac.compare_digest(candidate, token) for candidate in candidates)
 
 
+def _require_owner_or_internal_memory_read(request):
+    """Authorize owner Dashboard sessions or the existing internal bearer.
+
+    This narrower helper is used only by Memory authority read projections so
+    Aizizhu can proxy them to Reality without sharing a Dashboard cookie.
+    It does not broaden any other Dashboard or write endpoint.
+    """
+    if _dashboard_authenticated(request) or _authorized_memory_write(request):
+        return None
+    return _require_dashboard_auth(request)
+
+
 def _string_list(value, default: list[str]) -> list[str]:
     if value is None:
         return default
@@ -12235,7 +12247,7 @@ async def api_daily_chat_memory_pending(request):
 async def api_memory_authority_overview(request):
     """Owner-only Memory authority counts and projection health."""
     from starlette.responses import JSONResponse
-    err = _require_dashboard_auth(request)
+    err = _require_owner_or_internal_memory_read(request)
     if err:
         return err
     if memory_authority_store is None:
@@ -12251,7 +12263,7 @@ async def api_memory_authority_overview(request):
 async def api_memory_authority_memories(request):
     """Owner-only active/revisioned Memory list; body is opt-in."""
     from starlette.responses import JSONResponse
-    err = _require_dashboard_auth(request)
+    err = _require_owner_or_internal_memory_read(request)
     if err:
         return err
     if memory_authority_store is None:
@@ -12274,7 +12286,7 @@ async def api_memory_authority_memories(request):
 async def api_memory_authority_memory_detail(request):
     """Owner-only aggregate view: active body, revisions, rings, indexes."""
     from starlette.responses import JSONResponse
-    err = _require_dashboard_auth(request)
+    err = _require_owner_or_internal_memory_read(request)
     if err:
         return err
     if memory_authority_store is None:
@@ -12298,7 +12310,7 @@ async def api_memory_authority_memory_detail(request):
 async def api_memory_authority_aliases(request):
     """Owner-only entity alias projection used by Fast Recall."""
     from starlette.responses import JSONResponse
-    err = _require_dashboard_auth(request)
+    err = _require_owner_or_internal_memory_read(request)
     if err:
         return err
     if memory_authority_store is None:

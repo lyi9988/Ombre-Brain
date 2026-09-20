@@ -13,6 +13,7 @@ import asyncio
 import copy
 import json
 from types import SimpleNamespace
+from starlette.responses import JSONResponse
 
 import server
 from memory_authority import MemoryAuthorityStore
@@ -27,6 +28,7 @@ class FakeRequest:
         self.path_params = dict(path_params or {})
         self.headers = dict(headers or {})
         self.query_params = dict(query_params or {})
+        self.cookies = {}
 
     async def json(self):
         return copy.deepcopy(self._body)
@@ -294,6 +296,32 @@ def test_owner_memory_authority_read_models_are_revisioned_and_collapsible(monke
     rebuild_response = asyncio.run(server.api_identity_semantics_rebuild(FakeRequest()))
     assert rebuild_response.status_code == 409
     assert response_json(rebuild_response)["rebuild_allowed"] is False
+
+
+def test_memory_authority_read_accepts_internal_bearer_without_dashboard_cookie(monkeypatch, tmp_path):
+    _buckets, authority, _service, _projection = install(
+        monkeypatch, tmp_path, authority_enabled=True
+    )
+    monkeypatch.setattr(server, "_dashboard_authenticated", lambda _request: False)
+    monkeypatch.setattr(
+        server,
+        "_authorized_memory_write",
+        lambda request: request.headers.get("authorization") == "Bearer internal-token",
+    )
+    monkeypatch.setattr(
+        server,
+        "_require_dashboard_auth",
+        lambda _request: JSONResponse({"error": "unauthorized"}, status_code=401),
+    )
+
+    unauthorized = asyncio.run(server.api_memory_authority_overview(FakeRequest()))
+    authorized = asyncio.run(server.api_memory_authority_overview(FakeRequest(
+        headers={"authorization": "Bearer internal-token"}
+    )))
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    assert response_json(authorized)["enabled"] is True
 
 
 def test_api_memories_authority_create_update_revision_and_idempotency(monkeypatch, tmp_path):
