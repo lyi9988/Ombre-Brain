@@ -12194,6 +12194,90 @@ async def api_daily_chat_memory_pending(request):
     return JSONResponse({"status": "ok", "items": items})
 
 
+@mcp.custom_route("/api/memory-authority/overview", methods=["GET"])
+async def api_memory_authority_overview(request):
+    """Owner-only Memory authority counts and projection health."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    if memory_authority_store is None:
+        return JSONResponse({"status": "disabled", "enabled": False}, status_code=503)
+    return JSONResponse({
+        "status": "ok",
+        "enabled": True,
+        "overview": memory_authority_store.overview(),
+    })
+
+
+@mcp.custom_route("/api/memory-authority/memories", methods=["GET"])
+async def api_memory_authority_memories(request):
+    """Owner-only active/revisioned Memory list; body is opt-in."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    if memory_authority_store is None:
+        return JSONResponse({"status": "disabled", "enabled": False}, status_code=503)
+    params = request.query_params
+    include_body = _bool_value(params.get("include_body"), False)
+    items = memory_authority_store.list_memories(
+        state=str(params.get("state") or "active"),
+        limit=_int_between(params.get("limit"), 50, 1, 200),
+        offset=_int_between(params.get("offset"), 0, 0, 1000000),
+    )
+    if include_body:
+        for item in items:
+            bucket = await bucket_mgr.get(str(item.get("bucket_id") or ""))
+            item["body"] = str((bucket or {}).get("content") or "")
+    return JSONResponse({"status": "ok", "enabled": True, "items": items})
+
+
+@mcp.custom_route("/api/memory-authority/memories/{memory_id}", methods=["GET"])
+async def api_memory_authority_memory_detail(request):
+    """Owner-only aggregate view: active body, revisions, rings, indexes."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    if memory_authority_store is None:
+        return JSONResponse({"status": "disabled", "enabled": False}, status_code=503)
+    memory_id = str(request.path_params.get("memory_id") or "").strip()
+    memory = memory_authority_store.get_memory(memory_id)
+    if not memory:
+        return JSONResponse({"error": "memory not found"}, status_code=404)
+    bucket = await bucket_mgr.get(str(memory.get("bucket_id") or ""))
+    return JSONResponse({
+        "status": "ok",
+        "memory": memory,
+        "body": str((bucket or {}).get("content") or ""),
+        "revisions": memory_authority_store.list_memory_revisions(memory_id, limit=200),
+        "rings": memory_authority_store.list_memory_rings(memory_id, state="all", limit=200),
+        "projection_status": memory_authority_store.list_projection_status(memory_id),
+    })
+
+
+@mcp.custom_route("/api/memory-authority/aliases", methods=["GET"])
+async def api_memory_authority_aliases(request):
+    """Owner-only entity alias projection used by Fast Recall."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    if memory_authority_store is None:
+        return JSONResponse({"status": "disabled", "enabled": False}, status_code=503)
+    params = request.query_params
+    return JSONResponse({
+        "status": "ok",
+        "enabled": True,
+        "items": memory_authority_store.list_aliases(
+            state=str(params.get("state") or "active"),
+            trust=str(params.get("trust") or "all"),
+            limit=_int_between(params.get("limit"), 200, 1, 1000),
+        ),
+    })
+
+
 @mcp.custom_route("/api/daily-chat-memory/source-preview", methods=["GET"])
 async def api_daily_chat_memory_source_preview(request):
     """Owner-only read of the complete sanitized source text behind a candidate.

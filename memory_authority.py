@@ -1541,6 +1541,133 @@ class MemoryAuthorityStore:
         conn.close()
         return dict(row) if row else None
 
+    def list_memories(
+        self,
+        *,
+        state: str = "active",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if state and state != "all":
+            clauses.append("m.state=?")
+            params.append(str(state))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT m.*,r.body_sha256,r.snapshot_path,r.metadata_json,r.source_refs_json,"
+            "r.decision_source,r.created_at AS revision_created_at "
+            "FROM memories m LEFT JOIN memory_revisions r "
+            "ON r.memory_id=m.memory_id AND r.revision=m.active_revision "
+            f"{where} ORDER BY m.updated_at DESC,m.memory_id LIMIT ? OFFSET ?",
+            [*params, max(1, min(1000, int(limit))), max(0, int(offset))],
+        ).fetchall()
+        conn.close()
+        output = []
+        for row in rows:
+            value = dict(row)
+            value["metadata"] = _loads(value.pop("metadata_json", ""), {})
+            value["source_refs"] = _loads(value.pop("source_refs_json", ""), [])
+            output.append(value)
+        return output
+
+    def list_memory_revisions(self, memory_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT * FROM memory_revisions WHERE memory_id=? "
+            "ORDER BY revision DESC LIMIT ?",
+            (str(memory_id), max(1, min(1000, int(limit)))),
+        ).fetchall()
+        conn.close()
+        output = []
+        for row in rows:
+            value = dict(row)
+            value["metadata"] = _loads(value.pop("metadata_json"), {})
+            value["source_refs"] = _loads(value.pop("source_refs_json"), [])
+            output.append(value)
+        return output
+
+    def list_aliases(
+        self,
+        *,
+        state: str = "active",
+        trust: str = "all",
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if state and state != "all":
+            clauses.append("state=?")
+            params.append(str(state))
+        if trust and trust != "all":
+            clauses.append("trust=?")
+            params.append(str(trust))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        conn = self._connect()
+        rows = conn.execute(
+            f"SELECT * FROM entity_aliases {where} "
+            "ORDER BY updated_at DESC,alias_id LIMIT ?",
+            [*params, max(1, min(1000, int(limit)))],
+        ).fetchall()
+        conn.close()
+        output = []
+        for row in rows:
+            value = dict(row)
+            value["source_refs"] = _loads(value.pop("source_refs_json"), [])
+            output.append(value)
+        return output
+
+    def list_memory_rings(
+        self,
+        memory_id: str,
+        *,
+        state: str = "active",
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses = ["memory_id=?"]
+        params: list[Any] = [str(memory_id)]
+        if state and state != "all":
+            clauses.append("state=?")
+            params.append(str(state))
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT * FROM memory_rings WHERE " + " AND ".join(clauses)
+            + " ORDER BY created_at DESC,ring_id LIMIT ?",
+            [*params, max(1, min(1000, int(limit)))],
+        ).fetchall()
+        conn.close()
+        output = []
+        for row in rows:
+            value = dict(row)
+            value["source_refs"] = _loads(value.pop("source_refs_json"), [])
+            value["metadata"] = _loads(value.pop("metadata_json"), {})
+            output.append(value)
+        return output
+
+    def overview(self) -> dict[str, Any]:
+        conn = self._connect()
+        memory_rows = conn.execute(
+            "SELECT state,COUNT(*) AS count FROM memories GROUP BY state"
+        ).fetchall()
+        candidate_rows = conn.execute(
+            "SELECT status,COUNT(*) AS count FROM candidates GROUP BY status"
+        ).fetchall()
+        alias_rows = conn.execute(
+            "SELECT trust,COUNT(*) AS count FROM entity_aliases "
+            "WHERE state='active' GROUP BY trust"
+        ).fetchall()
+        outbox_rows = conn.execute(
+            "SELECT status,COUNT(*) AS count FROM outbox GROUP BY status"
+        ).fetchall()
+        conn.close()
+        return {
+            "memories": {str(row["state"]): int(row["count"]) for row in memory_rows},
+            "candidates": {str(row["status"]): int(row["count"]) for row in candidate_rows},
+            "aliases": {str(row["trust"]): int(row["count"]) for row in alias_rows},
+            "outbox": {str(row["status"]): int(row["count"]) for row in outbox_rows},
+        }
+
     def get_memory_revision(self, memory_id: str, revision: int) -> dict[str, Any] | None:
         conn = self._connect()
         row = conn.execute(

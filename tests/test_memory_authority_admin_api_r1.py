@@ -247,6 +247,47 @@ def seed_authority_memory(buckets, authority, service, bucket_id="memory-r1"):
     return bucket_id
 
 
+def test_owner_memory_authority_read_models_are_revisioned_and_collapsible(monkeypatch, tmp_path):
+    buckets, authority, service, _projection = install(
+        monkeypatch, tmp_path, authority_enabled=True
+    )
+    memory_id = seed_authority_memory(buckets, authority, service)
+    authority.upsert_alias(
+        entity_id="person:yanyan",
+        alias="晏晏",
+        trust="owner",
+        source_refs=[f"memory:{memory_id}"],
+    )
+
+    overview_response = asyncio.run(server.api_memory_authority_overview(FakeRequest()))
+    overview = response_json(overview_response)
+    assert overview_response.status_code == 200
+    assert overview["overview"]["memories"] == {"active": 1}
+    assert overview["overview"]["aliases"] == {"owner": 1}
+
+    list_response = asyncio.run(server.api_memory_authority_memories(FakeRequest(
+        query_params={"include_body": "true"}
+    )))
+    listed = response_json(list_response)
+    assert listed["items"][0]["memory_id"] == memory_id
+    assert listed["items"][0]["active_revision"] == 1
+    assert listed["items"][0]["body"] == "旧正文"
+
+    detail_response = asyncio.run(server.api_memory_authority_memory_detail(FakeRequest(
+        path_params={"memory_id": memory_id}
+    )))
+    detail = response_json(detail_response)
+    assert detail["memory"]["active_revision"] == 1
+    assert detail["body"] == "旧正文"
+    assert [row["revision"] for row in detail["revisions"]] == [1]
+    assert detail["rings"] == []
+
+    aliases_response = asyncio.run(server.api_memory_authority_aliases(FakeRequest()))
+    aliases = response_json(aliases_response)
+    assert aliases["items"][0]["alias"] == "晏晏"
+    assert aliases["items"][0]["source_refs"] == [f"memory:{memory_id}"]
+
+
 def test_api_memories_authority_create_update_revision_and_idempotency(monkeypatch, tmp_path):
     buckets, authority, _service, projection = install(monkeypatch, tmp_path, authority_enabled=True)
 
