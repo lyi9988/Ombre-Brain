@@ -5502,6 +5502,114 @@ class GatewayService:
         except Exception as exc:
             return self._prompt_mirror_error(exc)
 
+    async def handle_memory_authority_read(self, request: Request) -> JSONResponse:
+        """Owner-safe Memory projection served on the Gateway transport.
+
+        Reality reaches this only through Aizizhu.  The Gateway bearer is
+        accepted here; bodies remain opt-in and every response is no-store.
+        """
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+        view = getattr(self, "memory_authority_view", None)
+        if view is None or not view.available():
+            return JSONResponse(
+                {"status": "disabled", "enabled": False},
+                status_code=503,
+                headers=headers,
+            )
+
+        resource = str(request.path_params.get("resource") or "")
+        try:
+            if resource == "overview":
+                return JSONResponse({
+                    "status": "ok",
+                    "enabled": True,
+                    "overview": view.overview(),
+                }, headers=headers)
+            if resource == "memories":
+                state = str(request.query_params.get("state") or "active")
+                limit = max(1, min(200, int(request.query_params.get("limit") or 50)))
+                offset = max(0, min(1_000_000, int(request.query_params.get("offset") or 0)))
+                include_body = str(
+                    request.query_params.get("include_body") or ""
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                items = view.list_memories(state=state, limit=limit, offset=offset)
+                if include_body:
+                    for item in items:
+                        bucket = await self.bucket_mgr.get(str(item.get("bucket_id") or ""))
+                        item["body"] = str((bucket or {}).get("content") or "")
+                return JSONResponse({
+                    "status": "ok", "enabled": True, "items": items,
+                }, headers=headers)
+            if resource == "memory_detail":
+                memory_id = str(request.path_params.get("memory_id") or "").strip()
+                detail = view.memory_detail(memory_id)
+                if not detail:
+                    return JSONResponse(
+                        {"error": {"code": "memory_not_found", "message": "Memory not found"}},
+                        status_code=404,
+                        headers=headers,
+                    )
+                bucket = await self.bucket_mgr.get(
+                    str((detail.get("memory") or {}).get("bucket_id") or "")
+                )
+                detail["body"] = str((bucket or {}).get("content") or "")
+                return JSONResponse({"status": "ok", **detail}, headers=headers)
+            if resource == "aliases":
+                state = str(request.query_params.get("state") or "active")
+                trust = str(request.query_params.get("trust") or "all")
+                limit = max(1, min(1000, int(request.query_params.get("limit") or 200)))
+                return JSONResponse({
+                    "status": "ok",
+                    "enabled": True,
+                    "items": view.list_aliases(state=state, trust=trust, limit=limit),
+                }, headers=headers)
+            if resource == "settings":
+                return JSONResponse({
+                    "status": "ok",
+                    "settings": {
+                        "fast_enabled": True,
+                        "deep_enabled": bool(
+                            getattr(self.embedding_engine, "enabled", False)
+                            or getattr(self.reranker_engine, "enabled", False)
+                        ),
+                        "policy_revision": RECALL_POLICY_REVISION,
+                        "query_planner_enabled": bool(self.query_planner_enabled),
+                        "semantic_rescue_enabled": bool(self.semantic_rescue_enabled),
+                        "domain_sentinel_remote_in_prepare": bool(
+                            self.domain_sentinel_remote_in_prepare
+                        ),
+                    },
+                }, headers=headers)
+            if resource == "diagnostics":
+                overview = view.overview()
+                return JSONResponse({
+                    "status": "ok",
+                    "diagnostics": {
+                        "route": "unknown",
+                        "reason_codes": [],
+                        "provider_health": self._retrieval_runtime_debug(),
+                        "index_health": {
+                            "authority": "ok" if overview.get("available") else "unavailable",
+                            "outbox": overview.get("outbox") or {},
+                        },
+                        "inspector_required_for_request_route": True,
+                    },
+                }, headers=headers)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": {"code": "invalid_request", "message": "Invalid query parameter"}},
+                status_code=400,
+                headers=headers,
+            )
+        return JSONResponse(
+            {"error": {"code": "not_found", "message": "Unknown Memory resource"}},
+            status_code=404,
+            headers=headers,
+        )
+
     async def handle_prompt_binding_mirror(self, request: Request) -> JSONResponse:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
@@ -25196,6 +25304,13 @@ def create_gateway_app(
     async def prompt_source_detail_route(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_prompt_source_detail(request)
 
+    async def memory_authority_read(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_memory_authority_read(request)
+
+    async def memory_authority_detail(request: Request) -> Response:
+        request.path_params["resource"] = "memory_detail"
+        return await request.app.state.gateway_service.handle_memory_authority_read(request)
+
     app = Starlette(
         debug=False,
         routes=[
@@ -25216,6 +25331,10 @@ def create_gateway_app(
                   prompt_binding_mirror, methods=["GET", "PUT"]),
             Route("/api/internal/prompt-sources/{source_id}/body",
                   prompt_source_detail_route, methods=["GET"]),
+            Route("/api/memory-authority/memories/{memory_id}", memory_authority_detail,
+                  methods=["GET"], name="memory-detail"),
+            Route("/api/memory-authority/{resource}", memory_authority_read,
+                  methods=["GET"], name="memory-authority-read"),
             Route("/v1/models", models, methods=["GET"]),
             Route("/v1/chat/completions", chat_completions, methods=["POST"]),
             Route("/v1/messages", anthropic_messages, methods=["POST"]),

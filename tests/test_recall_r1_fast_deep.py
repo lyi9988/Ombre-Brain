@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import json
 from types import SimpleNamespace
 
 from gateway import GatewayService
@@ -384,6 +385,67 @@ def test_memory_recall_projection_records_authority_revision_and_body_hash():
     assert projection["status"] == "ready"
     assert projection["token_estimate"] > 0
     assert len(projection["body_sha256"]) == 64
+
+
+def test_gateway_serves_owner_safe_memory_projection_on_existing_bearer_transport():
+    class Request:
+        method = "GET"
+        headers = {"Authorization": "Bearer synthetic"}
+
+        def __init__(self, resource, *, memory_id="", query=None):
+            self.path_params = {"resource": resource, "memory_id": memory_id}
+            self.query_params = dict(query or {})
+
+    class Buckets:
+        async def get(self, bucket_id):
+            return {"id": bucket_id, "content": "owner body"}
+
+    view = SimpleNamespace(
+        available=lambda: True,
+        overview=lambda: {"available": True, "outbox": {"projected": 1}},
+        list_memories=lambda **_kwargs: [{"memory_id": "memory-1", "bucket_id": "bucket-1"}],
+        memory_detail=lambda _memory_id: {
+            "memory": {"memory_id": "memory-1", "bucket_id": "bucket-1"},
+            "revisions": [], "rings": [], "projection_status": [],
+        },
+        list_aliases=lambda **_kwargs: [{"alias": "晏晏", "trust": "owner"}],
+    )
+    service = GatewayService.__new__(GatewayService)
+    service._authorize = lambda _header: None
+    service.memory_authority_view = view
+    service.bucket_mgr = Buckets()
+    service.embedding_engine = SimpleNamespace(enabled=True)
+    service.reranker_engine = SimpleNamespace(enabled=True)
+    service.query_planner_enabled = True
+    service.semantic_rescue_enabled = False
+    service.domain_sentinel_remote_in_prepare = False
+    service._retrieval_runtime_debug = lambda: {
+        "embedding": {"status": "ok"}, "reranker": {"status": "ok"}
+    }
+
+    overview = asyncio.run(service.handle_memory_authority_read(Request("overview")))
+    metadata = asyncio.run(service.handle_memory_authority_read(Request("memories")))
+    with_body = asyncio.run(service.handle_memory_authority_read(Request(
+        "memories", query={"include_body": "true"}
+    )))
+    detail = asyncio.run(service.handle_memory_authority_read(Request(
+        "memory_detail", memory_id="memory-1"
+    )))
+    settings = asyncio.run(service.handle_memory_authority_read(Request("settings")))
+    diagnostics = asyncio.run(service.handle_memory_authority_read(Request("diagnostics")))
+
+    bodies = [json.loads(response.body.decode("utf-8")) for response in (
+        overview, metadata, with_body, detail, settings, diagnostics,
+    )]
+    assert all(response.status_code == 200 for response in (
+        overview, metadata, with_body, detail, settings, diagnostics,
+    ))
+    assert "body" not in bodies[1]["items"][0]
+    assert bodies[2]["items"][0]["body"] == "owner body"
+    assert bodies[3]["body"] == "owner body"
+    assert bodies[4]["settings"]["policy_revision"] == "recall-r1"
+    assert bodies[5]["diagnostics"]["route"] == "unknown"
+    assert "synthetic" not in str(bodies)
 
 
 def test_alias_resolves_memory_id_to_distinct_bucket_projection_id(tmp_path):
