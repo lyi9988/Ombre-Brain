@@ -298,6 +298,7 @@ moment_annotations:
 # 在转发上游模型前自动注入
 # 核心记忆 + 最近上下文 + 动态召回记忆
 gateway:
+  model_route_mirror_path: "" # default <buckets_dir>/model_route_mirror.sqlite3; secretless Aiz route slice
   host: "0.0.0.0"
   port: 8010
   default_session_id: "main"      # used only by compatible routes when the header is omitted
@@ -398,8 +399,8 @@ gateway:
   conversation_turns_max_entries: 500
   memory_sentinel_enabled: true     # grey-zone routing: search | tone_only | skip; hard recall signals bypass it
   domain_sentinel_enabled: true      # coarse routing: message_type, primary domain, optional should_recall=false
-  domain_sentinel_model: ""          # empty = use dehydration.model; prefer cheap/fast models
-  domain_sentinel_base_url: ""       # empty = reuse dehydration.base_url
+  domain_sentinel_model: ""          # legacy fallback when no verified memory_domain_sentinel route mirror exists
+  domain_sentinel_base_url: ""       # legacy fallback only; route mirror never contains endpoint/secret
   # domain_sentinel_api_key: ""      # empty = OMBRE_DOMAIN_SENTINEL_API_KEY or dehydration.api_key
   domain_sentinel_enable_thinking: false   # forced false
   domain_sentinel_max_tokens: 260
@@ -419,7 +420,7 @@ gateway:
   portrait_memory_max_sources: 8
   portrait_memory_include_anchors: false # true optionally adds ordinary anchors; never includes pinned/protected/self_anchor
   query_planner_enabled: true  # extra LLM call: split long/low-confidence messages into short recall queries
-  query_planner_model: ""      # empty = use dehydration.model via dehydration API
+  query_planner_model: ""      # legacy fallback when no verified memory_query_planner route mirror exists
   query_planner_min_chars: 16  # also catches short emotional reason lookups like "今天为什么激动哭"
   query_planner_max_queries: 3
   query_planner_max_tokens: 360
@@ -430,7 +431,7 @@ gateway:
   rerank_cache_ttl_seconds: 300
   rerank_cache_max_entries: 256
   query_planner_supplemental_semantic: false # planner short queries use keyword/exact by default; avoids repeated embedding calls
-  semantic_rescue_enabled: false # optional last gate for semantic-only candidates; validates an exact evidence span
+  semantic_rescue_enabled: false # optional last gate; model comes from memory_semantic_rescue route mirror, legacy Dehydrator fallback
   semantic_rescue_candidate_limit: 3 # one batched cheap-model call, top 1-3 semantic candidates
   semantic_rescue_max_tokens: 220
   semantic_rescue_timeout_seconds: 4

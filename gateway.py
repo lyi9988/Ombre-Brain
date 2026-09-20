@@ -66,6 +66,11 @@ from prompt_plan_mirror import (
     PromptPlanMirrorStore,
     PromptPlanMirrorValidationError,
 )
+from model_route_mirror import (
+    ModelRouteMirrorConflict,
+    ModelRouteMirrorStore,
+    ModelRouteMirrorValidationError,
+)
 from prompt_source_registry import (
     fixed_prompt_source,
     render_factory_body,
@@ -601,6 +606,10 @@ class GatewayService:
         self.prompt_plan_mirror = PromptPlanMirrorStore(
             self.gateway_cfg.get("prompt_plan_mirror_path")
             or os.path.join(config["buckets_dir"], "prompt_plan_mirror.sqlite3")
+        )
+        self.model_route_mirror = ModelRouteMirrorStore(
+            self.gateway_cfg.get("model_route_mirror_path")
+            or os.path.join(config["buckets_dir"], "model_route_mirror.sqlite3")
         )
         # Dehydrator and DreamEngine may be injected by tests or constructed
         # above this derived mirror.  Point both at the single Gateway mirror
@@ -5609,6 +5618,52 @@ class GatewayService:
             status_code=404,
             headers=headers,
         )
+
+    async def handle_model_route_mirror(self, request: Request) -> JSONResponse:
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+        try:
+            if request.method == "GET":
+                return JSONResponse({
+                    "mirror": self.model_route_mirror.active(),
+                }, headers=headers)
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ModelRouteMirrorValidationError("request body must be an object")
+            allowed = {
+                "revision", "route_sha256", "routes", "source_authority", "request_id",
+            }
+            if set(body) - allowed:
+                raise ModelRouteMirrorValidationError("request contains unsupported fields")
+            value = self.model_route_mirror.put(
+                revision=int(body.get("revision") or 0),
+                route_sha256=str(body.get("route_sha256") or ""),
+                routes=body.get("routes"),
+                source_authority=str(body.get("source_authority") or "aizizhu.model_registry"),
+                request_id=str(body.get("request_id") or ""),
+            )
+            return JSONResponse({"mirror": value}, headers=headers)
+        except ModelRouteMirrorConflict as exc:
+            return JSONResponse(
+                {"error": {"code": exc.code, "message": str(exc)}},
+                status_code=409,
+                headers=headers,
+            )
+        except ModelRouteMirrorValidationError as exc:
+            return JSONResponse(
+                {"error": {"code": exc.code, "message": str(exc)}},
+                status_code=400,
+                headers=headers,
+            )
+        except Exception:
+            logger.exception("Model route mirror request failed")
+            return JSONResponse(
+                {"error": {"code": "model_route_mirror_failed", "message": "Mirror failed"}},
+                status_code=500,
+                headers=headers,
+            )
 
     async def handle_prompt_binding_mirror(self, request: Request) -> JSONResponse:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
@@ -16452,14 +16507,19 @@ class GatewayService:
         if not allow_remote:
             debug["remote_skip_reason"] = "prepare_uses_local_rules"
             return debug
-        if not self.domain_sentinel_enabled or not self.domain_sentinel_model:
+        mirrored_route = self._internal_model_route("memory_domain_sentinel")
+        mirrored_model = (
+            str(((mirrored_route or {}).get("candidates") or [{}])[0].get("model_id") or "")
+            if mirrored_route else ""
+        )
+        if not self.domain_sentinel_enabled or not (mirrored_model or self.domain_sentinel_model):
             return debug
-        if not self.domain_sentinel_base_url or not self.domain_sentinel_api_key:
+        if not mirrored_route and (not self.domain_sentinel_base_url or not self.domain_sentinel_api_key):
             debug["errors"].append("domain_sentinel_api_not_configured")
             return debug
 
         payload = {
-            "model": self.domain_sentinel_model,
+            "model": mirrored_model or self.domain_sentinel_model,
             "messages": [
                 {
                     "role": "system",
@@ -16476,6 +16536,25 @@ class GatewayService:
         }
 
         try:
+            if mirrored_route:
+                content, error, route_debug = await asyncio.wait_for(
+                    self._call_mirrored_internal_route("memory_domain_sentinel", payload),
+                    timeout=self.domain_sentinel_timeout_seconds,
+                )
+                debug["model_route"] = route_debug
+                if error:
+                    debug["errors"].append(f"domain_sentinel_{error}")
+                    return debug
+                parsed = self._parse_domain_sentinel_response(content or "")
+                if parsed:
+                    parsed["enabled"] = True
+                    parsed["source"] = "model_route_mirror"
+                    parsed["called"] = True
+                    parsed["errors"] = []
+                    parsed["model_route"] = route_debug
+                    return parsed
+                debug["errors"].append("domain_sentinel_empty_response")
+                return debug
             response = await asyncio.wait_for(
                 self.http_client.post(
                     f"{self.domain_sentinel_base_url}/chat/completions",
@@ -16674,7 +16753,11 @@ class GatewayService:
             "relation_axis": [],
             "errors": [],
             "model": self.query_planner_model,
-            "model_source": "dehydration" if self.query_planner_uses_dehydrator else "gateway",
+            "model_source": (
+                "model_route_mirror"
+                if mirrored_route
+                else "dehydration" if self.query_planner_uses_dehydrator else "gateway"
+            ),
             "semantic": {
                 "query_timeout_seconds": self.embedding_query_timeout_seconds,
                 "supplemental_enabled": self.query_planner_supplemental_semantic,
@@ -17277,13 +17360,84 @@ class GatewayService:
             return True
         return False
 
+    def _internal_model_route(self, route_id: str) -> dict[str, Any] | None:
+        store = getattr(self, "model_route_mirror", None)
+        if store is None:
+            return None
+        try:
+            return store.resolve(route_id)
+        except Exception:
+            logger.warning("Internal model route mirror read failed | route=%s", route_id)
+            return None
+
+    @staticmethod
+    def _apply_internal_route_overrides(payload: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "temperature", "max_tokens", "max_completion_tokens",
+            "reasoning_effort", "enable_thinking", "thinking_mode",
+        }
+        output = deepcopy(payload)
+        for key, value in (overrides or {}).items():
+            if key in allowed:
+                output[key] = value
+        return output
+
+    async def _call_mirrored_internal_route(
+        self,
+        route_id: str,
+        payload: dict[str, Any],
+    ) -> tuple[str | None, str | None, dict[str, Any]]:
+        route = self._internal_model_route(route_id)
+        if not route:
+            return None, "route_mirror_unavailable", {}
+        errors = []
+        for candidate in route.get("candidates", []):
+            model = str(candidate.get("model_id") or "").strip()
+            if not model:
+                continue
+            request_payload = self._apply_internal_route_overrides(
+                {**payload, "model": model},
+                candidate.get("overrides") or {},
+            )
+            try:
+                response = await self._forward_upstream(request_payload)
+            except Exception as exc:
+                errors.append(f"{model}:{type(exc).__name__}")
+                continue
+            if response.status_code >= 400:
+                errors.append(f"{model}:http_{response.status_code}")
+                continue
+            try:
+                content = self._chat_completion_content(response.json())
+            except Exception:
+                content = ""
+            if content:
+                return content, None, {
+                    "route_id": route_id,
+                    "revision": route.get("revision"),
+                    "route_sha256": route.get("route_sha256"),
+                    "provider_id": candidate.get("provider_id"),
+                    "model_id": model,
+                }
+            errors.append(f"{model}:empty")
+        return None, "route_candidates_failed", {
+            "route_id": route_id,
+            "revision": route.get("revision"),
+            "route_sha256": route.get("route_sha256"),
+            "errors": errors,
+        }
+
     async def _call_query_planner(self, query: str) -> tuple[dict[str, Any] | None, str | None]:
         if not hasattr(self, "_query_planner_cache"):
             self._query_planner_cache = {}
             self._query_planner_inflight = {}
             self.query_planner_cache_ttl_seconds = 300.0
             self.query_planner_cache_max_entries = 128
-        model = self.query_planner_model
+        mirrored_route = self._internal_model_route("memory_query_planner")
+        model = (
+            str(((mirrored_route or {}).get("candidates") or [{}])[0].get("model_id") or "")
+            if mirrored_route else self.query_planner_model
+        )
         if not model:
             return None, "query_planner_model_missing"
         planner_prompt = self._resolve_gateway_background_prompt(
@@ -17293,9 +17447,11 @@ class GatewayService:
             "query": str(query or ""),
             "model": model,
             "model_source": "dehydration" if self.query_planner_uses_dehydrator else "gateway",
+            "route_revision": (mirrored_route or {}).get("revision"),
+            "route_sha256": (mirrored_route or {}).get("route_sha256"),
             "base_url": (
                 str(getattr(self.dehydrator, "base_url", "") or "")
-                if self.query_planner_uses_dehydrator
+                if self.query_planner_uses_dehydrator and not mirrored_route
                 else "gateway_model_route"
             ),
             "prompt_sha256": hashlib.sha256(planner_prompt.encode("utf-8")).hexdigest(),
@@ -17325,7 +17481,12 @@ class GatewayService:
             return plan, error
 
         task = asyncio.create_task(
-            self._call_query_planner_uncached(query, planner_prompt)
+            self._call_query_planner_uncached(
+                query,
+                planner_prompt,
+                model=model,
+                mirrored=bool(mirrored_route),
+            )
         )
         self._query_planner_inflight[cache_key] = task
         try:
@@ -17354,8 +17515,11 @@ class GatewayService:
         self,
         query: str,
         planner_prompt: str,
+        *,
+        model: str | None = None,
+        mirrored: bool = False,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        model = self.query_planner_model
+        model = str(model or self.query_planner_model or "")
         payload = {
             "model": model,
             "messages": [
@@ -17375,6 +17539,16 @@ class GatewayService:
             "max_tokens": self.query_planner_max_tokens,
             "stream": False,
         }
+        if mirrored:
+            content, error, _route_debug = await self._call_mirrored_internal_route(
+                "memory_query_planner", payload
+            )
+            if error:
+                return None, f"query_planner_{error}"
+            try:
+                return self._parse_query_planner_response(content or ""), None
+            except ValueError as exc:
+                return None, f"query_planner_parse_failed:{exc}"
         if self.query_planner_uses_dehydrator:
             content, error = await self._call_query_planner_with_dehydrator(payload)
             if error:
@@ -17523,7 +17697,12 @@ class GatewayService:
         if not candidates:
             finish("no_eligible_candidates")
             return None
-        if not self.semantic_rescue_model:
+        mirrored_rescue = self._internal_model_route("memory_semantic_rescue")
+        rescue_model = (
+            str(((mirrored_rescue or {}).get("candidates") or [{}])[0].get("model_id") or "")
+            if mirrored_rescue else self.semantic_rescue_model
+        )
+        if not rescue_model:
             finish("model_missing")
             return None
 
@@ -17556,7 +17735,7 @@ class GatewayService:
             "ombre.semantic_rescue_prompt", "memory.semantic_rescue",
             SEMANTIC_RESCUE_SYSTEM_PROMPT)
         payload = {
-            "model": self.semantic_rescue_model,
+            "model": rescue_model,
             "messages": [
                 {"role": "system", "content": rescue_prompt},
                 {
@@ -17578,10 +17757,17 @@ class GatewayService:
         debug["triggered"] = True
         debug["called"] = True
         try:
-            content, error = await asyncio.wait_for(
-                self._call_query_planner_with_dehydrator(payload),
-                timeout=self.semantic_rescue_timeout_seconds,
-            )
+            if mirrored_rescue:
+                content, error, route_debug = await asyncio.wait_for(
+                    self._call_mirrored_internal_route("memory_semantic_rescue", payload),
+                    timeout=self.semantic_rescue_timeout_seconds,
+                )
+                debug["model_route"] = route_debug
+            else:
+                content, error = await asyncio.wait_for(
+                    self._call_query_planner_with_dehydrator(payload),
+                    timeout=self.semantic_rescue_timeout_seconds,
+                )
         except asyncio.TimeoutError:
             debug["error"] = "semantic_rescue_timeout"
             finish("model_error")
@@ -25311,6 +25497,9 @@ def create_gateway_app(
         request.path_params["resource"] = "memory_detail"
         return await request.app.state.gateway_service.handle_memory_authority_read(request)
 
+    async def model_route_mirror(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_model_route_mirror(request)
+
     app = Starlette(
         debug=False,
         routes=[
@@ -25331,6 +25520,8 @@ def create_gateway_app(
                   prompt_binding_mirror, methods=["GET", "PUT"]),
             Route("/api/internal/prompt-sources/{source_id}/body",
                   prompt_source_detail_route, methods=["GET"]),
+            Route("/api/internal/model-routes", model_route_mirror,
+                  methods=["GET", "PUT"]),
             Route("/api/memory-authority/memories/{memory_id}", memory_authority_detail,
                   methods=["GET"], name="memory-detail"),
             Route("/api/memory-authority/{resource}", memory_authority_read,
