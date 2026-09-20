@@ -43,6 +43,8 @@ def test_authority_view_exposes_only_trusted_aliases_and_refreshes_wal(tmp_path)
     assert matches[0]["entity_id"] == "person:yanyan"
     assert matches[0]["trust"] == "owner"
     assert matches[0]["revision"] == 2
+    assert matches[0]["memory_ids"] == []
+    assert matches[0]["bucket_ids"] == []
 
 
 def _sentinel_service(alias_matches=None):
@@ -375,9 +377,50 @@ def test_memory_recall_projection_records_authority_revision_and_body_hash():
     assert projection["source_id"] == "ombre.memory_recall"
     assert projection["route"] == "fast"
     assert projection["reason_codes"] == ["FAST_OWNER_ALIAS"]
-    assert projection["selected_memory_ids"] == ["memory-1", "memory-2"]
+    assert projection["selected_memory_ids"] == ["memory-1"]
+    assert projection["selected_bucket_ids"] == ["memory-1", "memory-2"]
     assert projection["selected_memory_revisions"] == {"memory-1": 3}
     assert projection["selected_ring_ids"] == ["ring-1"]
     assert projection["status"] == "ready"
     assert projection["token_estimate"] > 0
     assert len(projection["body_sha256"]) == 64
+
+
+def test_alias_resolves_memory_id_to_distinct_bucket_projection_id(tmp_path):
+    state_dir = tmp_path / "state"
+    authority = MemoryAuthorityStore({"state_dir": str(state_dir)})
+    body = "主人和晏晏的共同经历。"
+    import hashlib
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    prepared = authority.prepare_memory_commit(
+        memory_id="memory-canonical-1",
+        bucket_id="bucket-projection-9",
+        expected_revision=0,
+        body_sha256=digest,
+        snapshot_path="revisions/memory-canonical-1/1.md",
+        metadata={"memory_type": "key_event"},
+        source_refs=["evt-1"],
+        decision_source="owner",
+        idempotency_key="commit-distinct-id",
+        actor="owner",
+    )
+    authority.record_body_written(prepared["operation_id"], observed_body_sha256=digest)
+    authority.finalize_memory_commit(prepared["operation_id"])
+    authority.upsert_alias(
+        entity_id="person:yanyan",
+        alias="晏晏",
+        trust="owner",
+        source_refs=["memory:memory-canonical-1"],
+    )
+    view = MemoryAuthorityRecallView({
+        "state_dir": str(state_dir),
+        "memory_authority": {"enabled": True},
+    })
+
+    match = view.match_aliases("晏晏是谁")[0]
+
+    assert match["memory_ids"] == ["memory-canonical-1"]
+    assert match["bucket_ids"] == ["bucket-projection-9"]
+    assert view.memory_revision_map(["bucket-projection-9"]) == {
+        "memory-canonical-1": 1
+    }

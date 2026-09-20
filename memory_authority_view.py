@@ -83,7 +83,21 @@ class MemoryAuthorityRecallView:
         for row in self.trusted_aliases():
             key = normalize_alias(str(row.get("normalized_alias") or row.get("alias") or "")).replace(" ", "")
             if key and key in normalized_query:
-                matches.append(row)
+                item = dict(row)
+                memory_ids = [
+                    str(ref)[len("memory:"):]
+                    for ref in item.get("source_refs", []) or []
+                    if str(ref or "").startswith("memory:")
+                    and len(str(ref or "")) > len("memory:")
+                ]
+                resolved = self.resolve_memory_refs(memory_ids)
+                item["memory_ids"] = list(resolved)
+                item["bucket_ids"] = list(dict.fromkeys(
+                    str(value.get("bucket_id") or "")
+                    for value in resolved.values()
+                    if str(value.get("bucket_id") or "")
+                ))
+                matches.append(item)
         return matches[:8]
 
     def watermark(self) -> dict[str, Any]:
@@ -120,16 +134,38 @@ class MemoryAuthorityRecallView:
         ))[:64]
         if not ids or not self.available():
             return {}
+        resolved = self.resolve_memory_refs(ids)
+        return {
+            memory_id: int(item.get("active_revision") or 0)
+            for memory_id, item in resolved.items()
+        }
+
+    def resolve_memory_refs(self, memory_or_bucket_ids: list[str]) -> dict[str, dict[str, Any]]:
+        ids = list(dict.fromkeys(
+            str(memory_id or "").strip()
+            for memory_id in memory_or_bucket_ids
+            if str(memory_id or "").strip()
+        ))[:64]
+        if not ids or not self.available():
+            return {}
         placeholders = ",".join("?" for _ in ids)
         conn = self._connect()
         try:
             rows = conn.execute(
-                f"SELECT memory_id,active_revision FROM memories "
-                f"WHERE state='active' AND memory_id IN ({placeholders})",
-                ids,
+                f"SELECT memory_id,bucket_id,active_revision FROM memories "
+                f"WHERE state='active' AND (memory_id IN ({placeholders}) "
+                f"OR bucket_id IN ({placeholders}))",
+                [*ids, *ids],
             ).fetchall()
         except sqlite3.Error:
             return {}
         finally:
             conn.close()
-        return {str(row[0]): int(row[1]) for row in rows}
+        return {
+            str(row[0]): {
+                "memory_id": str(row[0]),
+                "bucket_id": str(row[1]),
+                "active_revision": int(row[2]),
+            }
+            for row in rows
+        }

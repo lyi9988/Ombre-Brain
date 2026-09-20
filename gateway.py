@@ -15850,6 +15850,10 @@ class GatewayService:
         for match in (sentinel_debug or {}).get("owner_alias_matches", []) or []:
             if not isinstance(match, dict):
                 continue
+            for bucket_id in match.get("bucket_ids", []) or []:
+                value = str(bucket_id or "").strip()
+                if value:
+                    output.append(value)
             for source_ref in match.get("source_refs", []) or []:
                 value = str(source_ref or "").strip()
                 if value.startswith("memory:") and len(value) > len("memory:"):
@@ -15889,6 +15893,14 @@ class GatewayService:
                     "revision": int(row.get("revision") or 0),
                     "source_refs": [
                         str(item) for item in row.get("source_refs", []) or []
+                        if str(item or "").strip()
+                    ],
+                    "memory_ids": [
+                        str(item) for item in row.get("memory_ids", []) or []
+                        if str(item or "").strip()
+                    ],
+                    "bucket_ids": [
+                        str(item) for item in row.get("bucket_ids", []) or []
                         if str(item or "").strip()
                     ],
                 } for row in alias_matches],
@@ -21546,7 +21558,7 @@ class GatewayService:
         add("Targeted Memory Detail", targeted_memory_detail)
         add("Diffused Memory", related_memory)
         body = "\n\n".join(sections).strip()
-        selected_memory_ids = list(dict.fromkeys([
+        selected_bucket_ids = list(dict.fromkeys([
             *[
                 str(moment.get("bucket_id") or "").strip()
                 for moment in recalled_moments or []
@@ -21575,9 +21587,10 @@ class GatewayService:
         authority_view = getattr(self, "memory_authority_view", None)
         watermark = authority_view.watermark() if authority_view else {"available": False}
         revisions = (
-            authority_view.memory_revision_map(selected_memory_ids)
+            authority_view.memory_revision_map(selected_bucket_ids)
             if authority_view else {}
         )
+        selected_memory_ids = list(revisions) or list(selected_bucket_ids)
         component_hashes = {
             "direct": hashlib.sha256(str(recalled_memory or "").encode("utf-8")).hexdigest(),
             "targeted": hashlib.sha256(str(targeted_memory_detail or "").encode("utf-8")).hexdigest(),
@@ -21597,6 +21610,7 @@ class GatewayService:
             "policy_revision": RECALL_POLICY_REVISION,
             "authority_watermark": watermark,
             "selected_memory_ids": selected_memory_ids,
+            "selected_bucket_ids": selected_bucket_ids,
             "selected_memory_revisions": revisions,
             "selected_ring_ids": ring_ids,
             "body": body,
