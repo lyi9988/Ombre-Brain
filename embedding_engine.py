@@ -21,6 +21,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import hashlib
 from pathlib import Path
 
 import httpx
@@ -55,6 +56,16 @@ class EmbeddingEngine:
             or "Given a memory search query, retrieve relevant long-term memory passages."
         ).strip()
         self.document_instruction = str(embed_cfg.get("document_instruction") or "").strip()
+        self.query_cache_ttl_seconds = max(
+            0.0,
+            min(3600.0, float(embed_cfg.get("query_cache_ttl_seconds", 300.0))),
+        )
+        self.query_cache_max_entries = max(
+            0,
+            min(2000, int(embed_cfg.get("query_cache_max_entries", 256))),
+        )
+        self._query_cache: dict[str, tuple[float, list[float]]] = {}
+        self._query_inflight: dict[str, asyncio.Task] = {}
         self._runtime = {
             "last_operation": "none",
             "last_status": "not_requested",
@@ -67,6 +78,7 @@ class EmbeddingEngine:
             "transport": "persistent_httpx",
             "last_transport": "persistent_httpx",
             "connection_fallback_count": 0,
+            "last_query_cache_status": "not_requested",
         }
 
         # --- SQLite path: buckets_dir/embeddings.db ---
@@ -98,6 +110,57 @@ class EmbeddingEngine:
             ),
             **dict(self._runtime),
         }
+
+    def _query_cache_key(self, text: str) -> str:
+        prepared = self._prepare_embedding_input(text, kind="query")[: self.max_chars]
+        payload = {
+            "input": prepared,
+            "model": str(self.model or ""),
+            "base_url": str(self.base_url or ""),
+            "query_instruction": self.query_instruction,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    async def query_embedding(self, text: str) -> list[float]:
+        """Return one exact-key query vector with cache and singleflight.
+
+        The cache stores vectors only, never raw query text.  Document writes
+        deliberately bypass it because they carry revisioned index identity.
+        """
+        if not self.enabled or not str(text or "").strip():
+            self._runtime["last_query_cache_status"] = "disabled_or_empty"
+            return []
+        cache_key = self._query_cache_key(text)
+        now = time.monotonic()
+        cached = self._query_cache.get(cache_key)
+        if cached and cached[0] > now:
+            self._runtime["last_query_cache_status"] = "hit"
+            return list(cached[1])
+        if cached:
+            self._query_cache.pop(cache_key, None)
+        inflight = self._query_inflight.get(cache_key)
+        if inflight is not None:
+            self._runtime["last_query_cache_status"] = "singleflight"
+            return list(await asyncio.shield(inflight))
+
+        task = asyncio.create_task(self._generate_embedding(text, kind="query"))
+        self._query_inflight[cache_key] = task
+        try:
+            vector = list(await asyncio.shield(task))
+            if vector and self.query_cache_ttl_seconds > 0 and self.query_cache_max_entries > 0:
+                self._query_cache[cache_key] = (
+                    time.monotonic() + self.query_cache_ttl_seconds,
+                    list(vector),
+                )
+                while len(self._query_cache) > self.query_cache_max_entries:
+                    self._query_cache.pop(next(iter(self._query_cache)))
+            self._runtime["last_query_cache_status"] = "miss"
+            return vector
+        finally:
+            if self._query_inflight.get(cache_key) is task:
+                self._query_inflight.pop(cache_key, None)
 
     def _init_db(self):
         """Create embeddings table if not exists."""
@@ -469,7 +532,7 @@ class EmbeddingEngine:
             return []
 
         try:
-            query_embedding = await self._generate_embedding(query, kind="query")
+            query_embedding = await self.query_embedding(query)
             if not query_embedding:
                 return []
         except Exception as e:

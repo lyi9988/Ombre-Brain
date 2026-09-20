@@ -150,6 +150,8 @@ embedding:
   base_url: "https://api.siliconflow.cn/v1"
   max_chars: 6000                 # Max chars sent per embedding request / 单次向量化最多字符数
   query_timeout_seconds: 3         # Gateway recall query timeout / Gateway 召回查询向量超时秒数
+  query_cache_ttl_seconds: 300     # exact query-vector cache shared by Recall/Dream
+  query_cache_max_entries: 256     # no raw query text is stored in the key
   query_instruction: "Given a memory search query, retrieve relevant long-term memory passages."
   document_instruction: ""
   # api_key: ""                   # Use env var OMBRE_EMBEDDING_API_KEY / 请使用环境变量

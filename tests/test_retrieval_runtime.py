@@ -2,12 +2,14 @@ import asyncio
 import time
 from types import SimpleNamespace
 from pathlib import Path
+from datetime import datetime, timezone
 
 import httpx
 
 from embedding_engine import EmbeddingEngine
 from reranker_engine import RerankerEngine
 from gateway import GatewayService
+from dream_engine import DreamEngine
 
 
 def test_embedding_runtime_debug_records_success_without_body_or_credentials(tmp_path, monkeypatch):
@@ -46,6 +48,98 @@ def test_embedding_runtime_debug_records_success_without_body_or_credentials(tmp
     assert debug["configured"] is True
     assert "owner-secret" not in str(debug)
     assert "private query" not in str(debug)
+
+
+def test_query_embedding_cache_singleflights_exact_recall_and_dream_query(tmp_path, monkeypatch):
+    engine = EmbeddingEngine({
+        "buckets_dir": str(tmp_path),
+        "embedding": {
+            "enabled": True,
+            "api_key": "owner-secret",
+            "base_url": "https://embedding.example/v1",
+            "model": "test-embedding",
+            "query_cache_ttl_seconds": 300,
+        },
+    })
+    calls = []
+
+    async def fake_generate(text, *, kind="document"):
+        calls.append((text, kind))
+        await asyncio.sleep(0.01)
+        return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr(engine, "_generate_embedding", fake_generate)
+
+    async def run():
+        first, second = await asyncio.gather(
+            engine.query_embedding("晏晏是谁"),
+            engine.query_embedding("晏晏是谁"),
+        )
+        third = await engine.query_embedding("晏晏是谁")
+        return first, second, third
+
+    first, second, third = asyncio.run(run())
+
+    assert first == second == third == [0.1, 0.2, 0.3]
+    assert calls == [("晏晏是谁", "query")]
+    assert engine.runtime_debug()["last_query_cache_status"] == "hit"
+    assert "晏晏是谁" not in str(engine._query_cache)
+
+
+def test_dream_surface_reuses_embedding_engine_query_cache_contract():
+    calls = []
+
+    class Engine:
+        enabled = True
+
+        async def query_embedding(self, query):
+            calls.append(query)
+            return [0.4, 0.5]
+
+    dream = DreamEngine.__new__(DreamEngine)
+    vector = asyncio.run(dream._query_embedding("共同经历", Engine()))
+
+    assert vector == [0.4, 0.5]
+    assert calls == ["共同经历"]
+
+
+def test_dream_fast_route_keeps_local_cues_but_skips_remote_query_embedding(monkeypatch):
+    dream = DreamEngine.__new__(DreamEngine)
+    dream.enabled = True
+    dream.surface_enabled = True
+    dream.retain_after_surface = True
+    dream.tz = timezone.utc
+    dream.min_surface_age_hours = 0
+    dream.attempt_threshold = 2.0
+    dream.surface_threshold = 2.0
+    dream.alpha_subordinate = 0.25
+    dream.spontaneous_surface_prob = 0.0
+    dream.max_surface_attempts = 4
+    record = SimpleNamespace(
+        surfaced=False,
+        generated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        metadata={"surface_attempts": 0},
+        dream_id="dream-1",
+    )
+    dream.list_records = lambda: [record]
+    dream._eligible_context = lambda *_args: True
+
+    async def forbidden_embedding(*_args, **_kwargs):
+        raise AssertionError("Fast/tone routes must not block on dream embedding")
+
+    async def local_cue_only(*_args, **_kwargs):
+        return 0.0
+
+    dream._query_embedding = forbidden_embedding
+    dream._cue_score = local_cue_only
+
+    result = asyncio.run(dream.surface_with_status(
+        query="普通聊天",
+        embedding_engine=SimpleNamespace(enabled=True),
+        allow_semantic=False,
+    ))
+
+    assert result == {"status": "skipped", "reason": "no_resonance"}
 
 
 def test_embedding_runtime_debug_records_failure_type(tmp_path, monkeypatch):

@@ -4718,6 +4718,7 @@ class GatewayService:
                 dream_context, dream_context_status = await self._build_dream_context_block(
                     current_user_query,
                     session_id,
+                    allow_semantic=recall_execution["allow_semantic"],
                 )
             mark_step("dream_context", stage_started_at)
             shown_dream_source_bucket_ids = [
@@ -21346,7 +21347,13 @@ class GatewayService:
             truncated = self._trim_text(cleaned, 90)
             return f"📌 记忆桶: {title}\n{truncated}"
 
-    async def _build_dream_context_block(self, query: str, session_id: str) -> tuple[str, dict[str, Any]]:
+    async def _build_dream_context_block(
+        self,
+        query: str,
+        session_id: str,
+        *,
+        allow_semantic: bool = True,
+    ) -> tuple[str, dict[str, Any]]:
         if not self.dream_inject_enabled:
             return "", {"status": "skipped", "reason": "inject_disabled"}
         result = await self.dream_engine.surface_with_status(
@@ -21354,12 +21361,14 @@ class GatewayService:
             is_session_start=self.state_store.get_last_success_at(session_id) is None,
             embedding_engine=self.embedding_engine,
             retain_after_surface=self.dream_retain_after_inject,
+            allow_semantic=allow_semantic,
         )
         status = {
             key: value
             for key, value in result.items()
             if key != "text"
         }
+        status["semantic_allowed"] = bool(allow_semantic)
         text = str(result.get("text") or "").strip()
         if result.get("status") != "injected" or not text:
             return "", status

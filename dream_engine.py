@@ -916,7 +916,10 @@ class DreamEngine:
         if embedding_engine is None or not getattr(embedding_engine, "enabled", False):
             return None
         try:
-            embedding = await embedding_engine._generate_embedding(query)
+            if hasattr(embedding_engine, "query_embedding"):
+                embedding = await embedding_engine.query_embedding(query)
+            else:
+                embedding = await embedding_engine._generate_embedding(query, kind="query")
             return embedding or None
         except Exception as exc:
             logger.warning("Dream query embedding failed: %s", exc)
@@ -992,6 +995,7 @@ class DreamEngine:
         embedding_engine=None,
         now: datetime | None = None,
         retain_after_surface: bool | None = None,
+        allow_semantic: bool = True,
     ) -> str | None:
         result = await self.surface_with_status(
             query=query,
@@ -1001,6 +1005,7 @@ class DreamEngine:
             embedding_engine=embedding_engine,
             now=now,
             retain_after_surface=retain_after_surface,
+            allow_semantic=allow_semantic,
         )
         return str(result.get("text") or "") or None
 
@@ -1013,6 +1018,7 @@ class DreamEngine:
         embedding_engine=None,
         now: datetime | None = None,
         retain_after_surface: bool | None = None,
+        allow_semantic: bool = True,
     ) -> dict:
         if not self.enabled or not self.surface_enabled:
             return {"status": "skipped", "reason": "disabled"}
@@ -1029,7 +1035,11 @@ class DreamEngine:
         ]
         if not pending:
             return {"status": "skipped", "reason": "no_pending_dream"}
-        query_embedding = await self._query_embedding(query, embedding_engine)
+        query_embedding = (
+            await self._query_embedding(query, embedding_engine)
+            if allow_semantic
+            else None
+        )
         evaluated = []
         for record in pending:
             affect = self._affect_score(record, valence, arousal)
