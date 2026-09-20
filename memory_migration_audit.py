@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sqlite3
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
@@ -84,9 +85,91 @@ def _candidate_record(item: dict[str, Any]) -> dict[str, Any]:
 
 
 class MemoryMigrationAuditor:
-    def __init__(self, *, candidates_path: str | Path, buckets_dir: str | Path):
+    def __init__(
+        self,
+        *,
+        candidates_path: str | Path,
+        buckets_dir: str | Path,
+        identity_semantics_db_path: str | Path | None = None,
+    ):
         self.candidates_path = Path(candidates_path).resolve()
         self.buckets_dir = Path(buckets_dir).resolve()
+        self.identity_semantics_db_path = (
+            Path(identity_semantics_db_path).resolve()
+            if identity_semantics_db_path else None
+        )
+
+    def scan_identity_semantics(self, bucket_ids: set[str]) -> dict[str, Any]:
+        path = self.identity_semantics_db_path
+        if path is None:
+            return {
+                "configured": False,
+                "path": "",
+                "alias_count": 0,
+                "evidence_count": 0,
+                "eligible_alias_count": 0,
+                "aliases_without_evidence": [],
+                "orphan_evidence_bucket_ids": [],
+                "errors": [],
+            }
+        if not path.exists():
+            return {
+                "configured": True,
+                "path": str(path),
+                "alias_count": 0,
+                "evidence_count": 0,
+                "eligible_alias_count": 0,
+                "aliases_without_evidence": [],
+                "orphan_evidence_bucket_ids": [],
+                "errors": ["identity_semantics_db_missing"],
+            }
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            aliases = conn.execute(
+                "SELECT canonical,alias,scope,confidence,source FROM identity_aliases "
+                "ORDER BY canonical,alias"
+            ).fetchall()
+            evidence = conn.execute(
+                "SELECT canonical,alias,bucket_id FROM identity_alias_evidence "
+                "ORDER BY canonical,alias,bucket_id"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            return {
+                "configured": True,
+                "path": str(path),
+                "alias_count": 0,
+                "evidence_count": 0,
+                "eligible_alias_count": 0,
+                "aliases_without_evidence": [],
+                "orphan_evidence_bucket_ids": [],
+                "errors": [f"identity_semantics_schema:{type(exc).__name__}"],
+            }
+        finally:
+            conn.close()
+        evidence_keys = {
+            (str(row["canonical"]), str(row["alias"])) for row in evidence
+        }
+        aliases_without_evidence = [
+            f"{row['canonical']}::{row['alias']}"
+            for row in aliases
+            if (str(row["canonical"]), str(row["alias"])) not in evidence_keys
+        ]
+        orphan_ids = sorted({
+            str(row["bucket_id"])
+            for row in evidence
+            if str(row["bucket_id"]) not in bucket_ids
+        })
+        return {
+            "configured": True,
+            "path": str(path),
+            "alias_count": len(aliases),
+            "evidence_count": len(evidence),
+            "eligible_alias_count": len(aliases) - len(aliases_without_evidence),
+            "aliases_without_evidence": aliases_without_evidence,
+            "orphan_evidence_bucket_ids": orphan_ids,
+            "errors": [],
+        }
 
     def scan_buckets(self) -> dict[str, Any]:
         records: dict[str, dict[str, Any]] = {}
@@ -127,6 +210,7 @@ class MemoryMigrationAuditor:
         candidates = [_candidate_record(item) for item in _candidate_items(payload)]
         bucket_scan = self.scan_buckets()
         buckets = bucket_scan.pop("records")
+        identity_semantics = self.scan_identity_semantics(set(buckets))
 
         candidate_ids = [item["candidate_id"] for item in candidates if item["candidate_id"]]
         duplicate_candidates = sorted(
@@ -161,6 +245,8 @@ class MemoryMigrationAuditor:
             + len(bucket_scan["invalid_files"])
             + len(accepted_missing_bucket)
             + len(accepted_body_mismatch)
+            + len(identity_semantics["orphan_evidence_bucket_ids"])
+            + len(identity_semantics["errors"])
         )
         return {
             "schema_version": "memory-migration-audit-v1",
@@ -176,6 +262,7 @@ class MemoryMigrationAuditor:
                 "unverified_or_missing_source": unverified_sources,
             },
             "buckets": bucket_scan,
+            "identity_semantics": identity_semantics,
             "inconsistency_count": inconsistencies,
             "side_effects": {
                 "model_calls": 0,
@@ -191,11 +278,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Read-only RECALL-R1 migration audit")
     parser.add_argument("--candidates", required=True)
     parser.add_argument("--buckets-dir", required=True)
+    parser.add_argument("--identity-semantics-db")
     parser.add_argument("--output", help="Optional JSON report path")
     args = parser.parse_args()
     report = MemoryMigrationAuditor(
         candidates_path=args.candidates,
         buckets_dir=args.buckets_dir,
+        identity_semantics_db_path=args.identity_semantics_db,
     ).run()
     rendered = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output:

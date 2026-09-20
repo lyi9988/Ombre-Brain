@@ -72,18 +72,24 @@ class MemoryAuthorityMigrator:
         state_dir: str | Path,
         authority_db_path: str | Path,
         backup_dir: str | Path,
+        identity_semantics_db_path: str | Path | None = None,
     ):
         self.candidates_path = Path(candidates_path).resolve()
         self.buckets_dir = Path(buckets_dir).resolve()
         self.state_dir = Path(state_dir).resolve()
         self.authority_db_path = Path(authority_db_path).resolve()
         self.backup_dir = Path(backup_dir).resolve()
+        self.identity_semantics_db_path = (
+            Path(identity_semantics_db_path).resolve()
+            if identity_semantics_db_path else None
+        )
         self.revisions_dir = self.state_dir / "memory_revisions"
 
     def audit(self) -> dict[str, Any]:
         return MemoryMigrationAuditor(
             candidates_path=self.candidates_path,
             buckets_dir=self.buckets_dir,
+            identity_semantics_db_path=self.identity_semantics_db_path,
         ).run()
 
     @staticmethod
@@ -99,6 +105,11 @@ class MemoryAuthorityMigrator:
             reasons.append("duplicate_bucket_ids")
         if buckets["invalid_files"]:
             reasons.append("invalid_bucket_files")
+        identity = audit.get("identity_semantics") or {}
+        if identity.get("errors"):
+            reasons.append("identity_semantics_unreadable")
+        if identity.get("orphan_evidence_bucket_ids"):
+            reasons.append("identity_semantics_orphan_evidence")
         return reasons
 
     def _backup(self, audit: dict[str, Any]) -> dict[str, Any]:
@@ -121,12 +132,22 @@ class MemoryAuthorityMigrator:
                 source.close()
         else:
             db_absent.write_text("absent before migration\n", encoding="utf-8")
+        identity_backup = self.backup_dir / "identity_semantics.sqlite3.backup"
+        if self.identity_semantics_db_path and self.identity_semantics_db_path.exists():
+            source = sqlite3.connect(str(self.identity_semantics_db_path))
+            target = sqlite3.connect(str(identity_backup))
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
         restore_map = self.backup_dir / "RESTORE-MAP.txt"
         restore_map.write_text(
             "Restore candidate JSON to:\n"
             f"  {self.candidates_path}\n"
             "Restore authority DB backup to:\n"
             f"  {self.authority_db_path}\n"
+            "IdentitySemantic input is read-only; its optional backup is evidence only and is not rewritten.\n"
             "If the .absent marker exists, remove the newly-created authority DB instead.\n"
             "New immutable revision snapshots may be removed only after their paths are checked against MANIFEST.json.\n",
             encoding="utf-8",
@@ -144,13 +165,21 @@ class MemoryAuthorityMigrator:
                 "absent_marker": str(db_absent) if db_absent.exists() else "",
                 "sha256": _file_sha(db_backup) if db_backup.exists() else "",
             },
+            "identity_semantics_db": {
+                "source": str(self.identity_semantics_db_path or ""),
+                "backup": str(identity_backup) if identity_backup.exists() else "",
+                "sha256": _file_sha(identity_backup) if identity_backup.exists() else "",
+            },
             "restore_map": {"path": str(restore_map), "sha256": _file_sha(restore_map)},
             "audit": audit,
             "created_snapshots": [],
         }
         manifest_path = self.backup_dir / "MANIFEST.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        for path in (candidate_backup, db_backup, db_absent, restore_map, manifest_path):
+        for path in (
+            candidate_backup, db_backup, db_absent, identity_backup,
+            restore_map, manifest_path,
+        ):
             if path.exists():
                 try:
                     os.chmod(path, 0o600)
@@ -188,12 +217,24 @@ class MemoryAuthorityMigrator:
             refs.append(f"candidate:{candidate_id}")
         return list(dict.fromkeys(refs))
 
-    def apply(self, *, expected_candidates: int, expected_buckets: int) -> dict[str, Any]:
+    def apply(
+        self,
+        *,
+        expected_candidates: int,
+        expected_buckets: int,
+        expected_aliases: int | None = None,
+    ) -> dict[str, Any]:
         audit = self.audit()
         if int(audit["candidates"]["scanned"]) != int(expected_candidates):
             raise MigrationBlocked("candidate count differs from explicit expectation")
         if int(audit["buckets"]["count"]) != int(expected_buckets):
             raise MigrationBlocked("bucket count differs from explicit expectation")
+        identity_audit = audit.get("identity_semantics") or {}
+        if identity_audit.get("configured"):
+            if expected_aliases is None:
+                raise MigrationBlocked("identity alias count requires explicit expectation")
+            if int(identity_audit.get("alias_count") or 0) != int(expected_aliases):
+                raise MigrationBlocked("identity alias count differs from explicit expectation")
         reasons = self._blocking_reasons(audit)
         if reasons:
             raise MigrationBlocked(",".join(reasons))
@@ -201,6 +242,7 @@ class MemoryAuthorityMigrator:
         authority = MemoryAuthorityStore(str(self.authority_db_path))
         created_snapshots: list[str] = []
         imported_memories = imported_rings = 0
+        imported_aliases = 0
 
         for path in sorted(self.buckets_dir.rglob("*.md")):
             metadata, body = _frontmatter(path)
@@ -247,6 +289,42 @@ class MemoryAuthorityMigrator:
                     },
                 )
                 imported_rings += 1
+
+        if self.identity_semantics_db_path and self.identity_semantics_db_path.exists():
+            conn = sqlite3.connect(
+                f"file:{self.identity_semantics_db_path.as_posix()}?mode=ro",
+                uri=True,
+            )
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT a.canonical,a.alias,a.confidence,a.source,e.bucket_id "
+                    "FROM identity_aliases a JOIN identity_alias_evidence e "
+                    "ON e.canonical=a.canonical AND e.alias=a.alias "
+                    "ORDER BY a.canonical,a.alias,e.bucket_id"
+                ).fetchall()
+            finally:
+                conn.close()
+            grouped: dict[tuple[str, str], list[str]] = {}
+            for row in rows:
+                grouped.setdefault(
+                    (str(row["canonical"]), str(row["alias"])), []
+                ).append(str(row["bucket_id"]))
+            for (canonical, alias), bucket_ids in grouped.items():
+                source_refs = [
+                    f"memory:{bucket_id}"
+                    for bucket_id in dict.fromkeys(bucket_ids)
+                    if authority.get_memory(bucket_id)
+                ]
+                if not source_refs:
+                    continue
+                authority.upsert_alias(
+                    entity_id=f"identity:{canonical}",
+                    alias=alias,
+                    trust="trusted_source",
+                    source_refs=source_refs,
+                )
+                imported_aliases += 1
 
         candidate_payload = _json_file(self.candidates_path)
         imported_statuses: Counter[str] = Counter()
@@ -301,6 +379,7 @@ class MemoryAuthorityMigrator:
             "imported_memories": imported_memories,
             "imported_rings": imported_rings,
             "imported_candidates": sum(imported_statuses.values()),
+            "imported_aliases": imported_aliases,
             "candidate_status_counts": dict(sorted(imported_statuses.items())),
             "created_snapshots": len(created_snapshots),
             "bucket_writes": 0,
@@ -316,8 +395,10 @@ def main() -> int:
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--authority-db", required=True)
     parser.add_argument("--backup-dir", required=True)
+    parser.add_argument("--identity-semantics-db")
     parser.add_argument("--expected-candidates", type=int)
     parser.add_argument("--expected-buckets", type=int)
+    parser.add_argument("--expected-aliases", type=int)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     migrator = MemoryAuthorityMigrator(
@@ -326,6 +407,7 @@ def main() -> int:
         state_dir=args.state_dir,
         authority_db_path=args.authority_db,
         backup_dir=args.backup_dir,
+        identity_semantics_db_path=args.identity_semantics_db,
     )
     if not args.apply:
         print(json.dumps(migrator.audit(), ensure_ascii=False, indent=2, sort_keys=True))
@@ -333,8 +415,9 @@ def main() -> int:
     if args.expected_candidates is None or args.expected_buckets is None:
         parser.error("--apply requires --expected-candidates and --expected-buckets")
     result = migrator.apply(
-        expected_candidates=args.expected_candidates,
-        expected_buckets=args.expected_buckets,
+            expected_candidates=args.expected_candidates,
+            expected_buckets=args.expected_buckets,
+            expected_aliases=args.expected_aliases,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

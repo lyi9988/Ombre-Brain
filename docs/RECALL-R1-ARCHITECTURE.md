@@ -418,6 +418,13 @@ bodies, candidate counts/statuses, and source references. It must produce no
 model calls, embeddings, new canonical memories, Bucket writes, or regenerated
 text. Every inconsistency is reported with an explicit reconcile action.
 
+The audit also inventories the existing `IdentitySemanticStore`.  Apply mode
+requires an explicit alias count and imports only aliases backed by evidence
+Buckets that resolve to imported active Memories.  They enter the unified
+authority as `trusted_source`; orphan evidence blocks migration.  The old
+IdentitySemantic DB remains read-only backup evidence and cannot continue as a
+second live alias authority after cutover.
+
 The experience release is not complete until the owner has exercised Auto,
 Review, alias confirmation, body revision, ring append, exact Fast Recall, and
 ambiguous Deep Recall; then the exact immutable artifacts may advance

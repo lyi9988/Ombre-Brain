@@ -1,5 +1,6 @@
 import hashlib
 import asyncio
+import sqlite3
 
 import pytest
 import frontmatter
@@ -725,3 +726,69 @@ def test_apply_migration_requires_explicit_counts_and_blocks_missing_confirmed_b
         migrator.apply(expected_candidates=1, expected_buckets=0)
     assert not (tmp_path / "backup").exists()
     assert not (tmp_path / "state" / "memory_authority.sqlite3").exists()
+
+
+def test_migration_reuses_identity_semantic_evidence_as_trusted_authority_alias(tmp_path):
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text('{"items":[]}', encoding="utf-8")
+    bucket_dir = tmp_path / "buckets" / "dynamic" / "关系"
+    bucket_dir.mkdir(parents=True)
+    (bucket_dir / "memory-1.md").write_text(
+        "---\nid: memory-1\nname: 共同经历\n---\n主人和晏晏的共同经历。\n",
+        encoding="utf-8",
+    )
+    identity_db = tmp_path / "identity_semantics.sqlite"
+    conn = sqlite3.connect(identity_db)
+    conn.executescript("""
+        CREATE TABLE identity_aliases (
+            canonical TEXT NOT NULL, alias TEXT NOT NULL, scope TEXT NOT NULL,
+            confidence REAL NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL,
+            PRIMARY KEY(canonical, alias)
+        );
+        CREATE TABLE identity_alias_evidence (
+            canonical TEXT NOT NULL, alias TEXT NOT NULL, bucket_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL, PRIMARY KEY(canonical, alias, bucket_id)
+        );
+        INSERT INTO identity_aliases VALUES(
+            'yanyan','晏晏','private_relationship',0.91,'evidence_bucket','2026-09-20'
+        );
+        INSERT INTO identity_alias_evidence VALUES(
+            'yanyan','晏晏','memory-1','2026-09-20'
+        );
+    """)
+    conn.commit()
+    conn.close()
+    before_identity = identity_db.read_bytes()
+
+    audit = MemoryMigrationAuditor(
+        candidates_path=candidates,
+        buckets_dir=tmp_path / "buckets",
+        identity_semantics_db_path=identity_db,
+    ).run()
+
+    assert audit["identity_semantics"]["alias_count"] == 1
+    assert audit["identity_semantics"]["eligible_alias_count"] == 1
+    assert audit["identity_semantics"]["orphan_evidence_bucket_ids"] == []
+
+    migrator = MemoryAuthorityMigrator(
+        candidates_path=candidates,
+        buckets_dir=tmp_path / "buckets",
+        state_dir=tmp_path / "state",
+        authority_db_path=tmp_path / "state" / "memory_authority.sqlite3",
+        backup_dir=tmp_path / "backup",
+        identity_semantics_db_path=identity_db,
+    )
+    result = migrator.apply(
+        expected_candidates=0,
+        expected_buckets=1,
+        expected_aliases=1,
+    )
+    authority = MemoryAuthorityStore(str(tmp_path / "state" / "memory_authority.sqlite3"))
+    aliases = authority.list_aliases()
+
+    assert result["imported_aliases"] == 1
+    assert aliases[0]["entity_id"] == "identity:yanyan"
+    assert aliases[0]["trust"] == "trusted_source"
+    assert aliases[0]["source_refs"] == ["memory:memory-1"]
+    assert identity_db.read_bytes() == before_identity
+    assert (tmp_path / "backup" / "identity_semantics.sqlite3.backup").exists()
