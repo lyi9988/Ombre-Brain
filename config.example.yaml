@@ -402,6 +402,7 @@ gateway:
   domain_sentinel_enable_thinking: false   # forced false
   domain_sentinel_max_tokens: 260
   domain_sentinel_timeout_seconds: 4
+  domain_sentinel_remote_in_prepare: false # normal chat/hook uses local rules; remote classification is not on TTFT path
   date_persona_trace_enabled: true   # date words like 昨天/昨晚 add small same-day persona/original-turn trace
   date_persona_trace_budget: 220
   date_persona_trace_max_events: 5
@@ -420,6 +421,12 @@ gateway:
   query_planner_min_chars: 16  # also catches short emotional reason lookups like "今天为什么激动哭"
   query_planner_max_queries: 3
   query_planner_max_tokens: 360
+  query_planner_cache_ttl_seconds: 300 # exact key only: query + model + prompt revision/body
+  query_planner_cache_max_entries: 128
+  semantic_query_cache_ttl_seconds: 300 # exact query cache; embedding DB/WAL stamp invalidates on index change
+  semantic_query_cache_max_entries: 256
+  rerank_cache_ttl_seconds: 300
+  rerank_cache_max_entries: 256
   query_planner_supplemental_semantic: false # planner short queries use keyword/exact by default; avoids repeated embedding calls
   semantic_rescue_enabled: false # optional last gate for semantic-only candidates; validates an exact evidence span
   semantic_rescue_candidate_limit: 3 # one batched cheap-model call, top 1-3 semantic candidates
@@ -740,6 +747,7 @@ memory_authority:
   projection_enabled: true
   projection_interval_seconds: 5
   projection_batch_size: 20
+  moment_request_rebuild_enabled: false # Outbox worker owns incremental Moment updates; request path never full-rebuilds
   ingestion_policy:
     auto_confidence: 0.68
     # daily_chat is derived from reflection.daily_chat_memory_mode. Setting a

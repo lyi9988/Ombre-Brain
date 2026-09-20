@@ -354,3 +354,51 @@ def test_composer_can_disable_and_override_gateway_sources():
     assert "owner memory rule" in dynamic
     assert "live memory" not in dynamic
     assert debug["status"] == "applied"
+
+
+def test_canonical_memory_recall_source_suppresses_legacy_memory_fragments():
+    service = _gateway_service_for_composer()
+    gateway_slice = _legacy_gateway_slice()
+    gateway_slice["blocks"].append({
+        "block_id": "block:ombre.memory_recall",
+        "source_id": "ombre.memory_recall",
+        "scope": "talk.initial",
+        "stage": "ombre_post_injection",
+        "mode": "live_source",
+        "role": "user",
+        "lane": "message",
+        "anchor": "gateway.current_user_prefix",
+        "order": 295,
+        "priority": 295,
+        "enabled": True,
+        "owner_body": "",
+        "frozen_body": "",
+        "wrapper_text": "",
+        "token_budget": None,
+    })
+    stable, dynamic, debug = service._build_composed_context_messages({
+        "preset_id": "preset:test",
+        "preset_revision": 3,
+        "plan_sha256": "f" * 64,
+        "slice_sha256": "e" * 64,
+        "scope": "talk.initial",
+        "gateway_slice": gateway_slice,
+        "binding": {"aiz_binding_revision": 3},
+    }, persona_block="", core_memory="", portrait_memory="",
+       just_now_context="", recent_context="", recalled_memory="legacy-direct",
+       relationship_weather="", favorite_memory="", related_memory="legacy-diffused",
+       targeted_memory_detail="legacy-targeted", dream_context="", active_reminders="",
+       memory_detail_recall_instruction="", handoff_tool_hint="",
+       context_mode="", date_persona_trace="", date_recall="",
+       memory_recall_projection={"body": "one canonical memory projection"})
+
+    assert stable == ""
+    assert dynamic.count("one canonical memory projection") == 1
+    assert "legacy-direct" not in dynamic
+    assert "legacy-targeted" not in dynamic
+    assert "legacy-diffused" not in dynamic
+    resolved_sources = [row["source_id"] for row in debug["resolved_blocks"]]
+    assert resolved_sources.count("ombre.memory_recall") == 1
+    assert "ombre.recalled_memory" not in resolved_sources
+    assert "ombre.targeted_memory_detail" not in resolved_sources
+    assert "ombre.diffused_memory" not in resolved_sources

@@ -97,6 +97,7 @@ from memory_diffusion import (
 from memory_edges import MemoryEdgeStore
 from entity_edges import EntityEdgeStore
 from memory_moments import MemoryMomentStore, parse_bucket_moments, preview_bucket_moment_chunks
+from memory_authority_view import MemoryAuthorityRecallView
 from memory_relevance import (
     active_facets,
     content_terms_for_query,
@@ -156,7 +157,7 @@ from persona_event_selection import (
 )
 from raw_events import RawEventStore, raw_event_text_looks_injected, strip_raw_client_context
 from reminder_store import ReminderStore
-from reranker_engine import RerankerEngine
+from reranker_engine import RerankerEngine, RerankResult
 from self_anchor import is_self_anchor_bucket, is_self_anchor_metadata
 from source_refs import source_ref_window
 from utils import (
@@ -182,6 +183,7 @@ GENERIC_LEXICAL_STOPWORD_KEYS = frozenset(
     if str(term or "").strip()
 )
 FAVORITE_MEMORY_MARKER = "[[ombre:favorite]]"
+RECALL_POLICY_REVISION = "recall-r1"
 RETRYABLE_UPSTREAM_STATUS_CODES = {401, 403, 429, 500, 502, 503, 504}
 # Keep provider connect/write/read bounds below the caller's whole-request
 # watchdog.  The read timeout is applied per streamed read, so a quiet stream
@@ -666,6 +668,18 @@ class GatewayService:
             min(30.0, float(self.gateway_cfg.get("domain_sentinel_timeout_seconds", 4.0))),
         )
         self.domain_sentinel_enable_thinking = False
+        self.domain_sentinel_remote_in_prepare = self._bool_config_value(
+            self.gateway_cfg.get("domain_sentinel_remote_in_prepare"),
+            False,
+        )
+        authority_cfg = self.config.get("memory_authority", {}) if isinstance(
+            self.config.get("memory_authority", {}), dict) else {}
+        self.memory_authority_enabled = bool(authority_cfg.get("enabled", False))
+        self.memory_authority_view = MemoryAuthorityRecallView(self.config)
+        self.moment_request_rebuild_enabled = self._bool_config_value(
+            authority_cfg.get("moment_request_rebuild_enabled"),
+            not self.memory_authority_enabled,
+        )
         self.dynamic_top_k = int(self.gateway_cfg.get("dynamic_top_k", 10))
         self.semantic_candidate_top_k = max(
             self.dynamic_top_k,
@@ -871,6 +885,16 @@ class GatewayService:
         except (TypeError, ValueError):
             embedding_timeout = 3.0
         self.embedding_query_timeout_seconds = max(0.0, min(30.0, embedding_timeout))
+        self.semantic_query_cache_ttl_seconds = max(
+            0.0,
+            min(3600.0, float(self.gateway_cfg.get("semantic_query_cache_ttl_seconds", 300.0))),
+        )
+        self.semantic_query_cache_max_entries = max(
+            0,
+            min(2000, int(self.gateway_cfg.get("semantic_query_cache_max_entries", 256))),
+        )
+        self._semantic_query_cache: dict[str, tuple[float, list[tuple[str, float]]]] = {}
+        self._semantic_query_inflight: dict[str, asyncio.Task] = {}
         self.first_card_min_score = float(self.gateway_cfg.get("first_card_min_score", 0.55))
         self.second_card_min_score = float(self.gateway_cfg.get("second_card_min_score", 0.50))
         self.second_card_relative_score = float(
@@ -917,6 +941,26 @@ class GatewayService:
             0.0,
             0.30,
         )
+        self.query_planner_cache_ttl_seconds = max(
+            0.0,
+            min(3600.0, float(self.gateway_cfg.get("query_planner_cache_ttl_seconds", 300.0))),
+        )
+        self.query_planner_cache_max_entries = max(
+            0,
+            min(1000, int(self.gateway_cfg.get("query_planner_cache_max_entries", 128))),
+        )
+        self._query_planner_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._query_planner_inflight: dict[str, asyncio.Task] = {}
+        self.rerank_cache_ttl_seconds = max(
+            0.0,
+            min(3600.0, float(self.gateway_cfg.get("rerank_cache_ttl_seconds", 300.0))),
+        )
+        self.rerank_cache_max_entries = max(
+            0,
+            min(2000, int(self.gateway_cfg.get("rerank_cache_max_entries", 256))),
+        )
+        self._rerank_cache: dict[str, tuple[float, list[tuple[int, float]]]] = {}
+        self._rerank_inflight: dict[str, asyncio.Task] = {}
         self.semantic_rescue_enabled = self._bool_config_value(
             self.gateway_cfg.get("semantic_rescue_enabled"),
             False,
@@ -4315,8 +4359,9 @@ class GatewayService:
             )
             mark_step("memory_sentinel", stage_started_at)
             sentinel_route = str(memory_sentinel_debug.get("route") or "")
+            recall_execution = self._recall_route_execution_options(sentinel_route)
             sentinel_skip_broad = sentinel_route in {"tone_only", "skip"}
-            sentinel_search = sentinel_route == "search"
+            sentinel_search = sentinel_route in {"search", "fast", "deep"}
             pre_domain_skip_broad = (
                 skip_for_targeted_detail
                 or needs_handoff_first
@@ -4328,7 +4373,10 @@ class GatewayService:
             domain_sentinel_skip_broad = False
             if not pre_domain_skip_broad:
                 stage_started_at = time.perf_counter()
-                domain_sentinel_debug = await self._route_domain_sentinel(current_user_query)
+                domain_sentinel_debug = await self._route_domain_sentinel(
+                    current_user_query,
+                    allow_remote=self.domain_sentinel_remote_in_prepare,
+                )
                 mark_step("domain_sentinel", stage_started_at)
                 domain_sentinel_skip_broad = self._domain_sentinel_should_skip_recall(
                     domain_sentinel_debug,
@@ -4446,6 +4494,9 @@ class GatewayService:
                             memory_sentinel_debug,
                         ),
                         include_query_planner_debug=True,
+                        allow_semantic=recall_execution["allow_semantic"],
+                        allow_query_planner=recall_execution["allow_query_planner"],
+                        allow_rerank=recall_execution["allow_rerank"],
                     )
                     mark_step("dynamic_recall_bucket_select", stage_started_at)
                     stage_started_at = time.perf_counter()
@@ -4502,6 +4553,9 @@ class GatewayService:
                         ),
                         allow_bucket_rerank=self.graph_bucket_rerank_enabled,
                         include_query_planner_debug=True,
+                        allow_semantic=recall_execution["allow_semantic"],
+                        allow_query_planner=recall_execution["allow_query_planner"],
+                        allow_rerank=recall_execution["allow_rerank"],
                     )
                     mark_step("dynamic_recall_graph_select", stage_started_at)
             else:
@@ -4705,6 +4759,14 @@ class GatewayService:
 
         stage_started_at = time.perf_counter()
         prompt_composer_debug = {"status": "legacy_default"}
+        memory_recall_projection = self._build_memory_recall_projection(
+            recalled_memory=recalled_memory,
+            targeted_memory_detail=targeted_memory_detail,
+            related_memory=related_memory,
+            recalled_moments=recalled_moments,
+            targeted_memory_detail_debug=targeted_memory_detail_debug,
+            memory_sentinel_debug=memory_sentinel_debug,
+        )
         context_args = {
             "persona_block": persona_block,
             "core_memory": core_memory,
@@ -4740,7 +4802,10 @@ class GatewayService:
         else:
             stable_context, dynamic_context, prompt_composer_debug = (
                 self._build_composed_context_messages(
-                    prompt_plan, **context_args))
+                    prompt_plan,
+                    **context_args,
+                    memory_recall_projection=memory_recall_projection,
+                ))
         mark_step("build_context_messages", stage_started_at)
 
         stage_started_at = time.perf_counter()
@@ -4890,6 +4955,11 @@ class GatewayService:
             debug_payload["effective_config"] = effective_config
             debug_payload["candidate_stages"] = candidate_stages
             debug_payload["prompt_composer"] = prompt_composer_debug
+            debug_payload["memory_recall_projection"] = {
+                key: value
+                for key, value in memory_recall_projection.items()
+                if key != "body"
+            }
             debug_payload["post_injection_presence"] = {
                 "persona": bool(str(persona_block or "").strip()),
                 "emotion_relationship": bool(str(relationship_weather or "").strip()),
@@ -11501,7 +11571,12 @@ class GatewayService:
             if str(bucket.get("id") or "")
         }
         bucket_edges = self.memory_edge_store.list_edges()
-        signature = self._moment_graph_signature(recallable_buckets, bucket_edges)
+        signature = (
+            f"authority:{store_stamp}:{edge_stamp}"
+            if getattr(self, "memory_authority_enabled", False)
+            and not getattr(self, "moment_request_rebuild_enabled", True)
+            else self._moment_graph_signature(recallable_buckets, bucket_edges)
+        )
         if (
             signature
             and signature == self._moment_graph_cache_signature
@@ -11510,7 +11585,10 @@ class GatewayService:
         ):
             return self._moment_graph_cache_value
         persistent_signature = self.memory_moment_store.source_signature()
-        if not signature or persistent_signature != signature:
+        if (
+            getattr(self, "moment_request_rebuild_enabled", True)
+            and (not signature or persistent_signature != signature)
+        ):
             self.memory_moment_store.bulk_upsert(
                 recallable_buckets,
                 source_signature=signature,
@@ -12578,6 +12656,9 @@ class GatewayService:
         search_query: str = "",
         allow_bucket_rerank: bool = False,
         include_query_planner_debug: bool = False,
+        allow_semantic: bool = True,
+        allow_query_planner: bool = True,
+        allow_rerank: bool = True,
     ) -> tuple[list[dict], list[dict], list[dict], list[dict]] | tuple[
         list[dict], list[dict], list[dict], list[dict], dict[str, Any]
     ]:
@@ -12634,7 +12715,9 @@ class GatewayService:
             session_id,
             all_buckets,
             search_query=search_query,
-            allow_rerank=allow_bucket_rerank,
+            allow_rerank=allow_bucket_rerank and allow_rerank,
+            allow_semantic=allow_semantic,
+            allow_query_planner=allow_query_planner,
             include_query_planner_debug=True,
         )
         candidate_stages = query_planner_debug.setdefault("candidate_stages", [])
@@ -13131,18 +13214,27 @@ class GatewayService:
         if isinstance(diagnostics, dict):
             diagnostics["provider_input_count"] = len(head)
         documents = [self._moment_rerank_document(moment) for moment in head]
-        results = await self.reranker_engine.rerank(query, documents, top_n=len(head))
+        cache_debug: dict[str, Any] = {}
+        results = await self._rerank_cached(
+            namespace="moment",
+            query=query,
+            documents=documents,
+            top_n=len(head),
+            cache_debug=cache_debug,
+        )
         if not results:
             if isinstance(diagnostics, dict):
                 diagnostics.update({
                     "provider_output_count": 0,
                     "skipped": False,
+                    "cache": cache_debug,
                 })
             return candidates
         if isinstance(diagnostics, dict):
             diagnostics.update({
                 "provider_output_count": len(results),
                 "skipped": False,
+                "cache": cache_debug,
             })
 
         by_index = {result.index: result.score for result in results}
@@ -15202,7 +15294,7 @@ class GatewayService:
                 else:
                     base = self._entity_priority_recall_search_query(query)
         anchors = []
-        if isinstance(sentinel_debug, dict) and sentinel_debug.get("route") == "search":
+        if isinstance(sentinel_debug, dict) and sentinel_debug.get("route") in {"search", "fast", "deep"}:
             anchors = self._normalize_planner_terms(sentinel_debug.get("anchors"))
         if not anchors:
             return base
@@ -15732,7 +15824,18 @@ class GatewayService:
             "hard_bypass_reason": "",
             "rule_route": False,
             "searchable_residue_terms": [],
+            "owner_alias_matches": [],
+            "route_reason_codes": [],
             "original_query": self._clip_text(str(query or ""), 500),
+        }
+
+    @staticmethod
+    def _recall_route_execution_options(route: str) -> dict[str, bool]:
+        deep = str(route or "").strip().lower() == "deep"
+        return {
+            "allow_semantic": deep,
+            "allow_query_planner": deep,
+            "allow_rerank": deep,
         }
 
     async def _route_memory_sentinel(
@@ -15748,6 +15851,36 @@ class GatewayService:
     ) -> dict[str, Any]:
         debug = self._memory_sentinel_debug_base(query)
         debug["searchable_residue_terms"] = self._memory_sentinel_searchable_residue_terms(query)
+        authority_view = getattr(self, "memory_authority_view", None)
+        alias_matches = authority_view.match_aliases(query) if authority_view else []
+        if alias_matches:
+            debug.update(
+                route="fast",
+                reason="owner-confirmed alias",
+                anchors=list(dict.fromkeys([
+                    *[str(row.get("alias") or "") for row in alias_matches],
+                    *[str(row.get("entity_id") or "") for row in alias_matches],
+                ])),
+                confidence=1.0,
+                hard_bypass_reason="owner_alias",
+                owner_alias_matches=[{
+                    "alias_id": str(row.get("alias_id") or ""),
+                    "entity_id": str(row.get("entity_id") or ""),
+                    "alias": str(row.get("alias") or ""),
+                    "trust": str(row.get("trust") or ""),
+                    "revision": int(row.get("revision") or 0),
+                } for row in alias_matches],
+                route_reason_codes=["FAST_OWNER_ALIAS"],
+            )
+            return debug
+        if self._query_looks_emotional_reason_lookup(query):
+            debug.update(
+                route="deep",
+                reason="emotional or causal lookup",
+                confidence=0.9,
+                route_reason_codes=["DEEP_EMOTIONAL_REASON"],
+            )
+            return debug
         hard_bypass = self._memory_sentinel_hard_bypass_reason(
             query,
             all_buckets,
@@ -15758,6 +15891,37 @@ class GatewayService:
         )
         if hard_bypass:
             debug["hard_bypass_reason"] = hard_bypass
+            if hard_bypass == "explicit_recall_marker":
+                debug.update(
+                    route="deep",
+                    reason="explicit recall request",
+                    confidence=0.95,
+                    route_reason_codes=["DEEP_EXPLICIT_RECALL"],
+                )
+            elif hard_bypass in {"explicit_memory_id", "exact_anchor", "source_record"}:
+                code = {
+                    "explicit_memory_id": "FAST_EXPLICIT_MEMORY_ID",
+                    "exact_anchor": "FAST_EXACT_ANCHOR",
+                    "source_record": "FAST_SOURCE_RECORD",
+                }[hard_bypass]
+                debug.update(
+                    route="fast",
+                    reason=hard_bypass,
+                    confidence=1.0,
+                    route_reason_codes=[code],
+                )
+            elif hard_bypass in {"searchable_residue", "entity", "topic_evidence_marker"}:
+                code = {
+                    "searchable_residue": "FAST_LOCAL_TOPIC",
+                    "entity": "FAST_ENTITY",
+                    "topic_evidence_marker": "FAST_TOPIC_EVIDENCE",
+                }[hard_bypass]
+                debug.update(
+                    route="fast",
+                    reason=hard_bypass,
+                    confidence=0.8,
+                    route_reason_codes=[code],
+                )
             return debug
         if not self.memory_sentinel_enabled or not str(query or "").strip():
             return debug
@@ -15766,6 +15930,10 @@ class GatewayService:
         if rule_plan:
             debug["rule_route"] = True
             debug.update(rule_plan)
+            if debug.get("route") == "skip":
+                debug["route_reason_codes"] = ["SKIP_NO_MEMORY_SIGNAL"]
+            elif debug.get("route") == "tone_only":
+                debug["route_reason_codes"] = ["SKIP_TONE_ONLY"]
             return debug
         return debug
 
@@ -16120,7 +16288,12 @@ class GatewayService:
             or ""
         ).strip()
 
-    async def _route_domain_sentinel(self, query: str) -> dict[str, Any]:
+    async def _route_domain_sentinel(
+        self,
+        query: str,
+        *,
+        allow_remote: bool = True,
+    ) -> dict[str, Any]:
         debug = self._domain_sentinel_rule_plan(query)
         if self._domain_sentinel_query_explicitly_needs_memory(query):
             debug.update(
@@ -16133,6 +16306,9 @@ class GatewayService:
             )
             return debug
         if self._domain_sentinel_should_skip_recall(debug, query):
+            return debug
+        if not allow_remote:
+            debug["remote_skip_reason"] = "prepare_uses_local_rules"
             return debug
         if not self.domain_sentinel_enabled or not self.domain_sentinel_model:
             return debug
@@ -16960,12 +17136,84 @@ class GatewayService:
         return False
 
     async def _call_query_planner(self, query: str) -> tuple[dict[str, Any] | None, str | None]:
+        if not hasattr(self, "_query_planner_cache"):
+            self._query_planner_cache = {}
+            self._query_planner_inflight = {}
+            self.query_planner_cache_ttl_seconds = 300.0
+            self.query_planner_cache_max_entries = 128
         model = self.query_planner_model
         if not model:
             return None, "query_planner_model_missing"
         planner_prompt = self._resolve_gateway_background_prompt(
             "ombre.memory_query_planner_prompt", "memory.query_planner",
             QUERY_PLANNER_SYSTEM_PROMPT)
+        cache_material = {
+            "query": str(query or ""),
+            "model": model,
+            "model_source": "dehydration" if self.query_planner_uses_dehydrator else "gateway",
+            "base_url": (
+                str(getattr(self.dehydrator, "base_url", "") or "")
+                if self.query_planner_uses_dehydrator
+                else "gateway_model_route"
+            ),
+            "prompt_sha256": hashlib.sha256(planner_prompt.encode("utf-8")).hexdigest(),
+            "max_queries": self.query_planner_max_queries,
+            "max_tokens": self.query_planner_max_tokens,
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(cache_material, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        now = time.monotonic()
+        cached = self._query_planner_cache.get(cache_key)
+        if cached and cached[0] > now:
+            plan = deepcopy(cached[1])
+            plan["_cache"] = {"status": "hit", "key": cache_key[:16]}
+            return plan, None
+        if cached:
+            self._query_planner_cache.pop(cache_key, None)
+        inflight = self._query_planner_inflight.get(cache_key)
+        if inflight is not None:
+            try:
+                plan, error = await asyncio.shield(inflight)
+            except asyncio.CancelledError:
+                raise
+            if plan:
+                plan = deepcopy(plan)
+                plan["_cache"] = {"status": "singleflight", "key": cache_key[:16]}
+            return plan, error
+
+        task = asyncio.create_task(
+            self._call_query_planner_uncached(query, planner_prompt)
+        )
+        self._query_planner_inflight[cache_key] = task
+        try:
+            plan, error = await asyncio.shield(task)
+            if (
+                plan
+                and not error
+                and self.query_planner_cache_ttl_seconds > 0
+                and self.query_planner_cache_max_entries > 0
+            ):
+                self._query_planner_cache[cache_key] = (
+                    time.monotonic() + self.query_planner_cache_ttl_seconds,
+                    deepcopy(plan),
+                )
+                while len(self._query_planner_cache) > self.query_planner_cache_max_entries:
+                    self._query_planner_cache.pop(next(iter(self._query_planner_cache)))
+            if plan:
+                plan = deepcopy(plan)
+                plan["_cache"] = {"status": "miss", "key": cache_key[:16]}
+            return plan, error
+        finally:
+            if self._query_planner_inflight.get(cache_key) is task:
+                self._query_planner_inflight.pop(cache_key, None)
+
+    async def _call_query_planner_uncached(
+        self,
+        query: str,
+        planner_prompt: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        model = self.query_planner_model
         payload = {
             "model": model,
             "messages": [
@@ -18280,9 +18528,14 @@ class GatewayService:
             reason="empty normalized query" if not normalized_query else "keyword score hits",
         )
         stage_started_at = time.perf_counter()
+        semantic_cache_debug: dict[str, Any] = {}
         if allow_semantic:
             semantic_query = self._identity_name_semantic_query(raw_query) or raw_query
-            semantic_scores = await self._get_semantic_candidates(semantic_query, set(semantic_bucket_map))
+            semantic_scores = await self._get_semantic_candidates(
+                semantic_query,
+                set(semantic_bucket_map),
+                cache_debug=semantic_cache_debug,
+            )
         else:
             semantic_scores = {}
         mark("semantic_candidates", stage_started_at)
@@ -18293,6 +18546,7 @@ class GatewayService:
             limit=self.semantic_candidate_top_k,
             skipped=not allow_semantic,
             reason="disabled for this recall branch" if not allow_semantic else "eligible ids after embedding search",
+            cache=semantic_cache_debug,
         )
         bucket_map = dict(eligible_map)
         for bucket_id in semantic_scores:
@@ -18365,7 +18619,10 @@ class GatewayService:
             for bucket in all_buckets
             if isinstance(bucket, dict) and str(bucket.get("id") or "").strip()
         }
-        entity_edge_boosts = self._get_entity_edge_boosts(raw_query, all_bucket_ids)
+        entity_edge_boosts = self._get_entity_edge_boosts(
+            normalized_query or raw_query,
+            all_bucket_ids,
+        )
         candidate_ids |= set(entity_edge_boosts)
         record(
             "candidate_union",
@@ -18753,7 +19010,22 @@ class GatewayService:
         planner_debug = self._query_planner_debug_base(query)
         timing_debug = planner_debug.setdefault("timing_ms", {})
         candidate_stages = planner_debug.setdefault("candidate_stages", [])
+        planner_task = None
+        planner_parallel_started_at = 0.0
+        planner_pretrigger = ""
+        if allow_query_planner and self.query_planner_enabled:
+            if self._query_looks_multi_topic(query):
+                planner_pretrigger = "multi_topic"
+            elif self._query_looks_emotional_reason_lookup(query):
+                planner_pretrigger = "emotional_reason_lookup"
+            if planner_pretrigger:
+                planner_parallel_started_at = time.perf_counter()
+                planner_task = asyncio.create_task(self._call_query_planner(query))
+                planner_debug["parallel_started"] = True
+                planner_debug["parallel_pretrigger"] = planner_pretrigger
         if not query or self.inject_max_cards <= 0:
+            if planner_task is not None:
+                planner_task.cancel()
             if include_query_planner_debug:
                 return [], [], planner_debug
             return [], []
@@ -18762,6 +19034,8 @@ class GatewayService:
             and not str(search_query or "").strip()
             and not self._has_named_exact_anchor_candidate(query, all_buckets)
         ):
+            if planner_task is not None:
+                planner_task.cancel()
             planner_debug["skip_reason"] = "auto_vague_query"
             if include_query_planner_debug:
                 return [], [], planner_debug
@@ -18922,7 +19196,15 @@ class GatewayService:
             planner_debug["triggered"] = True
             planner_debug["trigger_reason"] = trigger_reason
             stage_started_at = time.perf_counter()
-            plan, error = await self._call_query_planner(query)
+            if planner_task is not None:
+                plan, error = await planner_task
+                planner_debug["parallel_reused"] = True
+                planner_debug["parallel_wall_ms"] = max(
+                    0,
+                    int((time.perf_counter() - planner_parallel_started_at) * 1000),
+                )
+            else:
+                plan, error = await self._call_query_planner(query)
             self._add_timing_ms(timing_debug, "query_planner_call", stage_started_at)
             if error:
                 planner_debug["errors"].append(error)
@@ -18931,6 +19213,7 @@ class GatewayService:
                     if plan:
                         planner_debug["errors"].append("query_planner_fallback_used")
             if plan:
+                planner_debug["cache"] = dict(plan.pop("_cache", {}) or {})
                 planner_debug["queries"] = plan.get("queries", [])
                 if plan.get("should_search") and not plan.get("too_vague"):
                     supplemental_items: list[dict] = []
@@ -19018,6 +19301,15 @@ class GatewayService:
             planner_debug["skip_reason"] = "query_planner_disabled_for_hook_fast_path"
         elif self.query_planner_enabled:
             planner_debug["skip_reason"] = "direct_recall_ok_or_query_short"
+        if planner_task is not None and not planner_task.done() and not trigger_reason:
+            planner_task.cancel()
+            planner_debug["parallel_cancelled"] = True
+        elif planner_task is not None and planner_task.done() and not trigger_reason:
+            try:
+                planner_task.result()
+            except BaseException:
+                pass
+            planner_debug["parallel_unused"] = True
 
         planner_debug["final_bucket_ids"] = [
             str((item.get("bucket") or {}).get("id") or "")
@@ -19380,6 +19672,68 @@ class GatewayService:
             return semantic_score
         return 0.0
 
+    async def _rerank_cached(
+        self,
+        *,
+        namespace: str,
+        query: str,
+        documents: list[str],
+        top_n: int,
+        cache_debug: dict[str, Any] | None = None,
+    ) -> list[RerankResult]:
+        if not hasattr(self, "_rerank_cache"):
+            self._rerank_cache = {}
+            self._rerank_inflight = {}
+            self.rerank_cache_ttl_seconds = 300.0
+            self.rerank_cache_max_entries = 256
+        material = {
+            "namespace": namespace,
+            "query": str(query or ""),
+            "documents": [hashlib.sha256(str(doc).encode("utf-8")).hexdigest() for doc in documents],
+            "model": str(getattr(self.reranker_engine, "model", "") or ""),
+            "base_url": str(getattr(self.reranker_engine, "base_url", "") or ""),
+            "top_n": int(top_n),
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        now = time.monotonic()
+        cached = self._rerank_cache.get(cache_key)
+        if cached and cached[0] > now:
+            if isinstance(cache_debug, dict):
+                cache_debug.update(status="hit", key=cache_key[:16])
+            return [RerankResult(index=index, score=score) for index, score in cached[1]]
+        if cached:
+            self._rerank_cache.pop(cache_key, None)
+        inflight = self._rerank_inflight.get(cache_key)
+        if inflight is not None:
+            if isinstance(cache_debug, dict):
+                cache_debug.update(status="singleflight", key=cache_key[:16])
+            rows = await asyncio.shield(inflight)
+            return [RerankResult(index=index, score=score) for index, score in rows]
+
+        async def execute() -> list[tuple[int, float]]:
+            results = await self.reranker_engine.rerank(query, documents, top_n=top_n)
+            return [(int(result.index), float(result.score)) for result in results]
+
+        task = asyncio.create_task(execute())
+        self._rerank_inflight[cache_key] = task
+        try:
+            rows = list(await asyncio.shield(task))
+            if self.rerank_cache_ttl_seconds > 0 and self.rerank_cache_max_entries > 0:
+                self._rerank_cache[cache_key] = (
+                    time.monotonic() + self.rerank_cache_ttl_seconds,
+                    list(rows),
+                )
+                while len(self._rerank_cache) > self.rerank_cache_max_entries:
+                    self._rerank_cache.pop(next(iter(self._rerank_cache)))
+            if isinstance(cache_debug, dict):
+                cache_debug.update(status="miss", key=cache_key[:16])
+            return [RerankResult(index=index, score=score) for index, score in rows]
+        finally:
+            if self._rerank_inflight.get(cache_key) is task:
+                self._rerank_inflight.pop(cache_key, None)
+
     async def _rerank_scored_bucket_candidates(
         self,
         query: str,
@@ -19411,18 +19765,27 @@ class GatewayService:
         if isinstance(diagnostics, dict):
             diagnostics["provider_input_count"] = len(head)
         documents = [self._bucket_rerank_document(item["bucket"]) for item in head]
-        results = await self.reranker_engine.rerank(query, documents, top_n=len(head))
+        cache_debug: dict[str, Any] = {}
+        results = await self._rerank_cached(
+            namespace="bucket",
+            query=query,
+            documents=documents,
+            top_n=len(head),
+            cache_debug=cache_debug,
+        )
         if not results:
             if isinstance(diagnostics, dict):
                 diagnostics.update({
                     "provider_output_count": 0,
                     "skipped": False,
+                    "cache": cache_debug,
                 })
             return scored_candidates
         if isinstance(diagnostics, dict):
             diagnostics.update({
                 "provider_output_count": len(results),
                 "skipped": False,
+                "cache": cache_debug,
             })
 
         by_index = {result.index: result.score for result in results}
@@ -20294,16 +20657,94 @@ class GatewayService:
         scored.sort(key=lambda item: item[1], reverse=True)
         return {bucket_id: score for bucket_id, score in scored[: self.dynamic_top_k]}
 
-    async def _get_semantic_candidates(self, query: str, eligible_ids: set[str]) -> dict[str, float]:
+    def _embedding_store_cache_stamp(self) -> tuple[int, int, int, int]:
+        path = str(getattr(self.embedding_engine, "db_path", "") or "")
+        values: list[int] = []
+        for candidate in (path, f"{path}-wal" if path else ""):
+            if not candidate:
+                values.extend([0, 0])
+                continue
+            try:
+                stat = os.stat(candidate)
+                values.extend([int(stat.st_mtime_ns), int(stat.st_size)])
+            except OSError:
+                values.extend([0, 0])
+        return tuple(values)  # type: ignore[return-value]
+
+    async def _semantic_search_cached(
+        self,
+        query: str,
+        *,
+        cache_debug: dict[str, Any] | None = None,
+    ) -> list[tuple[str, float]]:
+        if not hasattr(self, "_semantic_query_cache"):
+            self._semantic_query_cache = {}
+            self._semantic_query_inflight = {}
+            self.semantic_query_cache_ttl_seconds = 300.0
+            self.semantic_query_cache_max_entries = 256
+        material = {
+            "query": str(query or ""),
+            "model": str(getattr(self.embedding_engine, "model", "") or ""),
+            "base_url": str(getattr(self.embedding_engine, "base_url", "") or ""),
+            "top_k": self.semantic_candidate_top_k,
+            "store_stamp": self._embedding_store_cache_stamp(),
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        now = time.monotonic()
+        cached = self._semantic_query_cache.get(cache_key)
+        if cached and cached[0] > now:
+            if isinstance(cache_debug, dict):
+                cache_debug.update(status="hit", key=cache_key[:16])
+            return list(cached[1])
+        if cached:
+            self._semantic_query_cache.pop(cache_key, None)
+        inflight = self._semantic_query_inflight.get(cache_key)
+        if inflight is not None:
+            if isinstance(cache_debug, dict):
+                cache_debug.update(status="singleflight", key=cache_key[:16])
+            return list(await asyncio.shield(inflight))
+
+        async def execute() -> list[tuple[str, float]]:
+            search = self.embedding_engine.search_similar(
+                query,
+                top_k=self.semantic_candidate_top_k,
+            )
+            if self.embedding_query_timeout_seconds > 0:
+                return list(await asyncio.wait_for(search, timeout=self.embedding_query_timeout_seconds))
+            return list(await search)
+
+        task = asyncio.create_task(execute())
+        self._semantic_query_inflight[cache_key] = task
+        try:
+            results = list(await asyncio.shield(task))
+            if self.semantic_query_cache_ttl_seconds > 0 and self.semantic_query_cache_max_entries > 0:
+                self._semantic_query_cache[cache_key] = (
+                    time.monotonic() + self.semantic_query_cache_ttl_seconds,
+                    list(results),
+                )
+                while len(self._semantic_query_cache) > self.semantic_query_cache_max_entries:
+                    self._semantic_query_cache.pop(next(iter(self._semantic_query_cache)))
+            if isinstance(cache_debug, dict):
+                cache_debug.update(status="miss", key=cache_key[:16])
+            return results
+        finally:
+            if self._semantic_query_inflight.get(cache_key) is task:
+                self._semantic_query_inflight.pop(cache_key, None)
+
+    async def _get_semantic_candidates(
+        self,
+        query: str,
+        eligible_ids: set[str],
+        *,
+        cache_debug: dict[str, Any] | None = None,
+    ) -> dict[str, float]:
         if not getattr(self.embedding_engine, "enabled", False):
             return {}
 
         try:
-            search = self.embedding_engine.search_similar(query, top_k=self.semantic_candidate_top_k)
-            if self.embedding_query_timeout_seconds > 0:
-                results = await asyncio.wait_for(search, timeout=self.embedding_query_timeout_seconds)
-            else:
-                results = await search
+            results = await self._semantic_search_cached(query, cache_debug=cache_debug)
         except asyncio.TimeoutError:
             logger.warning(
                 "Gateway embedding semantic search timed out | query_chars=%s timeout_seconds=%.2f",
@@ -20968,6 +21409,91 @@ class GatewayService:
         remaining = max(0, self.inject_total_budget - stable_tokens)
         return stable_context, self._trim_text(dynamic_context, remaining)
 
+    def _build_memory_recall_projection(
+        self,
+        *,
+        recalled_memory: str,
+        targeted_memory_detail: str,
+        related_memory: str,
+        recalled_moments: list[dict],
+        targeted_memory_detail_debug: dict[str, Any],
+        memory_sentinel_debug: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build the one request-local Memory source consumed by Composer.
+
+        Recall decides evidence and body.  Composer may only place/wrap/budget
+        this projection; it must not re-run retrieval or own Memory facts.
+        """
+        sections: list[str] = []
+
+        def add(title: str, body: str) -> None:
+            text = str(body or "").strip()
+            if text:
+                sections.extend([title, text])
+
+        add("Recalled Memory", recalled_memory)
+        add("Targeted Memory Detail", targeted_memory_detail)
+        add("Diffused Memory", related_memory)
+        body = "\n\n".join(sections).strip()
+        selected_memory_ids = list(dict.fromkeys([
+            *[
+                str(moment.get("bucket_id") or "").strip()
+                for moment in recalled_moments or []
+                if str(moment.get("bucket_id") or "").strip()
+            ],
+            *[
+                str(item or "").strip()
+                for item in (targeted_memory_detail_debug or {}).get("accepted_ids", []) or []
+                if str(item or "").strip()
+            ],
+            *self._extract_bucket_ids_from_context(related_memory),
+        ]))
+        ring_ids = list(dict.fromkeys(
+            str(
+                moment.get("ring_id")
+                or (moment.get("metadata") or {}).get("ring_id")
+                or ""
+            ).strip()
+            for moment in recalled_moments or []
+            if str(
+                moment.get("ring_id")
+                or (moment.get("metadata") or {}).get("ring_id")
+                or ""
+            ).strip()
+        ))
+        authority_view = getattr(self, "memory_authority_view", None)
+        watermark = authority_view.watermark() if authority_view else {"available": False}
+        revisions = (
+            authority_view.memory_revision_map(selected_memory_ids)
+            if authority_view else {}
+        )
+        component_hashes = {
+            "direct": hashlib.sha256(str(recalled_memory or "").encode("utf-8")).hexdigest(),
+            "targeted": hashlib.sha256(str(targeted_memory_detail or "").encode("utf-8")).hexdigest(),
+            "diffused": hashlib.sha256(str(related_memory or "").encode("utf-8")).hexdigest(),
+        }
+        route = str((memory_sentinel_debug or {}).get("route") or "skip")
+        reason_codes = self._debug_str_list(
+            (memory_sentinel_debug or {}).get("route_reason_codes")
+        )
+        return {
+            "source_id": "ombre.memory_recall",
+            "authority": "ombre.memory_authority",
+            "body_mode": "dynamic",
+            "status": "ready" if body else "empty",
+            "route": route,
+            "reason_codes": reason_codes,
+            "policy_revision": RECALL_POLICY_REVISION,
+            "authority_watermark": watermark,
+            "selected_memory_ids": selected_memory_ids,
+            "selected_memory_revisions": revisions,
+            "selected_ring_ids": ring_ids,
+            "body": body,
+            "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "component_sha256": component_hashes,
+            "token_estimate": count_tokens_approx(body),
+        }
+
     @staticmethod
     def _prompt_scope_chain(gateway_slice: dict, scope: str) -> list[str]:
         inheritance = ((gateway_slice.get("settings") or {}).get(
@@ -21023,6 +21549,7 @@ class GatewayService:
         dream_context: str, active_reminders: str,
         memory_detail_recall_instruction: str, handoff_tool_hint: str,
         context_mode: str, date_persona_trace: str, date_recall: str,
+        memory_recall_projection: dict[str, Any] | None = None,
     ) -> tuple[str, str, dict[str, Any]]:
         """Compile the verified Gateway slice against live Ombre sources.
 
@@ -21137,6 +21664,10 @@ class GatewayService:
                 and str(self.identity.get("ai_name") or "").strip()
                 not in {"AI", "assistant"} else "Favorite Memory"), favorite_memory),
             "ombre.dream_context": ("Dream Context", dream_content),
+            "ombre.memory_recall": (
+                None,
+                str((memory_recall_projection or {}).get("body") or ""),
+            ),
             **fixed_source_values,
         }
         blocks = [
@@ -21147,6 +21678,20 @@ class GatewayService:
         blocks.sort(key=lambda item: (
             int(item.get("order") or 0), int(item.get("priority") or 0),
             str(item.get("block_id") or "")))
+        canonical_memory_source_present = any(
+            str(item.get("source_id") or "") == "ombre.memory_recall"
+            for item in blocks
+        )
+        if canonical_memory_source_present:
+            legacy_memory_sources = {
+                "ombre.recalled_memory",
+                "ombre.targeted_memory_detail",
+                "ombre.diffused_memory",
+            }
+            blocks = [
+                item for item in blocks
+                if str(item.get("source_id") or "") not in legacy_memory_sources
+            ]
         stable_sections: list[str] = []
         dynamic_sections: list[str] = []
         resolved = []
@@ -21467,6 +22012,38 @@ class GatewayService:
             return [str(item) for item in value if str(item).strip()]
         return [str(value)]
 
+    @staticmethod
+    def _admission_reason_code(reason: str, *, status: str) -> str:
+        key = str(reason or "").strip().lower()
+        mapping = {
+            "topic_evidence": "ADMIT_TOPIC_EVIDENCE",
+            "strong_semantic": "ADMIT_STRONG_SEMANTIC",
+            "strong_rerank": "ADMIT_STRONG_RERANK",
+            "high_confidence_direct_edge": "ADMIT_STRONG_ENTITY_EDGE",
+            "non_explicit_query": "ADMIT_NON_EXPLICIT_RELIABLE",
+            "anchor_must_group_missing": "REJECT_ANCHOR_GROUP_MISSING",
+            "activated_axis_mismatch": "REJECT_AXIS_MISMATCH",
+            "explicit_query_without_reliable_evidence": "REJECT_NO_RELIABLE_EVIDENCE",
+            "tech_domain_without_query_anchor": "REJECT_TECH_WITHOUT_ANCHOR",
+            "low_recall_evidence": "REJECT_LOW_RECALL_EVIDENCE",
+            "discriminative_anchor_missing": "REJECT_DISCRIMINATIVE_ANCHOR_MISSING",
+            "category_overview_item_missing": "REJECT_CATEGORY_ITEM_MISSING",
+            "no_hard_evidence": "REJECT_NO_HARD_EVIDENCE",
+            "semantic_only": "REJECT_SEMANTIC_ONLY",
+            "retrieval_alias_only": "REJECT_ALIAS_ONLY",
+            "generic_category_only": "REJECT_GENERIC_CATEGORY_ONLY",
+            "weak_evidence_only": "REJECT_WEAK_EVIDENCE_ONLY",
+            "session_hard_exclude": "REJECT_SESSION_HARD_EXCLUDE",
+            "semantic_session_dedupe": "REJECT_SESSION_DEDUPED",
+            "planner_must_terms_missing": "REJECT_PLANNER_TERMS_MISSING",
+            "word_map_topic_evidence_missing": "REJECT_WORD_MAP_ONLY",
+        }
+        if key in mapping:
+            return mapping[key]
+        prefix = "ADMIT" if str(status or "").lower() in {"selected", "admitted", "injected"} else "REJECT"
+        normalized = re.sub(r"[^A-Z0-9]+", "_", key.upper()).strip("_") or "UNSPECIFIED"
+        return f"{prefix}_{normalized}"
+
     def _recall_why_debug(
         self,
         item: dict[str, Any],
@@ -21634,6 +22211,7 @@ class GatewayService:
             },
             "admission": {
                 "reason": admission_reason,
+                "code": self._admission_reason_code(admission_reason, status=status),
                 "policy_debug": debug if isinstance(debug, dict) else {},
                 "semantic_session_dedupe": {
                     "similarity": (
@@ -22430,7 +23008,7 @@ class GatewayService:
         memory_sentinel_debug = self._memory_sentinel_debug_base(query)
         memory_sentinel_debug["searchable_residue_terms"] = self._memory_sentinel_searchable_residue_terms(query)
         query_planner_debug = self._query_planner_debug_base(query)
-        domain_sentinel_debug = await self._route_domain_sentinel(query)
+        domain_sentinel_debug = await self._route_domain_sentinel(query, allow_remote=False)
         if max_cards <= 0:
             return [], [], {
                 "query_preview": self._clip_text(query, 500),

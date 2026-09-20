@@ -120,7 +120,7 @@ DYNAMIC_CONTEXT_SOURCES = frozenset({
     "ombre.diffused_memory", "ombre.recent_context",
     "ombre.date_persona_trace", "ombre.handoff_hint", "ombre.persona_state",
     "ombre.relationship_weather", "ombre.favorite_memory",
-    "ombre.dream_context",
+    "ombre.dream_context", "ombre.memory_recall",
 })
 
 
