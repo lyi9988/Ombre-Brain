@@ -138,18 +138,23 @@ class MemoryProjectionWorker:
             enabled=word_enabled,
             action=(lambda: self.word_map_store.upsert_bucket(bucket)) if word_enabled else None,
         ))
-        identity_enabled = bool(
-            self.identity_semantic_store
-            and getattr(self.identity_semantic_store, "enabled", False)
-        )
-        if identity_enabled:
+        if self.authority is not None:
             results.append(self._record_status(
-                memory_id, revision, "identity_semantics", "pending_rebuild", source_sha,
-                {"reason": "legacy_store_requires_full_rebuild"},
+                memory_id, revision, "identity_semantics", "projected", source_sha,
+                {"authority": "memory_authority", "legacy_rebuild": False},
             ))
         else:
+            identity_enabled = bool(
+                self.identity_semantic_store
+                and getattr(self.identity_semantic_store, "enabled", False)
+            )
             results.append(self._record_status(
-                memory_id, revision, "identity_semantics", "disabled", source_sha, {},
+                memory_id,
+                revision,
+                "identity_semantics",
+                "pending_rebuild" if identity_enabled else "disabled",
+                source_sha,
+                {"reason": "legacy_store_requires_full_rebuild"} if identity_enabled else {},
             ))
         results.append(self._record_status(
             memory_id, revision, "memory_edges", "pending_rebuild", source_sha,
@@ -182,8 +187,14 @@ class MemoryProjectionWorker:
             {"reason": "delete_requires_word_map_rebuild"},
         ))
         results.append(self._record_status(
-            memory_id, revision, "identity_semantics", "pending_rebuild", source_sha,
-            {"reason": "delete_requires_identity_rebuild"},
+            memory_id,
+            revision,
+            "identity_semantics",
+            "projected" if self.authority is not None else "pending_rebuild",
+            source_sha,
+            ({"authority": "memory_authority", "legacy_rebuild": False}
+             if self.authority is not None
+             else {"reason": "delete_requires_identity_rebuild"}),
         ))
         return results
 

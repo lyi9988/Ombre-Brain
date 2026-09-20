@@ -2443,15 +2443,26 @@ def _bucket_dashboard_sort_key(item: dict) -> tuple[str, str]:
 
 def _identity_seed_alias_terms() -> set[str]:
     terms = set()
-    try:
-        terms |= {
-            str(alias).strip()
-            for node in identity_semantic_store.load_private_nodes()
-            for alias in node.seed_aliases
-            if str(alias).strip()
-        }
-    except Exception as e:
-        logger.warning("Failed to load private identity seed aliases: %s", e)
+    if memory_authority_store is not None:
+        try:
+            terms |= {
+                str(item.get("alias") or "").strip()
+                for item in memory_authority_store.list_aliases(state="active", trust="owner")
+                + memory_authority_store.list_aliases(state="active", trust="trusted_source")
+                if str(item.get("alias") or "").strip()
+            }
+        except Exception as e:
+            logger.warning("Failed to load Memory authority identity aliases: %s", e)
+    else:
+        try:
+            terms |= {
+                str(alias).strip()
+                for node in identity_semantic_store.load_private_nodes()
+                for alias in node.seed_aliases
+                if str(alias).strip()
+            }
+        except Exception as e:
+            logger.warning("Failed to load private identity seed aliases: %s", e)
     try:
         terms |= {str(item).strip() for item in reflection_identity_terms(config) if str(item).strip()}
     except Exception as e:
@@ -2538,6 +2549,26 @@ def _word_map_should_run_daily_rebuild(
 
 
 def _identity_semantics_payload(alias_limit: int = 100) -> dict:
+    if memory_authority_store is not None:
+        aliases = memory_authority_store.list_aliases(
+            state="active",
+            trust="all",
+            limit=_int_between(alias_limit, 100, 1, 1000),
+        )
+        return {
+            "enabled": True,
+            "authority": "memory_authority",
+            "private_configured": False,
+            "stats": {
+                "aliases": len(aliases),
+                "owner": sum(1 for item in aliases if item.get("trust") == "owner"),
+                "trusted_source": sum(
+                    1 for item in aliases if item.get("trust") == "trusted_source"
+                ),
+                "auto": sum(1 for item in aliases if item.get("trust") == "auto"),
+            },
+            "aliases": aliases,
+        }
     aliases = identity_semantic_store.list_aliases()
     return {
         "enabled": bool(getattr(identity_semantic_store, "enabled", False)),
@@ -10962,6 +10993,12 @@ async def api_identity_semantics_rebuild(request):
     err = _require_dashboard_auth(request)
     if err:
         return err
+    if memory_authority_store is not None:
+        return JSONResponse({
+            "error": "identity aliases are owned by Memory authority",
+            "authority": "memory_authority",
+            "rebuild_allowed": False,
+        }, status_code=409)
     try:
         body = await request.json()
     except Exception:

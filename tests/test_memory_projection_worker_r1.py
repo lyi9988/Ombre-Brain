@@ -236,6 +236,11 @@ def test_revision_outbox_all_projectors_projected_and_status_has_exact_revision_
     assert {item["status"] for item in statuses if item["projector"] in {
         "embedding", "moments", "memory_node", "entity_edges", "word_map"
     }} == {"projected"}
+    identity_status = next(
+        item for item in statuses if item["projector"] == "identity_semantics"
+    )
+    assert identity_status["status"] == "projected"
+    assert identity_status["details"]["authority"] == "memory_authority"
 
 
 def test_one_projector_failure_degrades_event_but_other_projectors_continue(tmp_path):
@@ -327,7 +332,7 @@ def test_tombstoned_or_disabled_memory_deletes_indexes(
     for projector in ("embedding", "moments", "memory_node", "entity_edges"):
         assert by_projector[projector]["status"] == "deleted"
     assert by_projector["word_map"]["status"] == "pending_rebuild"
-    assert by_projector["identity_semantics"]["status"] == "pending_rebuild"
+    assert by_projector["identity_semantics"]["status"] == "projected"
     outbox = _outbox_row(authority, commit["outbox_event_id"])
     assert outbox["status"] == "projected"
 

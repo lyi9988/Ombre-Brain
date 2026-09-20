@@ -287,6 +287,14 @@ def test_owner_memory_authority_read_models_are_revisioned_and_collapsible(monke
     assert aliases["items"][0]["alias"] == "晏晏"
     assert aliases["items"][0]["source_refs"] == [f"memory:{memory_id}"]
 
+    compatibility = server._identity_semantics_payload(100)
+    assert compatibility["authority"] == "memory_authority"
+    assert compatibility["aliases"][0]["alias"] == "晏晏"
+
+    rebuild_response = asyncio.run(server.api_identity_semantics_rebuild(FakeRequest()))
+    assert rebuild_response.status_code == 409
+    assert response_json(rebuild_response)["rebuild_allowed"] is False
+
 
 def test_api_memories_authority_create_update_revision_and_idempotency(monkeypatch, tmp_path):
     buckets, authority, _service, projection = install(monkeypatch, tmp_path, authority_enabled=True)
