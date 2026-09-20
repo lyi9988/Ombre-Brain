@@ -77,6 +77,42 @@ def test_owner_confirmed_alias_is_a_fast_hard_evidence_route():
     assert routed["anchors"] == ["晏晏", "person:yanyan"]
 
 
+def test_owner_alias_memory_link_becomes_first_class_hard_evidence():
+    service = GatewayService.__new__(GatewayService)
+    service.inject_max_cards = 2
+    service.first_card_min_score = 0.55
+    selected, forced = service._merge_owner_alias_memory_items(
+        [{"bucket": {"id": "memory-other"}, "score": 0.9}],
+        [
+            {"id": "memory-1", "metadata": {"name": "晏晏"}, "content": "共同经历"},
+            {"id": "memory-other", "metadata": {}, "content": "other"},
+        ],
+        ["memory-1"],
+    )
+
+    assert [item["bucket"]["id"] for item in selected] == [
+        "memory-1",
+        "memory-other",
+    ]
+    assert forced[0]["owner_alias_match"] is True
+    assert forced[0]["admission_reason"] == "owner_alias"
+    assert forced[0]["hard_evidence_labels"] == ["owner_alias"]
+
+
+def test_only_explicit_memory_source_refs_can_force_alias_recall():
+    debug = {
+        "owner_alias_matches": [{
+            "source_refs": [
+                "raw_event:evt-1",
+                "candidate:candidate-1",
+                "memory:memory-1",
+                "memory:memory-1",
+            ]
+        }]
+    }
+    assert GatewayService._owner_alias_memory_ids(debug) == ["memory-1"]
+
+
 def test_explicit_or_causal_recall_routes_deep_but_specific_topic_routes_fast():
     service = _sentinel_service()
     service._memory_sentinel_hard_bypass_reason = (

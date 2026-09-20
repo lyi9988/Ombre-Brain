@@ -689,6 +689,32 @@ class ReflectionEngine:
             BucketMemoryProjection(self.config, bucket_manager=bucket_mgr),
         )
 
+    def _commit_candidate_aliases_best_effort(
+        self,
+        candidate_id: str,
+        *,
+        memory_id: str,
+        trust: str,
+    ) -> None:
+        if not self.memory_authority_store:
+            return
+        try:
+            self.memory_authority_store.commit_candidate_aliases(
+                candidate_id,
+                memory_id=memory_id,
+                trust=trust,
+            )
+        except Exception as exc:
+            # The Memory revision is already committed.  Alias enrichment is a
+            # derived identity projection and must not rewrite that durable
+            # outcome as commit_failed.
+            logger.warning(
+                "Memory alias projection deferred | candidate=%s memory=%s error=%s",
+                candidate_id,
+                memory_id,
+                type(exc).__name__,
+            )
+
     async def _commit_background_memory(
         self,
         *,
@@ -718,6 +744,7 @@ class ReflectionEngine:
             "memory_type": memory_type,
             "confidence": metadata.get("confidence", 0.8),
             "requested_mode": "auto",
+            "proposed_aliases": list(metadata.get("proposed_aliases") or []),
             "metadata": {"legacy_candidate": {
                 "id": proposal_id,
                 "content": body,
@@ -756,6 +783,11 @@ class ReflectionEngine:
                 idempotency_key=f"{proposal_id}:revision:{expected_revision + 1}",
                 actor=source_type,
                 recall_policy=recall_policy,
+            )
+            self._commit_candidate_aliases_best_effort(
+                proposal_id,
+                memory_id=memory_id,
+                trust=decision.alias_trust,
             )
             current = self.memory_authority_store.get_candidate(proposal_id) or candidate
             if current.get("status") == "accepted":
@@ -870,6 +902,7 @@ class ReflectionEngine:
             "transient": bool(mode == "review" and "possibly_transient" in soft_flags),
             "generic": bool(mode == "review" and "possibly_generic" in soft_flags),
             "duplicate_of": str(candidate.get("duplicate_of") or ""),
+            "proposed_aliases": list(candidate.get("proposed_aliases") or []),
             "metadata": {"legacy_candidate": dict(candidate)},
         })
 
@@ -5464,6 +5497,11 @@ class ReflectionEngine:
                     decision_source=("owner" if mode == "review" else "auto"),
                     idempotency_key=f"daily-chat:{candidate_id}:candidate-revision:{row.get('revision')}",
                     actor=("owner" if mode == "review" else "daily_chat_memory"),
+                )
+                self._commit_candidate_aliases_best_effort(
+                    candidate_id,
+                    memory_id=candidate_id,
+                    trust=("owner" if mode == "review" else decision.alias_trust),
                 )
                 current = self.memory_authority_store.get_candidate(candidate_id) or row
                 if current.get("status") == "accepted":

@@ -1248,6 +1248,52 @@ class MemoryAuthorityStore:
         finally:
             conn.close()
 
+    def commit_candidate_aliases(
+        self,
+        candidate_id: str,
+        *,
+        memory_id: str,
+        trust: str,
+    ) -> list[dict[str, Any]]:
+        """Project structured aliases from one accepted candidate.
+
+        Alias rows remain derived identity facts linked back to the committed
+        Memory.  Auto aliases stay untrusted for Fast Recall; owner-reviewed
+        aliases become owner evidence.  Missing entity IDs are intentionally
+        skipped rather than guessed from prose.
+        """
+        candidate = self.get_candidate(candidate_id)
+        memory = self.get_memory(memory_id)
+        if not memory or str(memory.get("state") or "") != "active":
+            raise MemoryAuthorityError("aliases require one active committed Memory")
+        proposal = candidate.get("proposal", {}) if isinstance(candidate, dict) else {}
+        aliases = proposal.get("proposed_aliases", []) if isinstance(proposal, dict) else []
+        if not isinstance(aliases, list):
+            return []
+        trust_value = str(trust or "auto").strip().lower()
+        if trust_value == "weak":
+            trust_value = "auto"
+        if trust_value not in {"auto", "trusted_source", "owner"}:
+            trust_value = "auto"
+        committed = []
+        for raw in aliases:
+            if not isinstance(raw, Mapping):
+                continue
+            entity_id = str(raw.get("entity_id") or "").strip()
+            alias = str(raw.get("alias") or raw.get("value") or "").strip()
+            if not entity_id or not alias:
+                continue
+            committed.append(self.upsert_alias(
+                entity_id=entity_id,
+                alias=alias,
+                trust=trust_value,
+                source_refs=[
+                    f"memory:{memory_id}",
+                    f"candidate:{candidate_id}",
+                ],
+            ))
+        return committed
+
     def import_legacy_memory(
         self,
         *,

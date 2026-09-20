@@ -10,6 +10,7 @@ from memory_authority import (
     CommitStateError,
     IdempotencyConflict,
     MemoryAuthorityStore,
+    MemoryAuthorityError,
     MemoryIngestionPolicy,
     MemoryProposal,
     RevisionConflict,
@@ -103,6 +104,37 @@ def test_candidate_identity_is_idempotent_and_payload_drift_conflicts(tmp_path):
 
     with pytest.raises(IdempotencyConflict):
         authority.put_candidate(proposal(proposed_body="内容被偷偷换掉。"), decision)
+
+
+def test_candidate_alias_projection_requires_committed_memory_and_preserves_trust(tmp_path):
+    authority = store(tmp_path)
+    item = proposal(proposed_aliases=[{
+        "entity_id": "person:yanyan",
+        "alias": "晏晏",
+    }])
+    authority.put_candidate(item, MemoryIngestionPolicy().evaluate(item))
+
+    with pytest.raises(MemoryAuthorityError, match="active committed Memory"):
+        authority.commit_candidate_aliases(
+            item.proposal_id,
+            memory_id="memory-1",
+            trust="owner",
+        )
+
+    commit_first_memory(authority)
+    aliases = authority.commit_candidate_aliases(
+        item.proposal_id,
+        memory_id="memory-1",
+        trust="owner",
+    )
+
+    assert len(aliases) == 1
+    assert aliases[0]["entity_id"] == "person:yanyan"
+    assert aliases[0]["trust"] == "owner"
+    assert set(aliases[0]["source_refs"]) == {
+        "candidate:proposal-1",
+        "memory:memory-1",
+    }
 
 
 def test_candidate_decision_requires_expected_revision_and_request_is_idempotent(tmp_path):

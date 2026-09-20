@@ -4360,6 +4360,7 @@ class GatewayService:
             mark_step("memory_sentinel", stage_started_at)
             sentinel_route = str(memory_sentinel_debug.get("route") or "")
             recall_execution = self._recall_route_execution_options(sentinel_route)
+            owner_alias_memory_ids = self._owner_alias_memory_ids(memory_sentinel_debug)
             sentinel_skip_broad = sentinel_route in {"tone_only", "skip"}
             sentinel_search = sentinel_route in {"search", "fast", "deep"}
             pre_domain_skip_broad = (
@@ -4497,6 +4498,7 @@ class GatewayService:
                         allow_semantic=recall_execution["allow_semantic"],
                         allow_query_planner=recall_execution["allow_query_planner"],
                         allow_rerank=recall_execution["allow_rerank"],
+                        forced_memory_ids=owner_alias_memory_ids,
                     )
                     mark_step("dynamic_recall_bucket_select", stage_started_at)
                     stage_started_at = time.perf_counter()
@@ -4556,6 +4558,7 @@ class GatewayService:
                         allow_semantic=recall_execution["allow_semantic"],
                         allow_query_planner=recall_execution["allow_query_planner"],
                         allow_rerank=recall_execution["allow_rerank"],
+                        forced_memory_ids=owner_alias_memory_ids,
                     )
                     mark_step("dynamic_recall_graph_select", stage_started_at)
             else:
@@ -12659,6 +12662,7 @@ class GatewayService:
         allow_semantic: bool = True,
         allow_query_planner: bool = True,
         allow_rerank: bool = True,
+        forced_memory_ids: list[str] | None = None,
     ) -> tuple[list[dict], list[dict], list[dict], list[dict]] | tuple[
         list[dict], list[dict], list[dict], list[dict], dict[str, Any]
     ]:
@@ -12718,6 +12722,7 @@ class GatewayService:
             allow_rerank=allow_bucket_rerank and allow_rerank,
             allow_semantic=allow_semantic,
             allow_query_planner=allow_query_planner,
+            forced_memory_ids=forced_memory_ids,
             include_query_planner_debug=True,
         )
         candidate_stages = query_planner_debug.setdefault("candidate_stages", [])
@@ -15838,6 +15843,18 @@ class GatewayService:
             "allow_rerank": deep,
         }
 
+    @staticmethod
+    def _owner_alias_memory_ids(sentinel_debug: dict[str, Any] | None) -> list[str]:
+        output: list[str] = []
+        for match in (sentinel_debug or {}).get("owner_alias_matches", []) or []:
+            if not isinstance(match, dict):
+                continue
+            for source_ref in match.get("source_refs", []) or []:
+                value = str(source_ref or "").strip()
+                if value.startswith("memory:") and len(value) > len("memory:"):
+                    output.append(value[len("memory:"):])
+        return list(dict.fromkeys(output))[:16]
+
     async def _route_memory_sentinel(
         self,
         query: str,
@@ -15869,6 +15886,10 @@ class GatewayService:
                     "alias": str(row.get("alias") or ""),
                     "trust": str(row.get("trust") or ""),
                     "revision": int(row.get("revision") or 0),
+                    "source_refs": [
+                        str(item) for item in row.get("source_refs", []) or []
+                        if str(item or "").strip()
+                    ],
                 } for row in alias_matches],
                 route_reason_codes=["FAST_OWNER_ALIAS"],
             )
@@ -19006,6 +19027,7 @@ class GatewayService:
         allow_query_planner: bool = True,
         allow_semantic_session_dedupe: bool = True,
         allow_rerank: bool = True,
+        forced_memory_ids: list[str] | None = None,
     ) -> tuple[list[dict], list[dict]] | tuple[list[dict], list[dict], dict[str, Any]]:
         planner_debug = self._query_planner_debug_base(query)
         timing_debug = planner_debug.setdefault("timing_ms", {})
@@ -19311,6 +19333,27 @@ class GatewayService:
                 pass
             planner_debug["parallel_unused"] = True
 
+        forced_ids = list(dict.fromkeys(
+            str(memory_id or "").strip()
+            for memory_id in (forced_memory_ids or [])
+            if str(memory_id or "").strip()
+        ))[:16]
+        if forced_ids:
+            selected_items, forced_items = self._merge_owner_alias_memory_items(
+                selected_items,
+                all_buckets,
+                forced_ids,
+            )
+            structural_activation_items.extend(forced_items)
+            self._record_candidate_stage(
+                candidate_stages,
+                "authority.owner_alias",
+                len(forced_ids),
+                len(forced_items),
+                limit=self.inject_max_cards,
+                reason="owner-confirmed alias linked to committed Memory",
+            )
+
         planner_debug["final_bucket_ids"] = [
             str((item.get("bucket") or {}).get("id") or "")
             for item in selected_items
@@ -19338,6 +19381,58 @@ class GatewayService:
         if include_query_planner_debug:
             return (*result, planner_debug)
         return result
+
+    def _merge_owner_alias_memory_items(
+        self,
+        selected_items: list[dict],
+        all_buckets: list[dict],
+        forced_memory_ids: list[str],
+    ) -> tuple[list[dict], list[dict]]:
+        forced_ids = list(dict.fromkeys(
+            str(memory_id or "").strip()
+            for memory_id in forced_memory_ids
+            if str(memory_id or "").strip()
+        ))[:16]
+        forced_set = set(forced_ids)
+        selected_by_id = {
+            str((item.get("bucket") or {}).get("id") or ""): item
+            for item in selected_items
+            if isinstance(item, dict)
+        }
+        forced_items = []
+        for memory_id in forced_ids:
+            bucket = next(
+                (
+                    item for item in all_buckets
+                    if isinstance(item, dict) and str(item.get("id") or "") == memory_id
+                ),
+                None,
+            )
+            if bucket is None:
+                continue
+            item = dict(selected_by_id.get(memory_id) or {"bucket": bucket})
+            item.update({
+                "owner_alias_match": True,
+                "owner_alias_memory_id": memory_id,
+                "admission_reason": "owner_alias",
+                "blocked_reason": "",
+                "score": max(
+                    self._safe_float(item.get("score"), 0.0),
+                    self.first_card_min_score,
+                ),
+            })
+            labels = self._dedupe_evidence_labels([
+                *(item.get("evidence_labels") or []),
+                "owner_alias",
+            ])
+            item["evidence_labels"] = labels
+            item["hard_evidence_labels"] = self._hard_bucket_evidence_labels(labels)
+            forced_items.append(item)
+        remaining = [
+            item for item in selected_items
+            if str((item.get("bucket") or {}).get("id") or "") not in forced_set
+        ]
+        return [*forced_items, *remaining][: self.inject_max_cards], forced_items
 
     def _bucket_with_recall_signal(self, item: dict) -> dict:
         bucket = dict(item.get("bucket") or {})
@@ -19398,6 +19493,8 @@ class GatewayService:
                 "entity_edge_subject",
                 "entity_edge_relation",
                 "entity_edge_object",
+                "owner_alias_match",
+                "owner_alias_memory_id",
                 "explicit_relation_edge_match",
                 "explicit_relation_edge_confidence",
                 "explicit_relation_edge_peer_bucket_id",
@@ -19561,6 +19658,8 @@ class GatewayService:
             labels.append("title_anchor")
         if item.get("exact_anchor_match") or self._safe_float(item.get("exact_anchor_score"), 0.0) > 0:
             labels.append("exact_anchor")
+        if item.get("owner_alias_match"):
+            labels.append("owner_alias")
         protected_phrases = extract_protected_phrases(query)
         if protected_phrases and isinstance(bucket, dict):
             bucket_text_key = self._compact_lookup_key(self._date_recall_bucket_text(bucket))
@@ -19633,6 +19732,7 @@ class GatewayService:
             "semantic_rescue_direct_span",
             "strong_semantic",
             "strong_rerank",
+            "owner_alias",
         }
         return [label for label in labels or [] if label in hard]
 
@@ -19655,7 +19755,8 @@ class GatewayService:
         if not isinstance(item, dict):
             return 0.0
         if (
-            self._planner_lexical_direct_signal(item)
+            item.get("owner_alias_match")
+            or self._planner_lexical_direct_signal(item)
             or item.get("exact_anchor_match")
         ):
             return 1.0
@@ -19956,7 +20057,8 @@ class GatewayService:
         recent_ids: set[str] | None = None,
     ) -> tuple:
         if (
-            item.get("exact_anchor_match")
+            item.get("owner_alias_match")
+            or item.get("exact_anchor_match")
             or self._planner_lexical_direct_signal(item)
             or item.get("distinctive_anchor_match")
             or item.get("category_overview_item")
