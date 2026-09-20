@@ -1277,6 +1277,8 @@ class GatewayService:
         embedding_engine = getattr(self, "embedding_engine", None)
         reranker_engine = getattr(self, "reranker_engine", None)
         diffusion = getattr(self, "diffusion_options", None)
+        route_store = getattr(self, "model_route_mirror", None)
+        route_mirror = route_store.active() if route_store is not None else None
         return {
             "schema_version": 1,
             "embedding": {
@@ -1330,6 +1332,16 @@ class GatewayService:
                 "operit_context_rewrite_enabled": bool(
                     getattr(self, "operit_context_rewrite_enabled", False)
                 ),
+                "model_route_mirror": {
+                    "revision": int((route_mirror or {}).get("revision") or 0),
+                    "route_sha256": str((route_mirror or {}).get("route_sha256") or ""),
+                    "route_ids": [
+                        str(item.get("route_id") or "")
+                        for item in (route_mirror or {}).get("routes", []) or []
+                        if str(item.get("route_id") or "")
+                    ],
+                    "secretless": bool((route_mirror or {}).get("secretless")),
+                },
             },
             "memory_diffusion": {
                 "enabled": bool(getattr(diffusion, "enabled", False)),
@@ -17540,13 +17552,15 @@ class GatewayService:
             "stream": False,
         }
         if mirrored:
-            content, error, _route_debug = await self._call_mirrored_internal_route(
+            content, error, route_debug = await self._call_mirrored_internal_route(
                 "memory_query_planner", payload
             )
             if error:
                 return None, f"query_planner_{error}"
             try:
-                return self._parse_query_planner_response(content or ""), None
+                parsed = self._parse_query_planner_response(content or "")
+                parsed["_model_route"] = route_debug
+                return parsed, None
             except ValueError as exc:
                 return None, f"query_planner_parse_failed:{exc}"
         if self.query_planner_uses_dehydrator:
@@ -19543,6 +19557,7 @@ class GatewayService:
                         planner_debug["errors"].append("query_planner_fallback_used")
             if plan:
                 planner_debug["cache"] = dict(plan.pop("_cache", {}) or {})
+                planner_debug["model_route"] = dict(plan.pop("_model_route", {}) or {})
                 planner_debug["queries"] = plan.get("queries", [])
                 if plan.get("should_search") and not plan.get("too_vague"):
                     supplemental_items: list[dict] = []

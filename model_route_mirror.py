@@ -58,6 +58,8 @@ def _contains_forbidden_key(value: Any) -> bool:
 class ModelRouteMirrorStore:
     def __init__(self, path: str | os.PathLike[str]):
         self.path = Path(path).resolve()
+        self._active_stamp: tuple[int, int, int, int] | None = None
+        self._active_cache: dict[str, Any] | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -92,6 +94,19 @@ class ModelRouteMirrorStore:
             conn.commit()
         finally:
             conn.close()
+
+    def _file_stamp(self) -> tuple[int, int, int, int] | None:
+        try:
+            main = self.path.stat()
+            wal_path = Path(str(self.path) + "-wal")
+            try:
+                wal = wal_path.stat()
+                wal_values = (int(wal.st_mtime_ns), int(wal.st_size))
+            except FileNotFoundError:
+                wal_values = (0, 0)
+            return int(main.st_mtime_ns), int(main.st_size), *wal_values
+        except FileNotFoundError:
+            return None
 
     @staticmethod
     def normalize_routes(routes: Any) -> list[dict[str, Any]]:
@@ -203,6 +218,8 @@ class ModelRouteMirrorStore:
                     (request_id, fingerprint, revision, _canonical_json(result), now),
                 )
             conn.commit()
+            self._active_stamp = None
+            self._active_cache = None
             return result
         except Exception:
             conn.rollback()
@@ -211,6 +228,9 @@ class ModelRouteMirrorStore:
             conn.close()
 
     def active(self) -> dict[str, Any] | None:
+        stamp = self._file_stamp()
+        if stamp == self._active_stamp:
+            return json.loads(_canonical_json(self._active_cache)) if self._active_cache else None
         conn = self._connect()
         try:
             row = conn.execute(
@@ -220,14 +240,19 @@ class ModelRouteMirrorStore:
         finally:
             conn.close()
         if not row:
+            self._active_stamp = stamp
+            self._active_cache = None
             return None
-        return {
+        value = {
             "revision": int(row["revision"]),
             "route_sha256": str(row["route_sha256"]),
             "routes": json.loads(row["routes_json"]),
             "source_authority": str(row["source_authority"]),
             "secretless": True,
         }
+        self._active_stamp = stamp
+        self._active_cache = value
+        return json.loads(_canonical_json(value))
 
     def resolve(self, route_id: str) -> dict[str, Any] | None:
         active = self.active()
