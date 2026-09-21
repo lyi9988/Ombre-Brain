@@ -101,6 +101,8 @@ class MemoryAuthorityMigrator:
             reasons.append("duplicate_candidate_ids")
         if candidates["accepted_missing_bucket"]:
             reasons.append("accepted_missing_bucket")
+        if candidates["accepted_body_mismatch"]:
+            reasons.append("accepted_body_mismatch")
         if buckets["duplicate_ids"]:
             reasons.append("duplicate_bucket_ids")
         if buckets["invalid_files"]:

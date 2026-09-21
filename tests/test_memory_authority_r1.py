@@ -728,6 +728,32 @@ def test_apply_migration_requires_explicit_counts_and_blocks_missing_confirmed_b
     assert not (tmp_path / "state" / "memory_authority.sqlite3").exists()
 
 
+def test_apply_migration_blocks_accepted_body_mismatch_before_backup(tmp_path):
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text(
+        '{"items":[{"status":"confirmed","bucket_id":"memory-1",'
+        '"candidate":{"id":"memory-1","proposed_memory":"旧版本正文",'
+        '"source_verification":"verified","source_event_ids":["evt-1"]}}]}',
+        encoding="utf-8",
+    )
+    bucket_dir = tmp_path / "buckets" / "dynamic"
+    bucket_dir.mkdir(parents=True)
+    (bucket_dir / "memory-1.md").write_text(
+        "---\nid: memory-1\n---\n后来修订的正文\n", encoding="utf-8"
+    )
+    migrator = MemoryAuthorityMigrator(
+        candidates_path=candidates,
+        buckets_dir=tmp_path / "buckets",
+        state_dir=tmp_path / "state",
+        authority_db_path=tmp_path / "state" / "memory_authority.sqlite3",
+        backup_dir=tmp_path / "backup",
+    )
+
+    with pytest.raises(MigrationBlocked, match="accepted_body_mismatch"):
+        migrator.apply(expected_candidates=1, expected_buckets=1)
+    assert not (tmp_path / "backup").exists()
+
+
 def test_migration_reuses_identity_semantic_evidence_as_trusted_authority_alias(tmp_path):
     candidates = tmp_path / "candidates.json"
     candidates.write_text('{"items":[]}', encoding="utf-8")
