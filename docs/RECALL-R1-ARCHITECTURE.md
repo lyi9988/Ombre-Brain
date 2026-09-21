@@ -425,6 +425,19 @@ authority as `trusted_source`; orphan evidence blocks migration.  The old
 IdentitySemantic DB remains read-only backup evidence and cannot continue as a
 second live alias authority after cutover.
 
+Historical accepted candidates are reconciled without rewriting source data:
+
+- A missing active Bucket is a documented historical deletion only when an
+  exact-ID tombstone exists and its `deleted_at` is after candidate confirmation.
+  The candidate remains committed history; no active Memory is recreated.
+- A candidate/body hash mismatch is a documented legacy write projection only
+  when the Bucket points to that same candidate, was updated after confirmation,
+  and its current body is an exact suffix of the candidate with at most 128
+  wrapper characters removed.  The current Bucket body is authoritative.
+- Any other missing Bucket or divergent body remains a migration blocker.
+  The audit reports both raw historical counts and unresolved counts; a
+  reconciled history is not silently erased from the report.
+
 The experience release is not complete until the owner has exercised Auto,
 Review, alias confirmation, body revision, ring append, exact Fast Recall, and
 ambiguous Deep Recall; then the exact immutable artifacts may advance

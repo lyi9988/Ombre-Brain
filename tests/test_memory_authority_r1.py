@@ -754,6 +754,56 @@ def test_apply_migration_blocks_accepted_body_mismatch_before_backup(tmp_path):
     assert not (tmp_path / "backup").exists()
 
 
+def test_migration_reconciles_verified_tombstone_and_short_legacy_wrapper(tmp_path):
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text(
+        '{"items":['
+        '{"status":"confirmed","bucket_id":"deleted-1",'
+        '"confirmed_at":"2026-07-15T05:00:00+00:00",'
+        '"candidate":{"id":"deleted-1","proposed_memory":"已删除的历史记忆"}},'
+        '{"status":"confirmed","bucket_id":"memory-1",'
+        '"confirmed_at":"2026-07-15T05:00:00+00:00",'
+        '"candidate":{"id":"memory-1","proposed_memory":"简短旧包装：当前权威正文"}}'
+        ']}',
+        encoding="utf-8",
+    )
+    root = tmp_path / "buckets"
+    dynamic = root / "dynamic"
+    dynamic.mkdir(parents=True)
+    (dynamic / "memory-1.md").write_text(
+        "---\nid: memory-1\ndaily_chat_memory_candidate_id: memory-1\n"
+        "updated_at: '2026-07-15T13:01:00+08:00'\n---\n当前权威正文\n",
+        encoding="utf-8",
+    )
+    tombstones = root / ".tombstones"
+    tombstones.mkdir()
+    (tombstones / "deleted-1.json").write_text(
+        '{"id":"deleted-1","deleted_at":"2026-07-31T02:00:00+08:00"}',
+        encoding="utf-8",
+    )
+    migrator = MemoryAuthorityMigrator(
+        candidates_path=candidates,
+        buckets_dir=root,
+        state_dir=tmp_path / "state",
+        authority_db_path=tmp_path / "state" / "memory_authority.sqlite3",
+        backup_dir=tmp_path / "backup",
+    )
+
+    audit = migrator.audit()
+    assert audit["candidates"]["accepted_missing_bucket_tombstoned"] == ["deleted-1"]
+    assert audit["candidates"]["accepted_missing_bucket_unresolved"] == []
+    assert audit["candidates"]["accepted_body_mismatch_reconciled"] == ["memory-1"]
+    assert audit["candidates"]["accepted_body_mismatch_unresolved"] == []
+    assert audit["inconsistency_count"] == 0
+
+    result = migrator.apply(expected_candidates=2, expected_buckets=1)
+    authority = MemoryAuthorityStore(str(tmp_path / "state" / "memory_authority.sqlite3"))
+    assert result["imported_memories"] == 1
+    assert authority.get_memory("deleted-1") is None
+    assert authority.get_candidate("deleted-1")["status"] == "committed"
+    assert authority.get_memory("memory-1")["active_revision"] == 1
+
+
 def test_migration_reuses_identity_semantic_evidence_as_trusted_authority_alias(tmp_path):
     candidates = tmp_path / "candidates.json"
     candidates.write_text('{"items":[]}', encoding="utf-8")

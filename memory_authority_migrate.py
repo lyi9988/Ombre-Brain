@@ -99,9 +99,9 @@ class MemoryAuthorityMigrator:
         reasons = []
         if candidates["duplicate_candidate_ids"]:
             reasons.append("duplicate_candidate_ids")
-        if candidates["accepted_missing_bucket"]:
+        if candidates["accepted_missing_bucket_unresolved"]:
             reasons.append("accepted_missing_bucket")
-        if candidates["accepted_body_mismatch"]:
+        if candidates["accepted_body_mismatch_unresolved"]:
             reasons.append("accepted_body_mismatch")
         if buckets["duplicate_ids"]:
             reasons.append("duplicate_bucket_ids")

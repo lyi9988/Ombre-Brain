@@ -10,6 +10,7 @@ import hashlib
 import json
 import sqlite3
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -81,7 +82,59 @@ def _candidate_record(item: dict[str, Any]) -> dict[str, Any]:
         "source_status": str(candidate.get("source_verification") or candidate.get("source_status") or "legacy_unverified"),
         "source_ref_count": len([item for item in source_refs if str(item).strip()]),
         "expected_bucket_ids": expected_bucket_ids,
+        "confirmed_at": str(item.get("confirmed_at") or ""),
+        # This body stays in the in-process audit only; report output below
+        # contains hashes/classifications, never the original text.
+        "_body": body,
     }
+
+
+def _ordered_time(after: str, before: str) -> bool:
+    try:
+        later = datetime.fromisoformat(str(after or "").replace("Z", "+00:00"))
+        earlier = datetime.fromisoformat(str(before or "").replace("Z", "+00:00"))
+        return later.tzinfo is not None and earlier.tzinfo is not None and later >= earlier
+    except ValueError:
+        return False
+
+
+def _verified_tombstone(buckets_dir: Path, bucket_id: str, confirmed_at: str) -> bool:
+    if not bucket_id or Path(bucket_id).name != bucket_id:
+        return False
+    path = buckets_dir / ".tombstones" / f"{bucket_id}.json"
+    if not path.is_file():
+        return False
+    try:
+        payload = _json_file(path)
+    except (OSError, ValueError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and str(payload.get("id") or "") == bucket_id
+        and _ordered_time(payload.get("deleted_at"), confirmed_at)
+    )
+
+
+def _verified_legacy_body_projection(
+    buckets_dir: Path,
+    record: dict[str, Any],
+    candidate: dict[str, Any],
+) -> bool:
+    if record.get("source_candidate_id") != candidate.get("candidate_id"):
+        return False
+    if not _ordered_time(record.get("updated_at"), candidate.get("confirmed_at")):
+        return False
+    original = str(candidate.get("_body") or "")
+    if not original:
+        return False
+    try:
+        _metadata, current = _frontmatter(buckets_dir / str(record["relative_path"]))
+    except (OSError, ValueError):
+        return False
+    # The observed legacy case removed a short wrapper immediately before
+    # Bucket creation.  Never accept arbitrary divergent content or a long
+    # truncation as a silent equivalent revision.
+    return bool(current and original.endswith(current) and 0 < len(original) - len(current) <= 128)
 
 
 class MemoryMigrationAuditor:
@@ -196,6 +249,7 @@ class MemoryMigrationAuditor:
                 "ring_count": len(comments),
                 "source_candidate_id": str(metadata.get("daily_chat_memory_candidate_id") or ""),
                 "memory_revision": int(metadata.get("memory_revision") or 0),
+                "updated_at": str(metadata.get("updated_at") or ""),
             }
         return {
             "count": len(records),
@@ -219,7 +273,11 @@ class MemoryMigrationAuditor:
         statuses = Counter(item["legacy_status"] for item in candidates)
         mapped_statuses = Counter(item["status"] for item in candidates)
         accepted_missing_bucket = []
+        accepted_missing_bucket_tombstoned = []
+        accepted_missing_bucket_unresolved = []
         accepted_body_mismatch = []
+        accepted_body_mismatch_reconciled = []
+        accepted_body_mismatch_unresolved = []
         unverified_sources = []
         mapped = 0
         for item in candidates:
@@ -229,6 +287,13 @@ class MemoryMigrationAuditor:
                 mapped += 1
             if item["status"] == "accepted" and not observed:
                 accepted_missing_bucket.append(item["candidate_id"])
+                if expected and all(
+                    _verified_tombstone(self.buckets_dir, bucket_id, item["confirmed_at"])
+                    for bucket_id in expected
+                ):
+                    accepted_missing_bucket_tombstoned.append(item["candidate_id"])
+                else:
+                    accepted_missing_bucket_unresolved.append(item["candidate_id"])
             if (
                 item["status"] == "accepted"
                 and item["body_sha256"]
@@ -236,6 +301,13 @@ class MemoryMigrationAuditor:
                 and all(record["body_sha256"] != item["body_sha256"] for record in observed)
             ):
                 accepted_body_mismatch.append(item["candidate_id"])
+                if any(
+                    _verified_legacy_body_projection(self.buckets_dir, record, item)
+                    for record in observed
+                ):
+                    accepted_body_mismatch_reconciled.append(item["candidate_id"])
+                else:
+                    accepted_body_mismatch_unresolved.append(item["candidate_id"])
             if item["source_status"] != "verified" or item["source_ref_count"] == 0:
                 unverified_sources.append(item["candidate_id"])
 
@@ -243,8 +315,8 @@ class MemoryMigrationAuditor:
             len(duplicate_candidates)
             + len(bucket_scan["duplicate_ids"])
             + len(bucket_scan["invalid_files"])
-            + len(accepted_missing_bucket)
-            + len(accepted_body_mismatch)
+            + len(accepted_missing_bucket_unresolved)
+            + len(accepted_body_mismatch_unresolved)
             + len(identity_semantics["orphan_evidence_bucket_ids"])
             + len(identity_semantics["errors"])
         )
@@ -258,7 +330,11 @@ class MemoryMigrationAuditor:
                 "target_status_counts": dict(sorted(mapped_statuses.items())),
                 "duplicate_candidate_ids": duplicate_candidates,
                 "accepted_missing_bucket": accepted_missing_bucket,
+                "accepted_missing_bucket_tombstoned": accepted_missing_bucket_tombstoned,
+                "accepted_missing_bucket_unresolved": accepted_missing_bucket_unresolved,
                 "accepted_body_mismatch": accepted_body_mismatch,
+                "accepted_body_mismatch_reconciled": accepted_body_mismatch_reconciled,
+                "accepted_body_mismatch_unresolved": accepted_body_mismatch_unresolved,
                 "unverified_or_missing_source": unverified_sources,
             },
             "buckets": bucket_scan,
