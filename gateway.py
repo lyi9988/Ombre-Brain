@@ -12852,6 +12852,7 @@ class GatewayService:
             )
         if (
             self._auto_query_too_vague(query)
+            and not forced_memory_ids
             and not self._has_named_exact_anchor_candidate(query, all_buckets)
         ):
             query_planner_debug["skip_reason"] = "auto_vague_query"
@@ -12879,6 +12880,11 @@ class GatewayService:
             str(bucket.get("id") or "")
             for bucket in all_buckets
             if bucket.get("id") and self._is_semantic_candidate_bucket(bucket)
+        )
+        eligible_ids.update(
+            str(bucket.get("id") or "")
+            for bucket in all_buckets
+            if bucket.get("id") and str(bucket.get("id")) in set(forced_memory_ids or [])
         )
         self._add_timing_ms(timing_debug, "moment.eligible_ids", stage_started_at)
         if not eligible_ids:

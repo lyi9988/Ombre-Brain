@@ -73,6 +73,32 @@ def test_trusted_alias_without_active_memory_does_not_force_empty_fast_route(tmp
     assert view.match_aliases("晏晏是谁") == []
 
 
+def test_manual_only_memory_alias_cannot_force_automatic_fast_recall(tmp_path):
+    state_dir = tmp_path / "state"
+    authority = MemoryAuthorityStore({"state_dir": str(state_dir)})
+    body = "仅手动可读的私人记忆。"
+    import hashlib
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    prepared = authority.prepare_memory_commit(
+        memory_id="memory-private", bucket_id="bucket-private", expected_revision=0,
+        body_sha256=digest, snapshot_path="revisions/memory-private/1.md",
+        metadata={}, source_refs=["owner-1"], decision_source="owner",
+        idempotency_key="manual-only-memory", actor="owner",
+        recall_policy="manual_only",
+    )
+    authority.record_body_written(prepared["operation_id"], observed_body_sha256=digest)
+    authority.finalize_memory_commit(prepared["operation_id"])
+    authority.upsert_alias(
+        entity_id="person:private", alias="私密称呼", trust="owner",
+        source_refs=["memory:memory-private"],
+    )
+    view = MemoryAuthorityRecallView({
+        "state_dir": str(state_dir), "memory_authority": {"enabled": True},
+    })
+
+    assert view.match_aliases("私密称呼是谁") == []
+
+
 def _sentinel_service(alias_matches=None):
     service = GatewayService.__new__(GatewayService)
     service.memory_sentinel_enabled = True

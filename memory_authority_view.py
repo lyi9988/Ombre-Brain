@@ -294,7 +294,8 @@ class MemoryAuthorityRecallView:
         try:
             rows = conn.execute(
                 f"SELECT memory_id,bucket_id,active_revision FROM memories "
-                f"WHERE state='active' AND (memory_id IN ({placeholders}) "
+                f"WHERE state='active' AND recall_policy='enabled' "
+                f"AND (memory_id IN ({placeholders}) "
                 f"OR bucket_id IN ({placeholders}))",
                 [*ids, *ids],
             ).fetchall()
