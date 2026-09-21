@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
+from pathlib import Path
 from typing import Any
 
 from entity_edges import extract_entity_edges_from_bucket
@@ -70,6 +72,26 @@ class MemoryProjectionWorker:
         source_sha = str(memory.get("body_sha256") or "")
         statuses: list[dict[str, Any]] = []
 
+        if str(event.get("event_type") or "") == "LegacyMemoryImported":
+            if revision != int(event.get("aggregate_revision") or 0):
+                self.authority.set_outbox_status(event_id, status="projected")
+                return {
+                    "event_id": event_id, "memory_id": memory_id,
+                    "revision": revision, "status": "projected",
+                    "reason": "superseded_by_new_revision", "projections": [],
+                }
+            statuses = await self._inspect_legacy_indexes(memory, revision, source_sha)
+            # Migration does not request 820 fresh embeddings or rewrite old
+            # indexes. Missing derived rows remain visible as pending_rebuild
+            # for an explicit, separately budgeted repair.
+            self.authority.set_outbox_status(event_id, status="projected")
+            return {
+                "event_id": event_id, "memory_id": memory_id,
+                "revision": revision, "status": "projected",
+                "reason": "legacy_indexes_inspected_without_provider_calls",
+                "projections": statuses,
+            }
+
         if memory.get("state") == "tombstoned" or memory.get("recall_policy") == "disabled":
             statuses.extend(await self._delete_indexes(memory_id, revision, source_sha))
         else:
@@ -94,6 +116,150 @@ class MemoryProjectionWorker:
             "status": final_status,
             "projections": statuses,
         }
+
+    async def _inspect_legacy_indexes(
+        self, memory: dict[str, Any], revision: int, source_sha: str
+    ) -> list[dict[str, Any]]:
+        memory_id = str(memory["memory_id"])
+        bucket_id = str(memory.get("bucket_id") or memory_id)
+        if memory.get("state") != "active" or memory.get("recall_policy") != "enabled":
+            return [
+                self._record_status(
+                    memory_id, revision, projector, "disabled", source_sha,
+                    {"reason": "legacy_memory_not_auto_recallable", "index_unchanged": True},
+                )
+                for projector in (
+                    "embedding", "moments", "memory_node", "entity_edges",
+                    "word_map", "identity_semantics", "memory_edges",
+                )
+            ]
+
+        bucket = await self.bucket_manager.get(bucket_id)
+        if not bucket:
+            return [
+                self._record_status(
+                    memory_id, revision, projector, "pending_rebuild", source_sha,
+                    {"reason": "legacy_bucket_missing", "index_unchanged": True},
+                )
+                for projector in (
+                    "embedding", "moments", "memory_node", "entity_edges",
+                    "word_map", "identity_semantics", "memory_edges",
+                )
+            ]
+
+        results = []
+
+        async def inspect_async(projector: str, enabled: bool, read) -> None:
+            if not enabled:
+                results.append(self._record_status(
+                    memory_id, revision, projector, "disabled", source_sha,
+                    {"reason": "provider_disabled", "index_unchanged": True},
+                ))
+                return
+            try:
+                present = bool(await read())
+                status = "projected" if present else "pending_rebuild"
+                details = {
+                    "reason": "legacy_index_present" if present else "legacy_index_missing",
+                    "index_unchanged": True,
+                }
+            except Exception as exc:
+                status = "degraded"
+                details = {"error": type(exc).__name__, "index_unchanged": True}
+            results.append(self._record_status(
+                memory_id, revision, projector, status, source_sha, details,
+            ))
+
+        await inspect_async(
+            "embedding",
+            bool(self.embedding_engine and getattr(self.embedding_engine, "enabled", False)),
+            lambda: self.embedding_engine.get_embedding(bucket_id),
+        )
+
+        def inspect_sync(projector: str, store, read, *, required: bool = True) -> None:
+            if store is None:
+                status, details = "disabled", {"reason": "index_not_configured"}
+            else:
+                try:
+                    present = bool(read())
+                    status = "projected" if present or not required else "pending_rebuild"
+                    details = {
+                        "reason": (
+                            "legacy_index_present" if present else
+                            "no_index_rows_expected" if not required else "legacy_index_missing"
+                        )
+                    }
+                except Exception as exc:
+                    status, details = "degraded", {"error": type(exc).__name__}
+            results.append(self._record_status(
+                memory_id, revision, projector, status, source_sha,
+                {**details, "index_unchanged": True},
+            ))
+
+        inspect_sync(
+            "moments", self.moment_store,
+            lambda: self.moment_store.list_for_bucket(bucket_id, limit=1),
+        )
+        inspect_sync("memory_node", self.node_store, lambda: self.node_store.get(bucket_id))
+
+        try:
+            expected_edges = extract_entity_edges_from_bucket(bucket, self.identity)
+            if self.entity_edge_store is not None:
+                if not hasattr(self, "_legacy_entity_edge_ids"):
+                    self._legacy_entity_edge_ids = {
+                        str(row.get("bucket_id") or "")
+                        for row in self.entity_edge_store.list_edges()
+                    }
+                edge_ids = self._legacy_entity_edge_ids
+            else:
+                edge_ids = set()
+            inspect_sync(
+                "entity_edges", self.entity_edge_store,
+                lambda: bucket_id in edge_ids,
+                required=bool(expected_edges),
+            )
+        except Exception as exc:
+            results.append(self._record_status(
+                memory_id, revision, "entity_edges", "degraded", source_sha,
+                {"error": type(exc).__name__, "index_unchanged": True},
+            ))
+
+        word_enabled = bool(self.word_map_store and getattr(self.word_map_store, "enabled", False))
+        if word_enabled:
+            def word_present() -> bool:
+                path = Path(str(self.word_map_store.db_path))
+                conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+                try:
+                    return bool(conn.execute(
+                        "SELECT 1 FROM word_card_nodes WHERE bucket_id=? LIMIT 1",
+                        (bucket_id,),
+                    ).fetchone())
+                finally:
+                    conn.close()
+
+            try:
+                expected_terms = self.word_map_store.extract_bucket_terms(bucket)
+                inspect_sync(
+                    "word_map", self.word_map_store, word_present,
+                    required=bool(expected_terms),
+                )
+            except Exception as exc:
+                results.append(self._record_status(
+                    memory_id, revision, "word_map", "degraded", source_sha,
+                    {"error": type(exc).__name__, "index_unchanged": True},
+                ))
+        else:
+            inspect_sync("word_map", None, lambda: False)
+
+        results.append(self._record_status(
+            memory_id, revision, "identity_semantics", "projected", source_sha,
+            {"authority": "memory_authority", "index_unchanged": True},
+        ))
+        results.append(self._record_status(
+            memory_id, revision, "memory_edges", "pending_rebuild", source_sha,
+            {"reason": "legacy_edges_not_recomputed", "index_unchanged": True},
+        ))
+        return results
 
     async def _upsert_indexes(
         self, bucket: dict, memory_id: str, revision: int, source_sha: str
