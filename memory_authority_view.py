@@ -97,6 +97,11 @@ class MemoryAuthorityRecallView:
                     for value in resolved.values()
                     if str(value.get("bucket_id") or "")
                 ))
+                # A trusted name alone is not recall evidence.  If its
+                # linked Memory was archived, deleted, or never committed,
+                # it must not force a Fast route that cannot return a card.
+                if not item["bucket_ids"]:
+                    continue
                 matches.append(item)
         return matches[:8]
 

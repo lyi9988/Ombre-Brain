@@ -16053,7 +16053,7 @@ class GatewayService:
         if alias_matches:
             debug.update(
                 route="fast",
-                reason="owner-confirmed alias",
+                reason="trusted alias linked to active Memory",
                 anchors=list(dict.fromkeys([
                     *[str(row.get("alias") or "") for row in alias_matches],
                     *[str(row.get("entity_id") or "") for row in alias_matches],

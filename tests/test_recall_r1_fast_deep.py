@@ -36,16 +36,41 @@ def test_authority_view_exposes_only_trusted_aliases_and_refreshes_wal(tmp_path)
         entity_id="person:yanyan",
         alias="晏晏",
         trust="owner",
-        source_refs=["owner-confirmation-1"],
+        source_refs=["owner-confirmation-1", "memory:memory-1"],
     )
+    body = "主人与晏晏有一段共同经历。"
+    import hashlib
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    prepared = authority.prepare_memory_commit(
+        memory_id="memory-1", bucket_id="bucket-1", expected_revision=0,
+        body_sha256=digest, snapshot_path="revisions/memory-1/1.md",
+        metadata={}, source_refs=["evt-1"], decision_source="owner",
+        idempotency_key="alias-memory-1", actor="owner",
+    )
+    authority.record_body_written(prepared["operation_id"], observed_body_sha256=digest)
+    authority.finalize_memory_commit(prepared["operation_id"])
     matches = view.match_aliases("你还记得晏晏吗")
 
     assert len(matches) == 1
     assert matches[0]["entity_id"] == "person:yanyan"
     assert matches[0]["trust"] == "owner"
     assert matches[0]["revision"] == 2
-    assert matches[0]["memory_ids"] == []
-    assert matches[0]["bucket_ids"] == []
+    assert matches[0]["memory_ids"] == ["memory-1"]
+    assert matches[0]["bucket_ids"] == ["bucket-1"]
+
+
+def test_trusted_alias_without_active_memory_does_not_force_empty_fast_route(tmp_path):
+    state_dir = tmp_path / "state"
+    authority = MemoryAuthorityStore({"state_dir": str(state_dir)})
+    authority.upsert_alias(
+        entity_id="person:yanyan", alias="晏晏", trust="owner",
+        source_refs=["memory:missing-memory"],
+    )
+    view = MemoryAuthorityRecallView({
+        "state_dir": str(state_dir), "memory_authority": {"enabled": True},
+    })
+    assert view.trusted_aliases()
+    assert view.match_aliases("晏晏是谁") == []
 
 
 def _sentinel_service(alias_matches=None):
