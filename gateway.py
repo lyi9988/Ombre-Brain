@@ -16722,6 +16722,7 @@ class GatewayService:
         return model, True
 
     def _query_planner_debug_base(self, query: str) -> dict[str, Any]:
+        mirrored_route = self._internal_model_route("memory_query_planner")
         anchor_plan = self._query_anchor_plan(query)
         query_plan = self._recall_query_plan(query)
         raw_query = str(query or "")

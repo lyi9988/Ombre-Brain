@@ -2,6 +2,7 @@ import pytest
 import asyncio
 import json
 import httpx
+from unittest.mock import MagicMock
 
 from gateway import GatewayService
 from model_route_mirror import (
@@ -10,6 +11,26 @@ from model_route_mirror import (
     ModelRouteMirrorValidationError,
     route_slice_sha256,
 )
+
+
+@pytest.mark.parametrize(
+    ("mirrored_route", "expected_source"),
+    [
+        (None, "gateway"),
+        ({"candidates": [{"model_id": "deepseek-v4-flash"}]}, "model_route_mirror"),
+    ],
+)
+def test_query_planner_debug_base_resolves_route_without_name_error(
+    mirrored_route, expected_source
+):
+    service = MagicMock()
+    service._internal_model_route.return_value = mirrored_route
+    service.query_planner_uses_dehydrator = False
+
+    debug = GatewayService._query_planner_debug_base(service, "remember this")
+
+    service._internal_model_route.assert_called_once_with("memory_query_planner")
+    assert debug["model_source"] == expected_source
 
 
 def routes():
