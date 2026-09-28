@@ -445,3 +445,37 @@ def test_embedding_false_result_does_not_claim_projected(tmp_path):
         "memory-1", revision=1
     )}
     assert status["embedding"] == "degraded"
+
+
+def test_pending_repair_never_sends_manual_only_memory_to_provider(tmp_path):
+    authority = _authority(tmp_path)
+    _commit_memory(authority, recall_policy="manual_only")
+    memory = authority.get_memory("memory-1")
+    authority.set_projection_status(
+        memory_id="memory-1", memory_revision=1, projector="embedding",
+        status="pending_rebuild", source_sha256=memory["body_sha256"],
+    )
+    worker, _bucket_manager, embedding, *_rest = _worker(authority, tmp_path)
+
+    result = asyncio.run(worker.repair_pending_once(limit=1))
+
+    assert result["attempted"] == 0
+    assert embedding.generate_calls == []
+
+
+def test_pending_repair_rejects_bucket_archived_outside_live_recall(tmp_path):
+    authority = _authority(tmp_path)
+    _commit_memory(authority)
+    memory = authority.get_memory("memory-1")
+    authority.set_projection_status(
+        memory_id="memory-1", memory_revision=1, projector="embedding",
+        status="pending_rebuild", source_sha256=memory["body_sha256"],
+    )
+    worker, bucket_manager, embedding, *_rest = _worker(authority, tmp_path)
+    bucket_manager.bucket["path"] = str(tmp_path / "archive" / "memory-1.md")
+
+    result = asyncio.run(worker.repair_pending_once(limit=1))
+
+    assert result["attempted"] == 1
+    assert result["degraded"] == 1
+    assert embedding.generate_calls == []
