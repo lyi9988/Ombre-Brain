@@ -21,6 +21,8 @@ class MemoryAuthorityRecallView:
         ).resolve()
         self._stamp: tuple[int, int, int, int] | None = None
         self._trusted_aliases: list[dict[str, Any]] = []
+        self._auto_bucket_stamp: tuple[int, int, int, int] | None = None
+        self._auto_bucket_ids: frozenset[str] = frozenset()
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(f"file:{self.path.as_posix()}?mode=ro", uri=True, timeout=2.0)
@@ -40,6 +42,38 @@ class MemoryAuthorityRecallView:
 
     def available(self) -> bool:
         return bool(self.enabled and self.path.exists())
+
+    def auto_recallable_bucket_ids(self) -> frozenset[str]:
+        """Only committed, active, auto-enabled Memory may enter chat recall.
+
+        The Bucket files remain a readable projection, not a second policy
+        authority. A missing/unreadable Authority fails closed when enabled.
+        """
+        stamp = self._file_stamp()
+        if not self.available():
+            self._auto_bucket_stamp = stamp
+            self._auto_bucket_ids = frozenset()
+            return self._auto_bucket_ids
+        if stamp == self._auto_bucket_stamp:
+            return self._auto_bucket_ids
+        conn = None
+        try:
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT bucket_id FROM memories "
+                "WHERE state='active' AND recall_policy='enabled' "
+                "AND bucket_id IS NOT NULL AND bucket_id!=''"
+            ).fetchall()
+        except sqlite3.Error:
+            self._auto_bucket_ids = frozenset()
+            self._auto_bucket_stamp = None
+        else:
+            self._auto_bucket_ids = frozenset(str(row[0]) for row in rows)
+            self._auto_bucket_stamp = stamp
+        finally:
+            if conn is not None:
+                conn.close()
+        return self._auto_bucket_ids
 
     def trusted_aliases(self) -> list[dict[str, Any]]:
         stamp = self._file_stamp()

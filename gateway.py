@@ -1435,6 +1435,30 @@ class GatewayService:
         stage_log.append(row)
 
     @staticmethod
+    def _rejected_bucket_evidence(items: list[dict] | None) -> dict[str, Any]:
+        """Persist owner-safe reasons, never Bucket bodies or raw identifiers."""
+        counts: dict[str, int] = {}
+        refs: list[dict[str, Any]] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            raw_reason = str(item.get("admission_reason") or item.get("blocked_reason") or "unclassified")
+            reason = raw_reason if re.fullmatch(r"[a-z0-9_]{1,80}", raw_reason) else "other"
+            counts[reason] = counts.get(reason, 0) + 1
+            bucket = item.get("bucket") if isinstance(item.get("bucket"), dict) else {}
+            bucket_id = str(bucket.get("id") or "")
+            if bucket_id and len(refs) < 24:
+                refs.append({
+                    "bucket_ref": hashlib.sha256(bucket_id.encode("utf-8")).hexdigest()[:16],
+                    "reason": reason,
+                    "evidence_labels": [
+                        str(label)[:40] for label in item.get("hard_evidence_labels") or []
+                        if re.fullmatch(r"[a-z0-9_]{1,40}", str(label))
+                    ][:8],
+                })
+        return {"reason_counts": counts, "candidate_refs": refs}
+
+    @staticmethod
     def _runtime_env_value(name: str) -> str:
         """Read one secret from the mounted .env without exposing its value."""
         if not name:
@@ -4899,6 +4923,9 @@ class GatewayService:
             "recalled_moment_count": len(recalled_moments),
             "suppressed_moment_count": len(suppressed_moments),
             "suppressed_bucket_count": len(suppressed_buckets),
+            "suppressed_bucket_reasons": self._rejected_bucket_evidence(
+                suppressed_buckets
+            )["reason_counts"],
             "diffused_item_count": len(diffused_moment_debug),
             "active_reminder_count": len(active_reminder_ids),
             "recalled_chars": len(recalled_memory),
@@ -11941,6 +11968,8 @@ class GatewayService:
             bucket_id = str((bucket or {}).get("id") or "")
             if not bucket_id or bucket_id in seen:
                 continue
+            if not self._authority_auto_recall_allowed(bucket):
+                continue
             if not self._is_source_record_bucket(bucket):
                 continue
             if not self._source_record_explicit_bucket_match_reason(query, bucket):
@@ -11956,7 +11985,9 @@ class GatewayService:
         *,
         selected_reason: str = "",
     ) -> dict | None:
-        if not self._is_source_record_bucket(bucket) or self._is_self_anchor_recall_excluded_bucket(bucket):
+        if (not self._is_source_record_bucket(bucket)
+                or self._is_self_anchor_recall_excluded_bucket(bucket)
+                or not self._authority_auto_recall_allowed(bucket)):
             return None
         bucket_id = str(bucket.get("id") or "")
         if not bucket_id:
@@ -12300,6 +12331,8 @@ class GatewayService:
             "cooldown_penalty",
             "matched_query_terms",
             "dynamic_anchor_plan",
+            "short_cjk_identity_title_match",
+            "short_cjk_identity_title_terms",
             "distinctive_anchor_match",
             "distinctive_anchor_terms",
             "distinctive_anchor_missing_terms",
@@ -18396,6 +18429,15 @@ class GatewayService:
                     alias_counts[key] = min(alias_counts.get(key, count), count)
 
         overview = self._query_is_category_overview(query)
+        query_plan = self._recall_query_plan(query)
+        asks_identity = bool(
+            self._query_has_identity_name_intent(query)
+            or re.search(r"是谁|谁是|哪位|什么人|叫什么|昵称|称呼", str(query or ""))
+        )
+        short_cjk_axis_terms = [
+            str(term) for term in getattr(query_plan, "activated_axis_terms", ()) or ()
+            if re.fullmatch(r"[\u4e00-\u9fff]{2,3}", self._compact_lookup_key(term))
+        ] if asks_identity else []
         term_rows: list[dict[str, Any]] = []
         discriminative: list[str] = []
         category: list[str] = []
@@ -18472,6 +18514,7 @@ class GatewayService:
             "support_terms": list(dict.fromkeys(support)),
             "strict_diffusion": strict_diffusion,
             "term_stats": term_rows,
+            "short_cjk_identity_axis_terms": short_cjk_axis_terms,
             "retrieval_alias_bucket_ids": list(
                 dict.fromkeys(str(row.get("bucket_id") or "") for row in alias_hits if row.get("bucket_id"))
             ),
@@ -18515,6 +18558,7 @@ class GatewayService:
                 ]
             )
         )
+        short_cjk_title_terms = self._short_cjk_identity_title_terms(bucket, plan)
 
         def covered(term: str, *, allow_full: bool = False) -> bool:
             return bool(
@@ -18552,6 +18596,8 @@ class GatewayService:
         )
         return {
             "dynamic_anchor_plan": plan,
+            "short_cjk_identity_title_match": bool(short_cjk_title_terms),
+            "short_cjk_identity_title_terms": short_cjk_title_terms,
             "distinctive_anchor_match": bool(required_terms and not missing_terms),
             "distinctive_anchor_terms": matched_terms,
             "distinctive_anchor_missing_terms": missing_terms,
@@ -18585,6 +18631,48 @@ class GatewayService:
                 default=0,
             ),
         }
+
+    def _short_cjk_identity_title_terms(
+        self, bucket: dict, plan: dict[str, Any]
+    ) -> list[str]:
+        """Independent local evidence for a rare short Chinese name.
+
+        A two-character substring by itself is too weak. Require an identity
+        question, a rare query axis, and corroboration in both the title and
+        ordinary recall body of an auto-recallable committed Memory.
+        """
+        if (not isinstance(bucket, dict)
+                or self._is_source_record_bucket(bucket)
+                or not self._authority_auto_recall_allowed(bucket)):
+            return []
+        axis_keys = {
+            self._compact_lookup_key(term)
+            for term in plan.get("short_cjk_identity_axis_terms") or []
+        }
+        if not axis_keys:
+            return []
+        meta = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else {}
+        title_key = self._compact_lookup_key(meta.get("name") or bucket.get("name") or "")
+        body_key = self._compact_lookup_key(bucket_content_for_recall(bucket))
+        matched: list[str] = []
+        for row in plan.get("term_stats") or []:
+            if not isinstance(row, dict):
+                continue
+            term = str(row.get("term") or "")
+            key = self._compact_lookup_key(term)
+            if (key not in axis_keys
+                    or not re.fullmatch(r"[\u4e00-\u9fff]{2,3}", key)
+                    or self._dynamic_anchor_term_is_category(term)):
+                continue
+            frequency = max(0, int(row.get("document_frequency") or 0))
+            documents = max(0, int(row.get("document_count") or 0))
+            rare = (
+                frequency == 1 if documents < 20
+                else 0 < frequency <= 20 and frequency / documents <= 0.03
+            )
+            if rare and key in title_key and key in body_key:
+                matched.append(term)
+        return matched[:4]
 
     def _dynamic_anchor_node_payload(self, node: dict, plan: dict[str, Any]) -> dict[str, Any]:
         fields = self._compact_lookup_key(self._moment_search_fields(node))
@@ -18777,6 +18865,20 @@ class GatewayService:
         policy_query = str(context_query or query or "").strip() or query
         stage_started_at = time.perf_counter()
         relevance_query = self._query_has_relevance_facet(policy_query)
+        authority_view = getattr(self, "memory_authority_view", None)
+        authority_enabled = bool(
+            getattr(self, "memory_authority_enabled", False)
+            or getattr(authority_view, "enabled", False)
+        )
+        auto_bucket_getter = getattr(authority_view, "auto_recallable_bucket_ids", None)
+        auto_bucket_ids = (
+            (auto_bucket_getter() if callable(auto_bucket_getter) else frozenset())
+            if authority_enabled else None
+        )
+
+        def auto_allowed(bucket: dict) -> bool:
+            return auto_bucket_ids is None or str(bucket.get("id") or "") in auto_bucket_ids
+
         eligible = [
             bucket for bucket in all_buckets
             if (
@@ -18785,13 +18887,15 @@ class GatewayService:
                     or self._is_identity_name_candidate_bucket(raw_query, bucket)
                 )
                 and not self._is_relevance_suppressed(policy_query, bucket)
+                and auto_allowed(bucket)
             )
-            or (relevance_query and self._is_relevance_candidate_bucket(policy_query, bucket))
+            or (relevance_query and auto_allowed(bucket)
+                and self._is_relevance_candidate_bucket(policy_query, bucket))
         ]
         semantic_eligible = [
             bucket
             for bucket in all_buckets
-            if self._is_semantic_candidate_bucket(bucket)
+            if auto_allowed(bucket) and self._is_semantic_candidate_bucket(bucket)
         ]
         mark("eligible_filter", stage_started_at)
         record(
@@ -18799,6 +18903,10 @@ class GatewayService:
             len(all_buckets),
             len(eligible),
             secondary_output_count=len(semantic_eligible),
+            authority_filtered_count=(
+                sum(not auto_allowed(bucket) for bucket in all_buckets)
+                if auto_bucket_ids is not None else 0
+            ),
             reason="eligible and semantic-eligible pools",
         )
         if not eligible and not semantic_eligible:
@@ -18876,9 +18984,17 @@ class GatewayService:
             skipped=not bool(normalized_query),
             reason="empty normalized query" if not normalized_query else "keyword score hits",
         )
+        verified_local_anchor_ids = [
+            bucket_id for bucket_id in keyword_scores
+            if bucket_id in eligible_map
+            and self._short_cjk_identity_title_terms(
+                eligible_map[bucket_id], dynamic_anchor_plan
+            )
+        ]
+        dynamic_anchor_plan["short_cjk_fast_hit_count"] = len(verified_local_anchor_ids)
         stage_started_at = time.perf_counter()
         semantic_cache_debug: dict[str, Any] = {}
-        if allow_semantic:
+        if allow_semantic and not verified_local_anchor_ids:
             semantic_query = self._identity_name_semantic_query(raw_query) or raw_query
             semantic_scores = await self._get_semantic_candidates(
                 semantic_query,
@@ -18893,8 +19009,14 @@ class GatewayService:
             len(semantic_bucket_map),
             len(semantic_scores),
             limit=self.semantic_candidate_top_k,
-            skipped=not allow_semantic,
-            reason="disabled for this recall branch" if not allow_semantic else "eligible ids after embedding search",
+            skipped=not allow_semantic or bool(verified_local_anchor_ids),
+            reason=(
+                "disabled for this recall branch" if not allow_semantic
+                else "verified local short Chinese identity anchor"
+                if verified_local_anchor_ids
+                else "eligible ids after embedding search"
+            ),
+            verified_local_anchor_count=len(verified_local_anchor_ids),
             cache=semantic_cache_debug,
         )
         bucket_map = dict(eligible_map)
@@ -19139,6 +19261,7 @@ class GatewayService:
             if (
                 planner_lexical_direct_match
                 or exact_match
+                or dynamic_anchor.get("short_cjk_identity_title_match")
                 or dynamic_anchor.get("distinctive_anchor_match")
                 or dynamic_anchor.get("category_overview_item")
             ):
@@ -19312,6 +19435,7 @@ class GatewayService:
             admission_input_count,
             len(admitted_pool),
             retried=admission_retried,
+            rejection_evidence=self._rejected_bucket_evidence(suppressed_candidates),
             reason="recall policy admission",
         )
         stage_started_at = time.perf_counter()
@@ -19841,6 +19965,8 @@ class GatewayService:
                 "matched_query_terms",
                 "recall_policy_debug",
                 "dynamic_anchor_plan",
+                "short_cjk_identity_title_match",
+                "short_cjk_identity_title_terms",
                 "distinctive_anchor_match",
                 "distinctive_anchor_terms",
                 "distinctive_anchor_missing_terms",
@@ -20010,6 +20136,8 @@ class GatewayService:
             labels.append("taste_evidence")
         if item.get("distinctive_anchor_match"):
             labels.append("distinctive_anchor")
+        if item.get("short_cjk_identity_title_match"):
+            labels.append("short_cjk_identity_title")
         if item.get("category_overview_item"):
             labels.append("category_overview_item")
         if item.get("retrieval_alias_match"):
@@ -20053,6 +20181,7 @@ class GatewayService:
             "entity_match",
             "keyword_match",
             "distinctive_anchor",
+            "short_cjk_identity_title",
             "category_overview_item",
             "identity_name_match",
             "source_record_exact",
@@ -20390,6 +20519,7 @@ class GatewayService:
             or item.get("exact_anchor_match")
             or self._planner_lexical_direct_signal(item)
             or item.get("distinctive_anchor_match")
+            or item.get("short_cjk_identity_title_match")
             or item.get("category_overview_item")
             or item.get("explicit_relation_edge_match")
             or item.get("entity_edge_match")
@@ -20718,7 +20848,11 @@ class GatewayService:
         bucket = item.get("bucket") if isinstance(item, dict) else None
         if not isinstance(bucket, dict):
             return False
+        if not self._authority_auto_recall_allowed(bucket):
+            item["admission_reason"] = "authority_auto_recall_denied"
+            return False
         if self._is_self_anchor_recall_excluded_bucket(bucket):
+            item["admission_reason"] = "self_anchor_excluded"
             return False
         evidence_labels = self._bucket_evidence_labels(query, item)
         hard_evidence_labels = self._hard_bucket_evidence_labels(evidence_labels)
@@ -20732,6 +20866,7 @@ class GatewayService:
             or self._entity_edge_direct_signal(item)
             or self._is_identity_name_candidate_bucket(query, bucket)
             or "title_anchor" in hard_evidence_labels
+            or "short_cjk_identity_title" in hard_evidence_labels
             or "semantic_rescue_direct_span" in hard_evidence_labels
             or "strong_semantic" in hard_evidence_labels
             or "strong_rerank" in hard_evidence_labels
@@ -20785,6 +20920,7 @@ class GatewayService:
                 or self._entity_edge_direct_signal(item)
                 or item.get("semantic_rescue_direct_span")
                 or "title_anchor" in hard_evidence_labels
+                or "short_cjk_identity_title" in hard_evidence_labels
             ),
             auto=True,
         )
@@ -20851,6 +20987,7 @@ class GatewayService:
             self._planner_lexical_direct_signal(item)
             or item.get("exact_anchor_match")
             or item.get("distinctive_anchor_match")
+            or item.get("short_cjk_identity_title_match")
             or item.get("category_overview_item")
             or item.get("semantic_rescue_direct_span")
         ):
@@ -25014,6 +25151,17 @@ class GatewayService:
         if meta.get("pinned") or meta.get("protected"):
             return False
         return True
+
+    def _authority_auto_recall_allowed(self, bucket: dict | None) -> bool:
+        view = getattr(self, "memory_authority_view", None)
+        if not (getattr(self, "memory_authority_enabled", False)
+                or getattr(view, "enabled", False)):
+            return True
+        getter = getattr(view, "auto_recallable_bucket_ids", None)
+        if not callable(getter):
+            return False
+        bucket_id = str((bucket or {}).get("id") or "")
+        return bool(bucket_id and bucket_id in getter())
 
     def _is_identity_name_candidate_bucket(self, query: str, bucket: dict) -> bool:
         terms = self._identity_name_search_terms(query)

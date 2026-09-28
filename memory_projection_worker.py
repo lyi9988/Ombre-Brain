@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import hashlib
+import time
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +62,110 @@ class MemoryProjectionWorker:
             "results": results,
         }
 
+    async def repair_pending_once(self, *, limit: int = 1) -> dict[str, int]:
+        """Bounded background repair of missing auto-recall indexes.
+
+        Runs in the same scheduler as outbox projection, after normal events.
+        The source Memory revision and Bucket body must agree before an index
+        is written. Legacy relationship edges remain a separate projection.
+        """
+        budget = max(1, min(20, int(limit)))
+        result = {"attempted": 0, "projected": 0, "deferred": 0, "degraded": 0}
+        offset = 0
+        while result["attempted"] < budget:
+            page = self.authority.list_memories(state="active", limit=500, offset=offset)
+            if not page:
+                break
+            offset += len(page)
+            for memory in page:
+                if result["attempted"] >= budget:
+                    break
+                if memory.get("recall_policy") != "enabled":
+                    continue
+                memory_id = str(memory.get("memory_id") or "")
+                revision = int(memory.get("active_revision") or 0)
+                source_sha = str(memory.get("body_sha256") or "")
+                statuses = {
+                    str(item.get("projector") or ""): item
+                    for item in self.authority.list_projection_status(memory_id, revision=revision)
+                }
+                pending = [
+                    name for name in ("embedding", "entity_edges")
+                    if (statuses.get(name) or {}).get("status") == "pending_rebuild"
+                ]
+                if not pending:
+                    continue
+                now_ms = int(time.time() * 1000)
+                pending = [
+                    name for name in pending
+                    if int(((statuses[name].get("details") or {}).get("retry_after_ms") or 0)) <= now_ms
+                ]
+                if not pending:
+                    result["deferred"] += 1
+                    continue
+                result["attempted"] += 1
+                bucket_id = str(memory.get("bucket_id") or memory_id)
+                bucket = await self.bucket_manager.get(bucket_id)
+                live_dirs = [
+                    Path(self.bucket_manager.permanent_dir).resolve(),
+                    Path(self.bucket_manager.dynamic_dir).resolve(),
+                ]
+                bucket_path = Path(str((bucket or {}).get("path") or "")).resolve()
+                source_valid = bool(
+                    bucket and source_sha
+                    and any(bucket_path.is_relative_to(root) for root in live_dirs)
+                    and hashlib.sha256(str(bucket.get("content") or "").encode("utf-8")).hexdigest()
+                    == source_sha
+                )
+                if not source_valid:
+                    for name in pending:
+                        self._record_status(
+                            memory_id, revision, name, "degraded", source_sha,
+                            {"reason": "source_bucket_missing_archived_or_changed"},
+                        )
+                        result["degraded"] += 1
+                    continue
+                for name in pending:
+                    try:
+                        if name == "embedding":
+                            if not self.embedding_engine or not self.embedding_engine.enabled:
+                                result["deferred"] += 1
+                                continue
+                            ok = await self.embedding_engine.generate_and_store(
+                                bucket_id, bucket_text_for_embedding(bucket)
+                            )
+                            if not ok or not await self.embedding_engine.get_embedding(bucket_id):
+                                raise RuntimeError("embedding_not_stored")
+                            count = 1
+                        else:
+                            if self.entity_edge_store is None:
+                                result["deferred"] += 1
+                                continue
+                            edges = extract_entity_edges_from_bucket(bucket, self.identity)
+                            self.entity_edge_store.replace_bucket_edges(bucket_id, edges)
+                            count = len(edges)
+                        latest = self.authority.get_memory(memory_id)
+                        if (not latest or latest.get("state") != "active"
+                                or latest.get("recall_policy") != "enabled"
+                                or int(latest.get("active_revision") or 0) != revision
+                                or str(latest.get("body_sha256") or "") != source_sha):
+                            result["deferred"] += 1
+                            continue
+                        self._record_status(
+                            memory_id, revision, name, "projected", source_sha,
+                            {"reason": "bounded_background_repair", "result_count": count},
+                        )
+                        result["projected"] += 1
+                    except Exception as exc:
+                        retry_ms = int(time.time() * 1000) + 3600 * 1000
+                        self._record_status(
+                            memory_id, revision, name, "pending_rebuild", source_sha,
+                            {"reason": "repair_retry", "error_type": type(exc).__name__,
+                             "retry_after_ms": retry_ms},
+                        )
+                        result["deferred"] += 1
+        return result
+
     async def project_event(self, event: dict[str, Any]) -> dict[str, Any]:
         event_id = str(event.get("event_id") or "")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
@@ -93,7 +199,9 @@ class MemoryProjectionWorker:
             }
 
         if memory.get("state") == "tombstoned" or memory.get("recall_policy") == "disabled":
-            statuses.extend(await self._delete_indexes(memory_id, revision, source_sha))
+            statuses.extend(await self._delete_indexes(
+                memory_id, str(memory.get("bucket_id") or memory_id), revision, source_sha,
+            ))
         else:
             bucket = await self.bucket_manager.get(str(memory.get("bucket_id") or memory_id))
             if not bucket:
@@ -265,6 +373,7 @@ class MemoryProjectionWorker:
         self, bucket: dict, memory_id: str, revision: int, source_sha: str
     ) -> list[dict[str, Any]]:
         results = []
+        bucket_id = str(bucket.get("id") or memory_id)
         results.append(await self._project_async(
             "embedding",
             memory_id,
@@ -273,7 +382,7 @@ class MemoryProjectionWorker:
             enabled=bool(self.embedding_engine and getattr(self.embedding_engine, "enabled", False)),
             action=(
                 lambda: self.embedding_engine.generate_and_store(
-                    memory_id, bucket_text_for_embedding(bucket)
+                    bucket_id, bucket_text_for_embedding(bucket)
                 )
                 if self.embedding_engine else None
             ),
@@ -293,7 +402,7 @@ class MemoryProjectionWorker:
             enabled=self.entity_edge_store is not None,
             action=(
                 lambda: self.entity_edge_store.replace_bucket_edges(
-                    memory_id,
+                    bucket_id,
                     extract_entity_edges_from_bucket(bucket, self.identity),
                 )
             ) if self.entity_edge_store else None,
@@ -328,7 +437,9 @@ class MemoryProjectionWorker:
         ))
         return results
 
-    async def _delete_indexes(self, memory_id: str, revision: int, source_sha: str) -> list[dict[str, Any]]:
+    async def _delete_indexes(
+        self, memory_id: str, bucket_id: str, revision: int, source_sha: str
+    ) -> list[dict[str, Any]]:
         results = []
         actions = [
             ("embedding", self.embedding_engine.delete_embedding if self.embedding_engine else None),
@@ -341,7 +452,7 @@ class MemoryProjectionWorker:
                 results.append(self._record_status(memory_id, revision, projector, "disabled", source_sha, {}))
                 continue
             try:
-                action(memory_id)
+                action(bucket_id)
                 results.append(self._record_status(memory_id, revision, projector, "deleted", source_sha, {}))
             except Exception as exc:
                 results.append(self._record_status(
@@ -372,6 +483,8 @@ class MemoryProjectionWorker:
             return self._record_status(memory_id, revision, projector, "disabled", source_sha, {})
         try:
             result = await action()
+            if result is False:
+                raise RuntimeError("projection_action_returned_false")
             return self._record_status(
                 memory_id, revision, projector, "projected", source_sha,
                 {"result": bool(result)},

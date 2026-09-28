@@ -14330,6 +14330,10 @@ if __name__ == "__main__":
                 config.get("memory_authority", {}), dict) else {}
             interval = max(1, min(300, int(authority_cfg.get("projection_interval_seconds", 5))))
             batch_size = max(1, min(100, int(authority_cfg.get("projection_batch_size", 20))))
+            repair_enabled = bool(authority_cfg.get("repair_pending_enabled", False))
+            repair_interval = max(10, min(3600, int(authority_cfg.get("repair_interval_seconds", 30))))
+            repair_batch_size = max(1, min(20, int(authority_cfg.get("repair_batch_size", 1))))
+            next_repair_at = 0.0
             await asyncio.sleep(min(10, interval))
             local_bucket_mgr = BucketManager(config)
             local_embedding_engine = EmbeddingEngine(config)
@@ -14353,6 +14357,11 @@ if __name__ == "__main__":
                     result = await local_worker.run_once(limit=batch_size)
                     if result.get("claimed") or result.get("recovered_stale"):
                         logger.info("Memory projection run / 记忆派生投影: %s", result)
+                    if repair_enabled and time.monotonic() >= next_repair_at:
+                        next_repair_at = time.monotonic() + repair_interval
+                        repair = await local_worker.repair_pending_once(limit=repair_batch_size)
+                        if repair.get("attempted") or repair.get("degraded"):
+                            logger.info("Memory index repair / 记忆索引修复: %s", repair)
                 except Exception as exc:
                     logger.warning("Memory projection worker failed / 记忆派生投影失败: %s", exc)
                 await asyncio.sleep(interval)

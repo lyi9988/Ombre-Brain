@@ -9,11 +9,156 @@ from __future__ import annotations
 import asyncio
 import threading
 import json
+import hashlib
+import pytest
 from types import SimpleNamespace
 
 from gateway import GatewayService
 from memory_authority import MemoryAuthorityStore
 from memory_authority_view import MemoryAuthorityRecallView
+
+
+def test_short_cjk_identity_title_requires_rare_corrobated_authority_evidence():
+    service = GatewayService.__new__(GatewayService)
+    service._dynamic_anchor_term_is_category = lambda _term: False
+    plan = {
+        "short_cjk_identity_axis_terms": ["晏晏"],
+        "term_stats": [{
+            "term": "晏晏", "document_frequency": 12, "document_count": 744,
+        }],
+    }
+    bucket = {
+        "id": "memory-bucket", "metadata": {"type": "dynamic", "name": "晏晏的故事"},
+        "content": "晏晏与主人有共同经历。",
+    }
+    assert service._short_cjk_identity_title_terms(bucket, plan) == ["晏晏"]
+    assert GatewayService._hard_bucket_evidence_labels(["short_cjk_identity_title"]) == [
+        "short_cjk_identity_title"
+    ]
+    assert service._short_cjk_identity_title_terms(
+        {**bucket, "content": "另一段没有目标称呼的故事。"}, plan
+    ) == []
+    assert service._short_cjk_identity_title_terms(bucket, {
+        **plan, "term_stats": [{"term": "晏晏", "document_frequency": 80, "document_count": 744}],
+    }) == []
+    assert service._short_cjk_identity_title_terms(bucket, {
+        **plan, "short_cjk_identity_axis_terms": [],
+    }) == []
+
+
+def test_short_cjk_identity_question_activates_axis_without_owner_name_marker():
+    service = GatewayService.__new__(GatewayService)
+    service.bucket_mgr = SimpleNamespace(lexical_term_specificity_stats=lambda _terms, _buckets: {
+        "晏晏": {"document_frequency": 12, "document_count": 744},
+    })
+    service._recall_query_plan = lambda _query: SimpleNamespace(activated_axis_terms=("晏晏",))
+    service._dynamic_anchor_query_terms = lambda _query: ["晏晏"]
+    service._dynamic_anchor_term_is_category = lambda _term: False
+    service._query_has_identity_name_intent = lambda _query: False
+    plan = service._dynamic_anchor_plan("你还记得晏晏是谁吗？", [], [])
+    assert plan["short_cjk_identity_axis_terms"] == ["晏晏"]
+
+
+def test_verified_local_short_name_skips_remote_embedding():
+    class AfterSemanticBranch(Exception):
+        pass
+
+    service = GatewayService.__new__(GatewayService)
+    service.inject_max_cards = 2
+    service.dynamic_top_k = 10
+    service.semantic_candidate_top_k = 24
+    service.memory_authority_view = None
+    service._recall_query_plan = lambda _query: SimpleNamespace(
+        skip_reason="", skip_long_term_recall=False,
+    )
+    service._query_has_relevance_facet = lambda _query: False
+    service._is_dynamic_candidate = lambda _bucket: True
+    service._is_relevance_suppressed = lambda _query, _bucket: False
+    service._is_semantic_candidate_bucket = lambda _bucket: True
+    service._is_identity_name_candidate_bucket = lambda _query, _bucket: False
+    service._retrieval_alias_hits = lambda _query, _ids: []
+    service._dynamic_anchor_plan = lambda *_args: {"short_cjk_identity_axis_terms": ["晏晏"]}
+    service._normalized_recall_query = lambda _query: "晏晏"
+    service._get_keyword_candidates = lambda _query, _buckets: {"bucket-1": 0.9}
+    service._short_cjk_identity_title_terms = lambda _bucket, _plan: ["晏晏"]
+    service._add_timing_ms = lambda *_args: None
+    service._query_looks_emotional_reason_lookup = lambda _query: False
+
+    async def forbidden_semantic(*_args, **_kwargs):
+        raise AssertionError("remote embedding should not be called")
+
+    service._get_semantic_candidates = forbidden_semantic
+    service._get_exact_anchor_candidates = lambda *_args: (_ for _ in ()).throw(
+        AfterSemanticBranch()
+    )
+    stages = []
+    with pytest.raises(AfterSemanticBranch):
+        asyncio.run(service._dynamic_bucket_candidate_items(
+            "你还记得晏晏是谁吗？", "jiajia-main", [{"id": "bucket-1"}],
+            candidate_stages=stages,
+        ))
+    embedding_stage = next(row for row in stages if row["stage"] == "candidate.embedding_candidates")
+    assert embedding_stage["skipped"] is True
+    assert embedding_stage["verified_local_anchor_count"] == 1
+
+    calls = []
+    service._short_cjk_identity_title_terms = lambda _bucket, _plan: []
+
+    async def fallback_semantic(*_args, **_kwargs):
+        calls.append(True)
+        return {}
+
+    service._get_semantic_candidates = fallback_semantic
+    with pytest.raises(AfterSemanticBranch):
+        asyncio.run(service._dynamic_bucket_candidate_items(
+            "你还记得晏晏是谁吗？", "jiajia-main", [{"id": "bucket-1"}],
+        ))
+    assert calls == [True]
+
+
+def test_authority_auto_bucket_gate_fails_closed_and_rejections_are_body_free():
+    service = GatewayService.__new__(GatewayService)
+    service.memory_authority_view = SimpleNamespace(
+        enabled=True,
+        auto_recallable_bucket_ids=lambda: frozenset({"enabled-bucket"}),
+    )
+    assert service._authority_auto_recall_allowed({"id": "enabled-bucket"})
+    assert not service._authority_auto_recall_allowed({"id": "manual-bucket"})
+    rejected = {"bucket": {"id": "manual-bucket", "content": "private body"}}
+    assert service._admit_bucket_for_recall("test", rejected) is False
+    assert rejected["admission_reason"] == "authority_auto_recall_denied"
+    evidence = service._rejected_bucket_evidence([rejected])
+    assert evidence["reason_counts"] == {"authority_auto_recall_denied": 1}
+    assert "manual-bucket" not in json.dumps(evidence)
+    assert "private body" not in json.dumps(evidence)
+
+
+def test_authority_view_auto_bucket_ids_exclude_manual_only_and_refresh_wal(tmp_path):
+    authority = MemoryAuthorityStore({"state_dir": str(tmp_path)})
+
+    def commit(bucket_id, recall_policy):
+        digest = hashlib.sha256(bucket_id.encode()).hexdigest()
+        prepared = authority.prepare_memory_commit(
+            memory_id=f"memory:{bucket_id}", bucket_id=bucket_id,
+            expected_revision=0, body_sha256=digest,
+            snapshot_path=f"revisions/{bucket_id}/1.md", metadata={},
+            source_refs=["owner-test"], decision_source="owner",
+            idempotency_key=f"auto-gate:{bucket_id}", actor="owner",
+            recall_policy=recall_policy,
+        )
+        authority.record_body_written(prepared["operation_id"], observed_body_sha256=digest)
+        authority.finalize_memory_commit(prepared["operation_id"])
+
+    commit("enabled-bucket", "enabled")
+    commit("manual-bucket", "manual_only")
+    view = MemoryAuthorityRecallView({
+        "state_dir": str(tmp_path), "memory_authority": {"enabled": True},
+    })
+    assert view.auto_recallable_bucket_ids() == frozenset({"enabled-bucket"})
+    commit("new-enabled-bucket", "enabled")
+    assert view.auto_recallable_bucket_ids() == frozenset({
+        "enabled-bucket", "new-enabled-bucket",
+    })
 
 
 def test_authority_view_exposes_only_trusted_aliases_and_refreshes_wal(tmp_path):

@@ -12,6 +12,8 @@ class FakeBucketManager:
     def __init__(self, bucket):
         self.bucket = dict(bucket)
         self.get_calls = []
+        self.permanent_dir = ""
+        self.dynamic_dir = ""
 
     async def get(self, bucket_id):
         self.get_calls.append(str(bucket_id))
@@ -27,13 +29,21 @@ class FakeEmbedding:
         self.generate_calls = []
         self.delete_calls = []
         self.fail_generate = False
+        self.return_false = False
         self.fail_delete = False
+        self.stored = {}
 
     async def generate_and_store(self, memory_id, text):
         if self.fail_generate:
             raise RuntimeError("embedding unavailable")
+        if self.return_false:
+            return False
         self.generate_calls.append((memory_id, text))
+        self.stored[memory_id] = [0.1, 0.2]
         return {"memory_id": memory_id, "text": text}
+
+    async def get_embedding(self, bucket_id):
+        return self.stored.get(bucket_id)
 
     def delete_embedding(self, memory_id):
         if self.fail_delete:
@@ -160,6 +170,11 @@ def _commit_memory(
 
 def _worker(authority, tmp_path, memory_id="memory-1", body="主人喜欢清淡的手冲咖啡。"):
     bucket_manager = FakeBucketManager(_bucket(memory_id, body))
+    bucket_manager.dynamic_dir = str(tmp_path / "dynamic")
+    bucket_manager.permanent_dir = str(tmp_path / "permanent")
+    (tmp_path / "dynamic").mkdir(exist_ok=True)
+    (tmp_path / "permanent").mkdir(exist_ok=True)
+    bucket_manager.bucket["path"] = str(tmp_path / "dynamic" / f"{memory_id}.md")
     embedding = FakeEmbedding()
     moments = FakeMoment()
     node = FakeNode()
@@ -363,3 +378,70 @@ def test_stale_processing_event_is_recovered_then_projected(tmp_path):
     outbox = _outbox_row(authority, commit["outbox_event_id"])
     assert outbox["status"] == "projected"
     assert outbox["attempts"] == 1
+
+
+def test_pending_repair_is_bounded_and_marks_verified_indexes_once(tmp_path):
+    authority = _authority(tmp_path)
+    _commit_memory(authority)
+    memory = authority.get_memory("memory-1")
+    for projector in ("embedding", "entity_edges"):
+        authority.set_projection_status(
+            memory_id="memory-1", memory_revision=1, projector=projector,
+            status="pending_rebuild", source_sha256=memory["body_sha256"],
+            details={"reason": "legacy_index_missing"},
+        )
+    worker, _bucket_manager, embedding, _moments, _node, entity, _word_map = _worker(
+        authority, tmp_path
+    )
+
+    first = asyncio.run(worker.repair_pending_once(limit=1))
+    second = asyncio.run(worker.repair_pending_once(limit=1))
+
+    assert first["attempted"] == 1
+    assert first["projected"] == 2
+    assert second["attempted"] == 0
+    assert len(embedding.generate_calls) == 1
+    assert len(entity.replace_calls) == 1
+    status = {row["projector"]: row["status"] for row in authority.list_projection_status(
+        "memory-1", revision=1
+    )}
+    assert status["embedding"] == status["entity_edges"] == "projected"
+
+
+def test_projection_uses_bucket_identity_when_authority_id_differs(tmp_path):
+    authority = _authority(tmp_path)
+    body = "主人喜欢清淡的手冲咖啡。"
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    prepared = authority.prepare_memory_commit(
+        memory_id="authority-memory", bucket_id="bucket-projection",
+        expected_revision=0, body_sha256=digest,
+        snapshot_path="revisions/authority-memory/1.md",
+        metadata={}, source_refs=["test:distinct-id"],
+        decision_source="test", idempotency_key="distinct-id", actor="test",
+    )
+    authority.record_body_written(prepared["operation_id"], observed_body_sha256=digest)
+    authority.finalize_memory_commit(prepared["operation_id"])
+    worker, _bucket_manager, embedding, _moments, _node, entity, _word_map = _worker(
+        authority, tmp_path, memory_id="bucket-projection", body=body
+    )
+
+    result = asyncio.run(worker.run_once())
+
+    assert result["projected"] == 1
+    assert embedding.generate_calls[0][0] == "bucket-projection"
+    assert entity.replace_calls[0][0] == "bucket-projection"
+
+
+def test_embedding_false_result_does_not_claim_projected(tmp_path):
+    authority = _authority(tmp_path)
+    _commit_memory(authority)
+    worker, _bucket_manager, embedding, *_rest = _worker(authority, tmp_path)
+    embedding.return_false = True
+
+    result = asyncio.run(worker.run_once())
+
+    assert result["degraded"] == 1
+    status = {row["projector"]: row["status"] for row in authority.list_projection_status(
+        "memory-1", revision=1
+    )}
+    assert status["embedding"] == "degraded"
