@@ -2,6 +2,36 @@
 
 Status: design-frozen for M1 implementation.
 
+### 2026-09-29 natural conversation recall correction
+
+The request-local retrieval query may include the nearest previous user
+message for an anaphoric follow-up (a person, object, event, or causal
+follow-up). Only messages already present in the request are considered;
+assistant/tool messages never establish an antecedent. The previous user
+message must be within eight message positions and at most 500 characters.
+Acknowledgements stop the lookup. This context is a search cue, not an alias
+write, a resolved identity, or a change to canonical/chat messages. The trace
+records message positions, length, reason, and query hash.
+
+An unclassified query starts with local Fast retrieval. If Fast selects
+nothing and has an eligible weak candidate or a memory-seeking/contextual
+cue, the same selector may run Deep once. A successful Fast result avoids
+that work. Deep uses existing embedding, reranker and optional Query Planner;
+it does not call the main conversation model for a routing decision. The
+fallback has a 12-second default deadline, configurable through
+`gateway.recall_deep_fallback_timeout_seconds` (clamped to 1–30 seconds).
+Timeout returns the empty Fast result with an explicit diagnostic. External
+cancellation propagates and cancels/joins any parallel Planner task.
+
+Deep graph retrieval permits bucket reranking before bucket admission. A
+moment reranker that runs only after admission cannot provide evidence for
+a bucket already rejected. Provider enabled flags, Authority active/enabled
+policy, evidence thresholds, archive/privacy restrictions and Composer's
+single `ombre.memory_recall` projection remain authoritative. Fast cannot
+run remote Semantic Rescue. Diagnostics preserve the Fast pass and the
+Deep result separately. This correction requires natural owner acceptance;
+passing local tests does not establish production recall quality.
+
 ## 1. Purpose
 
 RECALL-R1 converges the existing Ombre memory writers and recall paths without

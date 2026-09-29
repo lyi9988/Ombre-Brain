@@ -639,7 +639,7 @@ def test_gateway_serves_owner_safe_memory_projection_on_existing_bearer_transpor
     assert "body" not in bodies[1]["items"][0]
     assert bodies[2]["items"][0]["body"] == "owner body"
     assert bodies[3]["body"] == "owner body"
-    assert bodies[4]["settings"]["policy_revision"] == "recall-r1"
+    assert bodies[4]["settings"]["policy_revision"] == "recall-r1-context-fallback-v2"
     assert bodies[5]["diagnostics"]["route"] == "unknown"
     assert "synthetic" not in str(bodies)
 

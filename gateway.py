@@ -188,7 +188,7 @@ GENERIC_LEXICAL_STOPWORD_KEYS = frozenset(
     if str(term or "").strip()
 )
 FAVORITE_MEMORY_MARKER = "[[ombre:favorite]]"
-RECALL_POLICY_REVISION = "recall-r1"
+RECALL_POLICY_REVISION = "recall-r1-context-fallback-v2"
 RETRYABLE_UPSTREAM_STATUS_CODES = {401, 403, 429, 500, 502, 503, 504}
 # Keep provider connect/write/read bounds below the caller's whole-request
 # watchdog.  The read timeout is applied per streamed read, so a quiet stream
@@ -4309,6 +4309,9 @@ class GatewayService:
         else:
             current_user_query = self._extract_current_turn_user_query(messages)
         is_new_user_turn = bool(current_user_query)
+        recall_query, recall_context_debug = self._contextual_recall_query(
+            current_user_query, messages,
+        )
         has_handoff_context = self._messages_contain_handoff_context(messages)
         is_session_start = self.state_store.get_last_success_at(session_id) is None
         just_now_context_requested = (
@@ -4339,7 +4342,7 @@ class GatewayService:
             self.date_recall_enabled
             and self._query_requests_date_recall(current_user_query)
         )
-        low_signal_auto_recall = self._auto_recall_low_signal_query(current_user_query)
+        low_signal_auto_recall = self._auto_recall_low_signal_query(recall_query)
         mark_step("classify_request", stage_started_at)
 
         persona_block = ""
@@ -4394,7 +4397,7 @@ class GatewayService:
             mark_step("targeted_skip_check", stage_started_at)
             stage_started_at = time.perf_counter()
             memory_sentinel_debug = await self._route_memory_sentinel(
-                current_user_query,
+                recall_query,
                 session_id,
                 all_buckets,
                 needs_handoff_first=needs_handoff_first,
@@ -4402,6 +4405,7 @@ class GatewayService:
                 date_recall_requested=date_recall_requested,
                 targeted_detail_skip=skip_for_targeted_detail,
             )
+            memory_sentinel_debug["query_context"] = recall_context_debug
             mark_step("memory_sentinel", stage_started_at)
             sentinel_route = str(memory_sentinel_debug.get("route") or "")
             recall_execution = self._recall_route_execution_options(sentinel_route)
@@ -4420,13 +4424,13 @@ class GatewayService:
             if not pre_domain_skip_broad:
                 stage_started_at = time.perf_counter()
                 domain_sentinel_debug = await self._route_domain_sentinel(
-                    current_user_query,
+                    recall_query,
                     allow_remote=self.domain_sentinel_remote_in_prepare,
                 )
                 mark_step("domain_sentinel", stage_started_at)
                 domain_sentinel_skip_broad = self._domain_sentinel_should_skip_recall(
                     domain_sentinel_debug,
-                    current_user_query,
+                    recall_query,
                 )
             if domain_sentinel_skip_broad:
                 domain_sentinel_debug["skip_applied"] = True
@@ -4531,12 +4535,14 @@ class GatewayService:
                     suppressed_buckets = []
                 elif self.retrieval_mode == "bucket":
                     stage_started_at = time.perf_counter()
-                    selected_buckets, suppressed_buckets, query_planner_debug = await self._select_dynamic_buckets(
-                        current_user_query,
+                    selected_buckets, suppressed_buckets, query_planner_debug = await self._select_recall_with_fallback(
+                        self._select_dynamic_buckets,
+                        recall_query,
                         session_id,
                         all_buckets,
+                        sentinel_debug=memory_sentinel_debug,
                         search_query=self._dynamic_recall_search_query(
-                            current_user_query,
+                            recall_query,
                             memory_sentinel_debug,
                         ),
                         include_query_planner_debug=True,
@@ -4548,7 +4554,7 @@ class GatewayService:
                     mark_step("dynamic_recall_bucket_select", stage_started_at)
                     stage_started_at = time.perf_counter()
                     selected_buckets = self._with_explicit_source_record_buckets(
-                        current_user_query,
+                        recall_query,
                         selected_buckets,
                         all_buckets,
                     )
@@ -4561,12 +4567,12 @@ class GatewayService:
                             if isinstance(bucket.get("_recall_signal"), dict)
                             else {}
                         )
-                        bucket_moments = self._direct_moments_for_bucket(bucket, current_user_query)
+                        bucket_moments = self._direct_moments_for_bucket(bucket, recall_query)
                         moment = self._representative_moment(bucket_moments)
                         if not moment:
                             moment = self._source_record_synthetic_moment_for_bucket(
                                 bucket,
-                                current_user_query,
+                                recall_query,
                                 selected_reason="selected_bucket",
                             )
                         if not moment:
@@ -4588,14 +4594,16 @@ class GatewayService:
                         suppressed_moments,
                         suppressed_buckets,
                         query_planner_debug,
-                    ) = await self._select_dynamic_moments(
-                        current_user_query,
+                    ) = await self._select_recall_with_fallback(
+                        self._select_dynamic_moments,
+                        recall_query,
                         session_id,
                         all_buckets,
                         grouped_moments,
+                        sentinel_debug=memory_sentinel_debug,
                         all_moments=all_moments,
                         search_query=self._dynamic_recall_search_query(
-                            current_user_query,
+                            recall_query,
                             memory_sentinel_debug,
                         ),
                         allow_bucket_rerank=self.graph_bucket_rerank_enabled,
@@ -4615,7 +4623,7 @@ class GatewayService:
                 grouped_moments,
                 all_buckets,
                 self.recalled_budget,
-                current_user_query,
+                recall_query,
                 context_mode=context_mode,
             )
             mark_step("format_recalled_memory", stage_started_at)
@@ -4658,7 +4666,7 @@ class GatewayService:
                     moment_candidates,
                     all_moments,
                     moment_edges,
-                    current_user_query,
+                    recall_query,
                     session_id=session_id,
                     context_mode=context_mode,
                 )
@@ -4920,6 +4928,10 @@ class GatewayService:
             "skip_broad_dynamic_recall": skip_broad_dynamic_recall,
             "retrieval_mode": self.retrieval_mode,
             "context_mode": context_mode,
+            "recall_route": str(memory_sentinel_debug.get("route") or ""),
+            "recall_query_context": recall_context_debug,
+            "recall_deep_fallback": memory_sentinel_debug.get("deep_fallback", {}),
+            "recall_policy_revision": RECALL_POLICY_REVISION,
             "recalled_moment_count": len(recalled_moments),
             "suppressed_moment_count": len(suppressed_moments),
             "suppressed_bucket_count": len(suppressed_buckets),
@@ -16058,6 +16070,143 @@ class GatewayService:
             "allow_rerank": deep,
         }
 
+    def _contextual_recall_query(
+        self, query: str, messages: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        """Give an elliptical follow-up its nearest user context for retrieval.
+
+        This is a search query, never an entity/alias fact or a replacement
+        for the actual user message. Assistant guesses and tool output cannot
+        supply an antecedent. Multiple people in the context remain ambiguous
+        and must pass the ordinary candidate admission rules.
+        """
+        debug = {"used": False, "source_message_indices": [], "reason": "standalone"}
+        if not query or not re.search(
+            r"他|她|它|这件事|那件事|那次|那时候|那个|这个|后来|然后呢|为什么会这样"
+            r"|\b(?:he|she|him|her|they|them|that|it)\b", query, re.IGNORECASE,
+        ):
+            return query, debug
+        current_index = None
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            text = self._strip_external_context_from_user_text(
+                self._coerce_message_text(message.get("content")),
+            ).strip()
+            if text == query.strip():
+                current_index = index
+                break
+        if current_index is None:
+            debug["reason"] = "current_user_not_located"
+            return query, debug
+        # Only the nearest previous user turn is eligible. Do not reach past
+        # a topic change/acknowledgement to find a convenient older name.
+        for index in range(current_index - 1, max(-1, current_index - 9), -1):
+            message = messages[index]
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            text = self._strip_external_context_from_user_text(
+                self._coerce_message_text(message.get("content")),
+            ).strip()
+            if not text or len(text) > 500 or self._memory_sentinel_obvious_skip_query(text):
+                debug["reason"] = "previous_user_unsuitable"
+                return query, debug
+            combined = f"{text}\n{query}"
+            debug.update(
+                used=True, reason="recent_user_context", source_message_indices=[index],
+                query_sha256=hashlib.sha256(combined.encode("utf-8")).hexdigest(),
+                context_chars=len(text),
+            )
+            return combined, debug
+        debug["reason"] = "no_recent_user_context"
+        return query, debug
+
+    async def _select_recall_with_fallback(
+        self, selector, query: str, *args,
+        sentinel_debug: dict[str, Any], **kwargs,
+    ):
+        """Run the existing selector, with at most one bounded Deep upgrade.
+
+        Both passes use the same authority, policy and projection. The main
+        conversation model is never invoked here. A fast miss is not evidence
+        that Memory contains nothing relevant.
+        """
+        route = str(sentinel_debug.get("route") or "")
+        if route == "deep" and "allow_bucket_rerank" in kwargs:
+            # Deep needs relevance evidence before source-bucket admission;
+            # the later moment reranker cannot rescue a rejected source.
+            kwargs["allow_bucket_rerank"] = bool(kwargs.get("allow_rerank"))
+        result = await selector(query, *args, **kwargs)
+        fallback = {"attempted": False, "reason": "route_not_fast"}
+        sentinel_debug["deep_fallback"] = fallback
+        if route != "fast":
+            return result
+        if result[0]:
+            fallback["reason"] = "fast_has_result"
+            return result
+        fast_debug = result[-1]
+        # There must be a query-derived cue or eligible weak candidate.
+        # Policy-denied and already-covered memories do not justify retries.
+        weak_reasons = {
+            "no_hard_evidence", "low_recall_evidence", "weak_evidence_only",
+            "keyword_only", "semantic_only", "below_threshold",
+            "discriminative_anchor_missing", "topic_evidence_missing",
+            "retrieval_alias_only", "generic_category_only",
+            "explicit_query_without_reliable_evidence",
+        }
+        rejected = result[-2]
+        weak_candidate = any(
+            isinstance(item, dict)
+            and str(item.get("admission_reason") or item.get("blocked_reason") or "") in weak_reasons
+            and self._authority_auto_recall_allowed(item.get("bucket") or {})
+            for item in rejected
+        )
+        memory_intent = (
+            self._query_has_explicit_recall_marker(query)
+            or self._query_looks_emotional_reason_lookup(query)
+            or bool((sentinel_debug.get("query_context") or {}).get("used"))
+            or self._query_has_identity_name_intent(query)
+            or bool(re.search(r"是谁|谁是|什么人|\bwho\s+(?:is|was|are|were)\b", query, re.IGNORECASE))
+        )
+        if not (weak_candidate or memory_intent):
+            fallback["reason"] = "no_eligible_memory_signal"
+            return result
+        options = dict(kwargs)
+        options.update(allow_semantic=True, allow_query_planner=True, allow_rerank=True)
+        # In graph mode the normal moment reranker runs after bucket
+        # admission. A failed Fast pass needs bucket reranking first, or weak
+        # semantic candidates are rejected before any reranker can see them.
+        if "allow_bucket_rerank" in options:
+            options["allow_bucket_rerank"] = True
+        budget = max(1.0, min(30.0, self._safe_float(
+            (getattr(self, "gateway_cfg", {}) or {}).get("recall_deep_fallback_timeout_seconds", 12.0),
+            12.0,
+        )))
+        started = time.perf_counter()
+        fallback.update(attempted=True, reason="fast_empty", budget_ms=round(budget * 1000))
+        sentinel_debug["initial_route"] = route
+        sentinel_debug["route"] = "deep"
+        sentinel_debug.setdefault("route_reason_codes", []).append("DEEP_AFTER_FAST_EMPTY")
+        try:
+            deep_result = await asyncio.wait_for(selector(query, *args, **options), timeout=budget)
+        except asyncio.TimeoutError:
+            fallback.update(reason="deep_timeout", duration_ms=round((time.perf_counter() - started) * 1000))
+            return result
+        fallback.update(
+            reason="deep_selected" if deep_result[0] else "deep_empty",
+            duration_ms=round((time.perf_counter() - started) * 1000),
+            selected_count=len(deep_result[0]),
+        )
+        # Retain the local pass in Inspector without replacing final-pass
+        # candidate counts or pretending either pass injected anything.
+        deep_result[-1]["fast_pass"] = {
+            "candidate_stages": fast_debug.get("candidate_stages", []),
+            "timing_ms": fast_debug.get("timing_ms", {}),
+            "rejections": self._rejected_bucket_evidence(rejected),
+        }
+        return deep_result
+
     @staticmethod
     def _owner_alias_memory_ids(sentinel_debug: dict[str, Any] | None) -> list[str]:
         output: list[str] = []
@@ -16183,6 +16332,10 @@ class GatewayService:
             elif debug.get("route") == "tone_only":
                 debug["route_reason_codes"] = ["SKIP_TONE_ONLY"]
             return debug
+        debug.update(
+            route="fast", reason="local candidate pass for unclassified query",
+            route_reason_codes=["FAST_LOCAL_DEFAULT"],
+        )
         return debug
 
     def _memory_sentinel_hard_bypass_reason(
@@ -19467,7 +19620,22 @@ class GatewayService:
         )
         return admitted_pool, suppressed_candidates
 
-    async def _select_dynamic_buckets(
+    async def _select_dynamic_buckets(self, *args, **kwargs):
+        planner_tasks: list[asyncio.Task] = []
+        try:
+            return await self._select_dynamic_buckets_impl(
+                *args, _planner_tasks=planner_tasks, **kwargs,
+            )
+        finally:
+            # A Deep deadline/client cancellation must not leave a parallel
+            # Planner provider request running after the turn has stopped.
+            for task in planner_tasks:
+                if not task.done():
+                    task.cancel()
+            if planner_tasks:
+                await asyncio.gather(*planner_tasks, return_exceptions=True)
+
+    async def _select_dynamic_buckets_impl(
         self,
         query: str,
         session_id: str,
@@ -19480,6 +19648,7 @@ class GatewayService:
         allow_semantic_session_dedupe: bool = True,
         allow_rerank: bool = True,
         forced_memory_ids: list[str] | None = None,
+        _planner_tasks: list[asyncio.Task] | None = None,
     ) -> tuple[list[dict], list[dict]] | tuple[list[dict], list[dict], dict[str, Any]]:
         planner_debug = self._query_planner_debug_base(query)
         timing_debug = planner_debug.setdefault("timing_ms", {})
@@ -19495,6 +19664,8 @@ class GatewayService:
             if planner_pretrigger:
                 planner_parallel_started_at = time.perf_counter()
                 planner_task = asyncio.create_task(self._call_query_planner(query))
+                if _planner_tasks is not None:
+                    _planner_tasks.append(planner_task)
                 planner_debug["parallel_started"] = True
                 planner_debug["parallel_pretrigger"] = planner_pretrigger
         if not query or self.inject_max_cards <= 0:
@@ -19548,8 +19719,8 @@ class GatewayService:
         )
 
         rescue_debug = planner_debug.setdefault("semantic_rescue", {})
-        if not self.semantic_rescue_enabled:
-            rescue_debug["skip_reason"] = "disabled"
+        if not self.semantic_rescue_enabled or not allow_semantic:
+            rescue_debug["skip_reason"] = "disabled" if not self.semantic_rescue_enabled else "fast_local_only"
         elif len(direct_selected) >= self.inject_max_cards:
             rescue_debug["skip_reason"] = "capacity_full"
         else:
