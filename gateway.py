@@ -4907,6 +4907,10 @@ class GatewayService:
             "handoff_tool_hint": handoff_tool_hint,
             "context_mode": context_mode,
         }
+        # Existing owner presets predate the unified Memory source. Project
+        # the same editable status into their existing direct-recall carrier;
+        # do not mutate the preset, its role/order, or its component toggles.
+        self._project_legacy_recall_status(prompt_plan, context_args, recall_status)
         if prompt_plan is None or prompt_plan.get("fallback_legacy"):
             stable_context, dynamic_context = (
                 self._build_injected_context_messages(**context_args))
@@ -22736,6 +22740,25 @@ class GatewayService:
             "token_estimate": count_tokens_approx(body),
         }
 
+    def _project_legacy_recall_status(self, gateway_plan: dict | None, context_args: dict,
+                                      status: dict) -> None:
+        if not status or status.get("status") == "disabled":
+            return
+        gateway_slice = (gateway_plan or {}).get("gateway_slice") or {}
+        chain = self._prompt_scope_chain(gateway_slice, str((gateway_plan or {}).get("scope") or "talk.initial"))
+        if any(isinstance(block, dict) and block.get("scope") in chain
+               and block.get("source_id") == "ombre.memory_recall"
+               for block in gateway_slice.get("blocks") or []):
+            return
+        body = self._resolve_gateway_fixed_prompt(
+            "ombre.memory_recall_status_wrapper_prompt",
+            runtime_values={"status": status.get("status"),
+                            "content": context_args.get("recalled_memory") or ""},
+        )
+        if body:
+            context_args["recalled_memory"] = body
+            status["legacy_compatibility_projection"] = True
+
     def _composer_live_recall_enabled(self, gateway_plan: dict | None) -> bool:
         if not gateway_plan or gateway_plan.get("fallback_legacy"):
             return True
@@ -22746,7 +22769,12 @@ class GatewayService:
                       if isinstance(b, dict) and b.get("scope") in chain
                       and b.get("source_id") == "ombre.memory_recall"]
         if not configured:
-            return True  # old plans preserve their existing legacy path
+            legacy = [b for b in gateway_slice.get("blocks") or []
+                      if isinstance(b, dict) and b.get("scope") in chain
+                      and b.get("source_id") in {"ombre.recalled_memory",
+                          "ombre.targeted_memory_detail", "ombre.diffused_memory"}]
+            return not legacy or any(b.get("enabled", True) and b.get("mode", "live_source") == "live_source"
+                                     for b in legacy)
         return any(b.get("enabled", True) and b.get("mode", "live_source") == "live_source"
                    for b in configured)
 
