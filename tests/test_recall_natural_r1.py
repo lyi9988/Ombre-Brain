@@ -431,7 +431,10 @@ def test_task_context_and_disabled_planner_do_not_turn_off_ordinary_semantics():
     assert calls[0]["context_mode"] == "task"
     assert calls[0]["allow_semantic"] is True
     assert calls[0]["allow_query_planner"] is False
-    assert result == ([], [], {})
+    assert result[:2] == ([], [])
+    assert [(item["phase"], item["status"]) for item in result[2]["selection_attempts"]] == [
+        ("initial", "completed"),
+    ]
 
 
 def test_natural_total_timeout_retries_local_only_with_all_provider_steps_disabled():
@@ -477,7 +480,10 @@ def test_natural_total_timeout_retries_local_only_with_all_provider_steps_disabl
         },
     ]
     assert "recall_total_timeout" in natural_input["incomplete_reasons"]
-    assert result == ([], [], {})
+    assert result[:2] == ([], [])
+    assert [(item["phase"], item["status"]) for item in result[2]["selection_attempts"]] == [
+        ("initial", "timeout"), ("timeout_fallback", "completed"),
+    ]
 
 
 def test_natural_timeout_retains_completed_verified_semantic_without_second_embedding_or_rerank():
@@ -540,6 +546,75 @@ def test_natural_timeout_retains_completed_verified_semantic_without_second_embe
     assert calls["selected"][0].get("rerank_score") is None
     assert natural_input["semantic_debug"]["provider_requests"] == 1
     assert "recall_total_timeout" in natural_input["incomplete_reasons"]
+
+
+def test_natural_timeout_preserves_initial_and_local_fallback_selection_telemetry():
+    query = "Synthetic ordinary recall question."
+    bucket = _natural_bucket("synthetic-timeout-bucket", "Synthetic committed source body.")
+    candidate = _natural_candidate(bucket, 0.93)
+    service, _calls, _metadata = _natural_finish_service(None, [bucket], {})
+    service._record_candidate_stage = GatewayService._record_candidate_stage
+    service.recall_timeout_seconds = 0.03
+    phases = []
+    rerank_cancelled = asyncio.Event()
+
+    async def candidate_builder(_query, _session_id, _buckets, *, timing_debug,
+                                timing_prefix, candidate_stages, natural_input, **_kwargs):
+        phase = "timeout_fallback" if natural_input.get("local_only") else "initial"
+        phases.append(phase)
+        timing_debug[f"{timing_prefix}.synthetic_lookup"] = 9 if phase == "timeout_fallback" else 7
+        candidate_stages.append({"stage": "synthetic.lookup", "candidate_count": 1})
+        return [dict(candidate)], []
+
+    async def blocked_rerank(_query, _items, **_kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            rerank_cancelled.set()
+
+    async def selector(selected_query, session_id, buckets, *, natural_input,
+                       allow_query_planner, allow_rerank, **_kwargs):
+        natural_input.update(allow_query_planner=allow_query_planner, allow_rerank=allow_rerank)
+        return await service._finish_natural_selection(
+            selected_query, session_id, buckets, recall_input=natural_input,
+        )
+
+    service._dynamic_bucket_candidate_items = candidate_builder
+    service._rerank_scored_bucket_candidates = blocked_rerank
+    natural_input = {"route": "ordinary", "q_current": query, "q_context": query,
+                     "metadata": {}, "_tasks": []}
+    selected, suppressed, debug = asyncio.run(service._select_recall_with_fallback(
+        selector, query, "synthetic-session", [bucket], sentinel_debug={"route": "ordinary"},
+        natural_input=natural_input, allow_semantic=True, allow_query_planner=False,
+        allow_rerank=True,
+    ))
+
+    assert phases == ["initial", "timeout_fallback"]
+    assert rerank_cancelled.is_set()
+    assert [item["id"] for item in selected] == [bucket["id"]] and suppressed == []
+    assert "recall_total_timeout" in natural_input["incomplete_reasons"]
+    initial, fallback = debug["selection_attempts"]
+    assert (initial["phase"], initial["status"]) == ("initial", "timeout")
+    assert (fallback["phase"], fallback["status"]) == ("timeout_fallback", "completed")
+    assert all(isinstance(attempt["duration_ms"], int) and attempt["duration_ms"] >= 0
+               for attempt in (initial, fallback))
+    assert initial["timing_ms"]["direct.synthetic_lookup"] == 7
+    assert fallback["timing_ms"]["direct.synthetic_lookup"] == 9
+    assert debug["timing_ms"]["initial.direct.synthetic_lookup"] == 7
+    assert debug["timing_ms"]["direct.synthetic_lookup"] == 9
+    assert [item["attempt_phase"] for item in debug["candidate_stages"]
+            if item["stage"] == "synthetic.lookup"] == ["initial", "timeout_fallback"]
+    assert initial["candidate_stages"][0]["stage"] == "synthetic.lookup"
+    assert fallback["candidate_stages"][0]["stage"] == "synthetic.lookup"
+    cancelled_rerank = next(item for item in initial["candidate_stages"]
+                            if item["stage"] == "natural.final_rerank")
+    assert cancelled_rerank["cancelled"] is True
+    assert isinstance(cancelled_rerank["duration_ms"], int)
+    assert cancelled_rerank["duration_ms"] == initial["timing_ms"]["natural.final_rerank"]
+    assert isinstance(debug["selection_total_ms"], int) and debug["selection_total_ms"] >= 0
+    assert isinstance(debug["selection_cleanup_ms"], int) and debug["selection_cleanup_ms"] >= 0
+    assert "_selection_debug" not in debug
+    assert "_selection_debug" not in natural_input
 
 
 @pytest.mark.parametrize("change", [
@@ -827,6 +902,56 @@ def test_below_threshold_or_incomplete_semantic_only_candidate_is_not_admitted(s
     assert selected == []
     assert len(suppressed) == 1
     assert suppressed[0]["admission_reason"] == "insufficient_contextual_relevance"
+
+
+@pytest.mark.parametrize(("semantic_score", "labels", "expected_selected"), [
+    (0.79, ("semantic_only",), False),
+    (0.81, ("semantic_only",), True),
+    (0.10, ("exact_anchor",), True),
+])
+def test_failed_final_rerank_marks_natural_recall_incomplete_without_lowering_admission(
+    semantic_score, labels, expected_selected,
+):
+    query = "An ordinary synthetic memory question."
+    bucket = _natural_bucket("memory-rerank-failure", "A synthetic committed memory body.")
+    candidate = _natural_candidate(bucket, semantic_score, labels=labels)
+    service, calls, _metadata = _natural_finish_service(None, [bucket], {query: [candidate]})
+    stages = []
+    service._record_candidate_stage = lambda _stages, stage, before, after, **kwargs: (
+        stages.append({"stage": stage, "before": before, "after": after, **kwargs})
+    )
+
+    async def failed_rerank(_query, items, *, diagnostics, documents_override):
+        calls["rerank"].append([item["bucket"]["id"] for item in items])
+        diagnostics.update(provider_input_count=len(items), provider_output_count=0,
+                           provider_status="error", provider_failed=True,
+                           provider_http_status=403, provider_latency_ms=5,
+                           provider_requests=1,
+                           cache={"status": "miss", "provider_requests": 1})
+        return items
+
+    service._rerank_scored_bucket_candidates = failed_rerank
+    recall_input = {"q_current": query, "q_context": query, "metadata": {}}
+    selected, suppressed, _debug = asyncio.run(service._finish_natural_selection(
+        query, "session-natural-rerank-failure", [bucket], recall_input=recall_input,
+    ))
+
+    assert calls["rerank"] == [[bucket["id"]]]
+    assert [item["id"] for item in selected] == ([bucket["id"]] if expected_selected else [])
+    assert len(suppressed) == (0 if expected_selected else 1)
+    assert "reranker_unavailable" in recall_input["incomplete_reasons"]
+    final_stage = next(stage for stage in stages if stage["stage"] == "natural.final_rerank")
+    assert final_stage["provider_failed"] is True
+    assert final_stage["provider_status"] == "error"
+    assert final_stage["provider_http_status"] == 403
+    assert final_stage["cache"]["status"] == "miss"
+    assert final_stage["duration_ms"] >= 0
+    if selected:
+        assert calls["selected"][0]["admission_reason"] == (
+            "verified_local_evidence" if labels == ("exact_anchor",) else "strong_semantic"
+        )
+    else:
+        assert suppressed[0]["admission_reason"] == "insufficient_contextual_relevance"
 
 
 def test_semantic_similarity_surfaces_related_experience_without_asserting_person_identity():

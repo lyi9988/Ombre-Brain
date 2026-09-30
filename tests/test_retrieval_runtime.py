@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import httpx
+import pytest
 
 from embedding_engine import EmbeddingEngine
 from reranker_engine import RerankerEngine
@@ -249,6 +250,323 @@ def test_reranker_runtime_debug_records_success_without_documents(monkeypatch):
     assert debug["last_http_status"] == 200
     assert debug["last_result_count"] == 1
     assert "embedding-secret" not in str(debug)
+
+
+@pytest.mark.parametrize(("body", "expected_status", "expected_indices"), [
+    ({"results": {}}, "invalid_response", []),
+    ({"results": [{"index": 0, "relevance_score": float("nan")}]}, "invalid_response", []),
+    ({"results": [{"index": 0, "relevance_score": 10 ** 400}]}, "invalid_response", []),
+    ({"results": [{"index": 0, "relevance_score": 0.9},
+                  {"index": 0, "relevance_score": 0.8}]}, "partial", [0]),
+    ({"results": [{"index": 0, "relevance_score": 0.9}]}, "partial", [0]),
+    ({"results": [{"index": 0, "relevance_score": 0.9},
+                  {"index": 1, "relevance_score": float("inf")}]}, "partial", [0]),
+])
+def test_reranker_response_validation_is_request_local_and_never_claims_success(
+    monkeypatch, body, expected_status, expected_indices,
+):
+    engine = RerankerEngine({
+        "reranker": {"api_key": "synthetic-secret", "base_url": "https://invalid.example/v1"},
+    })
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return body
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr("reranker_engine.httpx.AsyncClient", FakeClient)
+    results, diagnostics = asyncio.run(engine.rerank_with_diagnostics(
+        "synthetic query", ["synthetic document 1", "synthetic document 2"], top_n=2,
+    ))
+
+    assert [row.index for row in results] == expected_indices
+    assert diagnostics["last_status"] == expected_status
+    assert diagnostics["last_http_status"] == 200
+    assert diagnostics["last_result_count"] == len(expected_indices)
+    assert diagnostics["last_error_type"] == "InvalidRerankResponse"
+    assert "synthetic-secret" not in str(diagnostics)
+
+
+def test_reranker_http_403_is_failed_request_local_outcome(monkeypatch):
+    engine = RerankerEngine({
+        "reranker": {"api_key": "synthetic-secret", "base_url": "https://invalid.example/v1"},
+    })
+
+    class ForbiddenResponse:
+        status_code = 403
+
+        def raise_for_status(self):
+            request = httpx.Request("POST", "https://invalid.example/v1/rerank")
+            response = httpx.Response(403, request=request)
+            raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            return ForbiddenResponse()
+
+    monkeypatch.setattr("reranker_engine.httpx.AsyncClient", FakeClient)
+    results, diagnostics = asyncio.run(engine.rerank_with_diagnostics(
+        "synthetic query", ["synthetic document"], top_n=1,
+    ))
+
+    assert results == []
+    assert diagnostics["last_status"] == "error"
+    assert diagnostics["last_http_status"] == 403
+    assert diagnostics["last_error_type"] == "HTTPStatusError"
+
+
+def test_reranker_runtime_health_belongs_to_configuration_that_made_request(monkeypatch):
+    engine = RerankerEngine({
+        "reranker": {"model": "synthetic-reranker-old", "api_key": "old-secret",
+                     "base_url": "https://old.invalid/v1"},
+    })
+    assert engine.runtime_debug()["last_result_matches_current_config"] is None
+    requests = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"results": [{"index": 0, "relevance_score": 0.91}]}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, url, *, json, **_kwargs):
+            requests.append((url, json["model"]))
+            return FakeResponse()
+
+    monkeypatch.setattr("reranker_engine.httpx.AsyncClient", FakeClient)
+    first, first_diagnostics = asyncio.run(engine.rerank_with_diagnostics(
+        "synthetic query", ["synthetic document"], top_n=1,
+    ))
+    assert first and first_diagnostics["last_request_model"] == "synthetic-reranker-old"
+    assert engine.runtime_debug()["last_result_matches_current_config"] is True
+
+    engine.model = "synthetic-reranker-new"
+    assert engine.runtime_debug()["last_result_matches_current_config"] is False
+    engine.model = "synthetic-reranker-old"
+    engine.base_url = "https://new.invalid/v1"
+    assert engine.runtime_debug()["last_result_matches_current_config"] is False
+    engine.base_url = "https://old.invalid/v1"
+    engine.api_key = "new-secret"
+    assert engine.runtime_debug()["last_result_matches_current_config"] is False
+    engine.model = "synthetic-reranker-new"
+    engine.base_url = "https://new.invalid/v1"
+
+    second, second_diagnostics = asyncio.run(engine.rerank_with_diagnostics(
+        "synthetic query", ["synthetic document"], top_n=1,
+    ))
+    assert second and second_diagnostics["last_request_model"] == "synthetic-reranker-new"
+    runtime = engine.runtime_debug()
+    assert runtime["last_result_matches_current_config"] is True
+    assert runtime["last_request_model"] == "synthetic-reranker-new"
+    assert requests == [
+        ("https://old.invalid/v1/rerank", "synthetic-reranker-old"),
+        ("https://new.invalid/v1/rerank", "synthetic-reranker-new"),
+    ]
+    assert "old-secret" not in str(runtime)
+    assert "new-secret" not in str(runtime)
+    assert "fingerprint" not in str(runtime)
+
+
+def test_reranker_one_request_uses_one_config_snapshot_across_async_client_enter(monkeypatch):
+    engine = RerankerEngine({
+        "reranker": {"model": "model-before", "api_key": "key-before",
+                     "base_url": "https://before.invalid/v1", "timeout_seconds": 9},
+    })
+    entering, resume = asyncio.Event(), asyncio.Event()
+    client_timeouts, calls = [], []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"results": [{"index": 0, "relevance_score": 0.94}]}
+
+    class FakeClient:
+        def __init__(self, *, timeout):
+            client_timeouts.append(timeout)
+
+        async def __aenter__(self):
+            entering.set()
+            await resume.wait()
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, url, *, headers, json):
+            calls.append((url, headers["Authorization"], json["model"]))
+            return FakeResponse()
+
+    monkeypatch.setattr("reranker_engine.httpx.AsyncClient", FakeClient)
+
+    async def run():
+        task = asyncio.create_task(engine.rerank_with_diagnostics(
+            "synthetic question", ["synthetic document"], top_n=1,
+        ))
+        await asyncio.wait_for(entering.wait(), 1)
+        engine.model = "model-after"
+        engine.base_url = "https://after.invalid/v1"
+        engine.api_key = "key-after"
+        engine.timeout = 3.0
+        assert engine.runtime_debug()["model"] == "model-after"
+        assert engine.runtime_debug()["last_result_matches_current_config"] is False
+        resume.set()
+        return await task
+
+    rows, diagnostics = asyncio.run(run())
+    assert [(row.index, row.score) for row in rows] == [(0, 0.94)]
+    assert client_timeouts == [9.0]
+    assert calls == [("https://before.invalid/v1/rerank", "Bearer key-before", "model-before")]
+    assert diagnostics["last_status"] == "ok"
+    assert diagnostics["last_request_model"] == "model-before"
+    runtime = engine.runtime_debug()
+    assert runtime["model"] == "model-after"
+    assert runtime["last_request_model"] == "model-before"
+    assert runtime["last_result_matches_current_config"] is False
+    assert "key-before" not in str(runtime)
+    assert "key-after" not in str(runtime)
+    assert "fingerprint" not in str(runtime)
+
+
+def test_reranker_concurrent_requests_keep_separate_diagnostics_despite_global_health(monkeypatch):
+    engine = RerankerEngine({
+        "reranker": {"model": "synthetic-reranker", "api_key": "synthetic-secret",
+                     "base_url": "https://invalid.example/v1"},
+    })
+    started = {name: asyncio.Event() for name in ("failed", "success")}
+    release = {name: asyncio.Event() for name in started}
+
+    class FakeResponse:
+        def __init__(self, status):
+            self.status_code = status
+
+        def raise_for_status(self):
+            if self.status_code == 403:
+                request = httpx.Request("POST", "https://invalid.example/v1/rerank")
+                response = httpx.Response(403, request=request)
+                raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+        def json(self):
+            return {"results": [{"index": 0, "relevance_score": 0.92}]}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, *, json, **_kwargs):
+            query = json["query"]
+            started[query].set()
+            await release[query].wait()
+            return FakeResponse(403 if query == "failed" else 200)
+
+    monkeypatch.setattr("reranker_engine.httpx.AsyncClient", FakeClient)
+
+    async def run():
+        failed = asyncio.create_task(engine.rerank_with_diagnostics("failed", ["one"], top_n=1))
+        success = asyncio.create_task(engine.rerank_with_diagnostics("success", ["two"], top_n=1))
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started.values())), 1)
+        release["success"].set()
+        success_outcome = await success
+        release["failed"].set()
+        failed_outcome = await failed
+        return failed_outcome, success_outcome
+
+    (failed_rows, failed_debug), (success_rows, success_debug) = asyncio.run(run())
+    assert failed_rows == []
+    assert [(row.index, row.score) for row in success_rows] == [(0, 0.92)]
+    assert failed_debug["last_status"] == "error" and failed_debug["last_http_status"] == 403
+    assert success_debug["last_status"] == "ok" and success_debug["last_http_status"] == 200
+    assert engine.runtime_debug()["last_status"] == "error"
+    assert success_debug["last_status"] == "ok"
+
+
+def test_reranker_external_cancellation_propagates_and_records_local_cancellation(monkeypatch):
+    engine = RerankerEngine({
+        "reranker": {"api_key": "synthetic-secret", "base_url": "https://invalid.example/v1"},
+    })
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    monkeypatch.setattr("reranker_engine.httpx.AsyncClient", FakeClient)
+    diagnostics = {}
+
+    async def run():
+        task = asyncio.create_task(engine.rerank(
+            "synthetic query", ["synthetic document"], top_n=1, diagnostics=diagnostics,
+        ))
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert cancelled.is_set()
+    assert diagnostics["last_status"] == "cancelled"
+    assert diagnostics["last_error_type"] == "CancelledError"
 
 
 def test_retrieval_clients_are_reused_and_closed(monkeypatch, tmp_path):

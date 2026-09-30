@@ -1564,6 +1564,8 @@ class GatewayService:
             changed.append("embedding")
 
         if reranker or env_changed:
+            identity_fields = ("model", "base_url", "api_key", "enabled", "timeout", "candidate_limit", "score_weight")
+            previous_identity = tuple(getattr(self.reranker_engine, name, None) for name in identity_fields)
             current = self.config.setdefault("reranker", {})
             for key in ("enabled", "model", "base_url", "timeout_seconds", "candidate_limit", "score_weight"):
                 if key in reranker:
@@ -1591,6 +1593,8 @@ class GatewayService:
                 engine.score_weight = max(0.0, min(1.0, float(current.get("score_weight", engine.score_weight))))
             except (TypeError, ValueError):
                 pass
+            if tuple(getattr(engine, name, None) for name in identity_fields) != previous_identity:
+                self._rerank_config_revision = getattr(self, "_rerank_config_revision", 0) + 1
             changed.append("reranker")
 
         if gateway:
@@ -2370,6 +2374,9 @@ class GatewayService:
             os.environ["OMBRE_RERANKER_MODEL"] = reranker_cfg.get("model", "")
         if updated:
             self.reranker_engine = RerankerEngine(self.config)
+            # A credential/provider update must not join work or cached scores
+            # started under the previous owner configuration. No secret in keys.
+            self._rerank_config_revision = getattr(self, "_rerank_config_revision", 0) + 1
         return updated
 
     def _apply_memory_diffusion_config(self, payload: dict[str, Any]) -> list[str]:
@@ -4995,6 +5002,9 @@ class GatewayService:
             "steps_ms": dict(prepare_steps_ms),
             "effective_config": effective_config,
             "candidate_stages": candidate_stages,
+            "recall_selection_attempts": query_planner_debug.get("selection_attempts", []),
+            "recall_selection_total_ms": query_planner_debug.get("selection_total_ms"),
+            "recall_selection_cleanup_ms": query_planner_debug.get("selection_cleanup_ms"),
             "query_chars": len(current_user_query),
             "message_count": len(messages),
             "bucket_count": len(all_buckets),
@@ -16314,6 +16324,10 @@ class GatewayService:
         """
         debug = self._query_planner_debug_base(query)
         timings, stages = debug.setdefault("timing_ms", {}), debug.setdefault("candidate_stages", [])
+        # Request-local only. The wrapper snapshots numeric stages on timeout;
+        # it must not persist this whole debug object (which may contain queries).
+        recall_input["_selection_debug"] = debug
+        validation_started = time.perf_counter()
         view = getattr(self, "memory_authority_view", None)
         metadata_map = view.memory_index_metadata_map([b["id"] for b in all_buckets if b.get("id")]) if (
             view and callable(getattr(view, "memory_index_metadata_map", None))) else {}
@@ -16337,13 +16351,19 @@ class GatewayService:
                 recall_input.setdefault("incomplete_reasons", []).append("bucket_revision_mismatch")
                 continue
             valid.append(bucket)
-        pool, suppressed = await self._dynamic_bucket_candidate_items(
-            query, session_id, valid, search_query=query,
-            allow_semantic=not recall_input.get("local_only", False),
-            allow_rerank=False, allow_semantic_session_dedupe=False,
-            timing_debug=timings, timing_prefix="direct", candidate_stages=stages,
-            natural_input=recall_input,
-        )
+        self._add_timing_ms(timings, "natural.authority_validation", validation_started)
+        candidates_started = time.perf_counter()
+        try:
+            pool, suppressed = await self._dynamic_bucket_candidate_items(
+                query, session_id, valid, search_query=query,
+                allow_semantic=not recall_input.get("local_only", False),
+                allow_rerank=False, allow_semantic_session_dedupe=False,
+                timing_debug=timings, timing_prefix="direct", candidate_stages=stages,
+                natural_input=recall_input,
+            )
+        finally:
+            self._add_timing_ms(timings, "natural.candidate_channels", candidates_started)
+        moments_started = time.perf_counter()
         moment_hits = {}
         if grouped_moments is not None:
             fresh = {str(bucket["id"]): parse_bucket_moments(bucket, self.relevance_options)
@@ -16371,6 +16391,7 @@ class GatewayService:
             missing = set(forced_memory_ids) - {str(item["bucket"]["id"]) for item in pool}
             forced, _ = self._merge_owner_alias_memory_items([], valid, list(missing))
             pool.extend(forced)
+        self._add_timing_ms(timings, "natural.moment_alias_merge", moments_started)
         # A narrow pool with good lexical/identity evidence does not need a
         # Planner. Expansion is based on candidate uncertainty, not a magic
         # phrase in the user's message, and happens before the final rerank.
@@ -16422,14 +16443,34 @@ class GatewayService:
                 if part:
                     item["matched_moment"] = part
                     documents[parent] = self._moment_rerank_document(part)
-        if not recall_input.get("local_only") and recall_input.get("allow_rerank", True):
-            pool = await self._rerank_scored_bucket_candidates(
-                recall_input.get("q_context") or query, pool, diagnostics=rerank_debug,
-                documents_override=documents,
+        rerank_started = time.perf_counter()
+        rerank_cancelled = False
+        try:
+            if not recall_input.get("local_only") and recall_input.get("allow_rerank", True):
+                pool = await self._rerank_scored_bucket_candidates(
+                    recall_input.get("q_context") or query, pool, diagnostics=rerank_debug,
+                    documents_override=documents,
+                )
+        except asyncio.CancelledError:
+            rerank_cancelled = True
+            raise
+        finally:
+            self._add_timing_ms(timings, "natural.final_rerank", rerank_started)
+            self._record_candidate_stage(
+                stages, "natural.final_rerank", len(pool), len(pool),
+                timing_key="natural.final_rerank",
+                provider_input_count=rerank_debug.get("provider_input_count", 0),
+                provider_output_count=rerank_debug.get("provider_output_count", 0),
+                duration_ms=timings["natural.final_rerank"],
+                provider_status=rerank_debug.get("provider_status"),
+                provider_failed=bool(rerank_debug.get("provider_failed")),
+                provider_http_status=rerank_debug.get("provider_http_status"),
+                provider_latency_ms=rerank_debug.get("provider_latency_ms"),
+                provider_model=rerank_debug.get("provider_model"),
+                cancelled=rerank_cancelled, cache=rerank_debug.get("cache", {}),
             )
-        self._record_candidate_stage(stages, "natural.final_rerank", len(pool), len(pool),
-                                     provider_input_count=rerank_debug.get("provider_input_count", 0),
-                                     provider_output_count=rerank_debug.get("provider_output_count", 0))
+        if rerank_debug.get("provider_failed"):
+            recall_input.setdefault("incomplete_reasons", []).append("reranker_unavailable")
         accepted = []
         for item in pool:
             labels = self._bucket_evidence_labels(query, item)
@@ -16541,22 +16582,71 @@ class GatewayService:
         """
         natural_input = kwargs.get("natural_input")
         if natural_input is not None:
+            selection_started = time.perf_counter()
+            attempts: list[dict[str, Any]] = []
+            result = None
+
+            def capture_attempt(phase: str, status: str, started: float, completed=None) -> None:
+                attempt_debug = completed[-1] if completed is not None else natural_input.get("_selection_debug", {})
+                timings = dict(attempt_debug.get("timing_ms") or {})
+                stages = deepcopy(attempt_debug.get("candidate_stages") or [])
+                for stage in stages:
+                    stage["attempt_phase"] = phase
+                    if stage.get("timing_key") in timings:
+                        stage["duration_ms"] = timings[stage["timing_key"]]
+                # Copy count/timing telemetry only, never the full Planner
+                # debug or the verified semantic checkpoint/source bodies.
+                attempts.append({
+                    "phase": phase, "status": status,
+                    "start_offset_ms": max(0, int((started - selection_started) * 1000)),
+                    "duration_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                    "timing_ms": timings, "candidate_stages": stages,
+                })
+                natural_input.pop("_selection_debug", None)
+
+            natural_input.pop("_selection_debug", None)
             natural_input["_deadline"] = time.monotonic() + getattr(self, "recall_timeout_seconds", 15.0)
             try:
-                return await asyncio.wait_for(selector(query, *args, **kwargs),
-                                              timeout=getattr(self, "recall_timeout_seconds", 15.0))
-            except asyncio.TimeoutError:
-                natural_input.setdefault("incomplete_reasons", []).append("recall_total_timeout")
-                options = dict(kwargs)
-                options.update(allow_semantic=False, allow_query_planner=False, allow_rerank=False)
-                natural_input["local_only"] = True
-                return await selector(query, *args, **options)
+                initial_started = time.perf_counter()
+                try:
+                    result = await asyncio.wait_for(selector(query, *args, **kwargs),
+                                                    timeout=getattr(self, "recall_timeout_seconds", 15.0))
+                except asyncio.TimeoutError:
+                    capture_attempt("initial", "timeout", initial_started)
+                    natural_input.setdefault("incomplete_reasons", []).append("recall_total_timeout")
+                    options = dict(kwargs)
+                    options.update(allow_semantic=False, allow_query_planner=False, allow_rerank=False)
+                    natural_input["local_only"] = True
+                    fallback_started = time.perf_counter()
+                    result = await selector(query, *args, **options)
+                    capture_attempt("timeout_fallback", "completed", fallback_started, result)
+                else:
+                    capture_attempt("initial", "completed", initial_started, result)
+                debug = result[-1]
+                debug["selection_attempts"] = attempts
+                debug["candidate_stages"] = []
+                for attempt in attempts:
+                    prefix = "initial." if len(attempts) > 1 and attempt["phase"] == "initial" else ""
+                    debug.setdefault("timing_ms", {}).update({
+                        prefix + name: elapsed for name, elapsed in attempt["timing_ms"].items()
+                    })
+                    for raw_stage in attempt["candidate_stages"]:
+                        stage = deepcopy(raw_stage)
+                        if stage.get("timing_key"):
+                            stage["timing_key"] = prefix + stage["timing_key"]
+                        debug["candidate_stages"].append(stage)
+                return result
             finally:
+                cleanup_started = time.perf_counter()
                 for task in natural_input.get("_tasks", []):
                     if not task.done():
                         task.cancel()
                 if natural_input.get("_tasks"):
                     await asyncio.gather(*natural_input["_tasks"], return_exceptions=True)
+                natural_input.pop("_selection_debug", None)
+                if result is not None:
+                    result[-1]["selection_cleanup_ms"] = max(0, int((time.perf_counter() - cleanup_started) * 1000))
+                    result[-1]["selection_total_ms"] = max(0, int((time.perf_counter() - selection_started) * 1000))
                 sentinel_debug["route"] = natural_input.get("route", "ordinary")
         route = str(sentinel_debug.get("route") or "")
         if route == "deep" and "allow_bucket_rerank" in kwargs:
@@ -20902,12 +20992,15 @@ class GatewayService:
             self._rerank_inflight = {}
             self.rerank_cache_ttl_seconds = 300.0
             self.rerank_cache_max_entries = 256
+        engine = self.reranker_engine
+        config_revision = getattr(self, "_rerank_config_revision", 0)
         material = {
             "namespace": namespace,
             "query": str(query or ""),
             "documents": [hashlib.sha256(str(doc).encode("utf-8")).hexdigest() for doc in documents],
-            "model": str(getattr(self.reranker_engine, "model", "") or ""),
-            "base_url": str(getattr(self.reranker_engine, "base_url", "") or ""),
+            "model": str(getattr(engine, "model", "") or ""),
+            "base_url": str(getattr(engine, "base_url", "") or ""),
+            "config_revision": config_revision,
             "top_n": int(top_n),
         }
         cache_key = hashlib.sha256(
@@ -20915,9 +21008,11 @@ class GatewayService:
         ).hexdigest()
         now = time.monotonic()
         cached = self._rerank_cache.get(cache_key)
-        if cached and cached[0] > now:
+        if cached and cached[0] > now and cached[1]:
             if isinstance(cache_debug, dict):
-                cache_debug.update(status="hit", key=cache_key[:16])
+                cache_debug.update(status="hit", key=cache_key[:16],
+                                   provider_status="cached_success", provider_failed=False,
+                                   provider_requests=0)
             return [RerankResult(index=index, score=score) for index, score in cached[1]]
         if cached:
             self._rerank_cache.pop(cache_key, None)
@@ -20926,22 +21021,48 @@ class GatewayService:
             if isinstance(cache_debug, dict):
                 cache_debug.update(status="singleflight", key=cache_key[:16])
             try:
-                rows = await asyncio.shield(inflight)
+                rows, outcome = await asyncio.shield(inflight)
             except asyncio.CancelledError:
                 if asyncio.current_task().cancelling():
                     raise
                 raise RuntimeError("shared_rerank_request_cancelled") from None
+            if isinstance(cache_debug, dict):
+                cache_debug.update(outcome, provider_requests=0, shared_provider_request=True)
             return [RerankResult(index=index, score=score) for index, score in rows]
 
-        async def execute() -> list[tuple[int, float]]:
-            results = await self.reranker_engine.rerank(query, documents, top_n=top_n)
-            return [(int(result.index), float(result.score)) for result in results]
+        async def execute() -> tuple[list[tuple[int, float]], dict[str, Any]]:
+            # The overlay may mutate an engine between scheduling this task
+            # and its first instruction. Never send/cache under a stale key.
+            if (engine is not self.reranker_engine
+                    or config_revision != getattr(self, "_rerank_config_revision", 0)):
+                return [], {"provider_status": "configuration_changed",
+                            "provider_failed": True, "provider_requests": 0,
+                            "provider_http_status": None, "provider_latency_ms": 0,
+                            "provider_error_type": "ConfigurationChanged"}
+            measured = getattr(engine, "rerank_with_diagnostics", None)
+            if callable(measured):
+                results, runtime = await measured(query, documents, top_n=top_n)
+            else:
+                # Legacy adapters have no request-local health contract.
+                # Never infer success for an empty result from global health.
+                results = await engine.rerank(query, documents, top_n=top_n)
+                runtime = {"last_status": "ok" if results else "unverified_empty"}
+            outcome = {
+                "provider_status": runtime.get("last_status", "unknown"),
+                "provider_failed": runtime.get("last_status") != "ok",
+                "provider_http_status": runtime.get("last_http_status"),
+                "provider_error_type": runtime.get("last_error_type", ""),
+                "provider_latency_ms": runtime.get("last_latency_ms"),
+                "provider_model": runtime.get("last_request_model"),
+            }
+            return [(int(result.index), float(result.score)) for result in results], outcome
 
         task = asyncio.create_task(execute())
         self._rerank_inflight[cache_key] = task
         try:
-            rows = list(await asyncio.shield(task))
-            if self.rerank_cache_ttl_seconds > 0 and self.rerank_cache_max_entries > 0:
+            rows, outcome = await asyncio.shield(task)
+            if (rows and not outcome["provider_failed"]
+                    and self.rerank_cache_ttl_seconds > 0 and self.rerank_cache_max_entries > 0):
                 self._rerank_cache[cache_key] = (
                     time.monotonic() + self.rerank_cache_ttl_seconds,
                     list(rows),
@@ -20949,7 +21070,8 @@ class GatewayService:
                 while len(self._rerank_cache) > self.rerank_cache_max_entries:
                     self._rerank_cache.pop(next(iter(self._rerank_cache)))
             if isinstance(cache_debug, dict):
-                cache_debug.update(status="miss", key=cache_key[:16])
+                cache_debug.update(outcome, status="miss", key=cache_key[:16],
+                                   provider_requests=outcome.get("provider_requests", 1))
             return [RerankResult(index=index, score=score) for index, score in rows]
         except asyncio.CancelledError:
             task.cancel()
@@ -21000,6 +21122,12 @@ class GatewayService:
             top_n=len(head),
             cache_debug=cache_debug,
         )
+        if isinstance(diagnostics, dict):
+            diagnostics.update({key: cache_debug.get(key) for key in (
+                "provider_status", "provider_failed", "provider_http_status",
+                "provider_error_type", "provider_latency_ms", "provider_requests",
+                "provider_model",
+            )})
         if not results:
             if isinstance(diagnostics, dict):
                 diagnostics.update({

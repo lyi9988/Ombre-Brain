@@ -13,7 +13,9 @@ import hashlib
 import pytest
 from types import SimpleNamespace
 
+import gateway as gateway_module
 from gateway import GatewayService
+from reranker_engine import RerankerEngine
 from memory_authority import MemoryAuthorityStore
 from memory_authority_view import MemoryAuthorityRecallView
 
@@ -569,6 +571,518 @@ def test_rerank_exact_cache_reuses_document_identity_without_provider_call():
     assert reranker.calls == 1
     assert first_debug["status"] == "miss"
     assert second_debug["status"] == "hit"
+
+
+def _configured_rerank_cache_service():
+    service = GatewayService.__new__(GatewayService)
+    service.config = {"reranker": {
+        "enabled": True, "model": "same-synthetic-model",
+        "base_url": "https://same.invalid/v1", "api_key": "synthetic-key-old",
+    }}
+    service.reranker_engine = RerankerEngine(service.config)
+    service.rerank_cache_ttl_seconds = 300.0
+    service.rerank_cache_max_entries = 8
+    service._rerank_cache = {}
+    service._rerank_inflight = {}
+    return service
+
+
+def _overlay_rerank_cache_service():
+    service = _configured_rerank_cache_service()
+    service.config = {"gateway": {}, "embedding": {}, "reranker": {
+        "enabled": True, "model": "synthetic-model-old",
+        "base_url": "https://same.invalid/v1",
+    }}
+    service.gateway_cfg = service.config["gateway"]
+    service.embedding_engine = SimpleNamespace(
+        model="synthetic-embedding", base_url="https://embedding.invalid/v1",
+        api_key="synthetic-embedding-key", enabled=True,
+    )
+    service.reranker_engine = RerankerEngine({"reranker": {
+        **service.config["reranker"], "api_key": "synthetic-key-old",
+    }})
+    env_key = {"value": "synthetic-key-old"}
+    service._runtime_env_value = lambda name: (
+        env_key["value"] if name == "OMBRE_RERANKER_API_KEY" else ""
+    )
+    return service, env_key
+
+
+@pytest.mark.parametrize("switch", ["model", "env_key"])
+def test_rerank_runtime_overlay_switch_isolates_cache_and_inflight_and_reapply_is_idempotent(
+    monkeypatch, switch,
+):
+    service, env_key = _overlay_rerank_cache_service()
+    started = {phase: asyncio.Event() for phase in ("old", "new")}
+    release = {phase: asyncio.Event() for phase in started}
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, score):
+            self.score = score
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"results": [{"index": 0, "relevance_score": self.score}]}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, *, headers, json):
+            phase = ("old" if json["model"] == "synthetic-model-old" else "new") if switch == "model" else (
+                "old" if headers["Authorization"] == "Bearer synthetic-key-old" else "new"
+            )
+            calls.append((json["query"], phase))
+            if json["query"] == "inflight":
+                started[phase].set()
+                await release[phase].wait()
+            return FakeResponse(0.81 if phase == "old" else 0.92)
+
+    monkeypatch.setattr("reranker_engine.httpx.AsyncClient", FakeClient)
+    old_cache, old_hit, new_cache, new_hit, old_inflight, new_inflight = ({}, {}, {}, {}, {}, {})
+
+    async def invoke(query, debug):
+        return await service._rerank_cached(
+            namespace="bucket", query=query, documents=["synthetic document"],
+            top_n=1, cache_debug=debug,
+        )
+
+    async def run():
+        assert [row.score for row in await invoke("cache", old_cache)] == [0.81]
+        assert [row.score for row in await invoke("cache", old_hit)] == [0.81]
+        old_task = asyncio.create_task(invoke("inflight", old_inflight))
+        await asyncio.wait_for(started["old"].wait(), 1)
+        if switch == "model":
+            overlay, env_changed = {"reranker": {"model": "synthetic-model-new"}}, False
+        else:
+            env_key["value"] = "synthetic-key-new"
+            overlay, env_changed = {}, True
+        service._apply_runtime_overlay(overlay, env_changed=env_changed)
+        revision = service._rerank_config_revision
+        service._apply_runtime_overlay(overlay, env_changed=env_changed)
+        assert service._rerank_config_revision == revision == 1
+        assert [row.score for row in await invoke("cache", new_cache)] == [0.92]
+        new_task = asyncio.create_task(invoke("inflight", new_inflight))
+        await asyncio.wait_for(started["new"].wait(), 1)
+        release["new"].set()
+        assert [row.score for row in await new_task] == [0.92]
+        release["old"].set()
+        assert [row.score for row in await old_task] == [0.81]
+        assert [row.score for row in await invoke("cache", new_hit)] == [0.92]
+
+    asyncio.run(run())
+    assert calls == [("cache", "old"), ("inflight", "old"),
+                     ("cache", "new"), ("inflight", "new")]
+    assert old_cache["key"] != new_cache["key"]
+    assert old_inflight["key"] != new_inflight["key"]
+    assert [item["status"] for item in (old_cache, old_hit, new_cache, new_hit)] == [
+        "miss", "hit", "miss", "hit",
+    ]
+    assert old_inflight["status"] == new_inflight["status"] == "miss"
+    assert len(service._rerank_cache) == 4 and service._rerank_inflight == {}
+    assert all("synthetic-key-" not in str(item) for item in (
+        old_cache, old_hit, new_cache, new_hit, old_inflight, new_inflight,
+    ))
+
+
+def test_rerank_scheduled_before_overlay_change_never_calls_stale_provider(monkeypatch):
+    service, _env_key = _overlay_rerank_cache_service()
+    child_scheduled, child_release = asyncio.Event(), asyncio.Event()
+    provider_calls = []
+    real_create_task = asyncio.create_task
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            provider_calls.append(True)
+            raise AssertionError("stale configuration must stop before provider post")
+
+    def gated_create_task(coro):
+        async def gated():
+            child_scheduled.set()
+            await child_release.wait()
+            return await coro
+
+        return real_create_task(gated())
+
+    monkeypatch.setattr("reranker_engine.httpx.AsyncClient", FakeClient)
+    monkeypatch.setattr(gateway_module, "asyncio", SimpleNamespace(
+        create_task=gated_create_task, shield=asyncio.shield,
+        CancelledError=asyncio.CancelledError, current_task=asyncio.current_task,
+        gather=asyncio.gather,
+    ))
+    debug = {}
+
+    async def run():
+        owner = real_create_task(service._rerank_cached(
+            namespace="bucket", query="scheduled", documents=["synthetic document"],
+            top_n=1, cache_debug=debug,
+        ))
+        await asyncio.wait_for(child_scheduled.wait(), 1)
+        service._apply_runtime_overlay({"reranker": {"model": "synthetic-model-new"}}, env_changed=False)
+        child_release.set()
+        return await owner
+
+    assert asyncio.run(run()) == []
+    assert provider_calls == []
+    assert debug["provider_status"] == "configuration_changed"
+    assert debug["provider_failed"] is True
+    assert debug["provider_requests"] == 0
+    assert debug["provider_error_type"] == "ConfigurationChanged"
+    assert service._rerank_cache == {} and service._rerank_inflight == {}
+
+
+def test_rerank_formal_credential_update_invalidates_old_success_cache(monkeypatch):
+    for name in ("OMBRE_RERANKER_API_KEY", "OMBRE_RERANKER_BASE_URL", "OMBRE_RERANKER_MODEL"):
+        monkeypatch.setenv(name, "synthetic-before-test")
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, score):
+            self.score = score
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"results": [{"index": 0, "relevance_score": self.score}]}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, *, headers, **_kwargs):
+            authorization = headers["Authorization"]
+            calls.append(authorization)
+            return FakeResponse(0.81 if authorization == "Bearer synthetic-key-old" else 0.92)
+
+    monkeypatch.setattr("reranker_engine.httpx.AsyncClient", FakeClient)
+    service = _configured_rerank_cache_service()
+    debug = [{}, {}, {}, {}]
+
+    async def invoke(index):
+        return await service._rerank_cached(
+            namespace="bucket", query="same synthetic query", documents=["same synthetic document"],
+            top_n=1, cache_debug=debug[index],
+        )
+
+    async def run():
+        old = await invoke(0)
+        assert await invoke(1) == old
+        assert service._apply_reranker_config({"api_key": "synthetic-key-new"}) == ["reranker.api_key"]
+        new = await invoke(2)
+        assert await invoke(3) == new
+        return old, new
+
+    old, new = asyncio.run(run())
+    assert [row.score for row in old] == [0.81]
+    assert [row.score for row in new] == [0.92]
+    assert calls == ["Bearer synthetic-key-old", "Bearer synthetic-key-new"]
+    assert [item["status"] for item in debug] == ["miss", "hit", "miss", "hit"]
+    assert debug[0]["key"] != debug[2]["key"]
+    assert debug[2]["provider_requests"] == 1 and debug[3]["provider_requests"] == 0
+    assert service._rerank_config_revision == 1
+    assert all("synthetic-key-" not in str(item) for item in debug)
+
+
+def test_rerank_formal_credential_update_does_not_join_old_inflight_request(monkeypatch):
+    for name in ("OMBRE_RERANKER_API_KEY", "OMBRE_RERANKER_BASE_URL", "OMBRE_RERANKER_MODEL"):
+        monkeypatch.setenv(name, "synthetic-before-test")
+    started = {name: asyncio.Event() for name in ("old", "new")}
+    release = {name: asyncio.Event() for name in started}
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, score):
+            self.score = score
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"results": [{"index": 0, "relevance_score": self.score}]}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, *, headers, **_kwargs):
+            identity = "old" if headers["Authorization"] == "Bearer synthetic-key-old" else "new"
+            calls.append(identity)
+            started[identity].set()
+            await release[identity].wait()
+            return FakeResponse(0.81 if identity == "old" else 0.92)
+
+    monkeypatch.setattr("reranker_engine.httpx.AsyncClient", FakeClient)
+    service = _configured_rerank_cache_service()
+    old_debug, new_debug, cached_debug = {}, {}, {}
+
+    async def invoke(debug):
+        return await service._rerank_cached(
+            namespace="bucket", query="same synthetic query", documents=["same synthetic document"],
+            top_n=1, cache_debug=debug,
+        )
+
+    async def run():
+        old_engine = service.reranker_engine
+        old_task = asyncio.create_task(invoke(old_debug))
+        await asyncio.wait_for(started["old"].wait(), 1)
+        service._apply_reranker_config({"api_key": "synthetic-key-new"})
+        assert service.reranker_engine is not old_engine
+        new_task = asyncio.create_task(invoke(new_debug))
+        await asyncio.wait_for(started["new"].wait(), 1)
+        release["new"].set()
+        new = await new_task
+        release["old"].set()
+        old = await old_task
+        cached = await invoke(cached_debug)
+        return old, new, cached
+
+    old, new, cached = asyncio.run(run())
+    assert calls == ["old", "new"]
+    assert [row.score for row in old] == [0.81]
+    assert [row.score for row in new] == [0.92]
+    assert [row.score for row in cached] == [0.92]
+    assert old_debug["key"] != new_debug["key"]
+    assert old_debug["status"] == new_debug["status"] == "miss"
+    assert old_debug["provider_requests"] == new_debug["provider_requests"] == 1
+    assert cached_debug["status"] == "hit" and cached_debug["provider_requests"] == 0
+    assert len(service._rerank_cache) == 2 and service._rerank_inflight == {}
+
+
+@pytest.mark.parametrize(("initial_status", "initial_rows"), [
+    ("error", []),
+    ("invalid_response", []),
+    ("partial", [SimpleNamespace(index=0, score=0.92)]),
+])
+def test_rerank_failed_or_partial_outcome_is_not_cached_then_success_is_cached(
+    initial_status, initial_rows,
+):
+    class SequenceReranker:
+        model = "synthetic-reranker-v4"
+        base_url = "https://reranker.invalid/v1"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def rerank_with_diagnostics(self, _query, _documents, *, top_n):
+            self.calls += 1
+            if self.calls == 1:
+                return initial_rows[:top_n], {
+                    "last_status": initial_status, "last_http_status": 403 if initial_status == "error" else 200,
+                    "last_error_type": "HTTPStatusError" if initial_status == "error" else "InvalidRerankResponse",
+                    "last_latency_ms": 3,
+                }
+            return [SimpleNamespace(index=0, score=0.91)][:top_n], {
+                "last_status": "ok", "last_http_status": 200, "last_error_type": "",
+                "last_latency_ms": 4,
+            }
+
+    reranker = SequenceReranker()
+    service = GatewayService.__new__(GatewayService)
+    service.reranker_engine = reranker
+    service.rerank_cache_ttl_seconds = 300.0
+    service.rerank_cache_max_entries = 8
+    service._rerank_cache = {}
+    service._rerank_inflight = {}
+    debug = [{}, {}, {}]
+
+    async def run():
+        return [await service._rerank_cached(
+            namespace="bucket", query="synthetic query", documents=["synthetic document"],
+            top_n=1, cache_debug=entry,
+        ) for entry in debug]
+
+    first, second, third = asyncio.run(run())
+
+    assert [(row.index, row.score) for row in first] == [
+        (row.index, row.score) for row in initial_rows
+    ]
+    assert [(row.index, row.score) for row in second] == [(0, 0.91)]
+    assert [(row.index, row.score) for row in third] == [(0, 0.91)]
+    assert reranker.calls == 2
+    assert debug[0]["status"] == "miss" and debug[0]["provider_failed"] is True
+    assert debug[0]["provider_status"] == initial_status
+    assert debug[0]["provider_requests"] == 1
+    assert debug[1]["status"] == "miss" and debug[1]["provider_status"] == "ok"
+    assert debug[2]["status"] == "hit" and debug[2]["provider_status"] == "cached_success"
+    assert debug[2]["provider_failed"] is False and debug[2]["provider_requests"] == 0
+    assert debug[2].get("provider_http_status") is None
+
+
+def test_rerank_distinct_concurrent_keys_keep_their_request_local_outcomes():
+    started = {name: asyncio.Event() for name in ("failed", "success")}
+    release = {name: asyncio.Event() for name in started}
+
+    class ConcurrentReranker:
+        model = "synthetic-reranker-v4"
+        base_url = "https://reranker.invalid/v1"
+
+        async def rerank_with_diagnostics(self, query, _documents, *, top_n):
+            started[query].set()
+            await release[query].wait()
+            if query == "failed":
+                return [], {"last_status": "error", "last_http_status": 403,
+                            "last_error_type": "HTTPStatusError", "last_latency_ms": 8}
+            return [SimpleNamespace(index=0, score=0.93)][:top_n], {
+                "last_status": "ok", "last_http_status": 200,
+                "last_error_type": "", "last_latency_ms": 2,
+            }
+
+    service = GatewayService.__new__(GatewayService)
+    service.reranker_engine = ConcurrentReranker()
+    service.rerank_cache_ttl_seconds = 300.0
+    service.rerank_cache_max_entries = 8
+    service._rerank_cache = {}
+    service._rerank_inflight = {}
+    failed_debug, success_debug = {}, {}
+
+    async def run():
+        failed = asyncio.create_task(service._rerank_cached(
+            namespace="bucket", query="failed", documents=["one"], top_n=1,
+            cache_debug=failed_debug,
+        ))
+        success = asyncio.create_task(service._rerank_cached(
+            namespace="bucket", query="success", documents=["one"], top_n=1,
+            cache_debug=success_debug,
+        ))
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started.values())), 1)
+        release["success"].set()
+        success_rows = await success
+        release["failed"].set()
+        failed_rows = await failed
+        return failed_rows, success_rows
+
+    failed_rows, success_rows = asyncio.run(run())
+    assert failed_rows == [] and [(row.index, row.score) for row in success_rows] == [(0, 0.93)]
+    assert failed_debug["provider_status"] == "error"
+    assert failed_debug["provider_http_status"] == 403
+    assert failed_debug["provider_failed"] is True
+    assert success_debug["provider_status"] == "ok"
+    assert success_debug["provider_http_status"] == 200
+    assert success_debug["provider_failed"] is False
+    assert len(service._rerank_cache) == 1
+
+
+def test_rerank_singleflight_waiter_shares_failed_outcome_without_second_request():
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class BlockedReranker:
+        model = "synthetic-reranker-v4"
+        base_url = "https://reranker.invalid/v1"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def rerank_with_diagnostics(self, _query, _documents, *, top_n):
+            self.calls += 1
+            started.set()
+            await release.wait()
+            return [], {"last_status": "error", "last_http_status": 403,
+                        "last_error_type": "HTTPStatusError", "last_latency_ms": 5}
+
+    reranker = BlockedReranker()
+    service = GatewayService.__new__(GatewayService)
+    service.reranker_engine = reranker
+    service.rerank_cache_ttl_seconds = 300.0
+    service.rerank_cache_max_entries = 8
+    service._rerank_cache = {}
+    service._rerank_inflight = {}
+    owner_debug, waiter_debug, retry_debug = {}, {}, {}
+
+    async def invoke(debug):
+        return await service._rerank_cached(
+            namespace="bucket", query="same", documents=["one"], top_n=1,
+            cache_debug=debug,
+        )
+
+    async def run():
+        owner = asyncio.create_task(invoke(owner_debug))
+        await asyncio.wait_for(started.wait(), 1)
+        waiter = asyncio.create_task(invoke(waiter_debug))
+        await asyncio.sleep(0)
+        release.set()
+        assert await owner == await waiter == []
+        assert await invoke(retry_debug) == []
+
+    asyncio.run(run())
+    assert reranker.calls == 2
+    assert service._rerank_cache == {} and service._rerank_inflight == {}
+    assert owner_debug["provider_status"] == waiter_debug["provider_status"] == "error"
+    assert owner_debug["provider_http_status"] == waiter_debug["provider_http_status"] == 403
+    assert owner_debug["provider_requests"] == 1
+    assert waiter_debug["status"] == "singleflight"
+    assert waiter_debug["shared_provider_request"] is True
+    assert waiter_debug["provider_requests"] == 0
+    assert retry_debug["status"] == "miss" and retry_debug["provider_requests"] == 1
+
+
+def test_rerank_bucket_candidate_diagnostics_preserve_request_local_failure():
+    service = GatewayService.__new__(GatewayService)
+    service.reranker_engine = SimpleNamespace(enabled=True, candidate_limit=20, score_weight=0.65)
+    service._bucket_rerank_candidate_priority = lambda _query, item: (-item["score"],)
+    service._bucket_rerank_document = lambda bucket: bucket["content"]
+    calls = []
+
+    async def failed_cached(*, namespace, query, documents, top_n, cache_debug):
+        calls.append((namespace, query, len(documents), top_n))
+        cache_debug.update(status="miss", provider_status="error", provider_failed=True,
+                           provider_http_status=403, provider_error_type="HTTPStatusError",
+                           provider_latency_ms=7, provider_requests=1)
+        return []
+
+    service._rerank_cached = failed_cached
+    item = {"bucket": {"id": "synthetic-memory", "content": "synthetic document"}, "score": 0.79}
+    diagnostics = {}
+    results = asyncio.run(service._rerank_scored_bucket_candidates(
+        "synthetic query", [item], diagnostics=diagnostics,
+    ))
+
+    assert results == [item]
+    assert calls == [("bucket", "synthetic query", 1, 1)]
+    assert diagnostics["provider_input_count"] == 1
+    assert diagnostics["provider_output_count"] == 0
+    assert diagnostics["provider_status"] == "error"
+    assert diagnostics["provider_failed"] is True
+    assert diagnostics["provider_http_status"] == 403
+    assert diagnostics["provider_error_type"] == "HTTPStatusError"
+    assert diagnostics["provider_requests"] == 1
+    assert diagnostics["cache"]["status"] == "miss"
 
 
 def test_recall_why_uses_stable_owner_safe_reason_codes():

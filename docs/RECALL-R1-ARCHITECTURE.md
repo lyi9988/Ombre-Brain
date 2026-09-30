@@ -1,8 +1,13 @@
 # RECALL-R1 authoritative architecture
 
-Status: core authority contracts retained; natural semantic retrieval design
-accepted by the owner on 2026-09-30, implementation pending. Section 9 is the
-current target design. The detailed companion document is
+Status: core authority contracts retained; natural semantic retrieval accepted
+on 2026-09-30 is implemented in this feature lineage, not pending design.
+Section 9 is the current retrieval contract; older fixed-trigger Fast/Deep
+milestones below are historical, not rules for ordinary owner chat. The
+20261001 timeout release records Gateway `54ad5ad` as deployed; reranker
+failure/cache/attempt-telemetry repairs below are local and not yet released.
+Owner acceptance, general retrieval quality and latency are still open.
+The detailed companion document is
 `coordination/active/20260930-recall-r1-natural-retrieval-design.md` at the
 workspace root. Deployment facts belong to the RECALL-R1 implementation
 report, not to this design document.
@@ -64,7 +69,8 @@ checkouts, images, running containers, service health, owner acceptance, and
 
 The product outcome is a natural Auto/Review memory experience backed by one
 auditable commit path, owner-confirmed entity aliases, revision history,
-rebuildable derived indexes, and an explainable Fast/Deep recall route.
+rebuildable derived indexes, and local evidence plus ordinary semantic retrieval
+with optional bounded Deep expansion.
 
 ## 2. Authorities
 
@@ -256,6 +262,30 @@ no additional embedding/rerank call and does not claim that rerank succeeded.
 External cancellation still propagates; timeout remains an incomplete reason.
 This correctness repair is not evidence of a lower end-to-end latency.
 
+### Reranker failure and timeout telemetry repair (not yet deployed)
+
+Each rerank call owns its outcome rather than reading mutable last-request
+health. HTTP failures, malformed/empty provider responses and partial result
+sets are not successful no-matches and cannot populate the success cache.
+Valid partial rows remain usable with `reranker_unavailable` in incomplete
+reasons; no admission threshold is lowered and no extra retry is introduced.
+Only finite scores with unique in-range indices are accepted.
+
+Owner reranker configuration updates advance a process-local cache generation.
+New requests cannot join old-config inflight work or reuse its cache; existing
+requests keep their captured engine/config. Health distinguishes the current
+model from the model of the last request and marks config identity mismatch.
+Credentials and the private comparison fingerprint are never diagnostic fields.
+The tested per-call httpx transport is retained, not silently pooled again.
+
+Timeout diagnostics preserve initial and local-fallback attempts separately,
+with phase, start offset, duration, numeric/count stages, cleanup and selection
+wall time. First-pass timing keys are prefixed on fallback so durations cannot
+be overwritten by the second pass. Cancelled final-rerank work retains its
+elapsed time. Attempt envelopes include their child stages: do not add all
+numbers as independent durations, and do not treat fallback snapshot evidence
+as another provider call. This does not measure event-loop lag or device TTFT.
+
 `selected`, `no_match`, `incomplete`, and `disabled` are distinct. A timeout,
 missing index or uncovered query input cannot support a claim that a person
 or event does not exist. Status-only wrapper text is not an injected Memory
@@ -293,7 +323,9 @@ same outbox/watermark stream used for derived indexes.
 4. **Planner exact cache**: current-query hash + bounded recent-context hashes +
    Fast-evidence hash + planner route revision + planner prompt revision.
 5. **Rerank exact cache**: query hash + ordered candidate IDs/revision hashes +
-   reranker provider/model revision + scoring/prompt revision.
+   reranker provider/model revision + scoring/prompt revision. The current
+   failure repair also isolates runtime configuration generations and stores
+   only nonempty, completely validated successful provider results.
 6. **Final retrieval-plan cache**: identity scope + query hash + Memory authority
    watermark + Alias/Entity watermark + derived-index watermark + Recall policy
    revision.  It has a short TTL and never stores the final assistant answer.
@@ -312,6 +344,7 @@ version, and invalidation reason are owner-safe Inspector metadata.
 - Reminder state without its own revision;
 - Dream surfacing claims;
 - any result whose authority/index watermark is unknown.
+- failed, empty-error or partially validated reranker responses.
 
 Semantic caching of final LLM replies is intentionally excluded: a similar
 sentence can occur under different relationship, Memory, tool, or emotional
@@ -403,7 +436,8 @@ must remain usable at 320/390/430px.
 RECALL-R1 must compare the same owner query before/after with Inspector and
 Gateway timing evidence.  It reports at minimum:
 
-- routing decision (`skip`, `fast`, `deep`);
+- routing decision (ordinary semantic route / optional Deep / explicit skip,
+  with local evidence channels distinguished from remote work);
 - prepare/snapshot time;
 - embedding/planner/rerank request count and time;
 - cache hit/miss by layer;
@@ -413,9 +447,12 @@ Gateway timing evidence.  It reports at minimum:
 
 Expected direction, not an invented fixed SLA:
 
-- ordinary non-memory chat skips remote Recall work;
-- exact identity/date/anchor questions use local Fast Recall;
-- ambiguous past-context questions pay one bounded Planner/Deep path;
+- ordinary meaningful owner chat gets a semantic opportunity without needing
+  a keyword or memory-intent trigger; verified cache or explicit scope/policy
+  skips may avoid a remote request, but a guessed non-memory topic may not;
+- identity/date/anchor evidence remains a local channel, not a rule that
+  suppresses the ordinary semantic opportunity;
+- ambiguous candidate evidence may pay one bounded Planner/Deep expansion;
 - a tool continuation reuses the parent prepare snapshot;
 - no query performs repeated provider embedding/rerank for the same revisioned
   evidence within one logical turn.
@@ -428,7 +465,7 @@ not claim to fix provider latency it does not control.
 Prepare timing is measured as a dependency graph, not as a misleading sum of
 independent stage durations.
 
-At request start, one immutable request snapshot captures configuration,
+The broader concurrency target is to capture an immutable request snapshot of configuration,
 Composer binding, Memory authority/index watermarks, and identity scope.  The
 following independent reads may then run concurrently under one cancellation
 and deadline budget:
@@ -440,11 +477,16 @@ and deadline budget:
 - local Fast Recall evidence (keyword, exact anchor/date, owner alias, entity);
 - other owner-safe request metadata that does not depend on Recall output.
 
-Ordinary no-memory queries finish the local route and cancel/avoid Deep work.
+In the implemented natural path, local candidate work and semantic query work
+are scheduled concurrently; that alone does not prove wall-clock overlap or
+remove synchronous event-loop work. Broader projection parallelism remains a
+measured target, not a completed performance claim. Ordinary owner chat is not
+silently classified as no-memory merely because local keywords return zero.
 
-### Implemented feature milestones (not production release state)
+### Historical feature milestones (not current routing or release state)
 
-The feature branch currently contains these implementation milestones:
+The feature lineage contains these older implementation milestones, superseded
+by section 9 wherever their fixed-trigger routing conflicts:
 
 - Memory authority, revision/ring commit coordination, migration audit/apply,
   unified Auto/Review commits, legacy writer convergence, and outbox-derived
@@ -467,19 +509,16 @@ The feature branch currently contains these implementation milestones:
   one exact query vector so Dream cannot trigger a second identical embedding
   request (`352f36b`).
 
-These commits are feature evidence only.  They do not mean live activation,
-owner acceptance, `production/current` advancement, migration apply, or
-latency/recall-quality closure.  M5 still needs owner-safe authority APIs,
-collapsible Reality management/diagnostics, immutable release construction,
-synthetic migration rehearsal, owner-device experience acceptance, and then
-ordinary production cutover.
-Exact Fast evidence finishes without remote Planner, embedding, or rerank.
+These commits alone prove neither current live activation nor acceptance.
+Use coordination release records for migration, frontend, image and deployment
+state instead of treating an old M5 checklist as the current backlog. Natural
+quality, latency, archive-state reconciliation and owner acceptance remain open.
 
-For an ambiguous Deep query, the original-query embedding/search and the
-bounded Query Planner request may run concurrently.  Planner supplemental
-queries join afterward; candidates are normalized and deduplicated once before
-one final rerank/admission stage.  The same query/model/revision miss uses
-single-flight rather than launching duplicate provider requests.
+The current natural selector forms ordinary candidates first, then may call
+the Planner when evidence is unclear; it does not speculatively run a routing
+model for every message. Supplemental queries join the same bounded pool
+before one final rerank/admission stage. This differs from the older proposed
+embedding/Planner race. Same-key misses use singleflight where implemented.
 
 These stages remain dependency-ordered and are not speculatively duplicated:
 
