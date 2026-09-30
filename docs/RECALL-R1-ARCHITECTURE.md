@@ -1,8 +1,17 @@
 # RECALL-R1 authoritative architecture
 
-Status: design-frozen for M1 implementation.
+Status: core authority contracts retained; natural semantic retrieval design
+accepted by the owner on 2026-09-30, implementation pending. Section 9 is the
+current target design. The detailed companion document is
+`coordination/active/20260930-recall-r1-natural-retrieval-design.md` at the
+workspace root. Deployment facts belong to the RECALL-R1 implementation
+report, not to this design document.
 
-### 2026-09-29 natural conversation recall correction
+### Historical implementation note: 2026-09-29 correction
+
+This describes the deployed `dde985f` behavior, not the accepted target design
+in section 9. Its keyword/intent-gated Deep fallback and limited pronoun
+context are not sufficient evidence of natural Recall quality.
 
 The request-local retrieval query may include the nearest previous user
 message for an anaphoric follow-up (a person, object, event, or causal
@@ -181,26 +190,75 @@ new memory text.
 17. Migration invokes no model and produces no new semantic memory.
 18. Recall emits stable route/admission/rejection reason codes.
 
-## 9. Fast/Deep Recall
+## 9. Local Fast, ordinary semantic retrieval, and optional Deep
 
-Fast is local and evidence-driven: exact anchors, dates, canonical identities,
-owner-confirmed aliases, verified source records, and strong entity edges.
+These are costs within the existing Recall pipeline, not three independent
+Memory runtimes. Fast retains local anchors, aliases, entities and caches.
+Ordinary meaningful chat receives a semantic retrieval opportunity without
+requiring an explicit recall phrase, a keyword hit, a Deep route, or a
+particular `context_mode`. Deep is optional query expansion or disambiguation
+when the candidate evidence actually needs it. An empty result alone cannot
+cause repeated Deep calls.
 
-Deep runs only when the current query explicitly or strongly implies past
-context and Fast evidence is insufficient. The Query Planner receives the
-current query, up to three recent items, and an owner-safe Fast evidence
-summary. It returns structured supplemental queries/must-terms only. Original
-and supplemental candidates are merged before one semantic/graph retrieval and
-at most one provider rerank. Deterministic admission owns the final decision.
+The default semantic opportunity applies to owner-facing chat scope. Existing
+internal Planner, embedding/reranker, Memory ingestion/review, Diary/Digest,
+and background consumers retain their own request scopes and cannot re-enter
+main-chat Recall automatically, even through the same Gateway/provider.
+Scope comes from trusted runtime request context, not keywords in a prompt.
+Internal requests remain observable children without canonical chat writes.
 
-Planner failure degrades to the original query within the same bounded recall
-budget. It never fails the chat turn or recursively invokes itself.
+One request-local RecallInput contains every staged user event in order,
+bounded recent conversation with source versions, identity/conversation scope,
+and context revision. The default recent scope is two completed dialogue
+turns; the owner may adjust scope and budget. All current user events remain
+represented. Long inputs require accounted-for segmentation, not silent loss
+of the last or first message. Assistant history supplies search cues only,
+never confirmed aliases or facts. Candidate generation, rerank, entity/topic
+checks and admission consume the same RecallInput.
 
-The current R5 optimization that skips a guaranteed-empty Moment rerank is not
-Recall-quality closure.  RECALL-R1 is not accepted until real owner queries
-prove that strong candidates survive admission and every rejected candidate
-has a stable reason code.  A trace that still only shows `N -> 0` without
-rejection reasons fails acceptance.
+The target query views are `q_current` (all current user input) and `q_context`
+(that input with bounded background). Matching inputs share a vector. Batch
+embedding support must be verified against the configured provider; actual
+provider calls, input coverage and costs are observable. No main-model routing
+call is added. Existing local channels and query embedding run concurrently.
+Identity, privacy, recall policy and active/index revision eligibility are
+filtered before similarity Top-K, not after a global Top-K has discarded
+eligible memories. Stored candidate vectors are never regenerated in chat.
+
+Candidates from Memory/Moment/Ring and local/semantic channels merge with
+parent Memory IDs and revisions. Authorized semantic candidates may establish
+relevance without a literal phrase match; a `semantic_only` label is not by
+itself a rejection. Identity equivalence and source privacy remain separate
+constraints. Moment relevance cannot require its parent Bucket to have
+already passed a lexical admission gate. The final projection groups records
+by parent Memory and preserves ring/time/interpretation semantics.
+
+Clear evidence can be selected directly. Before the final rerank, unresolved
+entity/relation or query-coverage ambiguity may invoke the existing Query
+Planner at most once, with the same current input, recent context and
+necessary candidate evidence. Supplemental queries retain the original query
+and feed the same selector. The merged bounded pool uses at most one rerank
+round; an empty rerank output does not restart Deep. No recursive Planner or
+second fact authority is introduced.
+Provider/Planner cancellation and one overall recall deadline propagate.
+Failures preserve available evidence and allow chat to continue.
+
+`selected`, `no_match`, `incomplete`, and `disabled` are distinct. A timeout,
+missing index or uncovered query input cannot support a claim that a person
+or event does not exist. Status-only wrapper text is not an injected Memory
+item. Internal embedding/Planner/Rescue templates have editable internal
+Source Registry scopes; only the one `ombre.memory_recall` projection enters
+the owner's main-chat Composer. Emotion/Needs state does not lower evidence
+thresholds, write aliases, or drive a Recall feedback loop.
+
+Latency is a measured tradeoff: formerly skipped semantic work may add cost
+to ordinary chat. Parallelism, vector/result caches and parent prepare
+snapshots must remove duplicate work, but do not establish a fixed latency
+promise. Owner acceptance covers current and paraphrased queries, multi-user
+batches, pronouns, preferences, commitments, emotional experiences, topic
+changes, ambiguity and negative/privacy cases. Inspector must show actual
+selected/injected items and rejection reasons alongside first-token and total
+timings. Local test counts or health codes do not close Recall quality.
 
 ## 10. Revision-aware cache contract
 
