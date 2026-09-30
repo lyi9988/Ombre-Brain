@@ -1472,26 +1472,93 @@ class GatewayService:
         return {"reason_counts": counts, "candidate_refs": refs}
 
     @staticmethod
-    def _runtime_env_value(name: str) -> str:
-        """Read one secret from the mounted .env without exposing its value."""
-        if not name:
-            return ""
-        path = Path(__file__).with_name(".env")
+    def _runtime_env_path() -> Path:
+        return Path(os.environ.get("OMBRE_ENV_PATH") or Path(__file__).with_name(".env"))
+
+    @staticmethod
+    def _runtime_env_credentials() -> dict[str, str] | None:
+        """Read named mounted credentials; never expose values in diagnostics.
+
+        Empty/missing keys differ from an unreadable source. Interpolation is
+        disabled so an inherited container environment cannot replace a key.
+        """
+        path = GatewayService._runtime_env_path()
         try:
-            for raw in path.read_text(encoding="utf-8").splitlines():
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                if key.strip() != name:
-                    continue
-                value = value.strip()
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                    value = value[1:-1]
-                return value
-        except Exception:
-            return ""
-        return ""
+            text = path.read_text(encoding="utf-8-sig")
+        except FileNotFoundError:
+            return {}
+        except (OSError, UnicodeError):
+            return None
+        names = ("OMBRE_EMBEDDING_API_KEY", "OMBRE_RERANKER_API_KEY")
+        values: dict[str, str] = {}
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            name, separator, value = line.partition("=")
+            name = name.strip()
+            if name not in names:
+                continue
+            value = value.strip()
+            if not separator:
+                values[name] = ""
+                continue
+            try:
+                if value.startswith(chr(34)):
+                    # The existing dashboard writer uses JSON quoting.
+                    decoded, end = json.JSONDecoder().raw_decode(value)
+                    tail = value[end:].strip()
+                    if not isinstance(decoded, str) or (tail and not tail.startswith("#")):
+                        return None
+                    value = decoded
+                elif value.startswith(chr(39)):
+                    end = value.find(chr(39), 1)
+                    if end < 0:
+                        return None
+                    tail = value[end + 1:].strip()
+                    if tail and not tail.startswith("#"):
+                        return None
+                    value = value[1:end]
+                else:
+                    value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+            except (ValueError, TypeError):
+                return None
+            values[name] = value
+        return values
+
+    def _runtime_credential_value(
+        self, name: str, current: dict, engine, env_values: dict[str, str] | None,
+    ) -> str:
+        # Observe each named key, not just the mtime of the entire env file.
+        # This prevents an unrelated save from undoing a live owner override.
+        seen = getattr(self, "_runtime_credential_seen", None)
+        if seen is None:
+            seen = self._runtime_credential_seen = {}
+        managed = getattr(self, "_runtime_credential_managed", None)
+        if managed is None:
+            managed = self._runtime_credential_managed = set()
+        status = getattr(self, "_runtime_overlay_status", None)
+        if status is None:
+            status = self._runtime_overlay_status = {}
+        sources = status.setdefault("credential_sources", {})
+        if env_values is not None:
+            first = name not in seen
+            observed = env_values.get(name)
+            previous = seen.get(name)
+            seen[name] = observed
+            if (first and name in env_values) or (not first and previous != observed):
+                current["api_key"] = observed or ""
+                managed.add(name)
+                sources[name] = "mounted_env" if observed else "mounted_env_unset"
+        sources.setdefault(name, "startup_config")
+        if name in managed:
+            selected = str(current.get("api_key") or "")
+        else:
+            selected = str(current.get("api_key") or getattr(engine, "api_key", "") or "")
+        status.setdefault("credential_matches_observed_mount", {})[name] = (
+            selected == env_values[name] if env_values is not None and name in env_values else None
+        )
+        return selected
 
     def _runtime_overlay_snapshot(self) -> dict[str, Any]:
         path_text = str(getattr(self, "_runtime_overlay_path", "") or "").strip()
@@ -1511,7 +1578,7 @@ class GatewayService:
                 raw = b""
             except Exception:
                 valid = False
-        env_path = Path(__file__).with_name(".env")
+        env_path = self._runtime_env_path()
         try:
             env_stat = env_path.stat()
             env_signature = (env_stat.st_mtime_ns, env_stat.st_size)
@@ -1543,8 +1610,17 @@ class GatewayService:
         embedding = overlay.get("embedding") if isinstance(overlay.get("embedding"), dict) else {}
         reranker = overlay.get("reranker") if isinstance(overlay.get("reranker"), dict) else {}
         gateway = overlay.get("gateway") if isinstance(overlay.get("gateway"), dict) else {}
+        env_values = self._runtime_env_credentials()
+        status = getattr(self, "_runtime_overlay_status", None)
+        if status is None:
+            status = self._runtime_overlay_status = {}
+        status["credential_source_readable"] = env_values is not None
+        initial_credentials = any(
+            name not in getattr(self, "_runtime_credential_seen", {})
+            for name in ("OMBRE_EMBEDDING_API_KEY", "OMBRE_RERANKER_API_KEY")
+        )
 
-        if embedding or env_changed:
+        if embedding or env_changed or initial_credentials:
             current = self.config.setdefault("embedding", {})
             for key in ("enabled", "model", "base_url", "max_chars", "query_instruction", "document_instruction"):
                 if key in embedding:
@@ -1552,10 +1628,8 @@ class GatewayService:
             engine = self.embedding_engine
             engine.model = str(current.get("model") or getattr(engine, "model", "") or "")
             engine.base_url = str(current.get("base_url") or getattr(engine, "base_url", "") or "").rstrip("/")
-            engine.api_key = str(
-                current.get("api_key")
-                or self._runtime_env_value("OMBRE_EMBEDDING_API_KEY")
-                or getattr(engine, "api_key", "")
+            engine.api_key = self._runtime_credential_value(
+                "OMBRE_EMBEDDING_API_KEY", current, engine, env_values,
             )
             engine.enabled = bool(engine.api_key and engine.base_url) and self._bool_config_value(
                 current.get("enabled"), True
@@ -1563,7 +1637,7 @@ class GatewayService:
             self.embedding_cfg = current
             changed.append("embedding")
 
-        if reranker or env_changed:
+        if reranker or env_changed or initial_credentials:
             identity_fields = ("model", "base_url", "api_key", "enabled", "timeout", "candidate_limit", "score_weight")
             previous_identity = tuple(getattr(self.reranker_engine, name, None) for name in identity_fields)
             current = self.config.setdefault("reranker", {})
@@ -1573,10 +1647,8 @@ class GatewayService:
             engine = self.reranker_engine
             engine.model = str(current.get("model") or getattr(engine, "model", "") or "")
             engine.base_url = str(current.get("base_url") or getattr(engine, "base_url", "") or "").rstrip("/")
-            engine.api_key = str(
-                current.get("api_key")
-                or self._runtime_env_value("OMBRE_RERANKER_API_KEY")
-                or getattr(engine, "api_key", "")
+            engine.api_key = self._runtime_credential_value(
+                "OMBRE_RERANKER_API_KEY", current, engine, env_values,
             )
             engine.enabled = bool(engine.api_key and engine.base_url) and self._bool_config_value(
                 current.get("enabled"), True
@@ -1656,7 +1728,13 @@ class GatewayService:
                 snapshot["config"],
                 env_changed=(previous is not None and previous[2] != snapshot["signature"][2]),
             )
-            status["last_reload_status"] = "reloaded" if changed else "observed"
+            if status.get("credential_source_readable") is False:
+                status["last_reload_status"] = "credential_source_unavailable_preserved_previous"
+                # Retry a transient read failure even when the file stat stays
+                # unchanged; never report a fully applied credential update.
+                self._runtime_overlay_signature = None
+            else:
+                status["last_reload_status"] = "reloaded" if changed else "observed"
             status["last_changed"] = changed
             status["reload_count"] = int(status.get("reload_count") or 0) + (1 if changed else 0)
 
@@ -2365,7 +2443,26 @@ class GatewayService:
             reranker_cfg["score_weight"] = max(0.0, min(1.0, float(payload["score_weight"])))
             updated.append("reranker.score_weight")
         if "api_key" in payload and payload["api_key"]:
+            name = "OMBRE_RERANKER_API_KEY"
+            seen = getattr(self, "_runtime_credential_seen", None)
+            if seen is None:
+                seen = self._runtime_credential_seen = {}
+            observed = self._runtime_env_credentials()
+            if observed is not None:
+                seen.setdefault(name, observed.get(name))
+            managed = getattr(self, "_runtime_credential_managed", None)
+            if managed is None:
+                managed = self._runtime_credential_managed = set()
+            managed.add(name)
+            status = getattr(self, "_runtime_overlay_status", None)
+            if status is None:
+                status = self._runtime_overlay_status = {}
+            status.setdefault("credential_sources", {})[name] = "owner_runtime_api"
             reranker_cfg["api_key"] = str(payload["api_key"])
+            status.setdefault("credential_matches_observed_mount", {})[name] = (
+                reranker_cfg["api_key"] == observed[name]
+                if observed is not None and name in observed else None
+            )
             os.environ["OMBRE_RERANKER_API_KEY"] = reranker_cfg["api_key"]
             updated.append("reranker.api_key")
         if "base_url" in payload:
@@ -2374,6 +2471,13 @@ class GatewayService:
             os.environ["OMBRE_RERANKER_MODEL"] = reranker_cfg.get("model", "")
         if updated:
             self.reranker_engine = RerankerEngine(self.config)
+            if "OMBRE_RERANKER_API_KEY" in getattr(self, "_runtime_credential_managed", set()):
+                # An explicit mounted-key removal stays cleared even if the
+                # legacy constructor would inherit an embedding credential.
+                self.reranker_engine.api_key = str(reranker_cfg.get("api_key") or "")
+                self.reranker_engine.enabled = bool(
+                    self.reranker_engine.api_key and self.reranker_engine.base_url
+                ) and self._bool_config_value(reranker_cfg.get("enabled"), True)
             # A credential/provider update must not join work or cached scores
             # started under the previous owner configuration. No secret in keys.
             self._rerank_config_revision = getattr(self, "_rerank_config_revision", 0) + 1
@@ -19555,29 +19659,31 @@ class GatewayService:
         def auto_allowed(bucket: dict) -> bool:
             return auto_bucket_ids is None or str(bucket.get("id") or "") in auto_bucket_ids
 
-        eligible = [
-            bucket for bucket in all_buckets
-            if (
-                (
-                    self._is_dynamic_candidate(bucket)
-                    or self._is_identity_name_candidate_bucket(raw_query, bucket)
-                )
-                and not self._is_relevance_suppressed(policy_query, bucket)
-                and auto_allowed(bucket)
-            )
-            or (relevance_query and auto_allowed(bucket)
-                and self._is_relevance_candidate_bucket(policy_query, bucket))
-        ]
-        semantic_eligible = [
-            bucket
-            for bucket in all_buckets
-            if auto_allowed(bucket) and self._is_semantic_candidate_bucket(bucket)
-        ]
         if natural_input:
+            # The natural path has its own existing eligibility contract. Do
+            # not compute legacy pools that would immediately be overwritten.
             eligible = [bucket for bucket in all_buckets
                         if auto_allowed(bucket) and not self._is_self_anchor_recall_excluded_bucket(bucket)
                         and (self._is_dynamic_candidate(bucket) or self._is_semantic_candidate_bucket(bucket))]
             semantic_eligible = list(eligible)
+        else:
+            eligible = [
+                bucket for bucket in all_buckets
+                if (
+                    (
+                        self._is_dynamic_candidate(bucket)
+                        or self._is_identity_name_candidate_bucket(raw_query, bucket)
+                    )
+                    and not self._is_relevance_suppressed(policy_query, bucket)
+                    and auto_allowed(bucket)
+                )
+                or (relevance_query and auto_allowed(bucket)
+                    and self._is_relevance_candidate_bucket(policy_query, bucket))
+            ]
+            semantic_eligible = [
+                bucket for bucket in all_buckets
+                if auto_allowed(bucket) and self._is_semantic_candidate_bucket(bucket)
+            ]
         mark("eligible_filter", stage_started_at)
         record(
             "eligible_filter",

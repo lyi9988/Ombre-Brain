@@ -278,6 +278,22 @@ model from the model of the last request and marks config identity mismatch.
 Credentials and the private comparison fingerprint are never diagnostic fields.
 The tested per-call httpx transport is retained, not silently pooled again.
 
+Mounted credential activation is per named key, not per whole-file timestamp.
+The initial mounted named credential supersedes a stale startup/config value;
+later unrelated file or model changes preserve an explicit live owner override.
+A changed named key activates on reload. An explicit empty/deleted managed key
+stays cleared rather than inheriting an unrelated embedding credential. Missing
+dedicated keys at initial startup retain the existing fallback contract.
+Unreadable/malformed credential input preserves previous credentials, reports
+the limitation and retries on the next reload. Diagnostic source labels and
+equality-to-observed-mount booleans contain no key or key fingerprint.
+
+The natural candidate builder evaluates its existing eligibility contract
+directly, without first constructing legacy pools that it immediately replaces.
+This removes duplicate predicates, not source checks or admission thresholds.
+Revision-verified fresh fragment parsing is retained; a separate reuse design
+is required before removing that correctness boundary.
+
 Timeout diagnostics preserve initial and local-fallback attempts separately,
 with phase, start offset, duration, numeric/count stages, cleanup and selection
 wall time. First-pass timing keys are prefixed on fallback so durations cannot

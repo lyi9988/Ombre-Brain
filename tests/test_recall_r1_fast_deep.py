@@ -602,9 +602,9 @@ def _overlay_rerank_cache_service():
         **service.config["reranker"], "api_key": "synthetic-key-old",
     }})
     env_key = {"value": "synthetic-key-old"}
-    service._runtime_env_value = lambda name: (
-        env_key["value"] if name == "OMBRE_RERANKER_API_KEY" else ""
-    )
+    service._runtime_env_credentials = lambda: {
+        "OMBRE_RERANKER_API_KEY": env_key["value"],
+    }
     return service, env_key
 
 
