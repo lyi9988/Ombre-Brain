@@ -101,6 +101,46 @@ class MeasuredEmbeddingEngine(EmbeddingEngine):
             self.call_elapsed_ms.append(round((time.monotonic() - started) * 1000))
 
 
+def _provider_diagnostics(embedding: Any) -> dict[str, Any]:
+    """Last-call classification only: never serialize arbitrary runtime values."""
+    try:
+        runtime = embedding.runtime_debug()
+    except Exception:
+        runtime = {}
+    if not isinstance(runtime, dict):
+        runtime = {}
+
+    def enum_value(key: str, allowed: set[str], missing: str) -> str:
+        value = runtime.get(key, missing)
+        return value if type(value) is str and value in allowed else "other"
+
+    def bounded_int(key: str, lower: int, upper: int) -> int | None:
+        value = runtime.get(key)
+        return value if type(value) is int and lower <= value <= upper else None
+
+    return {
+        "last_status": enum_value("last_status", {
+            "not_requested", "started", "disabled", "ok", "empty",
+            "error", "cancelled",
+        }, "not_requested"),
+        "last_error_category": enum_value("last_error_category", {
+            "", "connect", "pool", "read", "write", "remote_protocol",
+            "timeout", "request_error", "http_status", "response_decode",
+            "cancelled", "unknown",
+        }, ""),
+        "last_error_type": enum_value("last_error_type", {
+            "", "HTTPError", "HTTPStatusError", "ConnectTimeout",
+            "ConnectError", "PoolTimeout", "ReadTimeout", "ReadError",
+            "WriteTimeout", "WriteError", "RemoteProtocolError",
+            "LocalProtocolError", "TimeoutException", "TimeoutError",
+            "RequestError", "JSONDecodeError", "ValueError", "TypeError",
+            "RuntimeError", "CancelledError", "URLError", "OSError",
+        }, ""),
+        "last_http_status": bounded_int("last_http_status", 100, 599),
+        "last_latency_ms": bounded_int("last_latency_ms", 0, 86400000),
+    }
+
+
 def _progress(*, mode: str, started: float, checked: int, completed: int,
               verified: int, degraded: int, embedding: MeasuredEmbeddingEngine) -> None:
     # Explicit field allowlist: do not emit arbitrary runtime/config dictionaries.
@@ -863,6 +903,7 @@ async def _apply_controller(
             "connection_fallback_count": int(embedding.runtime_debug().get("connection_fallback_count") or 0),
             "provider_call_total_ms": sum(embedding.call_elapsed_ms),
             "provider_call_max_ms": max(embedding.call_elapsed_ms, default=0),
+            "provider_diagnostics": _provider_diagnostics(embedding),
             "new_query_verified": int(pilot_verified),
             "query_provider_requests": query_requests,
             "query_input_chars": int(query_result.get("input_chars") or 0)

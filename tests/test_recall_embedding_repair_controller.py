@@ -134,6 +134,27 @@ def test_candidate_order_matches_worker_authority_order(tmp_path):
     assert repair._next_candidate(path)["memory_id"] == worker_order[0]
 
 
+def test_next_candidate_skips_cooling_memory_and_returns_none_when_all_cool(tmp_path, monkeypatch):
+    now_ms = 2_000_000_000_000
+    monkeypatch.setattr(repair.time, "time", lambda: now_ms / 1000)
+    authority = MemoryAuthorityStore({"state_dir": str(tmp_path / "state")})
+    path = Path(authority.path)
+    with sqlite3.connect(path) as conn:
+        for ident, retry_after in (("a", now_ms + 60_000), ("b", 0)):
+            conn.execute("INSERT INTO memories(memory_id,bucket_id,active_revision,state,recall_policy,updated_at) "
+                         "VALUES (?,?,1,'active','enabled','2026-09-30T12:00:00Z')", (ident, ident))
+            conn.execute("INSERT INTO memory_projection_status"
+                         "(memory_id,memory_revision,projector,status,details_json,updated_at) "
+                         "VALUES (?,1,'embedding','pending_rebuild',?,'2026-09-30T12:00:00Z')",
+                         (ident, json.dumps({"retry_after_ms": retry_after})))
+    assert repair._next_candidate(path)["memory_id"] == "b"
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE memory_projection_status SET details_json=? WHERE memory_id='b'",
+                     (json.dumps({"retry_after_ms": now_ms + 60_000}),))
+    assert repair._next_candidate(path) is None
+    assert repair._upgrade_candidate_count(path) == 2
+
+
 class FakeEmbedding:
     call_invocations = 0
     call_elapsed_ms = []
@@ -154,6 +175,14 @@ class FakeEmbedding:
 def test_failure_stops_without_query_or_next_memory(monkeypatch, capsys, worker_result, expected):
     calls = []
     embedding = FakeEmbedding()
+    if expected == "provider_failure":
+        embedding.runtime_debug = lambda: {
+            "last_status": "error", "last_error_category": "http_status",
+            "last_error_type": "HTTPStatusError", "last_http_status": 503,
+            "last_latency_ms": 91,
+            "api_key": "SENTINEL_PRIVATE_KEY", "provider_response": "PRIVATE_BODY",
+            "connection_fallback_count": 0,
+        }
     class Worker:
         async def repair_pending_once(self, **kwargs):
             calls.append(kwargs)
@@ -180,6 +209,15 @@ def test_failure_stops_without_query_or_next_memory(monkeypatch, capsys, worker_
                         "max_embedding_units": 7, "projectors": ("embedding",)}
     assert embedding.closed
     assert all(json.loads(line)["event"] == "progress" for line in capsys.readouterr().out.splitlines())
+    assert result["provider_diagnostics"] == repair._provider_diagnostics(embedding)
+    if expected == "provider_failure":
+        assert result["provider_diagnostics"] == {
+            "last_status": "error", "last_error_category": "http_status",
+            "last_error_type": "HTTPStatusError", "last_http_status": 503,
+            "last_latency_ms": 91,
+        }
+        assert "SENTINEL_PRIVATE_KEY" not in json.dumps(result)
+        assert "PRIVATE_BODY" not in json.dumps(result)
 
 
 def test_pilot_completes_one_memory_while_corpus_has_1041_units(monkeypatch, capsys):
@@ -220,6 +258,11 @@ def test_pilot_completes_one_memory_while_corpus_has_1041_units(monkeypatch, cap
     assert result["memories_checked"] == result["embedding_units_completed"] == 1
     assert result["verified_vector_rows"] == result["new_query_verified"] == 1
     assert result["embedding_units_remaining"] == 1040
+    assert result["provider_diagnostics"] == {
+        "last_status": "not_requested", "last_error_category": "",
+        "last_error_type": "", "last_http_status": None,
+        "last_latency_ms": None,
+    }
     assert selected == [1] and embedding.closed
     assert "SENTINEL_PRIVATE_KEY" not in capsys.readouterr().out
 
@@ -350,3 +393,61 @@ def test_measured_engine_counts_method_invocations_even_on_exception(monkeypatch
     assert measured.call_invocations == len(calls) == 2
     assert len(measured.call_elapsed_ms) == 2
     assert all(isinstance(value, int) and value >= 0 for value in measured.call_elapsed_ms)
+
+
+def test_provider_diagnostics_allowlists_failure_values_without_arbitrary_runtime_text():
+    secret = "SENTINEL_PRIVATE_KEY_AND_BODY"
+    class Embedding:
+        def runtime_debug(self):
+            return {
+                "last_status": "error", "last_error_category": "http_status",
+                "last_error_type": f"HTTPStatusError-{secret}",
+                "last_http_status": 503, "last_latency_ms": 91,
+                "base_url": f"https://{secret}.test", "api_key": secret,
+                "last_http_timing": {"response_body": secret},
+                "provider_response": secret,
+            }
+    diagnostics = repair._provider_diagnostics(Embedding())
+    assert diagnostics == {
+        "last_status": "error", "last_error_category": "http_status",
+        "last_error_type": "other", "last_http_status": 503,
+        "last_latency_ms": 91,
+    }
+    assert secret not in json.dumps(diagnostics)
+
+
+@pytest.mark.parametrize("runtime", [
+    {"last_status": ["private"], "last_error_category": "private",
+     "last_error_type": {"message": "private"},
+     "last_http_status": "503 private", "last_latency_ms": -1},
+    {"last_status": True, "last_error_category": None,
+     "last_error_type": 123, "last_http_status": True,
+     "last_latency_ms": 42.0},
+    {"last_status": "unknown private", "last_error_category": "read private",
+     "last_error_type": "Error private", "last_http_status": 600,
+     "last_latency_ms": 86400001},
+])
+def test_provider_diagnostics_malformed_values_are_bounded(runtime):
+    class Embedding:
+        def runtime_debug(self):
+            return runtime
+    assert repair._provider_diagnostics(Embedding()) == {
+        "last_status": "other", "last_error_category": "other",
+        "last_error_type": "other", "last_http_status": None,
+        "last_latency_ms": None,
+    }
+
+
+def test_provider_diagnostics_accepts_minimal_fake_and_unavailable_runtime():
+    default = {"last_status": "not_requested", "last_error_category": "",
+               "last_error_type": "", "last_http_status": None,
+               "last_latency_ms": None}
+    assert repair._provider_diagnostics(FakeEmbedding()) == default
+    class NonMappingEmbedding:
+        def runtime_debug(self):
+            return "PRIVATE_BODY"
+    class BrokenEmbedding:
+        def runtime_debug(self):
+            raise RuntimeError("PRIVATE_BODY")
+    assert repair._provider_diagnostics(NonMappingEmbedding()) == default
+    assert repair._provider_diagnostics(BrokenEmbedding()) == default
