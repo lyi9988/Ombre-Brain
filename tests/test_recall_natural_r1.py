@@ -480,6 +480,138 @@ def test_natural_total_timeout_retries_local_only_with_all_provider_steps_disabl
     assert result == ([], [], {})
 
 
+def test_natural_timeout_retains_completed_verified_semantic_without_second_embedding_or_rerank():
+    query = "An ordinary paraphrase about a shared evening experience."
+    bucket = _natural_bucket("memory-timeout-semantic", "A committed source-backed evening fact.")
+    service, calls, _metadata = _natural_finish_service(None, [bucket], {})
+    service.recall_timeout_seconds = 0.03
+    provider_calls = []
+    rerank_started = asyncio.Event()
+    rerank_cancelled = asyncio.Event()
+
+    async def search(queries, *, cache_debug, **_kwargs):
+        provider_calls.append(list(queries))
+        cache_debug.update(status="miss", provider_requests=1, coverage_status="complete")
+        return [{"bucket_id": bucket["id"], "score": 0.93,
+                 "unit_id": "unit-timeout", "index_status": "verified"}]
+
+    service.embedding_engine = SimpleNamespace(enabled=True, search_similar_queries=search)
+
+    async def candidate_builder(_query, _session_id, buckets, *, natural_input,
+                                allow_semantic, **_kwargs):
+        eligible = {item["id"] for item in buckets}
+        scores = (await service._natural_semantic_candidates(natural_input, eligible)
+                  if allow_semantic else service._reuse_completed_natural_semantic(natural_input, eligible))
+        hits = natural_input.get("semantic_hits") or {}
+        return ([_natural_candidate(bucket, scores[bucket["id"]],
+                                    index_status=hits[bucket["id"]]["index_status"])]
+                if bucket["id"] in scores else []), []
+
+    async def blocked_rerank(_query, _items, **_kwargs):
+        rerank_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            rerank_cancelled.set()
+
+    async def selector(selected_query, session_id, buckets, *, natural_input,
+                       allow_query_planner, allow_rerank, **_kwargs):
+        natural_input.update(allow_query_planner=allow_query_planner, allow_rerank=allow_rerank)
+        return await service._finish_natural_selection(
+            selected_query, session_id, buckets, recall_input=natural_input,
+        )
+
+    service._dynamic_bucket_candidate_items = candidate_builder
+    service._rerank_scored_bucket_candidates = blocked_rerank
+    natural_input = {"route": "ordinary", "q_current": query, "q_context": query,
+                     "metadata": {}, "_tasks": []}
+    selected, suppressed, debug = asyncio.run(service._select_recall_with_fallback(
+        selector, query, "session-timeout", [bucket], sentinel_debug={"route": "ordinary"},
+        natural_input=natural_input, allow_semantic=True, allow_query_planner=False,
+        allow_rerank=True,
+    ))
+
+    assert rerank_started.is_set() and rerank_cancelled.is_set()
+    assert provider_calls == [[query]]
+    assert [item["id"] for item in selected] == [bucket["id"]]
+    assert suppressed == []
+    assert debug["final_bucket_ids"] == [bucket["id"]]
+    assert calls["selected"][0]["admission_reason"] == "strong_semantic"
+    assert calls["selected"][0].get("rerank_score") is None
+    assert natural_input["semantic_debug"]["provider_requests"] == 1
+    assert "recall_total_timeout" in natural_input["incomplete_reasons"]
+
+
+@pytest.mark.parametrize("change", [
+    "context_query", "current_query", "memory_id", "revision", "body_sha256",
+    "disabled", "partial",
+])
+def test_completed_semantic_timeout_checkpoint_rejects_changed_or_unverified_source(change):
+    service = GatewayService.__new__(GatewayService)
+    service.semantic_candidate_top_k = 4
+    service._clamp = lambda score: max(0.0, min(1.0, float(score)))
+    calls = []
+    bucket_id = "memory-checkpoint"
+    query = "A synthetic ordinary experience paraphrase."
+    metadata = {bucket_id: {"memory_id": "authority-memory", "revision": 7,
+                            "body_sha256": "a" * 64}}
+
+    async def search(queries, *, cache_debug, **_kwargs):
+        calls.append(list(queries))
+        cache_debug.update(status="miss", provider_requests=1)
+        return [{"bucket_id": bucket_id, "score": 0.92, "unit_id": "unit-1",
+                 "index_status": "partial" if change == "partial" else "verified"}]
+
+    service.embedding_engine = SimpleNamespace(enabled=True, search_similar_queries=search)
+    recall_input = {"q_context": query, "q_current": query, "metadata": {},
+                    "index_metadata": metadata, "local_only": False}
+    asyncio.run(service._natural_semantic_candidates(recall_input, {bucket_id}))
+    assert len(calls) == 1
+    recall_input["local_only"] = True
+    if change == "context_query":
+        recall_input["q_context"] = query + " changed"
+    elif change == "current_query":
+        recall_input["q_current"] = query + " changed"
+    elif change == "disabled":
+        pass
+    elif change != "partial":
+        recall_input["index_metadata"] = {bucket_id: {**metadata[bucket_id], change: (
+            "different-memory" if change == "memory_id" else 8 if change == "revision" else "b" * 64)}}
+
+    eligible = set() if change == "disabled" else {bucket_id}
+    assert service._reuse_completed_natural_semantic(recall_input, eligible) == {}
+    assert recall_input["semantic_hits"] == {}
+    assert len(calls) == 1
+
+
+def test_external_natural_recall_cancellation_does_not_trigger_deadline_fallback():
+    service = GatewayService.__new__(GatewayService)
+    service.recall_timeout_seconds = 1.0
+    started = asyncio.Event()
+    calls = []
+    natural_input = {"route": "ordinary", "_tasks": []}
+
+    async def selector(*_args, **_kwargs):
+        calls.append(True)
+        started.set()
+        await asyncio.Event().wait()
+
+    async def scenario():
+        task = asyncio.create_task(service._select_recall_with_fallback(
+            selector, "synthetic query", sentinel_debug={"route": "ordinary"},
+            natural_input=natural_input, allow_semantic=True,
+        ))
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert calls == [True]
+    assert natural_input.get("local_only") is not True
+    assert "recall_total_timeout" not in natural_input.get("incomplete_reasons", [])
+
+
 def test_internal_runtime_scope_exits_before_memory_or_canonical_work():
     service = GatewayService.__new__(GatewayService)
     service._maybe_reload_runtime_overlay = lambda: None

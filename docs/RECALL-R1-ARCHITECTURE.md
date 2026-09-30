@@ -247,6 +247,15 @@ second fact authority is introduced.
 Provider/Planner cancellation and one overall recall deadline propagate.
 Failures preserve available evidence and allow chat to continue.
 
+The 2026-10-01 real-request regression exposed a later-rerank deadline
+discarding an already completed semantic lookup. Deadline fallback now keeps
+a request-local checkpoint of verified hits and revalidates both current and
+context query hashes, current eligibility, and Memory ID/revision/body hash
+before reusing scores. Partial/stale/disabled hits are excluded. It performs
+no additional embedding/rerank call and does not claim that rerank succeeded.
+External cancellation still propagates; timeout remains an incomplete reason.
+This correctness repair is not evidence of a lower end-to-end latency.
+
 `selected`, `no_match`, `incomplete`, and `disabled` are distinct. A timeout,
 missing index or uncovered query input cannot support a claim that a person
 or event does not exist. Status-only wrapper text is not an injected Memory

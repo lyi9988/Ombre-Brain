@@ -16262,7 +16262,45 @@ class GatewayService:
             diagnostics.update(status="error", error_type=type(exc).__name__, coverage_status="incomplete")
             hits = []
         recall_input["semantic_hits"] = {str(hit["bucket_id"]): hit for hit in hits}
+        # Request-local checkpoint: a later Planner/rerank timeout must not
+        # erase a completed, source-verified semantic lookup. This is not a
+        # cross-request cache and cannot authorize a stale/disabled Memory.
+        metadata = recall_input.get("index_metadata") or {}
+        recall_input["_completed_semantic"] = {
+            "query_sha256": hashlib.sha256(query.encode()).hexdigest(),
+            "current_query_sha256": hashlib.sha256(
+                str(recall_input.get("q_current") or "").encode()).hexdigest(),
+            "hits": {str(hit["bucket_id"]): dict(hit) for hit in hits
+                     if hit.get("index_status") == "verified"},
+            "source_metadata": {bid: dict(meta) for bid, meta in metadata.items()},
+        }
         return {str(hit["bucket_id"]): self._clamp(hit["score"]) for hit in hits}
+
+    def _reuse_completed_natural_semantic(
+        self, recall_input: dict, eligible_ids: set[str],
+    ) -> dict[str, float]:
+        """Reuse completed work only inside this request's deadline fallback."""
+        if not recall_input.get("local_only"):
+            return {}
+        recall_input["semantic_hits"] = {}
+        checkpoint = recall_input.get("_completed_semantic") or {}
+        query = recall_input.get("q_context") or recall_input.get("q_current") or ""
+        if (checkpoint.get("query_sha256") != hashlib.sha256(query.encode()).hexdigest()
+                or checkpoint.get("current_query_sha256") != hashlib.sha256(
+                    str(recall_input.get("q_current") or "").encode()).hexdigest()):
+            return {}
+        before = checkpoint.get("source_metadata") or {}
+        current = recall_input.get("index_metadata") or {}
+        retained = {}
+        for bid, hit in (checkpoint.get("hits") or {}).items():
+            old, new = before.get(bid) or {}, current.get(bid) or {}
+            if (bid in eligible_ids and hit.get("index_status") == "verified"
+                    and old.get("memory_id") and old.get("body_sha256")
+                    and all(old.get(key) == new.get(key)
+                            for key in ("memory_id", "revision", "body_sha256"))):
+                retained[bid] = dict(hit)
+        recall_input["semantic_hits"] = retained
+        return {bid: self._clamp(hit["score"]) for bid, hit in retained.items()}
 
     async def _finish_natural_selection(
         self, query: str, session_id: str, all_buckets: list[dict], *,
@@ -19554,6 +19592,10 @@ class GatewayService:
         dynamic_anchor_plan["short_cjk_fast_hit_count"] = len(verified_local_anchor_ids)
         stage_started_at = time.perf_counter()
         semantic_cache_debug: dict[str, Any] = {}
+        reused_completed_semantic = bool(
+            natural_input and natural_input.get("local_only")
+            and natural_input.get("_completed_semantic")
+        )
         if semantic_task is not None:
             try:
                 semantic_scores = await semantic_task
@@ -19562,6 +19604,16 @@ class GatewayService:
                 await asyncio.gather(semantic_task, return_exceptions=True)
                 raise
             semantic_cache_debug.update(natural_input.get("semantic_debug") or {})
+        elif reused_completed_semantic:
+            semantic_scores = self._reuse_completed_natural_semantic(
+                natural_input, set(semantic_bucket_map),
+            )
+            semantic_cache_debug.update(natural_input.get("semantic_debug") or {})
+            semantic_cache_debug.update(
+                reused_after_timeout=True,
+                reused_candidate_count=len(semantic_scores),
+                provider_requests_this_phase=0,
+            )
         elif allow_semantic and not verified_local_anchor_ids:
             semantic_query = self._identity_name_semantic_query(raw_query) or raw_query
             semantic_scores = await self._get_semantic_candidates(
@@ -19577,9 +19629,11 @@ class GatewayService:
             len(semantic_bucket_map),
             len(semantic_scores),
             limit=self.semantic_candidate_top_k,
-            skipped=not allow_semantic or (bool(verified_local_anchor_ids) and not natural_input),
+            skipped=(not allow_semantic and not reused_completed_semantic)
+                or (bool(verified_local_anchor_ids) and not natural_input),
             reason=(
-                "disabled for this recall branch" if not allow_semantic
+                "revalidated completed semantic result after timeout" if reused_completed_semantic
+                else "disabled for this recall branch" if not allow_semantic
                 else "verified local short Chinese identity anchor"
                 if verified_local_anchor_ids and not natural_input
                 else "eligible ids after embedding search"
