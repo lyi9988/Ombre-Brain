@@ -220,6 +220,7 @@ memory_projection_worker = (
         entity_edge_store=entity_edge_store,
         word_map_store=word_map_store,
         identity_semantic_store=identity_semantic_store,
+        prompt_plan_mirror=prompt_plan_mirror,
     )
     if memory_authority_store is not None
     else None
@@ -14351,6 +14352,7 @@ if __name__ == "__main__":
                 entity_edge_store=EntityEdgeStore(config),
                 word_map_store=WordMapStore(config),
                 identity_semantic_store=IdentitySemanticStore(config),
+                prompt_plan_mirror=prompt_plan_mirror,
             )
             while True:
                 try:

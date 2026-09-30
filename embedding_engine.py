@@ -66,6 +66,7 @@ class EmbeddingEngine:
         )
         self._query_cache: dict[str, tuple[float, list[float]]] = {}
         self._query_inflight: dict[str, asyncio.Task] = {}
+        self._query_batch_inflight: dict[tuple[str, ...], asyncio.Task] = {}
         self._runtime = {
             "last_operation": "none",
             "last_status": "not_requested",
@@ -111,13 +112,35 @@ class EmbeddingEngine:
             **dict(self._runtime),
         }
 
-    def _query_cache_key(self, text: str) -> str:
-        prepared = self._prepare_embedding_input(text, kind="query")[: self.max_chars]
+    def _query_config_snapshot(self, *, query_instruction: str | None = None,
+                               document_instruction: str | None = None) -> dict:
+        # Request-local: hot application cannot relabel an in-flight vector.
+        # api_key stays only in memory; it is never included in diagnostics.
+        return {"model": self.model, "base_url": self.base_url,
+                "api_key": self.api_key, "enabled": self.enabled,
+                "max_chars": self.max_chars,
+                "query_instruction": self.query_instruction if query_instruction is None else query_instruction,
+                "document_instruction": self.document_instruction if document_instruction is None else document_instruction,
+                "document_preparation": self.preparation_hash(instruction=document_instruction)}
+
+    @staticmethod
+    def _prepare_query_snapshot(text: str, snapshot: dict) -> str:
+        instruction = str(snapshot.get("query_instruction") or "")
+        return f"Instruct: {instruction}\nQuery: {text}" if instruction else str(text)
+
+    @staticmethod
+    def _prepare_document_snapshot(text: str, snapshot: dict) -> str:
+        instruction = str(snapshot.get("document_instruction") or "")
+        return f"Instruct: {instruction}\nDocument: {text}" if instruction else str(text)
+
+    def _query_cache_key(self, text: str, *, snapshot: dict | None = None) -> str:
+        snapshot = snapshot or self._query_config_snapshot()
+        prepared = self._prepare_query_snapshot(text, snapshot)[:snapshot["max_chars"]]
         payload = {
             "input": prepared,
-            "model": str(self.model or ""),
-            "base_url": str(self.base_url or ""),
-            "query_instruction": self.query_instruction,
+            "model": str(snapshot["model"] or ""),
+            "base_url": str(snapshot["base_url"] or ""),
+            "query_instruction": snapshot["query_instruction"],
         }
         return hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -143,7 +166,12 @@ class EmbeddingEngine:
         inflight = self._query_inflight.get(cache_key)
         if inflight is not None:
             self._runtime["last_query_cache_status"] = "singleflight"
-            return list(await asyncio.shield(inflight))
+            try:
+                return list(await asyncio.shield(inflight))
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+                raise RuntimeError("shared_embedding_request_cancelled") from None
 
         task = asyncio.create_task(self._generate_embedding(text, kind="query"))
         self._query_inflight[cache_key] = task
@@ -158,6 +186,10 @@ class EmbeddingEngine:
                     self._query_cache.pop(next(iter(self._query_cache)))
             self._runtime["last_query_cache_status"] = "miss"
             return vector
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         finally:
             if self._query_inflight.get(cache_key) is task:
                 self._query_inflight.pop(cache_key, None)
@@ -177,10 +209,123 @@ class EmbeddingEngine:
         """)
         self._ensure_column(conn, "embeddings", "model", "TEXT")
         self._ensure_column(conn, "embeddings", "dimension", "INTEGER")
+        for name, sql_type in {
+            "parent_bucket_id": "TEXT", "parent_memory_id": "TEXT",
+            "source_unit_id": "TEXT", "source_revision": "INTEGER",
+            "source_sha256": "TEXT", "input_sha256": "TEXT",
+            "preparation_sha256": "TEXT", "provider": "TEXT",
+            "input_truncated_chars": "INTEGER",
+        }.items():
+            self._ensure_column(conn, "embeddings", name, sql_type)
         conn.commit()
         conn.close()
 
-    async def generate_and_store(self, bucket_id: str, content: str) -> bool:
+    async def query_embeddings(self, texts: list[str], *, deadline: float | None = None,
+                               cache_debug: dict | None = None,
+                               config_snapshot: dict | None = None) -> list[list[float]]:
+        """Batch missing query vectors; cache values only, validate every index.
+
+        The task owner cancels the request on cancellation. Same-key peers
+        may observe it through shield, but no detached provider task survives
+        the owner's recall deadline.
+        """
+        snapshot = config_snapshot or self._query_config_snapshot()
+        if not snapshot["enabled"]:
+            if cache_debug is not None:
+                cache_debug.update(status="disabled", provider_requests=0)
+            return [[] for _ in texts]
+        keys = [self._query_cache_key(text, snapshot=snapshot) for text in texts]
+        now = time.monotonic()
+        found = {key: list(value[1]) for key, value in self._query_cache.items() if value[0] > now}
+        missing = {key: text for key, text in zip(keys, texts) if key not in found and text.strip()}
+        if not missing:
+            self._runtime["last_query_cache_status"] = "hit"
+            if cache_debug is not None:
+                cache_debug.update(status="hit", provider_requests=0, http_timing=None)
+            return [found.get(key, []) for key in keys]
+        if not hasattr(self, "_query_batch_inflight"):
+            self._query_batch_inflight = {}
+        batch_key = tuple(sorted(missing))
+        task = self._query_batch_inflight.get(batch_key)
+        owner = task is None
+
+        async def execute():
+            started = time.monotonic()
+            ordered_keys = list(batch_key)
+            prepared = [self._prepare_query_snapshot(missing[key], snapshot)[:snapshot["max_chars"]]
+                        for key in ordered_keys]
+            self._runtime.update(last_operation="query_batch", last_status="started",
+                                 last_provider_request_count=1, last_batch_size=len(prepared))
+            status, body = await self._request_embedding(
+                f"{snapshot['base_url'].rstrip('/')}/embeddings", snapshot["api_key"], snapshot["model"],
+                prepared if len(prepared) > 1 else prepared[0],
+                deadline=deadline or started + self.REQUEST_BUDGET_SECONDS,
+            )
+            data = body.get("data") if isinstance(body, dict) else None
+            if not isinstance(data, list) or len(data) != len(prepared):
+                raise ValueError("embedding_batch_cardinality_mismatch")
+            vectors = {}
+            dimension = None
+            for position, item in enumerate(data):
+                if not isinstance(item, dict):
+                    raise ValueError("embedding_batch_invalid_item")
+                index = item.get("index", position if len(data) == 1 else None)
+                vector = item.get("embedding")
+                if (type(index) is not int or index not in range(len(prepared))
+                        or index in vectors or not isinstance(vector, list) or not vector
+                        or any(type(v) not in (int, float) or not math.isfinite(v) for v in vector)):
+                    raise ValueError("embedding_batch_invalid_index_or_vector")
+                if dimension is not None and len(vector) != dimension:
+                    raise ValueError("embedding_batch_dimension_mismatch")
+                dimension = len(vector)
+                vectors[index] = vector
+            result = {key: list(vectors[i]) for i, key in enumerate(ordered_keys)}
+            if self.query_cache_ttl_seconds > 0 and self.query_cache_max_entries > 0:
+                for key, vector in result.items():
+                    self._query_cache[key] = (time.monotonic() + self.query_cache_ttl_seconds, vector)
+                while len(self._query_cache) > self.query_cache_max_entries:
+                    self._query_cache.pop(next(iter(self._query_cache)))
+            self._runtime.update(last_status="ok", last_http_status=status,
+                                 last_latency_ms=round((time.monotonic() - started) * 1000),
+                                 last_vector_dimension=dimension, last_result_count=len(result))
+            return result, dict(body.get("_local_http_timing") or {})
+
+        if owner:
+            task = asyncio.create_task(execute())
+            self._query_batch_inflight[batch_key] = task
+        if cache_debug is not None:
+            cache_debug.update(status="miss" if owner else "singleflight", provider_requests=1 if owner else 0,
+                               shared_provider_request=not owner)
+        try:
+            result, timing = await asyncio.shield(task)
+            found.update(result)
+            self._runtime["last_query_cache_status"] = "miss" if owner else "singleflight"
+            if cache_debug is not None:
+                cache_debug.update(status="miss" if owner else "singleflight",
+                                   provider_requests=int(timing.get("provider_attempts") or 1) if owner else 0,
+                                   shared_provider_request=not owner, http_timing=timing,
+                                   provider_batch_size=len(batch_key))
+            return [found.get(key, []) for key in keys]
+        except asyncio.CancelledError:
+            if owner:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            elif not asyncio.current_task().cancelling():
+                raise RuntimeError("shared_embedding_request_cancelled") from None
+            raise
+        except Exception as exc:
+            self._runtime.update(last_status="error", last_error_type=type(exc).__name__)
+            raise
+        finally:
+            if owner and self._query_batch_inflight.get(batch_key) is task:
+                self._query_batch_inflight.pop(batch_key, None)
+
+    async def generate_and_store(
+        self, bucket_id: str, content: str, *, source_revision: int | None = None,
+        source_sha256: str | None = None, source_unit_id: str | None = None,
+        parent_memory_id: str | None = None, document_instruction: str | None = None,
+        config_snapshot: dict | None = None,
+    ) -> bool:
         """
         Generate embedding for content and store in SQLite.
         为内容生成 embedding 并存入 SQLite。
@@ -190,18 +335,25 @@ class EmbeddingEngine:
             return False
 
         try:
-            embedding = await self._generate_embedding(content, kind="document")
+            snapshot = config_snapshot or self._query_config_snapshot(document_instruction=document_instruction)
+            embedding = await self._generate_embedding(content, kind="document", config_snapshot=snapshot)
             if not embedding:
                 return False
-            self._store_embedding(bucket_id, embedding)
+            self._store_embedding(
+                bucket_id, embedding, source_revision=source_revision,
+                source_sha256=source_sha256, source_unit_id=source_unit_id,
+                parent_memory_id=parent_memory_id, input_text=content, config_snapshot=snapshot,
+            )
             return True
         except Exception as e:
-            logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
+            logger.warning("Embedding generation failed | type=%s", type(e).__name__)
             return False
 
-    async def _generate_embedding(self, text: str, *, kind: str = "document") -> list[float]:
+    async def _generate_embedding(self, text: str, *, kind: str = "document",
+                                  config_snapshot: dict | None = None) -> list[float]:
         """Call API to generate embedding vector."""
-        started = time.perf_counter()
+        started = time.monotonic()
+        snapshot = config_snapshot or self._query_config_snapshot()
         self._runtime.update({
             "last_operation": str(kind or "document"),
             "last_status": "disabled" if not self.enabled else "started",
@@ -213,32 +365,34 @@ class EmbeddingEngine:
             "last_result_count": None,
             "last_transport": "persistent_httpx",
         })
-        if not self.enabled:
+        if not snapshot["enabled"]:
             return []
         # Truncate to avoid token limits
-        prepared = self._prepare_embedding_input(text, kind=kind)
-        truncated = prepared[: self.max_chars]
+        prepared = (self._prepare_query_snapshot(text, snapshot) if kind == "query"
+                    else self._prepare_document_snapshot(text, snapshot))
+        truncated = prepared[:snapshot["max_chars"]]
         try:
-            endpoint = f"{self.base_url.rstrip('/')}/embeddings"
+            endpoint = f"{snapshot['base_url'].rstrip('/')}/embeddings"
             http_status, body = await self._request_embedding(
-                endpoint, self.api_key, self.model, truncated,
+                endpoint, snapshot["api_key"], snapshot["model"], truncated,
                 deadline=started + self.REQUEST_BUDGET_SECONDS,
             )
             self._runtime["last_http_status"] = http_status
             data = body.get("data") if isinstance(body, dict) else None
             first = data[0] if isinstance(data, list) and data else None
             vector = first.get("embedding") if isinstance(first, dict) else None
-            if vector:
+            if (isinstance(vector, list) and vector
+                    and all(type(v) in (int, float) and math.isfinite(v) for v in vector)):
                 self._runtime.update({
                     "last_status": "ok",
-                    "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                    "last_latency_ms": max(0, int((time.monotonic() - started) * 1000)),
                     "last_vector_dimension": len(vector or []),
                     "last_result_count": 1,
                 })
                 return vector
             self._runtime.update({
                 "last_status": "empty",
-                "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                "last_latency_ms": max(0, int((time.monotonic() - started) * 1000)),
                 "last_result_count": 0,
             })
             return []
@@ -251,16 +405,16 @@ class EmbeddingEngine:
                 "last_error_type": type(e).__name__,
                 "last_error_category": "http_status",
                 "last_http_status": status,
-                "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                "last_latency_ms": max(0, int((time.monotonic() - started) * 1000)),
             })
-            logger.warning(f"Embedding API call failed: {e}")
+            logger.warning("Embedding API call failed | type=%s status=%s", type(e).__name__, status)
             return []
         except asyncio.CancelledError:
             self._runtime.update({
                 "last_status": "cancelled",
                 "last_error_type": "CancelledError",
                 "last_error_category": "cancelled",
-                "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                "last_latency_ms": max(0, int((time.monotonic() - started) * 1000)),
             })
             raise
         except Exception as e:
@@ -268,9 +422,9 @@ class EmbeddingEngine:
                 "last_status": "error",
                 "last_error_type": type(e).__name__,
                 "last_error_category": self._error_category(e),
-                "last_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                "last_latency_ms": max(0, int((time.monotonic() - started) * 1000)),
             })
-            logger.warning(f"Embedding API call failed: {e}")
+            logger.warning("Embedding API call failed | type=%s", type(e).__name__)
             return []
 
     @staticmethod
@@ -347,7 +501,7 @@ class EmbeddingEngine:
         return client
 
     async def _request_embedding(
-        self, endpoint: str, api_key: str, model: str, input_value: str,
+        self, endpoint: str, api_key: str, model: str, input_value: str | list[str],
         *, deadline: float | None = None,
     ) -> tuple[int, dict]:
         """Use the persistent pool with a bounded, connection-only fallback."""
@@ -356,7 +510,28 @@ class EmbeddingEngine:
             raise RuntimeError("embedding client unavailable")
         if deadline is None:
             deadline = time.monotonic() + self.REQUEST_BUDGET_SECONDS
-        remaining = max(0.1, deadline - time.monotonic())
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError("embedding_request_budget_exhausted")
+        request_started = time.monotonic()
+        phase_started, metrics = {}, {"source": "httpcore_trace", "provider_attempts": 1}
+
+        async def trace(event: str, _info: dict) -> None:
+            # Never retain/log info: it can contain request headers/secrets.
+            phase, _, state = event.rpartition(".")
+            phase = phase.rsplit(".", 1)[-1]
+            fields = {"connect_tcp": "connect_tcp_ms", "start_tls": "tls_ms",
+                      "receive_response_headers": "response_header_wait_ms",
+                      "receive_response_body": "response_body_ms"}
+            if phase not in fields:
+                return
+            now = time.monotonic()
+            if state == "started":
+                phase_started[phase] = now
+            elif state in {"complete", "failed"} and phase in phase_started:
+                metrics[fields[phase]] = round((now - phase_started[phase]) * 1000)
+                if phase == "receive_response_headers" and state == "complete":
+                    metrics["header_ms"] = round((now - request_started) * 1000)
         try:
             response = await client.post(
                 endpoint,
@@ -366,10 +541,15 @@ class EmbeddingEngine:
                 },
                 json={"model": model, "input": input_value},
                 timeout=remaining,
+                **({"extensions": {"trace": trace}} if isinstance(client, httpx.AsyncClient) else {}),
             )
             response.raise_for_status()
             body = response.json()
-            return int(response.status_code), body if isinstance(body, dict) else {}
+            metrics["total_ms"] = round((time.monotonic() - request_started) * 1000)
+            body = dict(body) if isinstance(body, dict) else {}
+            body["_local_http_timing"] = metrics
+            self._runtime["last_http_timing"] = dict(metrics)
+            return int(response.status_code), body
         except httpx.RequestError as exc:
             category = self._error_category(exc)
             self._runtime["last_error_category"] = category
@@ -386,7 +566,7 @@ class EmbeddingEngine:
                 self._runtime.get("connection_fallback_count") or 0
             ) + 1
             self._runtime["last_transport"] = "urllib_fallback"
-            return await asyncio.to_thread(
+            status, body = await asyncio.to_thread(
                 self._request_embedding_sync,
                 endpoint,
                 api_key,
@@ -394,6 +574,12 @@ class EmbeddingEngine:
                 input_value,
                 timeout_seconds=max(0.1, remaining),
             )
+            metrics.update(source="connect_fallback", provider_attempts=2,
+                           total_ms=round((time.monotonic() - request_started) * 1000))
+            body = dict(body) if isinstance(body, dict) else {}
+            body["_local_http_timing"] = metrics
+            self._runtime["last_http_timing"] = dict(metrics)
+            return status, body
 
     async def reconfigure(self, config: dict) -> None:
         """Apply hot-reloaded config and rotate the pooled client safely."""
@@ -453,16 +639,41 @@ class EmbeddingEngine:
             body = json.loads(response.read())
             return int(response.status), body if isinstance(body, dict) else {}
 
-    def _store_embedding(self, bucket_id: str, embedding: list[float]):
+    def preparation_hash(self, *, kind: str = "document", instruction: str | None = None) -> str:
+        if instruction is None:
+            instruction = self.query_instruction if kind == "query" else self.document_instruction
+        return hashlib.sha256(json.dumps({
+            "kind": kind, "instruction": instruction, "max_chars": self.max_chars,
+            "format": "embedding-input-v1",
+        }, sort_keys=True).encode()).hexdigest()
+
+    def _store_embedding(
+        self, bucket_id: str, embedding: list[float], *,
+        source_revision: int | None = None, source_sha256: str | None = None,
+        source_unit_id: str | None = None, parent_memory_id: str | None = None,
+        input_text: str = "", config_snapshot: dict | None = None,
+    ):
         """Store embedding in SQLite."""
         from utils import now_iso
         conn = sqlite3.connect(self.db_path)
+        unit = str(source_unit_id or bucket_id)
+        row_id = bucket_id if unit == bucket_id else "unit:" + hashlib.sha256(
+            f"{bucket_id}|{unit}".encode()).hexdigest()
+        snapshot = config_snapshot or self._query_config_snapshot()
+        prepared = self._prepare_document_snapshot(input_text, snapshot)
         conn.execute(
             """
-            INSERT OR REPLACE INTO embeddings (bucket_id, embedding, model, dimension, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO embeddings
+            (bucket_id, embedding, model, dimension, updated_at, parent_bucket_id,
+             parent_memory_id, source_unit_id, source_revision, source_sha256,
+             input_sha256, preparation_sha256, provider, input_truncated_chars)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (bucket_id, json.dumps(embedding), self.model, len(embedding), now_iso()),
+            (row_id, json.dumps(embedding), snapshot["model"], len(embedding), now_iso(), bucket_id,
+             parent_memory_id, unit, source_revision, source_sha256,
+             hashlib.sha256(prepared[:snapshot["max_chars"]].encode()).hexdigest(),
+             snapshot["document_preparation"], snapshot["base_url"].rstrip("/"),
+             max(0, len(prepared) - snapshot["max_chars"])),
         )
         conn.commit()
         conn.close()
@@ -470,7 +681,7 @@ class EmbeddingEngine:
     def delete_embedding(self, bucket_id: str):
         """Remove embedding when bucket is deleted."""
         conn = sqlite3.connect(self.db_path)
-        conn.execute("DELETE FROM embeddings WHERE bucket_id = ?", (bucket_id,))
+        conn.execute("DELETE FROM embeddings WHERE bucket_id = ? OR parent_bucket_id = ?", (bucket_id, bucket_id))
         conn.commit()
         conn.close()
 
@@ -541,7 +752,7 @@ class EmbeddingEngine:
 
         # Load all embeddings from SQLite
         conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT bucket_id, embedding, model, dimension FROM embeddings").fetchall()
+        rows = conn.execute("SELECT bucket_id, embedding, model, dimension, parent_bucket_id FROM embeddings").fetchall()
         conn.close()
 
         if not rows:
@@ -549,20 +760,151 @@ class EmbeddingEngine:
             return []
 
         # Calculate cosine similarity
-        results = []
-        for bucket_id, emb_json, model, dimension in rows:
+        by_parent = {}
+        for bucket_id, emb_json, model, dimension, parent_id in rows:
             try:
                 stored_embedding = json.loads(emb_json)
                 if not self._row_matches_current_model(model, dimension, stored_embedding):
                     continue
                 sim = self._cosine_similarity(query_embedding, stored_embedding)
-                results.append((bucket_id, sim))
+                parent = str(parent_id or bucket_id)
+                by_parent[parent] = max(by_parent.get(parent, -1.0), sim)
             except (json.JSONDecodeError, Exception):
                 continue
 
-        results.sort(key=lambda x: x[1], reverse=True)
+        results = sorted(by_parent.items(), key=lambda x: x[1], reverse=True)
         self._runtime["last_result_count"] = min(len(results), top_k)
         return results[:top_k]
+
+    async def search_similar_queries(
+        self, queries: list[str], top_k: int = 24, *, eligible_ids: set[str],
+        index_metadata: dict | None = None, cache_debug: dict | None = None,
+        deadline: float | None = None, query_instruction: str | None = None,
+        document_instruction: str | None = None,
+    ) -> list[dict]:
+        """Search allowed, revision-compatible units before each view's Top-K.
+
+        Existing bucket-vector APIs remain unchanged. New content units map
+        back to their committed parent Memory; stale rows never fill slots.
+        """
+        started = time.monotonic()
+        snapshot = self._query_config_snapshot(query_instruction=query_instruction,
+                                                document_instruction=document_instruction)
+        if not self.enabled or not eligible_ids or not queries:
+            if cache_debug is not None:
+                cache_debug.update(status="disabled_or_empty", provider_requests=0)
+            return []
+        # A long current message remains represented by several chunks.
+        # Query instructions reserve their own room instead of silently
+        # cutting the current message tail after prepending an instruction.
+        prefix_size = len(self._prepare_query_snapshot("", snapshot))
+        if prefix_size >= snapshot["max_chars"]:
+            raise ValueError("embedding_preparation_exceeds_character_budget")
+        chunk_size = max(1, snapshot["max_chars"] - prefix_size)
+        chunks, owners = [], []
+        for view, text in enumerate(queries):
+            for offset in range(0, len(text), chunk_size):
+                chunks.append(text[offset:offset + chunk_size])
+                owners.append(view)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT bucket_id,embedding,model,dimension,parent_bucket_id,"
+                "parent_memory_id,source_unit_id,source_revision,source_sha256,"
+                "preparation_sha256,provider,input_truncated_chars FROM embeddings"
+            ).fetchall()
+        finally:
+            conn.close()
+        valid, rejected = [], {}
+        for row in rows:
+            row_id, payload, model, dimension, parent, memory_id, unit, revision, body_sha, prep, provider, truncated = row
+            parent = str(parent or row_id)
+            if parent not in eligible_ids:
+                continue
+            reason = ""
+            expected = (index_metadata or {}).get(parent)
+            if index_metadata is not None and expected is None:
+                reason = "active_index_metadata_missing"
+            if expected is not None:
+                if revision is None or not body_sha or not provider or not prep:
+                    reason = "legacy_index_metadata_unavailable"
+                elif (int(revision) != int(expected.get("revision") or 0)
+                      or body_sha != expected.get("body_sha256")
+                      or (memory_id and memory_id != expected.get("memory_id"))):
+                    reason = "stale_memory_revision"
+            if not reason and provider and provider.rstrip("/") != snapshot["base_url"].rstrip("/"):
+                reason = "embedding_provider_mismatch"
+            if not reason and prep and prep != snapshot["document_preparation"]:
+                reason = "embedding_preparation_mismatch"
+            try:
+                vector = json.loads(payload)
+                if (model != snapshot["model"] or not isinstance(vector, list) or not vector
+                        or dimension != len(vector)
+                        or any(type(v) not in (int, float) or not math.isfinite(v) for v in vector)):
+                    reason = reason or "embedding_space_mismatch"
+            except (ValueError, TypeError):
+                reason = reason or "invalid_stored_vector"
+                vector = []
+            if reason:
+                rejected[reason] = rejected.get(reason, 0) + 1
+                continue
+            valid.append((parent, str(unit or row_id), vector, int(truncated or 0)))
+        query_debug = {}
+        if valid and chunks:
+            try:
+                vectors = await self.query_embeddings(chunks, deadline=deadline, cache_debug=query_debug,
+                                                      config_snapshot=snapshot)
+            except BaseException as exc:
+                if cache_debug is not None:
+                    cache_debug.update(query_debug)
+                    cache_debug.update(status="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                                       error_type=type(exc).__name__, coverage_status="incomplete",
+                                       index_rejections=rejected,
+                                       total_ms=round((time.monotonic() - started) * 1000))
+                raise
+            query_dimensions = {len(vector) for vector in vectors if vector}
+            dimension_matched = []
+            for item in valid:
+                if len(item[2]) not in query_dimensions:
+                    rejected["query_document_dimension_mismatch"] = rejected.get("query_document_dimension_mismatch", 0) + 1
+                else:
+                    dimension_matched.append(item)
+            valid = dimension_matched
+        else:
+            vectors = []
+            query_debug.update(status="no_compatible_index", provider_requests=0)
+        combined = {}
+        for view in range(len(queries)):
+            matches = {}
+            view_vectors = [vector for vector, owner in zip(vectors, owners) if owner == view and vector]
+            for parent, unit, vector, truncated in valid:
+                score = max((self._cosine_similarity(q, vector) for q in view_vectors), default=0.0)
+                if parent not in matches or score > matches[parent][0]:
+                    matches[parent] = (score, unit, truncated)
+            ranked = sorted(matches.items(), key=lambda pair: pair[1][0], reverse=True)[:top_k]
+            for rank, (parent, (score, unit, truncated)) in enumerate(ranked, 1):
+                item = combined.setdefault(parent, {
+                    "bucket_id": parent, "score": score, "unit_id": unit,
+                    "view_ranks": {}, "index_status": "verified", "fusion_rank_score": 0.0,
+                })
+                item["view_ranks"][str(view)] = rank
+                item["fusion_rank_score"] += 1.0 / (60 + rank)
+                if score > item["score"]:
+                    item.update(score=score, unit_id=unit)
+                if truncated:
+                    item["index_status"] = "partial"
+        result = sorted(combined.values(), key=lambda item: item["fusion_rank_score"], reverse=True)
+        if cache_debug is not None:
+            covered = {parent for parent, *_ in valid}
+            cache_debug.update(
+                **query_debug,
+                query_view_count=len(queries), query_chunk_count=len(chunks),
+                valid_unit_count=len(valid), indexed_bucket_count=len(covered),
+                eligible_bucket_count=len(eligible_ids), missing_bucket_count=len(eligible_ids - covered),
+                index_rejections=rejected, total_ms=round((time.monotonic() - started) * 1000),
+                coverage_status="complete" if eligible_ids <= covered else "incomplete",
+            )
+        return result
 
     def _prepare_embedding_input(self, text: str, *, kind: str) -> str:
         raw = str(text or "")

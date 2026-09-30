@@ -41,6 +41,22 @@ def _spec(source_id: str, scope: str, ref: str, *, render: str = "plain",
     )
 
 
+# Internal request preparation is owner-editable through its own scopes.  The
+# query factory matches EmbeddingEngine's existing default, while the empty
+# document factory preserves existing document preparation unless configured.
+_MEMORY_EMBEDDING_QUERY_PREPARATION_PROMPT = (
+    "Given a memory search query, retrieve relevant long-term memory passages."
+)
+_MEMORY_EMBEDDING_DOCUMENT_PREPARATION_PROMPT = ""
+_MEMORY_RECALL_STATUS_WRAPPER_PROMPT = """Recall status: {{status}}.
+
+Use only included committed Memory evidence for factual claims. `selected` means evidence items are included below. `no_match` means this completed search found no relevant Memory; it does not prove no Memory exists. `incomplete` means retrieval did not fully complete, so do not treat it as `no_match` or claim the remembered event/person does not exist. `disabled` means Memory recall was disabled. Status text by itself is not a selected Memory item.
+
+Semantic relevance and recent assistant wording are search cues, not proof of identity or aliases. An experience can be relevant without proving two names refer to the same person. Keep uncertain relationships uncertain; do not invent an identity from a relevant passage.
+
+{{content}}"""
+
+
 FIXED_PROMPT_SOURCES = {
     item.source_id: item for item in (
         _spec("ombre.persona_post_reply_prompt", "persona.post_reply_evaluation",
@@ -112,6 +128,31 @@ FIXED_PROMPT_SOURCES = {
 }
 
 
+# These fixed sources support internal preparation/status helpers only. They
+# are deliberately kept out of FIXED_PROMPT_SOURCES, the Gateway/main Composer
+# source allowlist consumed by PromptPlanMirror.
+INTERNAL_FIXED_PROMPT_SOURCES = {
+    item.source_id: item for item in (
+        _spec(
+            "ombre.memory_embedding_query_prep_prompt",
+            "memory.embedding_query",
+            "prompt_source_registry:_MEMORY_EMBEDDING_QUERY_PREPARATION_PROMPT",
+        ),
+        _spec(
+            "ombre.memory_embedding_document_prep_prompt",
+            "memory.embedding_document",
+            "prompt_source_registry:_MEMORY_EMBEDDING_DOCUMENT_PREPARATION_PROMPT",
+        ),
+        _spec(
+            "ombre.memory_recall_status_wrapper_prompt",
+            "memory.recall_status_wrapper",
+            "prompt_source_registry:_MEMORY_RECALL_STATUS_WRAPPER_PROMPT",
+            required=("{{status}}", "{{content}}"),
+        ),
+    )
+}
+
+
 DYNAMIC_CONTEXT_SOURCES = frozenset({
     "ombre.core_memory", "ombre.portrait_memory", "ombre.just_now_context",
     "ombre.date_recall", "ombre.context_mode", "ombre.active_reminders",
@@ -134,7 +175,8 @@ RUNTIME_MECHANIC_SOURCES = frozenset({"ombre.runtime.phase_marker"})
 
 
 def fixed_prompt_source(source_id: str) -> FixedPromptSource | None:
-    return FIXED_PROMPT_SOURCES.get(str(source_id or "").strip())
+    source_id = str(source_id or "").strip()
+    return FIXED_PROMPT_SOURCES.get(source_id) or INTERNAL_FIXED_PROMPT_SOURCES.get(source_id)
 
 
 def factory_body(source_id: str) -> str:
@@ -146,7 +188,7 @@ def factory_body(source_id: str) -> str:
 
 def prompt_source_kind(source_id: str) -> str:
     source_id = str(source_id or "").strip()
-    if source_id in FIXED_PROMPT_SOURCES:
+    if fixed_prompt_source(source_id) is not None:
         return "fixed_prompt"
     if source_id in OWNER_AUTHORED_PROMPT_SOURCES:
         return "fixed_prompt"
@@ -222,10 +264,17 @@ def source_detail(source_id: str, config: dict | None = None) -> dict[str, Any]:
             "reason": "owner-authored prompt has no factory body",
             "authority": "aizizhu.prompt_composer",
         }
-    spec = FIXED_PROMPT_SOURCES[source_id]
+    spec = fixed_prompt_source(source_id)
+    if spec is None:
+        return {
+            "source_id": source_id,
+            "body_kind": "unknown",
+            "reason": "source_id is not registered",
+        }
     factory_body = spec.factory_body()
-    live_body = render_factory_body(spec, factory_body, config)
-    return {
+    live_body = _configured_embedding_body(source_id, factory_body, config)
+    live_body = render_factory_body(spec, live_body, config)
+    detail = {
         "source_id": source_id,
         "body_kind": "fixed_prompt",
         "factory_body": factory_body,
@@ -234,6 +283,22 @@ def source_detail(source_id: str, config: dict | None = None) -> dict[str, Any]:
         "source_sha256": hashlib.sha256(factory_body.encode("utf-8")).hexdigest(),
         "authority": spec.authority,
     }
+    if source_id in INTERNAL_FIXED_PROMPT_SOURCES:
+        detail.update({
+            "source_type": "internal_helper",
+            "scope": spec.scope,
+            "allowlist": "internal_fixed_prompt_sources",
+        })
+    return detail
+
+
+def _configured_embedding_body(source_id: str, factory_body: str, config: dict | None) -> str:
+    key = {"ombre.memory_embedding_query_prep_prompt": "query_instruction",
+           "ombre.memory_embedding_document_prep_prompt": "document_instruction"}.get(source_id)
+    values = ((config or {}).get("embedding") or {})
+    if key and key in values and values[key] is not None:
+        return str(values[key]).strip()
+    return factory_body
 
 
 def resolve_fixed_prompt(store: Any, source_id: str, *,
@@ -245,9 +310,13 @@ def resolve_fixed_prompt(store: Any, source_id: str, *,
     if not spec:
         raise KeyError(source_id)
     factory_body = spec.factory_body()
+    live_body = _configured_embedding_body(source_id, factory_body, config)
     resolved, meta = store.resolve_text(
-        scope=spec.scope, source_id=source_id, live_body=factory_body,
+        scope=spec.scope, source_id=source_id, live_body=live_body,
         identity_id=identity_id, conversation_id=conversation_id)
+    selected = meta.get("selected_blocks") or []
+    if not resolved and selected and all(block.get("mode") == "off" for block in selected):
+        return "", meta
     validate_required_placeholders(source_id, resolved)
     rendered = render_factory_body(spec, resolved, config)
     rendered = render_runtime_placeholders(source_id, rendered, runtime_values)
@@ -256,6 +325,7 @@ def resolve_fixed_prompt(store: Any, source_id: str, *,
 
 __all__ = [
     "DYNAMIC_CONTEXT_SOURCES", "FIXED_PROMPT_SOURCES",
+    "INTERNAL_FIXED_PROMPT_SOURCES",
     "OWNER_AUTHORED_PROMPT_SOURCES", "RUNTIME_MECHANIC_SOURCES",
     "FixedPromptSource", "factory_body",
     "fixed_prompt_source",

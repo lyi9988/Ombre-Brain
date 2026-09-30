@@ -51,6 +51,86 @@ class FakeEmbedding:
         self.delete_calls.append(memory_id)
 
 
+class RevisionAwareFakeEmbedding(FakeEmbedding):
+    provider = "test-provider"
+    model = "test-embedding-model"
+    dimension = 2
+    base_url = "https://private.example.test/v1?key=do-not-store"
+
+    def __init__(self):
+        super().__init__()
+        self.revision_calls = []
+        self.config_snapshots = []
+
+    def preparation_hash(self, *, kind, instruction=None):
+        assert kind == "document"
+        if instruction is None:
+            return "d" * 64
+        return hashlib.sha256(instruction.encode("utf-8")).hexdigest()
+
+    async def generate_and_store(
+        self, memory_id, text, *, source_revision=None, source_sha256=None,
+        source_unit_id=None, parent_memory_id=None, document_instruction=None,
+        config_snapshot=None,
+    ):
+        self.config_snapshots.append(config_snapshot)
+        self.revision_calls.append({
+            "legacy_bucket_id": memory_id,
+            "text": text,
+            "source_revision": source_revision,
+            "source_sha256": source_sha256,
+            "source_unit_id": source_unit_id,
+            "parent_memory_id": parent_memory_id,
+            "document_instruction": document_instruction,
+            "config_snapshot": config_snapshot,
+        })
+        if self.fail_generate:
+            raise RuntimeError("embedding unavailable")
+        if self.return_false:
+            return False
+        self.generate_calls.append((source_unit_id, text))
+        self.stored[source_unit_id] = [0.1, 0.2]
+        return True
+
+
+class SnapshotRevisionAwareFakeEmbedding(RevisionAwareFakeEmbedding):
+    def __init__(self):
+        super().__init__()
+        self.snapshot_factory_calls = []
+        self.created_snapshot = None
+
+    def _query_config_snapshot(self, *, document_instruction=None):
+        self.snapshot_factory_calls.append(document_instruction)
+        self.created_snapshot = {
+            "base_url": "https://snapshot-provider.example/v1?api_key=fake-only",
+            "model": "snapshot-embedding-model",
+            "api_key": "fake-only-key",
+            "enabled": True,
+            "max_chars": 6000,
+            "document_instruction": document_instruction,
+            "document_preparation": "e" * 64,
+        }
+        return self.created_snapshot
+
+
+class FakePromptPlanMirror:
+    def __init__(self, body):
+        self.body = body
+        self.resolve_calls = []
+
+    def resolve_text(
+        self, *, scope, source_id, live_body, identity_id, conversation_id,
+    ):
+        self.resolve_calls.append({
+            "scope": scope,
+            "source_id": source_id,
+            "live_body": live_body,
+            "identity_id": identity_id,
+            "conversation_id": conversation_id,
+        })
+        return self.body, {"source_revision": "test-revision"}
+
+
 class FakeMoment:
     def __init__(self):
         self.upsert_calls = []
@@ -168,14 +248,18 @@ def _commit_memory(
     return authority.finalize_memory_commit(prepared["operation_id"])
 
 
-def _worker(authority, tmp_path, memory_id="memory-1", body="主人喜欢清淡的手冲咖啡。"):
+def _worker(
+    authority, tmp_path, memory_id="memory-1",
+    body="主人喜欢清淡的手冲咖啡。", embedding=None,
+    prompt_plan_mirror=None,
+):
     bucket_manager = FakeBucketManager(_bucket(memory_id, body))
     bucket_manager.dynamic_dir = str(tmp_path / "dynamic")
     bucket_manager.permanent_dir = str(tmp_path / "permanent")
     (tmp_path / "dynamic").mkdir(exist_ok=True)
     (tmp_path / "permanent").mkdir(exist_ok=True)
     bucket_manager.bucket["path"] = str(tmp_path / "dynamic" / f"{memory_id}.md")
-    embedding = FakeEmbedding()
+    embedding = embedding or FakeEmbedding()
     moments = FakeMoment()
     node = FakeNode()
     entity = FakeEntity()
@@ -196,6 +280,7 @@ def _worker(authority, tmp_path, memory_id="memory-1", body="主人喜欢清淡�
         node_store=node,
         entity_edge_store=entity,
         word_map_store=word_map,
+        prompt_plan_mirror=prompt_plan_mirror,
     )
     return worker, bucket_manager, embedding, moments, node, entity, word_map
 
@@ -256,6 +341,130 @@ def test_revision_outbox_all_projectors_projected_and_status_has_exact_revision_
     )
     assert identity_status["status"] == "projected"
     assert identity_status["details"]["authority"] == "memory_authority"
+
+
+def test_embedding_projection_carries_committed_revision_and_content_unit_metadata(tmp_path):
+    authority = _authority(tmp_path)
+    commit = _commit_memory(authority)
+    embedding = RevisionAwareFakeEmbedding()
+    worker, _bucket_manager, _embedding, *_rest = _worker(
+        authority, tmp_path, embedding=embedding,
+    )
+
+    result = asyncio.run(worker.run_once())
+
+    assert result["projected"] == 1
+    assert len(embedding.revision_calls) == 2
+    assert all(call["legacy_bucket_id"] == "memory-1" for call in embedding.revision_calls)
+    assert all(call["source_revision"] == 1 for call in embedding.revision_calls)
+    assert all(call["source_sha256"] == commit["body_sha256"] for call in embedding.revision_calls)
+    assert all(call["parent_memory_id"] == "memory-1" for call in embedding.revision_calls)
+    unit_ids = {call["source_unit_id"] for call in embedding.revision_calls}
+    assert "memory-1" in unit_ids
+    assert len(unit_ids) == 2
+    status = next(item for item in authority.list_projection_status(
+        "memory-1", revision=1
+    ) if item["projector"] == "embedding")
+    details = status["details"]
+    assert details["source_memory_id"] == "memory-1"
+    assert details["source_revision"] == 1
+    assert details["source_sha256"] == commit["body_sha256"]
+    assert details["source_unit_count"] == 2
+    assert details["provider"] == "test-provider"
+    assert details["model"] == "test-embedding-model"
+    assert details["dimension"] == 2
+    assert details["preparation_sha256"] == "d" * 64
+    assert details["metadata_complete"] is True
+    assert details["coverage_status"] == "current"
+    assert details["outdated"] is False
+    assert "do-not-store" not in str(details)
+    assert "清淡的手冲咖啡" not in str(details)
+
+
+def test_embedding_document_preparation_uses_prompt_mirror_snapshot(tmp_path):
+    authority = _authority(tmp_path)
+    _commit_memory(authority)
+    document_prompt = "Encode committed memory passages consistently."
+    prompt_mirror = FakePromptPlanMirror(document_prompt)
+    embedding = RevisionAwareFakeEmbedding()
+    worker, *_ = _worker(
+        authority,
+        tmp_path,
+        embedding=embedding,
+        prompt_plan_mirror=prompt_mirror,
+    )
+
+    result = asyncio.run(worker.run_once())
+
+    assert result["projected"] == 1
+    assert prompt_mirror.resolve_calls == [{
+        "scope": "memory.embedding_document",
+        "source_id": "ombre.memory_embedding_document_prep_prompt",
+        "live_body": "",
+        "identity_id": "jiajia-main",
+        "conversation_id": "",
+    }]
+    assert len(embedding.revision_calls) == 2
+    assert all(
+        call["document_instruction"] == document_prompt
+        for call in embedding.revision_calls
+    )
+    embedding_status = next(item for item in authority.list_projection_status(
+        "memory-1", revision=1
+    ) if item["projector"] == "embedding")
+    assert embedding_status["details"]["preparation_sha256"] == hashlib.sha256(
+        document_prompt.encode("utf-8")
+    ).hexdigest()
+
+
+def test_projection_freezes_engine_snapshot_for_all_units_without_persisting_key(tmp_path):
+    authority = _authority(tmp_path)
+    _commit_memory(authority)
+    document_prompt = "Use the same document preparation for this memory."
+    prompt_mirror = FakePromptPlanMirror(document_prompt)
+    embedding = SnapshotRevisionAwareFakeEmbedding()
+    worker, *_ = _worker(
+        authority,
+        tmp_path,
+        embedding=embedding,
+        prompt_plan_mirror=prompt_mirror,
+    )
+
+    result = asyncio.run(worker.run_once())
+
+    assert result["projected"] == 1
+    assert embedding.snapshot_factory_calls == [document_prompt]
+    assert len(embedding.config_snapshots) == 2
+    assert embedding.config_snapshots[0] is embedding.config_snapshots[1]
+    assert all(
+        call["document_instruction"] == document_prompt
+        for call in embedding.revision_calls
+    )
+    details = next(item for item in authority.list_projection_status(
+        "memory-1", revision=1
+    ) if item["projector"] == "embedding")["details"]
+    assert details["provider"] == "snapshot-provider.example"
+    assert details["model"] == "snapshot-embedding-model"
+    assert details["preparation_sha256"] == "e" * 64
+    assert "api_key" not in str(details)
+    assert "fake-only-key" not in str(details)
+
+
+def test_legacy_embedding_double_keeps_two_argument_contract(tmp_path):
+    authority = _authority(tmp_path)
+    _commit_memory(authority)
+    worker, _bucket_manager, embedding, *_rest = _worker(authority, tmp_path)
+
+    result = asyncio.run(worker.run_once())
+
+    assert result["projected"] == 1
+    assert len(embedding.generate_calls) == 1
+    status = next(item for item in authority.list_projection_status(
+        "memory-1", revision=1
+    ) if item["projector"] == "embedding")
+    assert status["details"]["revision_metadata_supported"] is False
+    assert status["details"]["coverage_status"] == "incomplete"
+    assert status["details"]["outdated"] is True
 
 
 def test_one_projector_failure_degrades_event_but_other_projectors_continue(tmp_path):
@@ -406,6 +615,61 @@ def test_pending_repair_is_bounded_and_marks_verified_indexes_once(tmp_path):
         "memory-1", revision=1
     )}
     assert status["embedding"] == status["entity_edges"] == "projected"
+
+
+def test_legacy_embedding_upgrade_marks_projected_pending_and_obeys_all_or_none_unit_budget(tmp_path):
+    authority = _authority(tmp_path)
+    _commit_memory(authority)
+    memory = authority.get_memory("memory-1")
+    authority.set_projection_status(
+        memory_id="memory-1", memory_revision=1, projector="embedding",
+        status="projected", source_sha256=memory["body_sha256"],
+        details={"metadata_complete": False, "index_unchanged": True},
+    )
+    authority.set_projection_status(
+        memory_id="memory-1", memory_revision=1, projector="entity_edges",
+        status="pending_rebuild", source_sha256=memory["body_sha256"],
+        details={"reason": "separate_projection"},
+    )
+    embedding = RevisionAwareFakeEmbedding()
+    worker, _bucket_manager, _embedding, *_rest = _worker(
+        authority, tmp_path, embedding=embedding,
+    )
+
+    too_small = asyncio.run(worker.repair_pending_once(
+        limit=1, upgrade_legacy_indexes=True, max_embedding_units=1,
+    ))
+
+    assert too_small["attempted"] == 1
+    assert too_small["projected"] == 0
+    assert too_small["deferred"] == 1
+    assert too_small["embedding_units_completed"] == 0
+    assert too_small["embedding_units_remaining"] == 2
+    assert too_small["embedding_units_budget_remaining"] == 1
+    assert embedding.generate_calls == []
+    statuses = {item["projector"]: item for item in authority.list_projection_status(
+        "memory-1", revision=1
+    )}
+    assert statuses["embedding"]["status"] == "pending_rebuild"
+    assert statuses["embedding"]["details"]["reason"] == "embedding_unit_budget_insufficient"
+    assert statuses["entity_edges"]["status"] == "pending_rebuild"
+
+    enough = asyncio.run(worker.repair_pending_once(
+        limit=1, upgrade_legacy_indexes=True, max_embedding_units=2,
+    ))
+
+    assert enough["attempted"] == 1
+    assert enough["projected"] == 1
+    assert enough["embedding_units_completed"] == 2
+    assert enough["embedding_units_remaining"] == 0
+    assert enough["embedding_units_budget_remaining"] == 0
+    assert len(embedding.generate_calls) == 2
+    statuses = {item["projector"]: item for item in authority.list_projection_status(
+        "memory-1", revision=1
+    )}
+    assert statuses["embedding"]["status"] == "projected"
+    assert statuses["embedding"]["details"]["metadata_complete"] is True
+    assert statuses["entity_edges"]["status"] == "pending_rebuild"
 
 
 def test_projection_uses_bucket_identity_when_authority_id_differs(tmp_path):

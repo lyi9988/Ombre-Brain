@@ -161,6 +161,54 @@ def test_authority_view_auto_bucket_ids_exclude_manual_only_and_refresh_wal(tmp_
     })
 
 
+def test_authority_view_index_metadata_uses_current_enabled_revision_only(tmp_path):
+    authority = MemoryAuthorityStore({"state_dir": str(tmp_path)})
+
+    def commit(memory_id, bucket_id, revision, body, policy="enabled"):
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        prepared = authority.prepare_memory_commit(
+            memory_id=memory_id,
+            bucket_id=bucket_id,
+            expected_revision=revision - 1,
+            body_sha256=digest,
+            snapshot_path=f"revisions/{memory_id}/{revision}.md",
+            metadata={},
+            source_refs=[f"test:{memory_id}:{revision}"],
+            decision_source="test",
+            idempotency_key=f"view-index:{memory_id}:{revision}",
+            actor="owner-test",
+            recall_policy=policy,
+        )
+        authority.record_body_written(
+            prepared["operation_id"], observed_body_sha256=digest,
+        )
+        authority.finalize_memory_commit(prepared["operation_id"])
+        return digest
+
+    commit("memory-enabled", "bucket-enabled", 1, "旧的已提交内容。")
+    current_sha = commit(
+        "memory-enabled", "bucket-enabled", 2, "当前已提交内容。",
+    )
+    commit(
+        "memory-manual", "bucket-manual", 1, "仅手动可读内容。",
+        policy="manual_only",
+    )
+    view = MemoryAuthorityRecallView({
+        "state_dir": str(tmp_path),
+        "memory_authority": {"enabled": True},
+    })
+
+    assert view.memory_index_metadata_map([
+        "bucket-enabled", "bucket-manual", "memory-enabled", "missing",
+    ]) == {
+        "bucket-enabled": {
+            "memory_id": "memory-enabled",
+            "revision": 2,
+            "body_sha256": current_sha,
+        },
+    }
+
+
 def test_authority_view_exposes_only_trusted_aliases_and_refreshes_wal(tmp_path):
     state_dir = tmp_path / "state"
     authority = MemoryAuthorityStore({"state_dir": str(state_dir)})
@@ -639,7 +687,7 @@ def test_gateway_serves_owner_safe_memory_projection_on_existing_bearer_transpor
     assert "body" not in bodies[1]["items"][0]
     assert bodies[2]["items"][0]["body"] == "owner body"
     assert bodies[3]["body"] == "owner body"
-    assert bodies[4]["settings"]["policy_revision"] == "recall-r1-context-fallback-v2"
+    assert bodies[4]["settings"]["policy_revision"] == "recall-r1-natural-v1"
     assert bodies[5]["diagnostics"]["route"] == "unknown"
     assert "synthetic" not in str(bodies)
 

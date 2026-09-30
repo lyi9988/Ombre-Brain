@@ -73,6 +73,19 @@ def test_plan_rejects_unknown_ombre_prefix_and_request_id_conflict(store):
                        gateway_slice=_slice(), request_id="req:fixed")
 
 
+@pytest.mark.parametrize("source_id", [
+    "ombre.memory_embedding_query_prep_prompt",
+    "ombre.memory_embedding_document_prep_prompt",
+    "ombre.memory_recall_status_wrapper_prompt",
+])
+def test_internal_recall_sources_cannot_enter_gateway_composer(store, source_id):
+    payload = _slice()
+    payload["blocks"][0]["source_id"] = source_id
+    with pytest.raises(PromptPlanMirrorValidationError):
+        store.put_plan("preset:test", 1, plan_sha256="b" * 64,
+                       gateway_slice=payload)
+
+
 def test_binding_requires_existing_matching_plan(store):
     with pytest.raises(Exception):
         store.put_binding(

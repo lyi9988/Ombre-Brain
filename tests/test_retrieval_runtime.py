@@ -356,11 +356,13 @@ def test_embedding_fallback_only_retries_connection_setup_failures(monkeypatch, 
 
 def test_embedding_does_not_fallback_after_total_budget_is_exhausted(monkeypatch, tmp_path):
     fallback_calls = []
+    provider_calls = []
 
     class FakeClient:
         is_closed = False
 
         async def post(self, *args, **kwargs):
+            provider_calls.append(True)
             raise httpx.ConnectError("connect")
 
         async def aclose(self):
@@ -379,11 +381,12 @@ def test_embedding_does_not_fallback_after_total_budget_is_exhausted(monkeypatch
                 "https://example/v1/embeddings", "secret", "model", "query",
                 deadline=time.monotonic() - 1,
             )
-        except httpx.ConnectError:
+        except asyncio.TimeoutError:
             return
-        raise AssertionError("an exhausted budget must not start urllib fallback")
+        raise AssertionError("an exhausted budget must stop before provider or fallback")
 
     asyncio.run(scenario())
+    assert provider_calls == []
     assert fallback_calls == []
     assert engine.runtime_debug()["connection_fallback_count"] == 0
 

@@ -188,7 +188,7 @@ GENERIC_LEXICAL_STOPWORD_KEYS = frozenset(
     if str(term or "").strip()
 )
 FAVORITE_MEMORY_MARKER = "[[ombre:favorite]]"
-RECALL_POLICY_REVISION = "recall-r1-context-fallback-v2"
+RECALL_POLICY_REVISION = "recall-r1-natural-v1"
 RETRYABLE_UPSTREAM_STATUS_CODES = {401, 403, 429, 500, 502, 503, 504}
 # Keep provider connect/write/read bounds below the caller's whole-request
 # watchdog.  The read timeout is applied per streamed read, so a quiet stream
@@ -558,6 +558,10 @@ class GatewayService:
         # value contains credentials or provider response bodies.
         self._effective_config_revision_no = 0
         self._effective_config_sha256 = ""
+        recall_cfg = config.get("gateway", {}) or {}
+        self.recall_recent_turns = max(0, min(32, int(recall_cfg.get("recall_recent_turns", 4))))
+        self.recall_timeout_seconds = max(1.0, min(30.0, float(recall_cfg.get("recall_timeout_seconds", 15))))
+        self.automatic_recall_enabled = self._bool_config_value(recall_cfg.get("automatic_recall_enabled"), True)
         self.self_anchor_cfg = config.get("self_anchor", {}) if isinstance(config.get("self_anchor", {}), dict) else {}
         self.self_anchor_entry_bucket_id = str(self.self_anchor_cfg.get("entry_bucket_id") or "").strip()
         self.embedding_cfg = config.get("embedding", {}) if isinstance(config.get("embedding", {}), dict) else {}
@@ -1287,6 +1291,12 @@ class GatewayService:
                 "base_url": str(getattr(embedding_engine, "base_url", "") or ""),
                 "max_chars": int(getattr(embedding_engine, "max_chars", 0) or 0),
                 "api_ready": bool(getattr(embedding_engine, "api_key", "")),
+                "query_preparation_sha256": hashlib.sha256(self._resolve_gateway_background_prompt(
+                    "ombre.memory_embedding_query_prep_prompt", "memory.embedding_query",
+                    str(getattr(embedding_engine, "query_instruction", ""))).encode()).hexdigest(),
+                "document_preparation_sha256": hashlib.sha256(self._resolve_gateway_background_prompt(
+                    "ombre.memory_embedding_document_prep_prompt", "memory.embedding_document",
+                    str(getattr(embedding_engine, "document_instruction", ""))).encode()).hexdigest(),
             },
             "reranker": {
                 "enabled": bool(getattr(reranker_engine, "enabled", False)),
@@ -1298,6 +1308,9 @@ class GatewayService:
                 "api_ready": bool(getattr(reranker_engine, "api_key", "")),
             },
             "gateway": {
+                "recall_recent_turns": getattr(self, "recall_recent_turns", 4),
+                "recall_timeout_seconds": getattr(self, "recall_timeout_seconds", 15.0),
+                "automatic_recall_enabled": getattr(self, "automatic_recall_enabled", True),
                 "retrieval_mode": str(getattr(self, "retrieval_mode", "") or ""),
                 "dynamic_top_k": int(getattr(self, "dynamic_top_k", 0) or 0),
                 "semantic_candidate_top_k": int(getattr(self, "semantic_candidate_top_k", 0) or 0),
@@ -1583,6 +1596,11 @@ class GatewayService:
         if gateway:
             current = self.gateway_cfg
             self.config.setdefault("gateway", current)
+            for name in ("recall_recent_turns", "recall_timeout_seconds", "automatic_recall_enabled"):
+                if name in gateway:
+                    current[name] = gateway[name]
+                    setattr(self, name, gateway[name])
+                    changed.append(f"gateway.{name}")
             if "current_inner_state_interval_rounds" in gateway:
                 current["current_inner_state_interval_rounds"] = gateway["current_inner_state_interval_rounds"]
                 self.current_inner_state_interval_rounds = max(0, int(gateway["current_inner_state_interval_rounds"]))
@@ -1944,6 +1962,11 @@ class GatewayService:
 
     def _apply_gateway_memory_config(self, payload: dict[str, Any]) -> list[str]:
         updated: list[str] = []
+        for name in ("recall_recent_turns", "recall_timeout_seconds", "automatic_recall_enabled"):
+            if name in payload:
+                setattr(self, name, payload[name])
+                self.gateway_cfg[name] = payload[name]
+                updated.append(f"gateway.{name}")
         if "upstreams" in payload:
             updated.extend(self._apply_gateway_upstreams_config(payload["upstreams"]))
         if "cooldown_hours" in payload:
@@ -2719,6 +2742,9 @@ class GatewayService:
         self, request: Request, payload: dict, session_id: str, current_user_text: str,
     ) -> tuple[dict, dict[str, Any]]:
         state: dict[str, Any] = {"enabled": False, "status": "not_target"}
+        if self._runtime_scope_for_request(request) != "chat":
+            state["status"] = "internal_scope"
+            return payload, state
         if not self._canonical_continuation_active(session_id):
             return payload, state
         state = {"enabled": True, "status": "preparing"}
@@ -4223,6 +4249,18 @@ class GatewayService:
                 payload.get("messages") or []
             ))
             timing["prepare_snapshot_cache"] = cache_debug
+        seen = set()
+        for container in (debug, timing, debug.get("memory_recall_projection")):
+            if not isinstance(container, dict):
+                continue
+            status = container.get("recall_status")
+            if not isinstance(status, dict) or id(status) in seen:
+                continue
+            seen.add(id(status))
+            status.update(parent_embedding_request_count=status.get("embedding_request_count"),
+                          embedding_request_count=0, embedding_timing=None,
+                          parent_route=status.get("route"), route="local",
+                          snapshot_reused_from_parent=True)
         return forward_payload, list(injected_ids), debug
 
     async def prepare_payload(
@@ -4256,6 +4294,12 @@ class GatewayService:
             raise ValueError("model is required when gateway.upstream_default_model is empty")
         self._get_upstream_for_model(model)
         mark_step("resolve_model", stage_started_at)
+        runtime_scope = str((payload.get("_ombre_trace_context") or {}).get("runtime_scope") or "chat")
+        if runtime_scope != "chat":
+            debug = {"runtime_scope": runtime_scope, "internal_scope": True,
+                     "recall_status": {"status": "disabled", "route": "local",
+                                       "injected_count": 0, "incomplete_reasons": []}}
+            return (dict(payload), None, debug) if include_debug else (dict(payload), None)
 
         snapshot_meta = self._prepare_snapshot_identity(
             payload,
@@ -4309,9 +4353,18 @@ class GatewayService:
         else:
             current_user_query = self._extract_current_turn_user_query(messages)
         is_new_user_turn = bool(current_user_query)
-        recall_query, recall_context_debug = self._contextual_recall_query(
-            current_user_query, messages,
+        from recall_input import build_recall_input
+        natural_input = build_recall_input(
+            messages, current_query=current_user_query,
+            text_extractor=self._coerce_message_text,
+            cleaner=self._strip_external_context_from_user_text,
+            recent_turns=getattr(self, "recall_recent_turns", 4),
+            trace_context=payload.get("_ombre_trace_context") or {},
         )
+        recall_query = natural_input["q_current"]
+        recall_context_debug = natural_input["metadata"]
+        if not recall_context_debug.get("current_input_complete"):
+            natural_input.setdefault("incomplete_reasons", []).append("current_input_not_fully_covered")
         has_handoff_context = self._messages_contain_handoff_context(messages)
         is_session_start = self.state_store.get_last_success_at(session_id) is None
         just_now_context_requested = (
@@ -4406,32 +4459,38 @@ class GatewayService:
                 targeted_detail_skip=skip_for_targeted_detail,
             )
             memory_sentinel_debug["query_context"] = recall_context_debug
+            memory_sentinel_debug["hint_route"] = memory_sentinel_debug.get("route")
+            composer_recall_enabled = self._composer_live_recall_enabled(prompt_plan)
+            natural_input["composer_recall_enabled"] = composer_recall_enabled
+            auto_enabled = getattr(self, "automatic_recall_enabled", True) and composer_recall_enabled
+            ordinary = bool(auto_enabled and recall_query and not self._memory_sentinel_obvious_skip_query(recall_query))
+            memory_sentinel_debug["route"] = "ordinary" if ordinary else "skip"
+            natural_input["route"] = "ordinary" if ordinary else "local"
+            if not ordinary:
+                natural_input["skip_reason"] = (
+                    "composer_live_recall_disabled" if not composer_recall_enabled
+                    else "automatic_recall_disabled" if not getattr(self, "automatic_recall_enabled", True)
+                    else "empty_current_input" if not recall_query else "obvious_acknowledgement")
             mark_step("memory_sentinel", stage_started_at)
             sentinel_route = str(memory_sentinel_debug.get("route") or "")
-            recall_execution = self._recall_route_execution_options(sentinel_route)
+            recall_execution = self._recall_route_execution_options(sentinel_route, ordinary=ordinary)
             owner_alias_memory_ids = self._owner_alias_memory_ids(memory_sentinel_debug)
             sentinel_skip_broad = sentinel_route in {"tone_only", "skip"}
             sentinel_search = sentinel_route in {"search", "fast", "deep"}
             pre_domain_skip_broad = (
-                skip_for_targeted_detail
-                or needs_handoff_first
-                or just_now_context_requested
-                or date_recall_requested
-                or sentinel_skip_broad
-                or (low_signal_auto_recall and not sentinel_search)
+                sentinel_skip_broad
             )
             domain_sentinel_skip_broad = False
             if not pre_domain_skip_broad:
                 stage_started_at = time.perf_counter()
                 domain_sentinel_debug = await self._route_domain_sentinel(
                     recall_query,
-                    allow_remote=self.domain_sentinel_remote_in_prepare,
+                    # Local hints suffice before ordinary retrieval. Do not
+                    # add a serial classifier request to every chat turn.
+                    allow_remote=False,
                 )
                 mark_step("domain_sentinel", stage_started_at)
-                domain_sentinel_skip_broad = self._domain_sentinel_should_skip_recall(
-                    domain_sentinel_debug,
-                    recall_query,
-                )
+                domain_sentinel_skip_broad = False
             if domain_sentinel_skip_broad:
                 domain_sentinel_debug["skip_applied"] = True
             skip_broad_dynamic_recall = (
@@ -4541,6 +4600,7 @@ class GatewayService:
                         session_id,
                         all_buckets,
                         sentinel_debug=memory_sentinel_debug,
+                        natural_input=natural_input,
                         search_query=self._dynamic_recall_search_query(
                             recall_query,
                             memory_sentinel_debug,
@@ -4601,6 +4661,7 @@ class GatewayService:
                         all_buckets,
                         grouped_moments,
                         sentinel_debug=memory_sentinel_debug,
+                        natural_input=natural_input,
                         all_moments=all_moments,
                         search_query=self._dynamic_recall_search_query(
                             recall_query,
@@ -4823,7 +4884,10 @@ class GatewayService:
             recalled_moments=recalled_moments,
             targeted_memory_detail_debug=targeted_memory_detail_debug,
             memory_sentinel_debug=memory_sentinel_debug,
+            natural_input=natural_input,
         )
+        recall_status = memory_recall_projection.get("recall_status", {})
+        recall_status["automatic_recall_enabled"] = getattr(self, "automatic_recall_enabled", True)
         context_args = {
             "persona_block": persona_block,
             "core_memory": core_memory,
@@ -4893,6 +4957,17 @@ class GatewayService:
             stable_context,
             dynamic_context,
         )
+        self._reconcile_memory_recall_injection(
+            memory_recall_projection, stable_context, dynamic_context,
+            enabled=natural_input.get("composer_recall_enabled", True),
+        )
+        recall_status = memory_recall_projection.get("recall_status", {})
+        # Only refs that survive actual compilation/budgets are injection
+        # evidence. Do not mark discarded selected cards as recently shown.
+        selected_for_recall = set(memory_recall_projection.get("selected_bucket_ids") or [])
+        if injected_ids is not None:
+            actually_injected = set(memory_recall_projection.get("injected_bucket_ids") or [])
+            injected_ids = [bid for bid in injected_ids if bid not in selected_for_recall or bid in actually_injected]
         self._apply_prompt_cache_hints(forward_payload, session_id)
         forward_payload["stream"] = payload.get("stream") is True
         mark_step("finalize_forward_payload", stage_started_at)
@@ -4930,6 +5005,11 @@ class GatewayService:
             "context_mode": context_mode,
             "recall_route": str(memory_sentinel_debug.get("route") or ""),
             "recall_query_context": recall_context_debug,
+            "recall_input": recall_context_debug,
+            "query_views": recall_context_debug.get("query_views", []),
+            "recall_status": recall_status,
+            "selected_memory_ids": memory_recall_projection.get("selected_memory_ids", []),
+            "injected_count": recall_status.get("injected_count", 0),
             "recall_deep_fallback": memory_sentinel_debug.get("deep_fallback", {}),
             "recall_policy_revision": RECALL_POLICY_REVISION,
             "recalled_moment_count": len(recalled_moments),
@@ -5022,13 +5102,12 @@ class GatewayService:
             debug_payload["memory_recall_projection"] = {
                 key: value
                 for key, value in memory_recall_projection.items()
-                if key != "body"
+                if key not in {"body", "fact_body"}
             }
             debug_payload["post_injection_presence"] = {
                 "persona": bool(str(persona_block or "").strip()),
                 "emotion_relationship": bool(str(relationship_weather or "").strip()),
-                "memory_recall": bool(str(
-                    recalled_memory or related_memory or targeted_memory_detail or "").strip()),
+                "memory_recall": bool(recall_status.get("injected_count")),
                 "core_memory": bool(str(core_memory or "").strip()),
                 "portrait_memory": bool(str(portrait_memory or "").strip()),
                 "canonical_continuation": bool(continuation_phase),
@@ -5246,6 +5325,17 @@ class GatewayService:
             fallback = str(detail.get("live_body") or detail.get("factory_body") or "")
             return render_runtime_placeholders(source_id, fallback, runtime_values)
 
+    @staticmethod
+    def _runtime_scope_for_request(request: Request) -> str:
+        raw = str(request.headers.get("X-Guyan-Runtime-Scope") or "").strip().lower()
+        if raw == "chat":
+            return "chat"
+        if raw:
+            return raw if re.fullmatch(r"internal:[a-z0-9_.-]{1,80}", raw) else "internal:invalid"
+        if str(request.headers.get("X-Guyan-Request-Type") or "").lower() in {"worker", "other"}:
+            return "internal:legacy"
+        return "chat"
+
     def _trace_context_from_request(self, request: Request, *, session_id: str,
                                     request_type: str, client_id: str) -> dict[str, Any]:
         """Consume internal trace headers without changing H1/H2/session."""
@@ -5290,6 +5380,7 @@ class GatewayService:
             "worker_operation_id": str(request.headers.get("X-Guyan-Worker-Operation-Id") or "")[:200],
             "client_id": marker, "session_id": session_id[:160],
             "coverage": coverage, "worldbook": worldbook[:64],
+            "runtime_scope": self._runtime_scope_for_request(request),
             "prompt_plan_identity": {
                 "preset_id": str(request.headers.get(
                     PROMPT_PRESET_HEADER) or "")[:200],
@@ -5474,6 +5565,11 @@ class GatewayService:
                 # The exact physical payload remains in raw_requests; this
                 # metadata explains where request preparation spent time.
                 "prepare_timing_debug": debug.get("prepare_timing_debug") or {},
+                "recall_input": (debug.get("prepare_timing_debug") or {}).get("recall_input", {}),
+                "recall_status": (debug.get("prepare_timing_debug") or {}).get("recall_status", {}),
+                "query_views": (debug.get("prepare_timing_debug") or {}).get("query_views", []),
+                "selected_memory_ids": (debug.get("prepare_timing_debug") or {}).get("selected_memory_ids", []),
+                "injected_count": (debug.get("prepare_timing_debug") or {}).get("injected_count"),
                 "effective_config": debug.get("effective_config")
                 or (debug.get("retrieval_runtime") or {}).get("effective_config", {}),
                 "candidate_stages": list(debug.get("candidate_stages") or []),
@@ -5581,6 +5677,8 @@ class GatewayService:
             )
 
         resource = str(request.path_params.get("resource") or "")
+        if request.method != "GET" and resource != "settings":
+            return JSONResponse({"error": "method_not_allowed"}, status_code=405)
         try:
             if resource == "overview":
                 return JSONResponse({
@@ -5627,10 +5725,56 @@ class GatewayService:
                     "items": view.list_aliases(state=state, trust=trust, limit=limit),
                 }, headers=headers)
             if resource == "settings":
+                if request.method == "PUT":
+                    body = await request.json()
+                    allowed = {"recent_turns", "recall_timeout_seconds", "automatic_recall_enabled"}
+                    if not isinstance(body, dict) or not body or set(body) - allowed:
+                        return JSONResponse({"error": "invalid_recall_settings", "applied": False}, status_code=400)
+                    recent = body.get("recent_turns", getattr(self, "recall_recent_turns", 4))
+                    timeout = body.get("recall_timeout_seconds", getattr(self, "recall_timeout_seconds", 15.0))
+                    auto = body.get("automatic_recall_enabled", getattr(self, "automatic_recall_enabled", True))
+                    import math
+                    if (not isinstance(recent, int) or isinstance(recent, bool) or not 0 <= recent <= 32
+                            or not isinstance(timeout, (int, float)) or isinstance(timeout, bool)
+                            or not math.isfinite(timeout) or not 1 <= timeout <= 30
+                            or not isinstance(auto, bool)):
+                        return JSONResponse({"error": "invalid_recall_settings", "applied": False}, status_code=400)
+                    path = str(getattr(self, "_runtime_overlay_path", "") or "")
+                    if not path:
+                        return JSONResponse({"error": "runtime_config_unavailable", "applied": False}, status_code=503)
+                    import tempfile
+                    target = Path(path)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    lock = getattr(self, "_runtime_overlay_lock", None) or threading.RLock()
+                    with lock:
+                        existing = yaml.safe_load(target.read_text(encoding="utf-8")) if target.exists() else {}
+                        if not isinstance(existing or {}, dict):
+                            return JSONResponse({"error": "runtime_config_invalid", "applied": False}, status_code=409)
+                        existing = existing or {}
+                        existing.setdefault("gateway", {}).update(
+                            recall_recent_turns=recent, recall_timeout_seconds=float(timeout),
+                            automatic_recall_enabled=auto,
+                        )
+                        fd, temp_path = tempfile.mkstemp(prefix=".recall-config-", dir=str(target.parent))
+                        try:
+                            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                                handle.write(yaml.safe_dump(existing, allow_unicode=True))
+                                handle.flush()
+                                os.fsync(handle.fileno())
+                            os.replace(temp_path, target)
+                        finally:
+                            if os.path.exists(temp_path):
+                                os.unlink(temp_path)
+                        self._apply_gateway_memory_config(existing["gateway"])
                 return JSONResponse({
                     "status": "ok",
+                    "applied": request.method == "PUT",
                     "settings": {
+                        "recent_turns": getattr(self, "recall_recent_turns", 4),
+                        "recall_timeout_seconds": getattr(self, "recall_timeout_seconds", 15.0),
+                        "automatic_recall_enabled": getattr(self, "automatic_recall_enabled", True),
                         "fast_enabled": True,
+                        "ordinary_semantic_enabled": bool(getattr(self.embedding_engine, "enabled", False)),
                         "deep_enabled": bool(
                             getattr(self.embedding_engine, "enabled", False)
                             or getattr(self.reranker_engine, "enabled", False)
@@ -12884,9 +13028,16 @@ class GatewayService:
         allow_query_planner: bool = True,
         allow_rerank: bool = True,
         forced_memory_ids: list[str] | None = None,
+        natural_input: dict[str, Any] | None = None,
     ) -> tuple[list[dict], list[dict], list[dict], list[dict]] | tuple[
         list[dict], list[dict], list[dict], list[dict], dict[str, Any]
     ]:
+        if natural_input is not None:
+            natural_input.update(allow_query_planner=allow_query_planner, allow_rerank=allow_rerank)
+            return await self._finish_natural_selection(
+                query, session_id, all_buckets, recall_input=natural_input,
+                grouped_moments=grouped_moments, forced_memory_ids=forced_memory_ids,
+            )
         query_planner_debug = self._query_planner_debug_base(query)
         timing_debug = query_planner_debug.setdefault("timing_ms", {})
         candidate_stages = query_planner_debug.setdefault("candidate_stages", [])
@@ -16062,13 +16213,227 @@ class GatewayService:
         }
 
     @staticmethod
-    def _recall_route_execution_options(route: str) -> dict[str, bool]:
+    def _recall_route_execution_options(route: str, *, ordinary: bool = False) -> dict[str, bool]:
         deep = str(route or "").strip().lower() == "deep"
         return {
-            "allow_semantic": deep,
-            "allow_query_planner": deep,
-            "allow_rerank": deep,
+            "allow_semantic": deep or ordinary,
+            "allow_query_planner": deep or ordinary,
+            "allow_rerank": deep or ordinary,
         }
+
+    async def _natural_semantic_candidates(self, recall_input: dict, eligible_ids: set[str]) -> dict[str, float]:
+        diagnostics = recall_input.setdefault("semantic_debug", {})
+        if not getattr(self.embedding_engine, "enabled", False):
+            diagnostics.update(status="disabled", provider_requests=0, coverage_status="incomplete")
+            return {}
+        # Ordinary chat encodes the full contextual query once. The isolated
+        # current view remains a local channel and is available for optional
+        # expansion without paying for two vectors on every ordinary turn.
+        query = recall_input.get("q_context") or recall_input.get("q_current") or ""
+        for view in recall_input.get("metadata", {}).get("query_views", []):
+            view["semantic_used"] = view.get("sha256") == hashlib.sha256(query.encode()).hexdigest()
+        search = getattr(self.embedding_engine, "search_similar_queries", None)
+        if not callable(search):
+            diagnostics.update(status="legacy_provider_adapter", coverage_status="incomplete")
+            return await self._get_semantic_candidates(query, eligible_ids, cache_debug=diagnostics)
+        try:
+            preparation = {}
+            if callable(getattr(self.embedding_engine, "_query_config_snapshot", None)):
+                preparation = {
+                    "query_instruction": self._resolve_gateway_background_prompt(
+                        "ombre.memory_embedding_query_prep_prompt", "memory.embedding_query",
+                        getattr(self.embedding_engine, "query_instruction", "")),
+                    "document_instruction": self._resolve_gateway_background_prompt(
+                        "ombre.memory_embedding_document_prep_prompt", "memory.embedding_document",
+                        getattr(self.embedding_engine, "document_instruction", "")),
+                }
+            hits = await search(
+                [query], top_k=self.semantic_candidate_top_k, eligible_ids=eligible_ids,
+                index_metadata=recall_input.get("index_metadata"), cache_debug=diagnostics,
+                deadline=recall_input.get("_deadline"), **preparation,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            diagnostics.update(status="error", error_type=type(exc).__name__, coverage_status="incomplete")
+            hits = []
+        recall_input["semantic_hits"] = {str(hit["bucket_id"]): hit for hit in hits}
+        return {str(hit["bucket_id"]): self._clamp(hit["score"]) for hit in hits}
+
+    async def _finish_natural_selection(
+        self, query: str, session_id: str, all_buckets: list[dict], *,
+        recall_input: dict, grouped_moments: dict[str, list[dict]] | None = None,
+        forced_memory_ids: list[str] | None = None,
+    ):
+        """Finalize the existing candidate builder under natural-chat policy.
+
+        No second store/engine: the same authority, candidate sources, parser,
+        cached reranker and final projection serve ordinary and expanded work.
+        """
+        debug = self._query_planner_debug_base(query)
+        timings, stages = debug.setdefault("timing_ms", {}), debug.setdefault("candidate_stages", [])
+        view = getattr(self, "memory_authority_view", None)
+        metadata_map = view.memory_index_metadata_map([b["id"] for b in all_buckets if b.get("id")]) if (
+            view and callable(getattr(view, "memory_index_metadata_map", None))) else {}
+        recall_input["index_metadata"] = metadata_map
+        if not metadata_map and all_buckets:
+            recall_input.setdefault("incomplete_reasons", []).append("authority_index_metadata_unavailable")
+        eligible_getter = getattr(view, "auto_recallable_bucket_ids", None)
+        if callable(eligible_getter):
+            missing_sources = set(eligible_getter()) - set(metadata_map)
+            recall_input["authority_missing_source_count"] = len(missing_sources)
+            if missing_sources:
+                recall_input.setdefault("incomplete_reasons", []).append("committed_memory_source_projection_unavailable")
+        valid = []
+        for bucket in all_buckets:
+            meta = metadata_map.get(str(bucket.get("id") or ""))
+            if (not meta or not self._authority_auto_recall_allowed(bucket)
+                    or self._is_self_anchor_recall_excluded_bucket(bucket)):
+                continue
+            body_sha = hashlib.sha256(str(bucket.get("content") or "").encode()).hexdigest()
+            if body_sha != meta.get("body_sha256"):
+                recall_input.setdefault("incomplete_reasons", []).append("bucket_revision_mismatch")
+                continue
+            valid.append(bucket)
+        pool, suppressed = await self._dynamic_bucket_candidate_items(
+            query, session_id, valid, search_query=query,
+            allow_semantic=not recall_input.get("local_only", False),
+            allow_rerank=False, allow_semantic_session_dedupe=False,
+            timing_debug=timings, timing_prefix="direct", candidate_stages=stages,
+            natural_input=recall_input,
+        )
+        moment_hits = {}
+        if grouped_moments is not None:
+            fresh = {str(bucket["id"]): parse_bucket_moments(bucket, self.relevance_options)
+                     for bucket in valid}
+            all_parts = [moment for parts in fresh.values() for moment in parts
+                         if str(moment.get("source") or "content") == "content"]
+            for moment in self.memory_moment_store.search_moment_items(
+                recall_input.get("q_context") or query, all_parts,
+                limit=self.semantic_candidate_top_k,
+            ):
+                parent = str(moment.get("bucket_id") or "")
+                if parent in metadata_map:
+                    moment_hits.setdefault(parent, moment)
+            current_ids = {str(item["bucket"]["id"]) for item in pool}
+            for bucket in valid:
+                parent = str(bucket["id"])
+                if parent in moment_hits and parent not in current_ids:
+                    pool.append({"bucket": bucket, "score": self._safe_float(moment_hits[parent].get("score"), 0),
+                                 "semantic_score": 0, "keyword_score": 0,
+                                 "natural_semantic": {}, "moment_source_match": True})
+            grouped_moments = fresh
+        if forced_memory_ids:
+            # Add verified aliases without prematurely reducing the combined
+            # semantic/moment pool to final card capacity.
+            missing = set(forced_memory_ids) - {str(item["bucket"]["id"]) for item in pool}
+            forced, _ = self._merge_owner_alias_memory_items([], valid, list(missing))
+            pool.extend(forced)
+        # A narrow pool with good lexical/identity evidence does not need a
+        # Planner. Expansion is based on candidate uncertainty, not a magic
+        # phrase in the user's message, and happens before the final rerank.
+        has_clear_candidate = any(
+            self._hard_bucket_evidence_labels(self._bucket_evidence_labels(query, item))
+            or ((item.get("natural_semantic") or {}).get("index_status") == "verified"
+                and self._safe_float(item.get("semantic_score"), 0) >= self.recall_policy.semantic_threshold)
+            for item in pool)
+        if (not recall_input.get("local_only") and recall_input.get("allow_query_planner", True)
+                and getattr(self, "query_planner_enabled", False) and pool
+                and not has_clear_candidate):
+            plan, error = await self._call_query_planner(recall_input.get("q_context") or query)
+            debug.update(triggered=True, error=error)
+            recall_input["route"] = "deep"
+            for row in (plan or {}).get("queries", [])[:getattr(self, "query_planner_max_queries", 2)]:
+                supplemental = str(row.get("query") or "").strip()
+                if not supplemental:
+                    continue
+                supplemental_input = {
+                    **recall_input, "q_context": supplemental, "q_current": supplemental,
+                    "semantic_debug": {}, "semantic_hits": {},
+                    "metadata": {**recall_input.get("metadata", {}), "query_views": [{
+                        "kind": "supplemental", "chars": len(supplemental),
+                        "sha256": hashlib.sha256(supplemental.encode()).hexdigest()}]},
+                }
+                more, _ = await self._dynamic_bucket_candidate_items(
+                    supplemental, session_id, valid, allow_rerank=False,
+                    allow_semantic=bool(getattr(self, "query_planner_supplemental_semantic", False)),
+                    allow_semantic_session_dedupe=False, natural_input=supplemental_input,
+                )
+                recall_input.get("metadata", {}).setdefault("query_views", []).extend(
+                    supplemental_input["metadata"]["query_views"])
+                supplemental_debug = supplemental_input.get("semantic_debug") or {}
+                if supplemental_debug:
+                    semantic_debug = recall_input.setdefault("semantic_debug", {})
+                    semantic_debug["provider_requests"] = int(semantic_debug.get("provider_requests") or 0) + int(supplemental_debug.get("provider_requests") or 0)
+                    semantic_debug.setdefault("supplemental_requests", []).append(supplemental_debug)
+                existing = {str(item["bucket"]["id"]) for item in pool}
+                pool.extend(item for item in more if str(item["bucket"]["id"]) not in existing)
+        rerank_debug = {}
+        documents = {}
+        if grouped_moments is not None:
+            for item in pool:
+                bucket = item["bucket"]
+                parent = str(bucket["id"])
+                unit = (item.get("natural_semantic") or {}).get("unit_id")
+                parts = grouped_moments.get(parent) or []
+                part = next((row for row in parts if row.get("moment_id") == unit), None) or moment_hits.get(parent)
+                if part:
+                    item["matched_moment"] = part
+                    documents[parent] = self._moment_rerank_document(part)
+        if not recall_input.get("local_only") and recall_input.get("allow_rerank", True):
+            pool = await self._rerank_scored_bucket_candidates(
+                recall_input.get("q_context") or query, pool, diagnostics=rerank_debug,
+                documents_override=documents,
+            )
+        self._record_candidate_stage(stages, "natural.final_rerank", len(pool), len(pool),
+                                     provider_input_count=rerank_debug.get("provider_input_count", 0),
+                                     provider_output_count=rerank_debug.get("provider_output_count", 0))
+        accepted = []
+        for item in pool:
+            labels = self._bucket_evidence_labels(query, item)
+            hard = [label for label in self._hard_bucket_evidence_labels(labels)
+                    if label in {"owner_alias", "exact_anchor", "source_record_exact",
+                                 "short_cjk_identity_title", "identity_name_match"}]
+            rerank = item.get("rerank_score")
+            semantic = self._safe_float(item.get("semantic_score"), 0)
+            semantic_verified = (item.get("natural_semantic") or {}).get("index_status") == "verified"
+            admit = bool(hard or (rerank is not None and self._safe_float(rerank, 0) >= self.recall_policy.rerank_threshold)
+                         or (rerank is None and semantic_verified and semantic >= self.recall_policy.semantic_threshold))
+            item["admission_reason"] = "verified_local_evidence" if hard else "strong_rerank" if admit and rerank is not None else "strong_semantic" if admit else "insufficient_contextual_relevance"
+            item["evidence_labels"] = labels
+            item["hard_evidence_labels"] = self._hard_bucket_evidence_labels(labels)
+            item["identity_evidence_status"] = (
+                "verified" if any(label in hard for label in
+                                  {"owner_alias", "short_cjk_identity_title", "identity_name_match"})
+                else "related_evidence_only")
+            if admit:
+                accepted.append(item)
+            else:
+                suppressed.append(item)
+        selected = self._pick_dynamic_cards(accepted, query=query)
+        self._record_candidate_stage(stages, "natural.admit_candidates", len(pool), len(accepted),
+                                     rejection_evidence=self._rejected_bucket_evidence(suppressed))
+        debug["final_bucket_ids"] = [str(item["bucket"]["id"]) for item in selected]
+        recall_input["selected_buckets"] = debug["final_bucket_ids"]
+        buckets = [self._bucket_with_recall_signal(item) for item in selected]
+        if grouped_moments is None:
+            return buckets, suppressed, debug
+        moments, candidates = [], []
+        for item in pool:
+            bucket = item["bucket"]
+            bucket_id = str(bucket["id"])
+            parts = grouped_moments.get(bucket_id) or self._direct_moments_for_bucket(bucket, query)
+            unit_id = (item.get("natural_semantic") or {}).get("unit_id")
+            moment = item.get("matched_moment") or next((m for m in parts if m.get("moment_id") == unit_id), None)
+            moment = moment or self._representative_moment(parts)
+            if moment:
+                candidate = self._moment_with_bucket_recall_signal(moment, self._bucket_candidate_recall_signal(item))
+                candidate.update(memory_revision=metadata_map[bucket_id]["revision"],
+                                 memory_id=metadata_map[bucket_id]["memory_id"])
+                candidates.append(candidate)
+                if bucket_id in recall_input["selected_buckets"]:
+                    moments.append(candidate)
+        return moments, candidates, [], suppressed, debug
 
     def _contextual_recall_query(
         self, query: str, messages: list[dict[str, Any]],
@@ -16132,6 +16497,25 @@ class GatewayService:
         conversation model is never invoked here. A fast miss is not evidence
         that Memory contains nothing relevant.
         """
+        natural_input = kwargs.get("natural_input")
+        if natural_input is not None:
+            natural_input["_deadline"] = time.monotonic() + getattr(self, "recall_timeout_seconds", 15.0)
+            try:
+                return await asyncio.wait_for(selector(query, *args, **kwargs),
+                                              timeout=getattr(self, "recall_timeout_seconds", 15.0))
+            except asyncio.TimeoutError:
+                natural_input.setdefault("incomplete_reasons", []).append("recall_total_timeout")
+                options = dict(kwargs)
+                options.update(allow_semantic=False, allow_query_planner=False, allow_rerank=False)
+                natural_input["local_only"] = True
+                return await selector(query, *args, **options)
+            finally:
+                for task in natural_input.get("_tasks", []):
+                    if not task.done():
+                        task.cancel()
+                if natural_input.get("_tasks"):
+                    await asyncio.gather(*natural_input["_tasks"], return_exceptions=True)
+                sentinel_debug["route"] = natural_input.get("route", "ordinary")
         route = str(sentinel_debug.get("route") or "")
         if route == "deep" and "allow_bucket_rerank" in kwargs:
             # Deep needs relevance evidence before source-bucket admission;
@@ -17679,7 +18063,9 @@ class GatewayService:
             try:
                 plan, error = await asyncio.shield(inflight)
             except asyncio.CancelledError:
-                raise
+                if asyncio.current_task().cancelling():
+                    raise
+                raise RuntimeError("shared_planner_request_cancelled") from None
             if plan:
                 plan = deepcopy(plan)
                 plan["_cache"] = {"status": "singleflight", "key": cache_key[:16]}
@@ -17712,6 +18098,10 @@ class GatewayService:
                 plan = deepcopy(plan)
                 plan["_cache"] = {"status": "miss", "key": cache_key[:16]}
             return plan, error
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         finally:
             if self._query_planner_inflight.get(cache_key) is task:
                 self._query_planner_inflight.pop(cache_key, None)
@@ -18974,6 +19364,7 @@ class GatewayService:
         timing_debug: dict[str, Any] | None = None,
         timing_prefix: str = "candidate",
         candidate_stages: list[dict[str, Any]] | None = None,
+        natural_input: dict[str, Any] | None = None,
     ) -> tuple[list[dict], list[dict]]:
         def mark(name: str, started_at: float) -> None:
             self._add_timing_ms(timing_debug, f"{timing_prefix}.{name}", started_at)
@@ -18995,7 +19386,7 @@ class GatewayService:
         if not query or self.inject_max_cards <= 0:
             return [], []
         early_query_plan = self._recall_query_plan(query)
-        if getattr(early_query_plan, "skip_reason", "") == "recall_meta_without_target":
+        if not natural_input and getattr(early_query_plan, "skip_reason", "") == "recall_meta_without_target":
             return [], []
         allow_raw_semantic_for_auto_vague = (
             getattr(early_query_plan, "skip_reason", "") == "auto_vague_query"
@@ -19003,7 +19394,7 @@ class GatewayService:
             and not self._auto_query_too_vague(query)
         )
         named_exact_anchor_match = bool(
-            getattr(early_query_plan, "skip_long_term_recall", False)
+            not natural_input and getattr(early_query_plan, "skip_long_term_recall", False)
             and self._has_named_exact_anchor_candidate(query, all_buckets)
         )
         if (
@@ -19050,6 +19441,11 @@ class GatewayService:
             for bucket in all_buckets
             if auto_allowed(bucket) and self._is_semantic_candidate_bucket(bucket)
         ]
+        if natural_input:
+            eligible = [bucket for bucket in all_buckets
+                        if auto_allowed(bucket) and not self._is_self_anchor_recall_excluded_bucket(bucket)
+                        and (self._is_dynamic_candidate(bucket) or self._is_semantic_candidate_bucket(bucket))]
+            semantic_eligible = list(eligible)
         mark("eligible_filter", stage_started_at)
         record(
             "eligible_filter",
@@ -19067,6 +19463,13 @@ class GatewayService:
 
         eligible_map = {bucket["id"]: bucket for bucket in eligible if bucket.get("id")}
         semantic_bucket_map = {bucket["id"]: bucket for bucket in semantic_eligible if bucket.get("id")}
+        semantic_task = None
+        if natural_input and allow_semantic:
+            semantic_task = asyncio.create_task(self._natural_semantic_candidates(
+                natural_input, set(semantic_bucket_map),
+            ))
+            natural_input.setdefault("_tasks", []).append(semantic_task)
+            await asyncio.sleep(0)
         alias_eligible_map = {**semantic_bucket_map, **eligible_map}
         stage_started_at = time.perf_counter()
         retrieval_alias_hits = self._retrieval_alias_hits(policy_query, set(alias_eligible_map))
@@ -19147,7 +19550,15 @@ class GatewayService:
         dynamic_anchor_plan["short_cjk_fast_hit_count"] = len(verified_local_anchor_ids)
         stage_started_at = time.perf_counter()
         semantic_cache_debug: dict[str, Any] = {}
-        if allow_semantic and not verified_local_anchor_ids:
+        if semantic_task is not None:
+            try:
+                semantic_scores = await semantic_task
+            except asyncio.CancelledError:
+                semantic_task.cancel()
+                await asyncio.gather(semantic_task, return_exceptions=True)
+                raise
+            semantic_cache_debug.update(natural_input.get("semantic_debug") or {})
+        elif allow_semantic and not verified_local_anchor_ids:
             semantic_query = self._identity_name_semantic_query(raw_query) or raw_query
             semantic_scores = await self._get_semantic_candidates(
                 semantic_query,
@@ -19162,11 +19573,11 @@ class GatewayService:
             len(semantic_bucket_map),
             len(semantic_scores),
             limit=self.semantic_candidate_top_k,
-            skipped=not allow_semantic or bool(verified_local_anchor_ids),
+            skipped=not allow_semantic or (bool(verified_local_anchor_ids) and not natural_input),
             reason=(
                 "disabled for this recall branch" if not allow_semantic
                 else "verified local short Chinese identity anchor"
-                if verified_local_anchor_ids
+                if verified_local_anchor_ids and not natural_input
                 else "eligible ids after embedding search"
             ),
             verified_local_anchor_count=len(verified_local_anchor_ids),
@@ -19340,6 +19751,9 @@ class GatewayService:
             if exact_match:
                 keyword_score = max(keyword_score, exact_score)
             relevance_score = relevance_multiplier(policy_query, self._bucket_relevance_node(bucket), self.relevance_options)
+            if natural_input:
+                # Domain/facet guesses are ranking hints, not permissions.
+                relevance_score = max(0.25, relevance_score)
             if relevance_score <= 0:
                 continue
             matched_query_terms = self._bucket_matched_query_terms(bucket, diversity_terms)
@@ -19491,6 +19905,13 @@ class GatewayService:
             key=lambda item: self._bucket_primary_candidate_rank(query, item)
         )
         mark("sort_candidates", stage_started_at)
+        if natural_input:
+            for item in scored_candidates:
+                item["natural_semantic"] = (natural_input.get("semantic_hits") or {}).get(
+                    str((item.get("bucket") or {}).get("id") or ""), {})
+            record("candidate_pool", len(candidate_ids), len(scored_candidates),
+                   reason="authorized candidates; final admission follows merged evidence")
+            return scored_candidates, []
         stage_started_at = time.perf_counter()
         bucket_rerank_diagnostics: dict[str, Any] = {}
         if allow_rerank:
@@ -19649,7 +20070,14 @@ class GatewayService:
         allow_rerank: bool = True,
         forced_memory_ids: list[str] | None = None,
         _planner_tasks: list[asyncio.Task] | None = None,
+        natural_input: dict[str, Any] | None = None,
     ) -> tuple[list[dict], list[dict]] | tuple[list[dict], list[dict], dict[str, Any]]:
+        if natural_input is not None:
+            natural_input.update(allow_query_planner=allow_query_planner, allow_rerank=allow_rerank)
+            return await self._finish_natural_selection(
+                query, session_id, all_buckets, recall_input=natural_input,
+                forced_memory_ids=forced_memory_ids,
+            )
         planner_debug = self._query_planner_debug_base(query)
         timing_debug = planner_debug.setdefault("timing_ms", {})
         candidate_stages = planner_debug.setdefault("candidate_stages", [])
@@ -20439,7 +20867,12 @@ class GatewayService:
         if inflight is not None:
             if isinstance(cache_debug, dict):
                 cache_debug.update(status="singleflight", key=cache_key[:16])
-            rows = await asyncio.shield(inflight)
+            try:
+                rows = await asyncio.shield(inflight)
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+                raise RuntimeError("shared_rerank_request_cancelled") from None
             return [RerankResult(index=index, score=score) for index, score in rows]
 
         async def execute() -> list[tuple[int, float]]:
@@ -20460,6 +20893,10 @@ class GatewayService:
             if isinstance(cache_debug, dict):
                 cache_debug.update(status="miss", key=cache_key[:16])
             return [RerankResult(index=index, score=score) for index, score in rows]
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         finally:
             if self._rerank_inflight.get(cache_key) is task:
                 self._rerank_inflight.pop(cache_key, None)
@@ -20470,6 +20907,7 @@ class GatewayService:
         scored_candidates: list[dict],
         *,
         diagnostics: dict[str, Any] | None = None,
+        documents_override: dict[str, str] | None = None,
     ) -> list[dict]:
         enabled = bool(getattr(self.reranker_engine, "enabled", False))
         if not scored_candidates or not enabled:
@@ -20494,7 +20932,8 @@ class GatewayService:
         head = [item for _index, item in head_pairs]
         if isinstance(diagnostics, dict):
             diagnostics["provider_input_count"] = len(head)
-        documents = [self._bucket_rerank_document(item["bucket"]) for item in head]
+        documents = [(documents_override or {}).get(str(item["bucket"].get("id")))
+                     or self._bucket_rerank_document(item["bucket"]) for item in head]
         cache_debug: dict[str, Any] = {}
         results = await self._rerank_cached(
             namespace="bucket",
@@ -21443,7 +21882,12 @@ class GatewayService:
         if inflight is not None:
             if isinstance(cache_debug, dict):
                 cache_debug.update(status="singleflight", key=cache_key[:16])
-            return list(await asyncio.shield(inflight))
+            try:
+                return list(await asyncio.shield(inflight))
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+                raise RuntimeError("shared_semantic_request_cancelled") from None
 
         async def execute() -> list[tuple[str, float]]:
             search = self.embedding_engine.search_similar(
@@ -21468,6 +21912,10 @@ class GatewayService:
             if isinstance(cache_debug, dict):
                 cache_debug.update(status="miss", key=cache_key[:16])
             return results
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
         finally:
             if self._semantic_query_inflight.get(cache_key) is task:
                 self._semantic_query_inflight.pop(cache_key, None)
@@ -22165,6 +22613,7 @@ class GatewayService:
         recalled_moments: list[dict],
         targeted_memory_detail_debug: dict[str, Any],
         memory_sentinel_debug: dict[str, Any],
+        natural_input: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build the one request-local Memory source consumed by Composer.
 
@@ -22182,6 +22631,7 @@ class GatewayService:
         add("Targeted Memory Detail", targeted_memory_detail)
         add("Diffused Memory", related_memory)
         body = "\n\n".join(sections).strip()
+        fact_body = body
         selected_bucket_ids = list(dict.fromkeys([
             *[
                 str(moment.get("bucket_id") or "").strip()
@@ -22194,6 +22644,7 @@ class GatewayService:
                 if str(item or "").strip()
             ],
             *self._extract_bucket_ids_from_context(related_memory),
+            *self._extract_bucket_ids_from_context(recalled_memory),
         ]))
         ring_ids = list(dict.fromkeys(
             str(
@@ -22215,6 +22666,46 @@ class GatewayService:
             if authority_view else {}
         )
         selected_memory_ids = list(revisions) or list(selected_bucket_ids)
+        natural_status = {}
+        if natural_input is not None:
+            frozen = natural_input.get("index_metadata") or {}
+            revisions = {frozen[bid]["memory_id"]: frozen[bid]["revision"]
+                         for bid in selected_bucket_ids if bid in frozen}
+            selected_memory_ids = list(revisions) or list(selected_bucket_ids)
+            reasons = list(natural_input.get("incomplete_reasons") or [])
+            if natural_input.get("selected_buckets") and not body.strip():
+                reasons.append("selected_memory_not_rendered")
+            semantic = natural_input.get("semantic_debug") or {}
+            if semantic.get("coverage_status") == "incomplete":
+                reasons.append("semantic_index_or_provider_incomplete")
+            injected = set(self._extract_bucket_ids_from_context(body))
+            if body and selected_bucket_ids and not injected:
+                # Some existing formatters expose authority refs separately;
+                # retain provenance but do not count a status-only wrapper.
+                injected = set(selected_bucket_ids)
+            status = "selected" if injected else "incomplete" if reasons else "no_match"
+            if natural_input.get("skip_reason") and not injected:
+                status = "disabled"
+            if not getattr(self, "automatic_recall_enabled", True):
+                status = "disabled"
+            natural_status = {
+                "status": status, "route": natural_input.get("route", "ordinary"),
+                "selected_count": len(natural_input.get("selected_buckets") or selected_bucket_ids),
+                "injected_count": len(injected), "status_only": not bool(injected),
+                "incomplete_reasons": list(dict.fromkeys(reasons)),
+                "embedding_request_count": semantic.get("provider_requests"),
+                "embedding_timing": semantic.get("http_timing"),
+                "authority_missing_source_count": natural_input.get("authority_missing_source_count", 0),
+                "disabled_reason": natural_input.get("skip_reason") if status == "disabled" else None,
+            }
+            if status != "disabled":
+                wrapped = self._resolve_gateway_fixed_prompt(
+                    "ombre.memory_recall_status_wrapper_prompt",
+                    runtime_values={"status": status, "content": body},
+                )
+                if wrapped:
+                    body = wrapped
+            natural_status["status_wrapper_present"] = bool(body)
         component_hashes = {
             "direct": hashlib.sha256(str(recalled_memory or "").encode("utf-8")).hexdigest(),
             "targeted": hashlib.sha256(str(targeted_memory_detail or "").encode("utf-8")).hexdigest(),
@@ -22226,6 +22717,7 @@ class GatewayService:
         )
         return {
             "source_id": "ombre.memory_recall",
+            "recall_status": natural_status,
             "authority": "ombre.memory_authority",
             "body_mode": "dynamic",
             "status": "ready" if body else "empty",
@@ -22237,11 +22729,62 @@ class GatewayService:
             "selected_bucket_ids": selected_bucket_ids,
             "selected_memory_revisions": revisions,
             "selected_ring_ids": ring_ids,
+            "fact_body": fact_body,
             "body": body,
             "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
             "component_sha256": component_hashes,
             "token_estimate": count_tokens_approx(body),
         }
+
+    def _composer_live_recall_enabled(self, gateway_plan: dict | None) -> bool:
+        if not gateway_plan or gateway_plan.get("fallback_legacy"):
+            return True
+        gateway_slice = gateway_plan.get("gateway_slice") or {}
+        scope = str(gateway_plan.get("scope") or "talk.initial")
+        chain = self._prompt_scope_chain(gateway_slice, scope)
+        configured = [b for b in gateway_slice.get("blocks") or []
+                      if isinstance(b, dict) and b.get("scope") in chain
+                      and b.get("source_id") == "ombre.memory_recall"]
+        if not configured:
+            return True  # old plans preserve their existing legacy path
+        return any(b.get("enabled", True) and b.get("mode", "live_source") == "live_source"
+                   for b in configured)
+
+    def _reconcile_memory_recall_injection(self, projection: dict, stable: str, dynamic: str,
+                                          *, enabled: bool = True) -> None:
+        """Measure committed facts in the *compiled* context, not source presence.
+
+        A status wrapper, a discarded block, or a truncated ID-only header
+        does not prove fact injection. Original incoming history is excluded.
+        """
+        actual = "\n\n".join(part for part in (stable, dynamic) if part)
+        facts = str(projection.get("fact_body") or "").strip()
+        selected = list(projection.get("selected_bucket_ids") or [])
+        injected = []
+        if enabled and facts and facts in actual:
+            injected = selected
+        elif enabled and facts:
+            # Count a budget-trimmed fact only if its ID and an actual fact
+            # fragment survive together; metadata alone is not a Memory.
+            for match in re.finditer(r"\[bucket_id:([^\]\s]+)\]", facts):
+                bid = match.group(1)
+                tail = facts[match.end():].split("[bucket_id:", 1)[0].strip()
+                fragment = tail[:64].strip()
+                if bid in selected and fragment and f"[bucket_id:{bid}]" in actual and fragment in actual:
+                    injected.append(bid)
+        projection["injected_bucket_ids"] = list(dict.fromkeys(injected))
+        status = projection.setdefault("recall_status", {})
+        status.update(injected_count=len(set(injected)), status_only=not bool(injected),
+                      injection_measured_after_compile=True)
+        if not enabled:
+            status.update(status="disabled", disabled_reason="composer_live_recall_disabled")
+        elif injected:
+            status["status"] = "selected"
+        elif selected:
+            status["status"] = "incomplete"
+            reasons = status.setdefault("incomplete_reasons", [])
+            if "selected_memory_not_in_final_context" not in reasons:
+                reasons.append("selected_memory_not_in_final_context")
 
     @staticmethod
     def _prompt_scope_chain(gateway_slice: dict, scope: str) -> list[str]:
@@ -22429,7 +22972,8 @@ class GatewayService:
             str(item.get("block_id") or "")))
         canonical_memory_source_present = any(
             str(item.get("source_id") or "") == "ombre.memory_recall"
-            for item in blocks
+            for item in gateway_slice.get("blocks") or []
+            if isinstance(item, dict) and item.get("scope") in scope_chain
         )
         if canonical_memory_source_present:
             legacy_memory_sources = {
@@ -25866,7 +26410,7 @@ def create_gateway_app(
             Route("/api/memory-authority/memories/{memory_id}", memory_authority_detail,
                   methods=["GET"], name="memory-detail"),
             Route("/api/memory-authority/{resource}", memory_authority_read,
-                  methods=["GET"], name="memory-authority-read"),
+                  methods=["GET", "PUT"], name="memory-authority-read"),
             Route("/v1/models", models, methods=["GET"]),
             Route("/v1/chat/completions", chat_completions, methods=["POST"]),
             Route("/v1/messages", anthropic_messages, methods=["POST"]),

@@ -315,6 +315,70 @@ class MemoryAuthorityRecallView:
             for memory_id, item in resolved.items()
         }
 
+    def memory_index_metadata_map(
+        self, bucket_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve eligible bucket projections to their committed revision.
+
+        This is a read-only lookup for derived Recall indexes.  It deliberately
+        includes only active, auto-enabled Memory so manual-only/private rows
+        cannot become searchable through an index metadata join.
+        """
+        ids = list(dict.fromkeys(
+            str(bucket_id or "").strip()
+            for bucket_id in bucket_ids
+            if str(bucket_id or "").strip()
+        ))
+        if not ids or not self.available():
+            return {}
+        conn = self._connect()
+        try:
+            # This is the index eligibility pool, not a 64-result owner tool.
+            # Batch bind variables without silently losing the tail of Memory.
+            conn.execute("BEGIN")
+            rows = []
+            for offset in range(0, len(ids), 400):
+                chunk = ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(conn.execute(
+                    "SELECT m.memory_id,COALESCE(NULLIF(m.bucket_id,''),m.memory_id),"
+                    "m.active_revision,COALESCE(r.body_sha256,'') "
+                    "FROM memories AS m LEFT JOIN memory_revisions AS r "
+                    "ON r.memory_id=m.memory_id AND r.revision=m.active_revision "
+                    "WHERE m.state='active' AND m.recall_policy='enabled' "
+                    f"AND (m.bucket_id IN ({placeholders}) "
+                    f"OR m.memory_id IN ({placeholders}))",
+                    [*chunk, *chunk],
+                ).fetchall())
+        except sqlite3.Error:
+            return {}
+        finally:
+            conn.close()
+
+        result: dict[str, dict[str, Any]] = {}
+        ambiguous: set[str] = set()
+        seen_rows: set[tuple] = set()
+        for row in rows:
+            signature = tuple(row)
+            if signature in seen_rows:
+                continue
+            seen_rows.add(signature)
+            bucket_id = str(row[1] or row[0])
+            if not bucket_id or bucket_id in ambiguous:
+                continue
+            if bucket_id in result:
+                # A bucket projected from multiple active authorities is not
+                # safe to associate with either revision.
+                result.pop(bucket_id, None)
+                ambiguous.add(bucket_id)
+                continue
+            result[bucket_id] = {
+                "memory_id": str(row[0]),
+                "revision": int(row[2] or 0),
+                "body_sha256": str(row[3] or ""),
+            }
+        return result
+
     def resolve_memory_refs(self, memory_or_bucket_ids: list[str]) -> dict[str, dict[str, Any]]:
         ids = list(dict.fromkeys(
             str(memory_id or "").strip()

@@ -209,7 +209,7 @@ Internal requests remain observable children without canonical chat writes.
 
 One request-local RecallInput contains every staged user event in order,
 bounded recent conversation with source versions, identity/conversation scope,
-and context revision. The default recent scope is two completed dialogue
+and context revision. The default recent scope is four completed dialogue
 turns; the owner may adjust scope and budget. All current user events remain
 represented. Long inputs require accounted-for segmentation, not silent loss
 of the last or first message. Assistant history supplies search cues only,
@@ -217,10 +217,14 @@ never confirmed aliases or facts. Candidate generation, rerank, entity/topic
 checks and admission consume the same RecallInput.
 
 The target query views are `q_current` (all current user input) and `q_context`
-(that input with bounded background). Matching inputs share a vector. Batch
-embedding support must be verified against the configured provider; actual
-provider calls, input coverage and costs are observable. No main-model routing
-call is added. Existing local channels and query embedding run concurrently.
+(that input with bounded background). Ordinary chat embeds only `q_context`;
+`q_current` remains the independent local evidence channel. Dual vectors are
+optional expansion, not the default cost of every ordinary message. Long
+current inputs require recorded chunks. Actual provider calls, vector counts,
+input coverage and costs are observable. No main-model routing call is added.
+Existing local channels and query embedding run concurrently. Empty or stale
+indexes are diagnosed before spending a query request; they are incomplete,
+not proof that Memory contains no match.
 Identity, privacy, recall policy and active/index revision eligibility are
 filtered before similarity Top-K, not after a global Top-K has discarded
 eligible memories. Stored candidate vectors are never regenerated in chat.

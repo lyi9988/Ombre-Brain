@@ -286,7 +286,12 @@ def test_legacy_import_only_reads_existing_derived_indexes(tmp_path):
     _assert_no_legacy_writes(embedding, moments, node, entity, word_map)
 
     statuses = _by_projector(result)
-    for projector in ("embedding", "moments", "memory_node", "entity_edges", "word_map"):
+    assert statuses["embedding"]["status"] == "pending_rebuild"
+    assert statuses["embedding"]["details"]["reason"] == "legacy_index_metadata_unavailable"
+    assert statuses["embedding"]["details"]["coverage_status"] == "incomplete"
+    assert statuses["embedding"]["details"]["outdated"] is True
+    assert statuses["embedding"]["details"]["index_unchanged"] is True
+    for projector in ("moments", "memory_node", "entity_edges", "word_map"):
         assert statuses[projector]["status"] == "projected"
         assert statuses[projector]["details"]["index_unchanged"] is True
 

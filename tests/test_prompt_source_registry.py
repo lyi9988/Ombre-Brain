@@ -11,6 +11,7 @@ from prompt_plan_mirror import (
 )
 from prompt_source_registry import (
     FIXED_PROMPT_SOURCES,
+    INTERNAL_FIXED_PROMPT_SOURCES,
     RUNTIME_MECHANIC_SOURCES,
     DYNAMIC_CONTEXT_SOURCES,
     resolve_fixed_prompt,
@@ -58,6 +59,64 @@ def test_registry_contains_every_included_fixed_source():
     assert set(FIXED_PROMPT_SOURCES) == EXPECTED_FIXED_SOURCE_IDS
     assert not EXPECTED_FIXED_SOURCE_IDS & DYNAMIC_CONTEXT_SOURCES
     assert not EXPECTED_FIXED_SOURCE_IDS & RUNTIME_MECHANIC_SOURCES
+
+
+def test_internal_recall_preparation_sources_are_scoped_and_provenanced():
+    expected_scopes = {
+        "ombre.memory_embedding_query_prep_prompt": "memory.embedding_query",
+        "ombre.memory_embedding_document_prep_prompt": "memory.embedding_document",
+        "ombre.memory_recall_status_wrapper_prompt": "memory.recall_status_wrapper",
+    }
+    assert set(INTERNAL_FIXED_PROMPT_SOURCES) == set(expected_scopes)
+    assert not set(INTERNAL_FIXED_PROMPT_SOURCES) & set(FIXED_PROMPT_SOURCES)
+    assert not set(INTERNAL_FIXED_PROMPT_SOURCES) & DYNAMIC_CONTEXT_SOURCES
+
+    for source_id, scope in expected_scopes.items():
+        spec = INTERNAL_FIXED_PROMPT_SOURCES[source_id]
+        detail = source_detail(source_id, {})
+        assert spec.scope == scope
+        assert scope != "talk.initial"
+        assert detail["body_kind"] == "fixed_prompt"
+        assert detail["source_type"] == "internal_helper"
+        assert detail["allowlist"] == "internal_fixed_prompt_sources"
+        assert detail["scope"] == scope
+        assert detail["source_revision"]
+        assert detail["authority"]
+        assert detail["source_sha256"] == hashlib.sha256(
+            detail["factory_body"].encode("utf-8")
+        ).hexdigest()
+
+    query = source_detail("ombre.memory_embedding_query_prep_prompt", {})
+    document = source_detail("ombre.memory_embedding_document_prep_prompt", {})
+    wrapper = source_detail("ombre.memory_recall_status_wrapper_prompt", {})
+    assert query["factory_body"] == (
+        "Given a memory search query, retrieve relevant long-term memory passages."
+    )
+    assert document["factory_body"] == ""
+    for state in ("selected", "no_match", "incomplete", "disabled"):
+        assert state in wrapper["factory_body"]
+    assert "does not prove no Memory exists" in wrapper["factory_body"]
+    assert "Status text by itself is not a selected Memory item" in wrapper["factory_body"]
+
+
+def test_internal_recall_preparation_sources_resolve_in_their_own_scope():
+    class InternalPromptStore:
+        def resolve_text(self, *, scope, source_id, live_body, **_kwargs):
+            self.scope = scope
+            self.source_id = source_id
+            return live_body, {"status": "internal_default"}
+
+    store = InternalPromptStore()
+    resolved, meta = resolve_fixed_prompt(
+        store,
+        "ombre.memory_recall_status_wrapper_prompt",
+        runtime_values={"status": "incomplete", "content": ""},
+    )
+    assert meta["status"] == "internal_default"
+    assert store.scope == "memory.recall_status_wrapper"
+    assert store.source_id == "ombre.memory_recall_status_wrapper_prompt"
+    assert "Recall status: incomplete." in resolved
+    assert "do not treat it as `no_match`" in resolved
 
 
 def test_fixed_detail_has_factory_and_live_body_only():

@@ -18,6 +18,7 @@ from typing import Any
 from prompt_source_registry import (
     DYNAMIC_CONTEXT_SOURCES,
     FIXED_PROMPT_SOURCES,
+    INTERNAL_FIXED_PROMPT_SOURCES,
     OWNER_AUTHORED_PROMPT_SOURCES,
     RUNTIME_MECHANIC_SOURCES,
     prompt_source_kind,
@@ -107,9 +108,12 @@ def normalize_gateway_slice(value: Any) -> dict:
         block_id = _identifier(raw.get("block_id"), f"blocks[{index}].block_id")
         source_id = _identifier(
             raw.get("source_id"), f"blocks[{index}].source_id")
-        if source_id not in _GATEWAY_SOURCES:
+        internal_spec = INTERNAL_FIXED_PROMPT_SOURCES.get(source_id)
+        if source_id not in _GATEWAY_SOURCES and internal_spec is None:
             raise PromptPlanMirrorValidationError(
                 f"blocks[{index}] is not a Gateway source")
+        if internal_spec is not None and str(raw.get("scope") or "") != internal_spec.scope:
+            raise PromptPlanMirrorValidationError("internal source cannot enter main chat scope")
         if block_id in seen:
             raise PromptPlanMirrorValidationError("block_id must be unique")
         seen.add(block_id)
@@ -555,8 +559,11 @@ class PromptPlanMirrorStore:
         """
         scope = _identifier(scope, "scope")
         source_id = _identifier(source_id, "source_id")
-        if source_id not in _GATEWAY_SOURCES:
+        internal_spec = INTERNAL_FIXED_PROMPT_SOURCES.get(source_id)
+        if source_id not in _GATEWAY_SOURCES and internal_spec is None:
             raise PromptPlanMirrorValidationError("source_id is not a Gateway source")
+        if internal_spec is not None and scope != internal_spec.scope:
+            raise PromptPlanMirrorValidationError("internal source scope mismatch")
         live_body = str(live_body or "")
         binding = self.get_binding(
             scope, identity_id=identity_id,
