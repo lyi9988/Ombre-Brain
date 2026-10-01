@@ -589,7 +589,7 @@ def test_natural_timeout_preserves_initial_and_local_fallback_selection_telemetr
         allow_rerank=True,
     ))
 
-    assert phases == ["initial", "timeout_fallback"]
+    assert phases == ["initial"]  # Completed candidate work is not scanned twice.
     assert rerank_cancelled.is_set()
     assert [item["id"] for item in selected] == [bucket["id"]] and suppressed == []
     assert "recall_total_timeout" in natural_input["incomplete_reasons"]
@@ -599,13 +599,16 @@ def test_natural_timeout_preserves_initial_and_local_fallback_selection_telemetr
     assert all(isinstance(attempt["duration_ms"], int) and attempt["duration_ms"] >= 0
                for attempt in (initial, fallback))
     assert initial["timing_ms"]["direct.synthetic_lookup"] == 7
-    assert fallback["timing_ms"]["direct.synthetic_lookup"] == 9
+    assert "direct.synthetic_lookup" not in fallback["timing_ms"]
+    assert fallback["timing_ms"]["natural.checkpoint_restore"] >= 0
     assert debug["timing_ms"]["initial.direct.synthetic_lookup"] == 7
-    assert debug["timing_ms"]["direct.synthetic_lookup"] == 9
+    assert "direct.synthetic_lookup" not in debug["timing_ms"]
     assert [item["attempt_phase"] for item in debug["candidate_stages"]
-            if item["stage"] == "synthetic.lookup"] == ["initial", "timeout_fallback"]
+            if item["stage"] == "synthetic.lookup"] == ["initial"]
     assert initial["candidate_stages"][0]["stage"] == "synthetic.lookup"
-    assert fallback["candidate_stages"][0]["stage"] == "synthetic.lookup"
+    assert fallback["candidate_stages"][0]["stage"] == "natural.candidate_checkpoint"
+    assert fallback["candidate_stages"][0]["reused"] is True
+    assert debug["candidate_checkpoint"]["status"] == "reused"
     cancelled_rerank = next(item for item in initial["candidate_stages"]
                             if item["stage"] == "natural.final_rerank")
     assert cancelled_rerank["cancelled"] is True
@@ -615,6 +618,8 @@ def test_natural_timeout_preserves_initial_and_local_fallback_selection_telemetr
     assert isinstance(debug["selection_cleanup_ms"], int) and debug["selection_cleanup_ms"] >= 0
     assert "_selection_debug" not in debug
     assert "_selection_debug" not in natural_input
+    assert "_completed_candidate_pool" not in debug
+    assert "_completed_candidate_pool" not in natural_input
 
 
 @pytest.mark.parametrize("change", [

@@ -4,8 +4,10 @@ Status: core authority contracts retained; natural semantic retrieval accepted
 on 2026-09-30 is implemented in this feature lineage, not pending design.
 Section 9 is the current retrieval contract; older fixed-trigger Fast/Deep
 milestones below are historical, not rules for ordinary owner chat. The
-20261001 timeout release records Gateway `54ad5ad` as deployed; reranker
-failure/cache/attempt-telemetry repairs below are local and not yet released.
+2026-10-01 runtime audit records Gateway `ac08e09` as deployed, including
+the earlier verified-semantic timeout and reranker failure/telemetry repairs.
+The completed-candidate checkpoint refinement below is a later change; its
+actual deployment state is recorded separately in coordination.
 Owner acceptance, general retrieval quality and latency are still open.
 The detailed companion document is
 `coordination/active/20260930-recall-r1-natural-retrieval-design.md` at the
@@ -262,7 +264,28 @@ no additional embedding/rerank call and does not claim that rerank succeeded.
 External cancellation still propagates; timeout remains an incomplete reason.
 This correctness repair is not evidence of a lower end-to-end latency.
 
-### Reranker failure and timeout telemetry repair (not yet deployed)
+### Completed-candidate deadline resume (2026-10-01 refinement)
+
+Before awaiting the final remote reranker, keep a deep-copied, request-local
+checkpoint of the complete candidate pool, completed Planner additions and
+matched content moments. If that reranker exhausts the request deadline,
+revalidate authority eligibility and every source Memory ID/revision/body hash
+before restoring the pool. Query/context/session, graph mode and forced IDs
+must match; the Authority DB/WAL generation must remain stable through both
+checkpoint construction and restoration. Otherwise use the existing local
+rebuild path. Revalidate forced owner aliases against current active/trusted
+matches even on that rebuild, so revoking an alias cannot retain stale hard
+evidence merely because its linked Memory body did not change.
+
+Restoration does not rerun completed candidate/Planner/moment work or claim a
+successful rerank. It applies the same admission thresholds and final card
+selection; failed or unfinished remote work remains explicitly incomplete.
+No rerank-written score is checkpointed. The pool never leaves request memory
+and is discarded on wrapper entry and in finally; public telemetry contains
+only status/count/timing fields, not the private candidate checkpoint. Derived
+weak-hint files do not gain a new freshness guarantee from this change.
+
+### Reranker failure and timeout telemetry repair (included in ac08 lineage)
 
 Each rerank call owns its outcome rather than reading mutable last-request
 health. HTTP failures, malformed/empty provider responses and partial result

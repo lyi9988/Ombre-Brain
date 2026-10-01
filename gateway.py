@@ -16433,9 +16433,23 @@ class GatewayService:
         recall_input["_selection_debug"] = debug
         validation_started = time.perf_counter()
         view = getattr(self, "memory_authority_view", None)
+        authority_stamp = getattr(view, "_file_stamp", None)
+        authority_generation = authority_stamp() if callable(authority_stamp) else None
         metadata_map = view.memory_index_metadata_map([b["id"] for b in all_buckets if b.get("id")]) if (
             view and callable(getattr(view, "memory_index_metadata_map", None))) else {}
         recall_input["index_metadata"] = metadata_map
+        if forced_memory_ids:
+            # The outer Sentinel may predate a long embedding/rerank wait.
+            # Revoke stale alias hard evidence even when the Memory body is
+            # unchanged; a fallback must not reuse the Sentinel IDs blindly.
+            alias_matcher = getattr(view, "match_aliases", None)
+            if callable(alias_matcher):
+                current_alias_ids = set(self._owner_alias_memory_ids({
+                    "owner_alias_matches": alias_matcher(query),
+                }))
+                forced_memory_ids = [bid for bid in forced_memory_ids if bid in current_alias_ids]
+            elif getattr(view, "enabled", False) or getattr(self, "memory_authority_enabled", False):
+                forced_memory_ids = []
         if not metadata_map and all_buckets:
             recall_input.setdefault("incomplete_reasons", []).append("authority_index_metadata_unavailable")
         eligible_getter = getattr(view, "auto_recallable_bucket_ids", None)
@@ -16456,97 +16470,166 @@ class GatewayService:
                 continue
             valid.append(bucket)
         self._add_timing_ms(timings, "natural.authority_validation", validation_started)
-        candidates_started = time.perf_counter()
-        try:
-            pool, suppressed = await self._dynamic_bucket_candidate_items(
-                query, session_id, valid, search_query=query,
-                allow_semantic=not recall_input.get("local_only", False),
-                allow_rerank=False, allow_semantic_session_dedupe=False,
-                timing_debug=timings, timing_prefix="direct", candidate_stages=stages,
-                natural_input=recall_input,
+        # Keep the last *complete* candidate pool before the remote reranker.
+        # A deadline must not discard finished Planner/moment work and then
+        # rescan the whole library. Reuse is confined to this request and only
+        # after the normal authority/revision/body checks above have run again.
+        checkpoint_context = {
+            "session_id": str(session_id),
+            "query_sha256": hashlib.sha256(query.encode()).hexdigest(),
+            "current_query_sha256": hashlib.sha256(
+                str(recall_input.get("q_current") or "").encode()).hexdigest(),
+            "context_query_sha256": hashlib.sha256(
+                str(recall_input.get("q_context") or "").encode()).hexdigest(),
+            "graph_mode": grouped_moments is not None,
+            "forced_memory_ids": sorted(set(forced_memory_ids or [])),
+            "authority_generation": authority_generation,
+        }
+        checkpoint_sources = {
+            str(bucket["id"]): dict(metadata_map[str(bucket["id"])]) for bucket in valid
+        }
+        checkpoint = recall_input.get("_completed_candidate_pool") or {}
+        resume = bool(
+            recall_input.get("local_only")
+            and (not callable(authority_stamp)
+                 or (authority_generation is not None and authority_stamp() == authority_generation))
+            and checkpoint.get("context") == checkpoint_context
+            and checkpoint.get("sources") == checkpoint_sources
+        )
+        if resume:
+            restore_started = time.perf_counter()
+            pool = deepcopy(checkpoint["pool"])
+            suppressed = deepcopy(checkpoint["suppressed"])
+            grouped_moments = deepcopy(checkpoint["grouped_moments"])
+            documents = {}
+            debug.update(checkpoint["planner_debug"])
+            debug["candidate_checkpoint"] = {
+                "status": "reused", "candidate_count": len(pool),
+                "revalidated_source_count": len(checkpoint_sources),
+            }
+            self._add_timing_ms(timings, "natural.checkpoint_restore", restore_started)
+            self._record_candidate_stage(
+                stages, "natural.candidate_checkpoint", len(pool), len(pool),
+                timing_key="natural.checkpoint_restore", reused=True,
+                revalidated_source_count=len(checkpoint_sources),
             )
-        finally:
-            self._add_timing_ms(timings, "natural.candidate_channels", candidates_started)
-        moments_started = time.perf_counter()
-        moment_hits = {}
-        if grouped_moments is not None:
-            fresh = {str(bucket["id"]): parse_bucket_moments(bucket, self.relevance_options)
-                     for bucket in valid}
-            all_parts = [moment for parts in fresh.values() for moment in parts
-                         if str(moment.get("source") or "content") == "content"]
-            for moment in self.memory_moment_store.search_moment_items(
-                recall_input.get("q_context") or query, all_parts,
-                limit=self.semantic_candidate_top_k,
-            ):
-                parent = str(moment.get("bucket_id") or "")
-                if parent in metadata_map:
-                    moment_hits.setdefault(parent, moment)
-            current_ids = {str(item["bucket"]["id"]) for item in pool}
-            for bucket in valid:
-                parent = str(bucket["id"])
-                if parent in moment_hits and parent not in current_ids:
-                    pool.append({"bucket": bucket, "score": self._safe_float(moment_hits[parent].get("score"), 0),
-                                 "semantic_score": 0, "keyword_score": 0,
-                                 "natural_semantic": {}, "moment_source_match": True})
-            grouped_moments = fresh
-        if forced_memory_ids:
-            # Add verified aliases without prematurely reducing the combined
-            # semantic/moment pool to final card capacity.
-            missing = set(forced_memory_ids) - {str(item["bucket"]["id"]) for item in pool}
-            forced, _ = self._merge_owner_alias_memory_items([], valid, list(missing))
-            pool.extend(forced)
-        self._add_timing_ms(timings, "natural.moment_alias_merge", moments_started)
-        # A narrow pool with good lexical/identity evidence does not need a
-        # Planner. Expansion is based on candidate uncertainty, not a magic
-        # phrase in the user's message, and happens before the final rerank.
-        has_clear_candidate = any(
-            self._hard_bucket_evidence_labels(self._bucket_evidence_labels(query, item))
-            or ((item.get("natural_semantic") or {}).get("index_status") == "verified"
-                and self._safe_float(item.get("semantic_score"), 0) >= self.recall_policy.semantic_threshold)
-            for item in pool)
-        if (not recall_input.get("local_only") and recall_input.get("allow_query_planner", True)
-                and getattr(self, "query_planner_enabled", False) and pool
-                and not has_clear_candidate):
-            plan, error = await self._call_query_planner(recall_input.get("q_context") or query)
-            debug.update(triggered=True, error=error)
-            recall_input["route"] = "deep"
-            for row in (plan or {}).get("queries", [])[:getattr(self, "query_planner_max_queries", 2)]:
-                supplemental = str(row.get("query") or "").strip()
-                if not supplemental:
-                    continue
-                supplemental_input = {
-                    **recall_input, "q_context": supplemental, "q_current": supplemental,
-                    "semantic_debug": {}, "semantic_hits": {},
-                    "metadata": {**recall_input.get("metadata", {}), "query_views": [{
-                        "kind": "supplemental", "chars": len(supplemental),
-                        "sha256": hashlib.sha256(supplemental.encode()).hexdigest()}]},
-                }
-                more, _ = await self._dynamic_bucket_candidate_items(
-                    supplemental, session_id, valid, allow_rerank=False,
-                    allow_semantic=bool(getattr(self, "query_planner_supplemental_semantic", False)),
-                    allow_semantic_session_dedupe=False, natural_input=supplemental_input,
+        else:
+            candidates_started = time.perf_counter()
+            try:
+                pool, suppressed = await self._dynamic_bucket_candidate_items(
+                    query, session_id, valid, search_query=query,
+                    allow_semantic=not recall_input.get("local_only", False),
+                    allow_rerank=False, allow_semantic_session_dedupe=False,
+                    timing_debug=timings, timing_prefix="direct", candidate_stages=stages,
+                    natural_input=recall_input,
                 )
-                recall_input.get("metadata", {}).setdefault("query_views", []).extend(
-                    supplemental_input["metadata"]["query_views"])
-                supplemental_debug = supplemental_input.get("semantic_debug") or {}
-                if supplemental_debug:
-                    semantic_debug = recall_input.setdefault("semantic_debug", {})
-                    semantic_debug["provider_requests"] = int(semantic_debug.get("provider_requests") or 0) + int(supplemental_debug.get("provider_requests") or 0)
-                    semantic_debug.setdefault("supplemental_requests", []).append(supplemental_debug)
-                existing = {str(item["bucket"]["id"]) for item in pool}
-                pool.extend(item for item in more if str(item["bucket"]["id"]) not in existing)
+            finally:
+                self._add_timing_ms(timings, "natural.candidate_channels", candidates_started)
+            moments_started = time.perf_counter()
+            moment_hits = {}
+            if grouped_moments is not None:
+                fresh = {str(bucket["id"]): parse_bucket_moments(bucket, self.relevance_options)
+                         for bucket in valid}
+                all_parts = [moment for parts in fresh.values() for moment in parts
+                             if str(moment.get("source") or "content") == "content"]
+                for moment in self.memory_moment_store.search_moment_items(
+                    recall_input.get("q_context") or query, all_parts,
+                    limit=self.semantic_candidate_top_k,
+                ):
+                    parent = str(moment.get("bucket_id") or "")
+                    if parent in metadata_map:
+                        moment_hits.setdefault(parent, moment)
+                current_ids = {str(item["bucket"]["id"]) for item in pool}
+                for bucket in valid:
+                    parent = str(bucket["id"])
+                    if parent in moment_hits and parent not in current_ids:
+                        pool.append({"bucket": bucket, "score": self._safe_float(moment_hits[parent].get("score"), 0),
+                                     "semantic_score": 0, "keyword_score": 0,
+                                     "natural_semantic": {}, "moment_source_match": True})
+                grouped_moments = fresh
+            if forced_memory_ids:
+                # Add verified aliases without prematurely reducing the combined
+                # semantic/moment pool to final card capacity.
+                missing = set(forced_memory_ids) - {str(item["bucket"]["id"]) for item in pool}
+                forced, _ = self._merge_owner_alias_memory_items([], valid, list(missing))
+                pool.extend(forced)
+            self._add_timing_ms(timings, "natural.moment_alias_merge", moments_started)
+            # A narrow pool with good lexical/identity evidence does not need a
+            # Planner. Expansion is based on candidate uncertainty, not a magic
+            # phrase in the user's message, and happens before the final rerank.
+            has_clear_candidate = any(
+                self._hard_bucket_evidence_labels(self._bucket_evidence_labels(query, item))
+                or ((item.get("natural_semantic") or {}).get("index_status") == "verified"
+                    and self._safe_float(item.get("semantic_score"), 0) >= self.recall_policy.semantic_threshold)
+                for item in pool)
+            if (not recall_input.get("local_only") and recall_input.get("allow_query_planner", True)
+                    and getattr(self, "query_planner_enabled", False) and pool
+                    and not has_clear_candidate):
+                plan, error = await self._call_query_planner(recall_input.get("q_context") or query)
+                debug.update(triggered=True, error=error)
+                recall_input["route"] = "deep"
+                for row in (plan or {}).get("queries", [])[:getattr(self, "query_planner_max_queries", 2)]:
+                    supplemental = str(row.get("query") or "").strip()
+                    if not supplemental:
+                        continue
+                    supplemental_input = {
+                        **recall_input, "q_context": supplemental, "q_current": supplemental,
+                        "semantic_debug": {}, "semantic_hits": {},
+                        "metadata": {**recall_input.get("metadata", {}), "query_views": [{
+                            "kind": "supplemental", "chars": len(supplemental),
+                            "sha256": hashlib.sha256(supplemental.encode()).hexdigest()}]},
+                    }
+                    more, _ = await self._dynamic_bucket_candidate_items(
+                        supplemental, session_id, valid, allow_rerank=False,
+                        allow_semantic=bool(getattr(self, "query_planner_supplemental_semantic", False)),
+                        allow_semantic_session_dedupe=False, natural_input=supplemental_input,
+                    )
+                    recall_input.get("metadata", {}).setdefault("query_views", []).extend(
+                        supplemental_input["metadata"]["query_views"])
+                    supplemental_debug = supplemental_input.get("semantic_debug") or {}
+                    if supplemental_debug:
+                        semantic_debug = recall_input.setdefault("semantic_debug", {})
+                        semantic_debug["provider_requests"] = int(semantic_debug.get("provider_requests") or 0) + int(supplemental_debug.get("provider_requests") or 0)
+                        semantic_debug.setdefault("supplemental_requests", []).append(supplemental_debug)
+                    existing = {str(item["bucket"]["id"]) for item in pool}
+                    pool.extend(item for item in more if str(item["bucket"]["id"]) not in existing)
+            documents = {}
+            if grouped_moments is not None:
+                for item in pool:
+                    bucket = item["bucket"]
+                    parent = str(bucket["id"])
+                    unit = (item.get("natural_semantic") or {}).get("unit_id")
+                    parts = grouped_moments.get(parent) or []
+                    part = next((row for row in parts if row.get("moment_id") == unit), None) or moment_hits.get(parent)
+                    if part:
+                        item["matched_moment"] = part
+                        documents[parent] = self._moment_rerank_document(part)
+            # Entity/alias changes can revoke hard evidence without changing a
+            # Memory body revision. Do not checkpoint across such a change.
+            authority_unchanged = (not callable(authority_stamp)
+                                   or (authority_generation is not None
+                                       and authority_stamp() == authority_generation))
+            if not recall_input.get("local_only") and authority_unchanged:
+                checkpoint_started = time.perf_counter()
+                pool_ids = {str(item["bucket"]["id"]) for item in pool}
+                recall_input["_completed_candidate_pool"] = {
+                    "context": checkpoint_context, "sources": checkpoint_sources,
+                    "pool": deepcopy(pool), "suppressed": deepcopy(suppressed),
+                    "grouped_moments": (None if grouped_moments is None else {
+                        bid: deepcopy(parts) for bid, parts in grouped_moments.items()
+                        if bid in pool_ids
+                    }),
+                    "planner_debug": {key: deepcopy(debug[key]) for key in ("triggered", "error")
+                                      if key in debug},
+                }
+                self._add_timing_ms(timings, "natural.checkpoint_save", checkpoint_started)
+                debug["candidate_checkpoint"] = {"status": "saved", "candidate_count": len(pool)}
+            elif not recall_input.get("local_only"):
+                recall_input.pop("_completed_candidate_pool", None)
+                debug["candidate_checkpoint"] = {"status": "authority_changed"}
+            elif checkpoint:
+                debug["candidate_checkpoint"] = {"status": "invalidated"}
         rerank_debug = {}
-        documents = {}
-        if grouped_moments is not None:
-            for item in pool:
-                bucket = item["bucket"]
-                parent = str(bucket["id"])
-                unit = (item.get("natural_semantic") or {}).get("unit_id")
-                parts = grouped_moments.get(parent) or []
-                part = next((row for row in parts if row.get("moment_id") == unit), None) or moment_hits.get(parent)
-                if part:
-                    item["matched_moment"] = part
-                    documents[parent] = self._moment_rerank_document(part)
         rerank_started = time.perf_counter()
         rerank_cancelled = False
         try:
@@ -16709,6 +16792,7 @@ class GatewayService:
                 natural_input.pop("_selection_debug", None)
 
             natural_input.pop("_selection_debug", None)
+            natural_input.pop("_completed_candidate_pool", None)
             natural_input["_deadline"] = time.monotonic() + getattr(self, "recall_timeout_seconds", 15.0)
             try:
                 initial_started = time.perf_counter()
@@ -16748,6 +16832,7 @@ class GatewayService:
                 if natural_input.get("_tasks"):
                     await asyncio.gather(*natural_input["_tasks"], return_exceptions=True)
                 natural_input.pop("_selection_debug", None)
+                natural_input.pop("_completed_candidate_pool", None)
                 if result is not None:
                     result[-1]["selection_cleanup_ms"] = max(0, int((time.perf_counter() - cleanup_started) * 1000))
                     result[-1]["selection_total_ms"] = max(0, int((time.perf_counter() - selection_started) * 1000))
