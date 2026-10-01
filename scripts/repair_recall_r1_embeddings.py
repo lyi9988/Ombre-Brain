@@ -23,8 +23,6 @@ from typing import Any
 from urllib.parse import urlsplit
 
 
-logging.disable(logging.CRITICAL)
-
 _SCRIPT_PATH = Path(__file__)
 ROOT = (
     _SCRIPT_PATH.resolve().parents[1]
@@ -65,7 +63,7 @@ STOP_REASONS = {
     "provider_failure", "metadata_failure", "query_input_too_large",
     "query_smoke_failed", "concurrent_change", "no_progress", "remaining_deferred",
     "pilot_complete",
-    "unit_cap_reached", "complete", "error",
+    "unit_cap_reached", "complete", "error", "paused", "config_changed", "maintenance_busy",
 }
 
 
@@ -757,7 +755,7 @@ def _build_worker_config(config: dict, paths: dict[str, Path]) -> dict[str, Any]
 
 async def _apply_controller(
     config: dict, paths: dict[str, Path], inventory: dict[str, Any],
-    *, mode: str, total_unit_cap: int,
+    *, mode: str, total_unit_cap: int, progress_callback=None, stop_reason_callback=None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     if not inventory.get("path_identity_ok"):
@@ -800,6 +798,19 @@ async def _apply_controller(
                   verified=0, degraded=0, embedding=embedding)
         last_progress = time.monotonic()
         while checked_memories < max_memory_checks:
+            if progress_callback is not None:
+                progress_callback({
+                    "memories_checked": checked_memories,
+                    "embedding_units_completed": completed_units,
+                    "verified_vector_rows": verified_rows,
+                    "provider_call_invocations": embedding.call_invocations,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000),
+                })
+            if stop_reason_callback is not None:
+                requested_stop = stop_reason_callback()
+                if requested_stop:
+                    stop_reason = requested_stop if requested_stop in {"paused", "config_changed"} else "paused"
+                    break
             if checked_memories and time.monotonic() - last_progress >= 20:
                 _progress(mode=mode, started=started, checked=checked_memories,
                           completed=completed_units, verified=verified_rows,
@@ -976,8 +987,15 @@ async def _async_main(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    logging.disable(logging.CRITICAL)
     args = _parser().parse_args()
+    lease = None
     try:
+        if args.mode != "inventory" and args.execute:
+            from memory_index_lease import MemoryIndexLease
+            lease = MemoryIndexLease(_paths(load_config())["state"])
+            if not lease.acquire():
+                return _emit({"mode": args.mode, "stop_reason": "maintenance_busy"}, exit_code=2)
         return asyncio.run(_async_main(args))
     except Exception as exc:
         return _emit({
@@ -985,6 +1003,9 @@ def main() -> int:
             "stop_reason": "error",
             "error_type": type(exc).__name__,
         }, exit_code=2)
+    finally:
+        if lease is not None:
+            lease.release()
 
 
 if __name__ == "__main__":

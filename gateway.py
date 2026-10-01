@@ -5779,6 +5779,41 @@ class GatewayService:
         except Exception as exc:
             return self._prompt_mirror_error(exc)
 
+    async def handle_memory_embedding_index(self, request: Request) -> JSONResponse:
+        """Narrow owner transport to Brain's existing index worker, never a writer."""
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        headers = {"Cache-Control": "no-store"}
+        action = str(request.path_params.get("action") or "")
+        if (request.method, action) not in {
+            ("GET", ""), ("POST", "preview"), ("POST", "start"), ("POST", "stop"),
+            ("POST", "continue"),
+        }:
+            return JSONResponse({"error": "not_found"}, status_code=404, headers=headers)
+        try:
+            body = None if request.method == "GET" else await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid_json"}, status_code=400, headers=headers)
+        base = os.environ.get("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://ombre-brain:8000").rstrip("/")
+        token = os.environ.get("OMBRE_MEMORY_WRITE_TOKEN") or self.gateway_token
+        if not base or not token:
+            return JSONResponse({"error": "embedding_maintenance_unconfigured"}, status_code=503, headers=headers)
+        path = "/api/memory-authority/embedding-index" + (("/" + action) if action else "")
+        try:
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+                response = await client.request(request.method, base + path,
+                    headers={"Authorization": "Bearer " + token}, json=body)
+            if response.status_code not in {200, 400, 409, 503}:
+                return JSONResponse({"error": "embedding_maintenance_unavailable"}, status_code=503, headers=headers)
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("invalid_maintenance_response")
+            return JSONResponse(payload, status_code=response.status_code, headers=headers)
+        except Exception as exc:
+            logger.warning("Memory index transport failed: %s", type(exc).__name__)
+            return JSONResponse({"error": "embedding_maintenance_unavailable"}, status_code=503, headers=headers)
+
     async def handle_memory_authority_read(self, request: Request) -> JSONResponse:
         """Owner-safe Memory projection served on the Gateway transport.
 
@@ -26792,6 +26827,9 @@ def create_gateway_app(
     async def memory_authority_read(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_memory_authority_read(request)
 
+    async def memory_embedding_index(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_memory_embedding_index(request)
+
     async def memory_authority_detail(request: Request) -> Response:
         request.path_params["resource"] = "memory_detail"
         return await request.app.state.gateway_service.handle_memory_authority_read(request)
@@ -26821,6 +26859,10 @@ def create_gateway_app(
                   prompt_source_detail_route, methods=["GET"]),
             Route("/api/internal/model-routes", model_route_mirror,
                   methods=["GET", "PUT"]),
+            Route("/api/memory-authority/embedding-index", memory_embedding_index,
+                  methods=["GET"], name="embedding-index-status"),
+            Route("/api/memory-authority/embedding-index/{action}", memory_embedding_index,
+                  methods=["POST"], name="embedding-index-action"),
             Route("/api/memory-authority/memories/{memory_id}", memory_authority_detail,
                   methods=["GET"], name="memory-detail"),
             Route("/api/memory-authority/{resource}", memory_authority_read,

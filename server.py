@@ -117,6 +117,8 @@ from memory_layers import (
 from memory_authority import MemoryAuthorityStore, MemoryProposal, PolicyDecision
 from memory_commit_service import BucketMemoryProjection, MemoryCommitService
 from memory_projection_worker import MemoryProjectionWorker
+from memory_embedding_jobs import MemoryEmbeddingJobs, EmbeddingJobError
+from memory_index_lease import MemoryIndexLease
 from memory_metadata import domain_options, normalize_domain_key, normalize_memory_metadata
 from recall_policy import RecallPolicy, diffusion_seed_topic_term_has_specific_residue
 from memory_write_gate import MemoryWriteGate, WriteGateDecision
@@ -225,6 +227,8 @@ memory_projection_worker = (
     if memory_authority_store is not None
     else None
 )
+
+memory_embedding_jobs = MemoryEmbeddingJobs(lambda: config)
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -12244,6 +12248,46 @@ async def api_daily_chat_memory_pending(request):
     return JSONResponse({"status": "ok", "items": items})
 
 
+def _require_owner_or_internal_index_maintenance(request):
+    # Explicit maintenance authorization, independent from the read-only guard.
+    # The existing internal Memory write bearer stays server-side in Aiz/Gateway.
+    if _dashboard_authenticated(request) or _authorized_memory_write(request):
+        return None
+    return _require_dashboard_auth(request)
+
+
+@mcp.custom_route("/api/memory-authority/embedding-index", methods=["GET"])
+@mcp.custom_route("/api/memory-authority/embedding-index/{action}", methods=["POST"])
+async def api_memory_embedding_index(request):
+    from starlette.responses import JSONResponse
+    err = _require_owner_or_internal_index_maintenance(request)
+    if err:
+        return err
+    headers = {"Cache-Control": "no-store"}
+    try:
+        action = request.path_params.get("action", "")
+        if request.method == "GET" and not action:
+            result = memory_embedding_jobs.view()
+        elif request.method == "POST" and action == "preview":
+            result = await memory_embedding_jobs.preview()
+        elif request.method == "POST" and action in {"start", "stop", "continue"}:
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "invalid_json"}, status_code=400, headers=headers)
+            result = (memory_embedding_jobs.start(body) if action == "start"
+                      else memory_embedding_jobs.continue_full(body) if action == "continue"
+                      else memory_embedding_jobs.stop(body))
+        else:
+            return JSONResponse({"error": "not_found"}, status_code=404, headers=headers)
+        return JSONResponse(result, headers=headers)
+    except EmbeddingJobError as exc:
+        return JSONResponse({"error": exc.code}, status_code=exc.status, headers=headers)
+    except Exception as exc:
+        logger.warning("Embedding maintenance API failed: %s", type(exc).__name__)
+        return JSONResponse({"error": "embedding_maintenance_unavailable"}, status_code=503, headers=headers)
+
+
 @mcp.custom_route("/api/memory-authority/overview", methods=["GET"])
 async def api_memory_authority_overview(request):
     """Owner-only Memory authority counts and projection health."""
@@ -12572,6 +12616,8 @@ async def api_config_get(request):
             "base_url": emb.get("base_url", ""),
             "api_key_masked": _mask_key(emb.get("api_key", "")),
             "effective_base_url": embedding_engine.base_url,
+            "dimensions": emb.get("dimensions"),
+            "effective_dimensions": embedding_engine.dimension,
             "has_own_api_key": bool(emb.get("api_key", "")),
         },
         "reranker": {
@@ -12834,6 +12880,20 @@ async def api_config_update(request):
     except Exception:
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
 
+    # Validate before mutating any runtime section or persisting a partial save.
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid config object"}, status_code=400)
+    if "embedding" in body:
+        if not isinstance(body["embedding"], dict):
+            return JSONResponse({"error": "invalid embedding config"}, status_code=400)
+        if "dimensions" in body["embedding"]:
+            try:
+                body["embedding"]["dimensions"] = EmbeddingEngine._requested_dimension(
+                    body["embedding"]["dimensions"]
+                )
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+
     updated = []
     env_updates: dict[str, str] = {}
 
@@ -12924,6 +12984,9 @@ async def api_config_update(request):
         if "base_url" in e:
             emb["base_url"] = e["base_url"]
             updated.append("embedding.base_url")
+        if "dimensions" in e:
+            emb["dimensions"] = e["dimensions"]
+            updated.append("embedding.dimensions")
         if "api_key" in e and e["api_key"]:
             emb["api_key"] = e["api_key"]
             env_updates["OMBRE_EMBEDDING_API_KEY"] = str(e["api_key"])
@@ -13480,7 +13543,7 @@ async def api_config_update(request):
 
             if "embedding" in body:
                 sc_emb = save_config.setdefault("embedding", {})
-                for key in ("enabled", "model", "base_url"):
+                for key in ("enabled", "model", "base_url", "dimensions"):
                     if key in body["embedding"]:
                         sc_emb[key] = body["embedding"][key]
                 # Never persist api_key to yaml (use env var)
@@ -14355,7 +14418,14 @@ if __name__ == "__main__":
                 prompt_plan_mirror=prompt_plan_mirror,
             )
             while True:
+                index_lease = MemoryIndexLease(memory_embedding_jobs.state_dir)
+                if not index_lease.acquire():
+                    await asyncio.sleep(interval)
+                    continue
                 try:
+                    # This scheduler owns its own event-loop/client; refresh it
+                    # too after owner config changes, not only the HTTP engine.
+                    await local_embedding_engine.reconfigure(config)
                     result = await local_worker.run_once(limit=batch_size)
                     if result.get("claimed") or result.get("recovered_stale"):
                         logger.info("Memory projection run / 记忆派生投影: %s", result)
@@ -14366,6 +14436,8 @@ if __name__ == "__main__":
                             logger.info("Memory index repair / 记忆索引修复: %s", repair)
                 except Exception as exc:
                     logger.warning("Memory projection worker failed / 记忆派生投影失败: %s", exc)
+                finally:
+                    index_lease.release()
                 await asyncio.sleep(interval)
 
         def _start_memory_projection_scheduler():

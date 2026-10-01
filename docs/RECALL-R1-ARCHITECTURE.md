@@ -1,5 +1,47 @@
 # RECALL-R1 authoritative architecture
 
+## 2026-10-01 owner vector maintenance contract
+
+- Reality's existing Memory workbench exposes a collapsed index-maintenance panel;
+  App bearer/device auth stays in Aiz. The narrow Gateway transport proxies only
+  status, preview, start, continue and stop to Brain. It is not a second index writer.
+- Brain runs the same bounded repair controller as the operator CLI, with its
+  existing Authority/revision/source-SHA/archive gates and explicit encoder space.
+  This is SQLite vector repair, not a new ANN database or a new ingestion path.
+- Preview never calls a provider. Starting requires explicit API-use confirmation
+  bound to the exact in-memory configuration preview (opaque random token, no key
+  hash), including the current document/query prompt identity. A persistent
+  operational job runs a real pilot/query verification, then stops at
+  `awaiting_review`. Only explicit `continue` may process the remaining bounded
+  corpus. A failed pilot never starts full repair.
+- Default operation fills known pending/incomplete or incompatible projections;
+  it does not force re-encode already compatible Memories. Archived/missing or
+  revision-mismatched sources are not restored. Memory facts, year rings,
+  admission thresholds and recall policy are not changed.
+- Before writes, private 0700/0600 backups retain derived embedding SQLite via
+  online backup, projection status and runtime YAML. They do not authorize
+  restoring an old Authority database over newer facts.
+- Stop finishes the current Memory boundary. Stop during `awaiting_review`
+  cancels that review without undoing vectors or deleting its pilot evidence.
+  Restart/crash marks active jobs interrupted, without automatic provider retries.
+  A pending review loses its in-memory confirmation after restart/config/prompt
+  change: `review_restart_required` tells the UI to offer cancel, preview, and a
+  new pilot instead of an unusable continue button. Repeated previews with the
+  same configuration/prompts preserve a valid token. A new job archives the old
+  operational record and skips compatible completed Memory projections.
+- One cross-process file lease excludes the normal outbox/index worker and CLI
+  maintenance while rebuilding. Normal chat reads remain available; new Memory
+  indexing queues until maintenance releases the lease. Fact ingestion continues.
+- Model/dimension/prompt changes during a job pause before its next Memory. The
+  writer scheduler refreshes its own embedding client between batches, not just
+  the Dashboard HTTP engine. Both Brain and Gateway must run dimension-aware code.
+- Transport uses OMBRE_MEMORY_INDEX_ADMIN_URL (Docker default
+  http://ombre-brain:8000) and the existing internal Memory-write bearer. No
+  Dashboard cookie, provider key or private body is delivered to Reality.
+- Index repair success is not natural Recall or TTFT acceptance. Verify a real
+  owner turn's candidates, admission, Full owner body injection and presentation
+  timestamps separately. Do not flush a staged owner message for maintenance.
+
 Status: core authority contracts retained; natural semantic retrieval accepted
 on 2026-09-30 is implemented in this feature lineage, not pending design.
 Section 9 is the current retrieval contract; older fixed-trigger Fast/Deep
