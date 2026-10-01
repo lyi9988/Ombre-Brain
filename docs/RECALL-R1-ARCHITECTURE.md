@@ -285,6 +285,33 @@ and is discarded on wrapper entry and in finally; public telemetry contains
 only status/count/timing fields, not the private candidate checkpoint. Derived
 weak-hint files do not gain a new freshness guarantee from this change.
 
+### Explicit embedding output space and bounded model-change repair
+
+`embedding.dimensions` is optional (`null` means the provider default); when
+set it must be an integer from 1 through 65536 and is sent as `dimensions` by
+single, batched and connection-fallback transports. It is not the model maximum
+and is never inferred from one default response. Query cache/singleflight and
+legacy Gateway semantic caches bind the model, endpoint, preparation and
+requested dimension to the same in-flight snapshot. Returned vectors with a
+different shape must not be cached or stored, and stored rows with an explicit
+dimension mismatch are not eligible for search.
+
+Changing a wire model ID does not prove an equivalent encoder. Never relabel,
+truncate or pad old vectors. The existing explicit `upgrade_legacy_indexes`
+repair path also recognizes projected rows whose model, provider host or
+explicit dimension no longer matches the requested space; `metadata_complete`
+alone is insufficient. Controller inventory, selection and worker repair use
+the same predicate and retain active/enabled, source SHA/live-directory, retry
+cooldown, per-Memory unit budget, postimage and pilot-query gates. This does not
+enable bulk migration in ordinary background repair. Provider host comparison
+does not establish equivalence of every endpoint path or encoder version.
+
+Both the Brain writer and Gateway reader must load the intended dimension
+before a production space transition; changing only the Gateway would let
+Brain keep generating incompatible default-dimension rows. A controlled pilot
+and explicit full-batch decision remain separate from code or health checks.
+Memory facts/revisions and archived-source policy are not part of this repair.
+
 ### Reranker failure and timeout telemetry repair (included in ac08 lineage)
 
 Each rerank call owns its outcome rather than reading mutable last-request

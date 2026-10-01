@@ -21,6 +21,19 @@ from utils import bucket_text_for_embedding
 logger = logging.getLogger("ombre_brain.memory_projection")
 
 
+def embedding_projection_needs_upgrade(status: str, details: Any, expected_space: dict | None = None) -> bool:
+    """Repair derived vectors, never relabel them or change Memory revisions."""
+    if status == "pending_rebuild":
+        return True
+    if status != "projected":
+        return False
+    if not isinstance(details, dict) or details.get("metadata_complete") is not True:
+        return True
+    return any(value is not None and value != "" and details.get(key) != value
+               for key, value in (expected_space or {}).items()
+               if key in {"model", "provider", "dimension"})
+
+
 class MemoryProjectionWorker:
     def __init__(
         self,
@@ -100,6 +113,14 @@ class MemoryProjectionWorker:
             "embedding_units_completed": 0,
             "embedding_units_remaining": 0,
         }
+        expected_embedding_space = {}
+        if upgrade_legacy_indexes and self.embedding_engine is not None:
+            engine = self.embedding_engine
+            expected_embedding_space = {
+                "model": str(getattr(engine, "model", "") or ""),
+                "provider": str(urlsplit(str(getattr(engine, "base_url", "") or "")).hostname or ""),
+                "dimension": getattr(engine, "dimension", None),
+            }
         offset = 0
         while result["attempted"] < budget:
             page = self.authority.list_memories(state="active", limit=500, offset=offset)
@@ -123,10 +144,10 @@ class MemoryProjectionWorker:
                     status = statuses.get(name) or {}
                     is_pending = status.get("status") == "pending_rebuild"
                     details = status.get("details") or {}
-                    if (upgrade_legacy_indexes and name == "embedding"
-                            and status.get("status") == "projected"
-                            and details.get("metadata_complete") is not True):
-                        is_pending = True
+                    if upgrade_legacy_indexes and name == "embedding":
+                        is_pending = embedding_projection_needs_upgrade(
+                            str(status.get("status") or ""), details, expected_embedding_space,
+                        )
                     if is_pending:
                         pending.append(name)
                 if not pending:
@@ -632,9 +653,12 @@ class MemoryProjectionWorker:
             units = units[:1]
 
         projected_units: list[dict[str, Any]] = []
+        actual_dimensions: set[int] = set()
+        result_dimensions_complete = True
         for unit in units:
             if progress is not None:
                 progress["attempted"] = int(progress.get("attempted") or 0) + 1
+            result_metadata: dict[str, Any] = {}
             result = await self._call_embedding_engine(
                 engine_method,
                 bucket_id,
@@ -645,9 +669,17 @@ class MemoryProjectionWorker:
                 parent_memory_id=memory_id,
                 document_instruction=document_instruction,
                 config_snapshot=config_snapshot,
+                result_metadata=result_metadata,
             )
             if result is False:
                 raise RuntimeError("projection_action_returned_false")
+            actual_dimension = result_metadata.get("dimension")
+            if type(actual_dimension) is int and actual_dimension > 0:
+                actual_dimensions.add(actual_dimension)
+            else:
+                result_dimensions_complete = False
+            if len(actual_dimensions) > 1:
+                raise RuntimeError("embedding_projection_dimension_changed")
             if progress is not None:
                 progress["completed"] = int(progress.get("completed") or 0) + 1
             projected_units.append({
@@ -659,6 +691,11 @@ class MemoryProjectionWorker:
             })
 
         space = self._embedding_space_metadata(document_instruction, config_snapshot)
+        if config_snapshot is not None:
+            # The default-dimension response belongs to this Memory, not to
+            # a mutable engine setting or another request's last-call health.
+            space["dimension"] = (next(iter(actual_dimensions))
+                                  if result_dimensions_complete and actual_dimensions else None)
         metadata_complete = bool(
             supports_metadata and space.get("provider") and space.get("model")
             and space.get("dimension") and space.get("preparation_sha256")
@@ -697,6 +734,7 @@ class MemoryProjectionWorker:
         source_sha256: str, source_unit_id: str, parent_memory_id: str,
         document_instruction: str | None = None,
         config_snapshot: dict[str, Any] | None = None,
+        result_metadata: dict[str, Any] | None = None,
     ):
         metadata = {
             "source_revision": source_revision,
@@ -705,6 +743,7 @@ class MemoryProjectionWorker:
             "parent_memory_id": parent_memory_id,
             "document_instruction": document_instruction,
             "config_snapshot": config_snapshot,
+            "result_metadata": result_metadata,
         }
         try:
             parameters = inspect.signature(method).parameters
@@ -787,11 +826,8 @@ class MemoryProjectionWorker:
             provider = ""
         runtime = getattr(engine, "_runtime", {})
         runtime = runtime if isinstance(runtime, dict) else {}
-        dimension = (
-            (snapshot or {}).get("dimension")
-            or getattr(engine, "dimension", None)
-            or runtime.get("last_vector_dimension")
-        )
+        dimension = (snapshot.get("dimension") if snapshot is not None else
+                     (getattr(engine, "dimension", None) or runtime.get("last_vector_dimension")))
         try:
             dimension = int(dimension) if dimension else None
         except (TypeError, ValueError):

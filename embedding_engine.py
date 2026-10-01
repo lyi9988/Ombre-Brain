@@ -49,6 +49,7 @@ class EmbeddingEngine:
             or "https://generativelanguage.googleapis.com/v1beta/openai/"
         )
         self.model = embed_cfg.get("model", "gemini-embedding-001")
+        self.dimension = self._requested_dimension(embed_cfg.get("dimensions"))
         self.enabled = bool(self.api_key) and embed_cfg.get("enabled", True)
         self.max_chars = self._int_between(embed_cfg.get("max_chars", 6000), 6000, 500, 32000)
         self.query_instruction = str(
@@ -104,6 +105,7 @@ class EmbeddingEngine:
             "enabled": bool(self.enabled),
             "configured": bool(self.api_key and self.base_url),
             "model": self.model,
+            "requested_dimension": getattr(self, "dimension", None),
             "base_url": self.base_url,
             "client_open": bool(
                 self.client is not None
@@ -112,11 +114,25 @@ class EmbeddingEngine:
             **dict(self._runtime),
         }
 
+    @staticmethod
+    def _requested_dimension(value) -> int | None:
+        """An explicit output contract, not the model maximum or an inferred migration."""
+        if value is None:
+            return None
+        if isinstance(value, bool) or not (type(value) is int or (
+                isinstance(value, str) and value.strip().isascii() and value.strip().isdigit())):
+            raise ValueError("embedding_dimensions_must_be_positive_integer")
+        dimension = int(value)
+        if not 1 <= dimension <= 65536:
+            raise ValueError("embedding_dimensions_out_of_range")
+        return dimension
+
     def _query_config_snapshot(self, *, query_instruction: str | None = None,
                                document_instruction: str | None = None) -> dict:
         # Request-local: hot application cannot relabel an in-flight vector.
         # api_key stays only in memory; it is never included in diagnostics.
         return {"model": self.model, "base_url": self.base_url,
+                "dimension": getattr(self, "dimension", None),
                 "api_key": self.api_key, "enabled": self.enabled,
                 "max_chars": self.max_chars,
                 "query_instruction": self.query_instruction if query_instruction is None else query_instruction,
@@ -139,6 +155,7 @@ class EmbeddingEngine:
         payload = {
             "input": prepared,
             "model": str(snapshot["model"] or ""),
+            "dimension": snapshot.get("dimension"),
             "base_url": str(snapshot["base_url"] or ""),
             "query_instruction": snapshot["query_instruction"],
         }
@@ -146,16 +163,17 @@ class EmbeddingEngine:
             json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
 
-    async def query_embedding(self, text: str) -> list[float]:
+    async def query_embedding(self, text: str, *, config_snapshot: dict | None = None) -> list[float]:
         """Return one exact-key query vector with cache and singleflight.
 
         The cache stores vectors only, never raw query text.  Document writes
         deliberately bypass it because they carry revisioned index identity.
         """
-        if not self.enabled or not str(text or "").strip():
+        snapshot = config_snapshot or self._query_config_snapshot()
+        if not snapshot["enabled"] or not str(text or "").strip():
             self._runtime["last_query_cache_status"] = "disabled_or_empty"
             return []
-        cache_key = self._query_cache_key(text)
+        cache_key = self._query_cache_key(text, snapshot=snapshot)
         now = time.monotonic()
         cached = self._query_cache.get(cache_key)
         if cached and cached[0] > now:
@@ -173,7 +191,7 @@ class EmbeddingEngine:
                     raise
                 raise RuntimeError("shared_embedding_request_cancelled") from None
 
-        task = asyncio.create_task(self._generate_embedding(text, kind="query"))
+        task = asyncio.create_task(self._generate_embedding(text, kind="query", config_snapshot=snapshot))
         self._query_inflight[cache_key] = task
         try:
             vector = list(await asyncio.shield(task))
@@ -260,6 +278,7 @@ class EmbeddingEngine:
                 f"{snapshot['base_url'].rstrip('/')}/embeddings", snapshot["api_key"], snapshot["model"],
                 prepared if len(prepared) > 1 else prepared[0],
                 deadline=deadline or started + self.REQUEST_BUDGET_SECONDS,
+                **({"dimensions": snapshot["dimension"]} if snapshot.get("dimension") is not None else {}),
             )
             data = body.get("data") if isinstance(body, dict) else None
             if not isinstance(data, list) or len(data) != len(prepared):
@@ -277,6 +296,8 @@ class EmbeddingEngine:
                     raise ValueError("embedding_batch_invalid_index_or_vector")
                 if dimension is not None and len(vector) != dimension:
                     raise ValueError("embedding_batch_dimension_mismatch")
+                if snapshot.get("dimension") is not None and len(vector) != snapshot["dimension"]:
+                    raise ValueError("embedding_requested_dimension_mismatch")
                 dimension = len(vector)
                 vectors[index] = vector
             result = {key: list(vectors[i]) for i, key in enumerate(ordered_keys)}
@@ -325,6 +346,7 @@ class EmbeddingEngine:
         source_sha256: str | None = None, source_unit_id: str | None = None,
         parent_memory_id: str | None = None, document_instruction: str | None = None,
         config_snapshot: dict | None = None,
+        result_metadata: dict | None = None,
     ) -> bool:
         """
         Generate embedding for content and store in SQLite.
@@ -333,6 +355,8 @@ class EmbeddingEngine:
         """
         if not self.enabled or not content or not content.strip():
             return False
+        if result_metadata is not None:
+            result_metadata.clear()
 
         try:
             snapshot = config_snapshot or self._query_config_snapshot(document_instruction=document_instruction)
@@ -344,6 +368,8 @@ class EmbeddingEngine:
                 source_sha256=source_sha256, source_unit_id=source_unit_id,
                 parent_memory_id=parent_memory_id, input_text=content, config_snapshot=snapshot,
             )
+            if result_metadata is not None:
+                result_metadata["dimension"] = len(embedding)
             return True
         except Exception as e:
             logger.warning("Embedding generation failed | type=%s", type(e).__name__)
@@ -376,6 +402,7 @@ class EmbeddingEngine:
             http_status, body = await self._request_embedding(
                 endpoint, snapshot["api_key"], snapshot["model"], truncated,
                 deadline=started + self.REQUEST_BUDGET_SECONDS,
+                **({"dimensions": snapshot["dimension"]} if snapshot.get("dimension") is not None else {}),
             )
             self._runtime["last_http_status"] = http_status
             data = body.get("data") if isinstance(body, dict) else None
@@ -383,6 +410,8 @@ class EmbeddingEngine:
             vector = first.get("embedding") if isinstance(first, dict) else None
             if (isinstance(vector, list) and vector
                     and all(type(v) in (int, float) and math.isfinite(v) for v in vector)):
+                if snapshot.get("dimension") is not None and len(vector) != snapshot["dimension"]:
+                    raise ValueError("embedding_requested_dimension_mismatch")
                 self._runtime.update({
                     "last_status": "ok",
                     "last_latency_ms": max(0, int((time.monotonic() - started) * 1000)),
@@ -502,7 +531,7 @@ class EmbeddingEngine:
 
     async def _request_embedding(
         self, endpoint: str, api_key: str, model: str, input_value: str | list[str],
-        *, deadline: float | None = None,
+        *, deadline: float | None = None, dimensions: int | None = None,
     ) -> tuple[int, dict]:
         """Use the persistent pool with a bounded, connection-only fallback."""
         client = await self._ensure_client()
@@ -539,7 +568,8 @@ class EmbeddingEngine:
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
-                json={"model": model, "input": input_value},
+                json={"model": model, "input": input_value,
+                      **({"dimensions": dimensions} if dimensions is not None else {})},
                 timeout=remaining,
                 **({"extensions": {"trace": trace}} if isinstance(client, httpx.AsyncClient) else {}),
             )
@@ -573,6 +603,7 @@ class EmbeddingEngine:
                 model,
                 input_value,
                 timeout_seconds=max(0.1, remaining),
+                **({"dimensions": dimensions} if dimensions is not None else {}),
             )
             metrics.update(source="connect_fallback", provider_attempts=2,
                            total_ms=round((time.monotonic() - request_started) * 1000))
@@ -593,6 +624,7 @@ class EmbeddingEngine:
             or "https://generativelanguage.googleapis.com/v1beta/openai/"
         )
         self.model = embed_cfg.get("model", "gemini-embedding-001")
+        self.dimension = self._requested_dimension(embed_cfg.get("dimensions"))
         self.enabled = bool(self.api_key) and _bool_value(
             embed_cfg.get("enabled", True)
         )
@@ -621,12 +653,14 @@ class EmbeddingEngine:
         endpoint: str,
         api_key: str,
         model: str,
-        input_value: str,
+        input_value: str | list[str],
         timeout_seconds: float = REQUEST_BUDGET_SECONDS,
+        dimensions: int | None = None,
     ) -> tuple[int, dict]:
         request = urllib.request.Request(
             endpoint,
-            data=json.dumps({"model": model, "input": input_value}).encode("utf-8"),
+            data=json.dumps({"model": model, "input": input_value,
+                             **({"dimensions": dimensions} if dimensions is not None else {})}).encode("utf-8"),
             method="POST",
             headers={
                 "Authorization": f"Bearer {api_key}",
@@ -661,6 +695,9 @@ class EmbeddingEngine:
             f"{bucket_id}|{unit}".encode()).hexdigest()
         snapshot = config_snapshot or self._query_config_snapshot()
         prepared = self._prepare_document_snapshot(input_text, snapshot)
+        if snapshot.get("dimension") is not None and len(embedding) != snapshot["dimension"]:
+            conn.close()
+            raise ValueError("embedding_requested_dimension_mismatch")
         conn.execute(
             """
             INSERT OR REPLACE INTO embeddings
@@ -733,17 +770,18 @@ class EmbeddingEngine:
                 output[str(bucket_id)] = embedding
         return output
 
-    async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
+    async def search_similar(self, query: str, top_k: int = 10, *, config_snapshot: dict | None = None) -> list[tuple[str, float]]:
         """
         Search for buckets similar to query text.
         Returns list of (bucket_id, similarity_score) sorted by score desc.
         搜索与查询文本相似的桶。返回 (bucket_id, 相似度分数) 列表。
         """
-        if not self.enabled:
+        snapshot = config_snapshot or self._query_config_snapshot()
+        if not snapshot["enabled"]:
             return []
 
         try:
-            query_embedding = await self.query_embedding(query)
+            query_embedding = await self.query_embedding(query, config_snapshot=snapshot)
             if not query_embedding:
                 return []
         except Exception as e:
@@ -764,7 +802,7 @@ class EmbeddingEngine:
         for bucket_id, emb_json, model, dimension, parent_id in rows:
             try:
                 stored_embedding = json.loads(emb_json)
-                if not self._row_matches_current_model(model, dimension, stored_embedding):
+                if not self._row_matches_current_model(model, dimension, stored_embedding, config_snapshot=snapshot):
                     continue
                 sim = self._cosine_similarity(query_embedding, stored_embedding)
                 parent = str(parent_id or bucket_id)
@@ -840,6 +878,7 @@ class EmbeddingEngine:
                 vector = json.loads(payload)
                 if (model != snapshot["model"] or not isinstance(vector, list) or not vector
                         or dimension != len(vector)
+                        or (snapshot.get("dimension") is not None and dimension != snapshot["dimension"])
                         or any(type(v) not in (int, float) or not math.isfinite(v) for v in vector)):
                     reason = reason or "embedding_space_mismatch"
             except (ValueError, TypeError):
@@ -914,16 +953,18 @@ class EmbeddingEngine:
             return f"Instruct: {self.document_instruction}\nDocument: {raw}"
         return raw
 
-    def _row_matches_current_model(self, model: str | None, dimension: int | None, embedding: list[float]) -> bool:
+    def _row_matches_current_model(self, model: str | None, dimension: int | None, embedding: list[float],
+                                   *, config_snapshot: dict | None = None) -> bool:
         if not embedding:
             return False
-        if model != self.model:
+        if model != (config_snapshot["model"] if config_snapshot is not None else self.model):
             return False
         try:
             stored_dimension = int(dimension)
         except (TypeError, ValueError):
             return False
-        return stored_dimension == len(embedding)
+        requested = config_snapshot.get("dimension") if config_snapshot is not None else getattr(self, "dimension", None)
+        return stored_dimension == len(embedding) and (requested is None or stored_dimension == requested)
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:

@@ -1288,6 +1288,7 @@ class GatewayService:
             "embedding": {
                 "enabled": bool(getattr(embedding_engine, "enabled", False)),
                 "model": str(getattr(embedding_engine, "model", "") or ""),
+                "dimensions": getattr(embedding_engine, "dimension", None),
                 "base_url": str(getattr(embedding_engine, "base_url", "") or ""),
                 "max_chars": int(getattr(embedding_engine, "max_chars", 0) or 0),
                 "api_ready": bool(getattr(embedding_engine, "api_key", "")),
@@ -1622,11 +1623,13 @@ class GatewayService:
 
         if embedding or env_changed or initial_credentials:
             current = self.config.setdefault("embedding", {})
-            for key in ("enabled", "model", "base_url", "max_chars", "query_instruction", "document_instruction"):
+            dimension = EmbeddingEngine._requested_dimension(embedding.get("dimensions", current.get("dimensions")))
+            for key in ("enabled", "model", "base_url", "dimensions", "max_chars", "query_instruction", "document_instruction"):
                 if key in embedding:
                     current[key] = embedding[key]
             engine = self.embedding_engine
             engine.model = str(current.get("model") or getattr(engine, "model", "") or "")
+            engine.dimension = dimension
             engine.base_url = str(current.get("base_url") or getattr(engine, "base_url", "") or "").rstrip("/")
             engine.api_key = self._runtime_credential_value(
                 "OMBRE_EMBEDDING_API_KEY", current, engine, env_values,
@@ -22237,13 +22240,22 @@ class GatewayService:
             self._semantic_query_inflight = {}
             self.semantic_query_cache_ttl_seconds = 300.0
             self.semantic_query_cache_max_entries = 256
+        engine = self.embedding_engine
+        snapshot_getter = getattr(engine, "_query_config_snapshot", None)
+        snapshot = snapshot_getter() if callable(snapshot_getter) else None
         material = {
             "query": str(query or ""),
             "model": str(getattr(self.embedding_engine, "model", "") or ""),
+            "dimensions": getattr(self.embedding_engine, "dimension", None),
             "base_url": str(getattr(self.embedding_engine, "base_url", "") or ""),
             "top_k": self.semantic_candidate_top_k,
             "store_stamp": self._embedding_store_cache_stamp(),
         }
+        if snapshot is not None:
+            material.update(model=snapshot["model"], base_url=snapshot["base_url"],
+                            dimensions=snapshot.get("dimension"), max_chars=snapshot["max_chars"],
+                            query_instruction=snapshot["query_instruction"],
+                            document_preparation=snapshot["document_preparation"])
         cache_key = hashlib.sha256(
             json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
@@ -22267,9 +22279,10 @@ class GatewayService:
                 raise RuntimeError("shared_semantic_request_cancelled") from None
 
         async def execute() -> list[tuple[str, float]]:
-            search = self.embedding_engine.search_similar(
+            search = engine.search_similar(
                 query,
                 top_k=self.semantic_candidate_top_k,
+                **({"config_snapshot": snapshot} if snapshot is not None else {}),
             )
             if self.embedding_query_timeout_seconds > 0:
                 return list(await asyncio.wait_for(search, timeout=self.embedding_query_timeout_seconds))

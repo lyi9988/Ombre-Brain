@@ -38,7 +38,7 @@ from bucket_manager import BucketManager
 from embedding_engine import EmbeddingEngine
 from memory_authority import MemoryAuthorityStore
 from memory_moments import _annotation_options_from_config
-from memory_projection_worker import MemoryProjectionWorker
+from memory_projection_worker import MemoryProjectionWorker, embedding_projection_needs_upgrade
 from memory_relevance import memory_relevance_options_from_config
 from prompt_plan_mirror import PromptPlanMirrorStore
 from prompt_source_registry import resolve_fixed_prompt
@@ -232,20 +232,29 @@ def _active_enabled_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def _is_upgrade_candidate(status: str, details_json: str) -> bool:
-    if status == "pending_rebuild":
-        return True
-    if status != "projected":
-        return False
+def _expected_embedding_space(config: dict) -> dict:
+    embedding = _config_section(config, "embedding")
+    if not embedding.get("model"):
+        return {}  # Preserve legacy inventory behavior when no target is configured.
+    base_url = embedding.get("base_url") or _config_section(config, "dehydration").get("base_url")
+    return {
+        "model": str(embedding["model"]),
+        "provider": str(urlsplit(str(base_url or "")).hostname or ""),
+        "dimension": EmbeddingEngine._requested_dimension(embedding.get("dimensions")),
+    }
+
+
+def _is_upgrade_candidate(status: str, details_json: str, expected_space: dict | None = None) -> bool:
     try:
         details = json.loads(details_json or "{}")
     except (TypeError, ValueError):
         details = {}
-    return not isinstance(details, dict) or details.get("metadata_complete") is not True
+    return embedding_projection_needs_upgrade(status, details, expected_space)
 
 
 async def _inventory(config: dict, paths: dict[str, Path]) -> dict[str, Any]:
     started = time.monotonic()
+    expected_space = _expected_embedding_space(config)
     output: dict[str, Any] = {
         "mode": "inventory",
         "stop_reason": "inventory_only",
@@ -292,7 +301,7 @@ async def _inventory(config: dict, paths: dict[str, Path]) -> dict[str, Any]:
         )
         output["legacy_upgrade_candidates"] = sum(
             1 for row in rows if _is_upgrade_candidate(
-                str(row["embedding_status"]), str(row["details_json"]),
+                str(row["embedding_status"]), str(row["details_json"]), expected_space,
             )
         )
         output["active_revision_sha_mismatch"] = int(authority.execute(
@@ -379,7 +388,7 @@ async def _inventory(config: dict, paths: dict[str, Path]) -> dict[str, Any]:
         units = unit_counter._embedding_source_units(bucket, str(row["memory_id"]))
         source_units += len(units)
         if _is_upgrade_candidate(
-            str(row["embedding_status"]), str(row["details_json"]),
+            str(row["embedding_status"]), str(row["details_json"]), expected_space,
         ):
             repair_candidate_memories += 1
             upgrade_source_units += len(units)
@@ -406,14 +415,14 @@ async def _inventory(config: dict, paths: dict[str, Path]) -> dict[str, Any]:
     return output
 
 
-def _next_candidate(authority_path: Path) -> dict[str, Any] | None:
+def _next_candidate(authority_path: Path, *, expected_space: dict | None = None) -> dict[str, Any] | None:
     connection = _readonly(authority_path)
     try:
         rows = _active_enabled_rows(connection)
         now_ms = int(time.time() * 1000)
         for row in rows:
             status = str(row["embedding_status"])
-            if not _is_upgrade_candidate(status, str(row["details_json"])):
+            if not _is_upgrade_candidate(status, str(row["details_json"]), expected_space):
                 continue
             try:
                 details = json.loads(row["details_json"] or "{}")
@@ -433,13 +442,13 @@ def _next_candidate(authority_path: Path) -> dict[str, Any] | None:
         connection.close()
 
 
-def _upgrade_candidate_count(authority_path: Path) -> int:
+def _upgrade_candidate_count(authority_path: Path, *, expected_space: dict | None = None) -> int:
     connection = _readonly(authority_path)
     try:
         rows = _active_enabled_rows(connection)
         return sum(
             1 for row in rows if _is_upgrade_candidate(
-                str(row["embedding_status"]), str(row["details_json"]),
+                str(row["embedding_status"]), str(row["details_json"]), expected_space,
             )
         )
     finally:
@@ -775,6 +784,8 @@ async def _apply_controller(
 
     worker, embedding, mirror = _prepare_apply_components(config, paths)
     document_instruction, _query_instruction = _resolve_prompts(config, mirror)
+    expected_space = _expected_embedding_space(config)
+    space_kwargs = {"expected_space": expected_space} if expected_space else {}
     max_memory_checks = MAX_PILOT_MEMORY_CHECKS if mode == "pilot" else 10000
     unit_attempts = completed_units = degraded_memories = checked_memories = 0
     verified_rows = query_requests = 0
@@ -797,9 +808,9 @@ async def _apply_controller(
             if mode == "full" and unit_attempts >= total_unit_cap:
                 stop_reason = "unit_cap_reached"
                 break
-            candidate = _next_candidate(paths["authority"])
+            candidate = _next_candidate(paths["authority"], **space_kwargs)
             if candidate is None:
-                if _upgrade_candidate_count(paths["authority"]):
+                if _upgrade_candidate_count(paths["authority"], **space_kwargs):
                     stop_reason = "remaining_deferred"
                 else:
                     stop_reason = "complete" if mode == "full" else "no_candidates"
@@ -816,7 +827,7 @@ async def _apply_controller(
                 paths["authority"], candidate["memory_id"],
             )
             if (not before or not _is_upgrade_candidate(
-                    before["status"], json.dumps(before["details"]),
+                    before["status"], json.dumps(before["details"]), expected_space,
                     ) or not active_before or active_before["state"] != "active"
                     or active_before["recall_policy"] != "enabled"
                     or int(active_before["active_revision"] or 0) != int(candidate["revision"])
