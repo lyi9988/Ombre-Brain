@@ -8587,6 +8587,66 @@ function setConfigStatus(html) {
   });
 }
 
+function configSavePresentation(result) {
+  var activation = result.gateway_activation;
+  var persistence = result.persistence || {};
+  var parts = [];
+  if (result.local_update === 'applied') parts.push('Brain 内存配置已更新');
+  if (persistence.runtime_yaml === 'saved') parts.push('配置已保存');
+  if (persistence.credentials === 'saved') parts.push('凭据已保存');
+  if (persistence.runtime_yaml === 'not_requested') parts.push('本次未保存配置到磁盘');
+  if (persistence.credentials === 'not_requested') parts.push('本次未保存凭据到磁盘');
+  if (!result.ok) {
+    var errors = {
+      runtime_persist_failed: '配置落盘失败',
+      credential_persist_failed: '凭据落盘失败',
+    };
+    parts.push(errors[result.error] || '保存失败');
+    parts.push('可能已有部分更新；Gateway 生效未确认，输入已保留');
+    return {text: parts.join('；'), tone: 'negative', refresh: false};
+  }
+  if (!activation) {
+    parts.push('服务端未提供 Gateway 生效回执，不能确认已生效');
+    return {text: parts.join('；'), tone: 'warning', refresh: false};
+  }
+  if (activation.state === 'confirmed') {
+    parts.push('Gateway 已确认本次配置');
+    parts.push('未执行供应商鉴权或模型测试');
+  } else if (activation.state === 'not_required') {
+    parts.push('本次无需同步 Gateway');
+  } else {
+    var reasons = {
+      gateway_admin_not_configured: 'Gateway 同步入口未配置',
+      gateway_timeout: 'Gateway 确认超时（可能已应用）',
+      gateway_http_error: 'Gateway 拒绝或未完成同步',
+      gateway_transport_error: 'Gateway 连接异常，生效未确认',
+      gateway_sync_error: 'Gateway 同步异常，生效未确认',
+      invalid_acknowledgement: 'Gateway 未返回有效确认',
+      incomplete_acknowledgement: 'Gateway 只确认了部分配置',
+      embedding_requires_persistence: 'Embedding 需保存配置及修改过的凭据后才能同步',
+      health_endpoint_unavailable: '无法读取 Gateway 的运行配置',
+      embedding_readback_failed: 'Embedding 运行状态读取失败',
+      embedding_runtime_not_confirmed: 'Embedding 运行参数或挂载凭据未确认匹配',
+      reranker_runtime_not_confirmed: 'Reranker 运行参数未确认匹配',
+      persistence_failed: '落盘未完成，未主动同步 Gateway',
+    };
+    parts.push(reasons[activation.reason] || 'Gateway 生效未确认');
+    parts.push('输入已保留，可核对后重新保存并同步');
+    return {text: parts.join('；'), tone: 'warning', refresh: false};
+  }
+  if (result.attention_required) {
+    parts.push('仍有未确认项，输入已保留');
+    return {text: parts.join('；'), tone: 'warning', refresh: false};
+  }
+  if (persistence.credentials === 'not_requested' && (result.updated || []).some(function(field) {
+    return typeof field === 'string' && field.endsWith('api_key');
+  })) {
+    parts.push('新密钥仅在运行时应用；输入已保留，可继续保存到 .env');
+    return {text: parts.join('；'), tone: 'positive', refresh: false};
+  }
+  return {text: parts.join('；'), tone: 'positive', refresh: true};
+}
+
 async function saveConfig(persist, persistEnv) {
   if (!configSnapshot) {
     setConfigStatus('<span style="color:var(--negative)">配置还没加载完成，请先刷新配置页</span>');
@@ -8855,20 +8915,20 @@ async function saveConfig(persist, persistEnv) {
     });
     if (!res) return;
     var result = await res.json();
+    var presentation = configSavePresentation(result);
+    var statusText = presentation.text;
     if (result.ok) {
-      var statusText = '✓ 已更新: ' + (result.updated || []).join(', ');
       if (activeTarget === 'upstream-config' && persistEnv && upstreamKeyValueCounts.length) {
         statusText += '；Key values 读取: ' + upstreamKeyValueCounts.map(function(item) {
           return item.name + '=' + item.count + '行';
         }).join(', ');
       }
-      setConfigStatus('<span style="color:var(--positive)">' + esc(statusText) + '</span>');
-      loadConfig();
-    } else {
-      setConfigStatus('<span style="color:var(--negative)">✗ ' + esc(result.error || '未知错误') + '</span>');
     }
+    setConfigStatus('<span style="color:var(--' + presentation.tone + ')">' + esc(statusText) + '</span>');
+    // A warning must not erase a newly entered key before the owner can retry.
+    if (presentation.refresh) loadConfig();
   } catch (e) {
-    setConfigStatus('<span style="color:var(--negative)">✗ 请求失败: ' + esc(e.message) + '</span>');
+    setConfigStatus('<span style="color:var(--negative)">请求失败，生效未确认；输入已保留</span>');
   }
 }
 

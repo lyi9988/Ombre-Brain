@@ -66,6 +66,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import Context, FastMCP
 
 from bucket_manager import BucketManager
+from config_activation import activate_gateway, activation_receipt, config_save_result
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from darkroom import DarkroomStore
@@ -520,26 +521,17 @@ def _dashboard_gateway_upstreams_payload(gateway_cfg: dict) -> list[dict]:
     return payload
 
 
-async def _hot_update_gateway_config(gateway_payload: dict) -> str | None:
-    if not gateway_payload:
-        return None
-    admin_url = os.environ.get("OMBRE_GATEWAY_ADMIN_URL", "").strip()
-    token = os.environ.get("OMBRE_GATEWAY_TOKEN", "").strip()
-    if not admin_url or not token:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.post(
-                admin_url,
-                headers={"Authorization": f"Bearer {token}"},
-                json=gateway_payload,
-            )
-        if response.status_code >= 400:
-            return f"gateway_hot_reload_failed:{response.status_code}"
-        return "gateway_hot_reloaded"
-    except Exception as exc:
-        logger.warning("Gateway hot config update failed: %s", exc)
-        return f"gateway_hot_reload_failed:{type(exc).__name__}"
+async def _hot_update_gateway_config(gateway_payload: dict, **kwargs) -> dict:
+    receipt = await activate_gateway(
+        gateway_payload,
+        admin_url=os.environ.get("OMBRE_GATEWAY_ADMIN_URL", "").strip(),
+        token=os.environ.get("OMBRE_GATEWAY_TOKEN", "").strip(),
+        **kwargs,
+    )
+    if receipt["state"] not in ("confirmed", "not_required"):
+        logger.warning("Gateway config activation state=%s reason=%s",
+                       receipt["state"], receipt["reason"])
+    return receipt
 
 
 def _gateway_debug_injections_url() -> str:
@@ -12896,6 +12888,10 @@ async def api_config_update(request):
 
     updated = []
     env_updates: dict[str, str] = {}
+    persistence = {
+        "runtime_yaml": "pending" if body.get("persist") else "not_requested",
+        "credentials": "pending" if body.get("persist_env") else "not_requested",
+    }
 
     def _memory_diffusion_dashboard_config(payload) -> dict:
         if not isinstance(payload, dict):
@@ -12965,11 +12961,13 @@ async def api_config_update(request):
         gateway_hot_update_payload["dehydration"] = {
             "model": dehydrator.model,
             "base_url": dehydrator.base_url,
-            "api_key": dehydrator.api_key,
             "thinking_mode": dehy.get("thinking_mode", ""),
             "max_tokens": dehy.get("max_tokens", 1024),
             "temperature": dehy.get("temperature", 0.1),
         }
+        # Gateway ignores empty credentials, so do not request an ACK for one.
+        if dehydrator.api_key:
+            gateway_hot_update_payload["dehydration"]["api_key"] = dehydrator.api_key
 
     # --- Embedding config ---
     if "embedding" in body:
@@ -12990,6 +12988,9 @@ async def api_config_update(request):
         if "api_key" in e and e["api_key"]:
             emb["api_key"] = e["api_key"]
             env_updates["OMBRE_EMBEDDING_API_KEY"] = str(e["api_key"])
+            updated.append("embedding.api_key")
+        elif body.get("persist_env", False) and emb.get("api_key"):
+            env_updates["OMBRE_EMBEDDING_API_KEY"] = str(emb["api_key"])
             updated.append("embedding.api_key")
 
         # Hot-reload the persistent embedding pool.  The engine owns the
@@ -13043,6 +13044,7 @@ async def api_config_update(request):
             # credential, not silently leave the Gateway's old named key behind.
             # Never take an embedding/dehydration fallback from the engine here.
             env_updates["OMBRE_RERANKER_API_KEY"] = str(reranker_cfg["api_key"])
+            reranker_gateway_payload["api_key"] = str(reranker_cfg["api_key"])
             updated.append("reranker.api_key_from_runtime")
         if "base_url" in r:
             os.environ["OMBRE_RERANKER_BASE_URL"] = reranker_cfg.get("base_url", "")
@@ -13525,10 +13527,6 @@ async def api_config_update(request):
             os.environ["OMBRE_DREAM_MODEL"] = str(dream_cfg["model"])
         dream_engine = DreamEngine(config, prompt_plan_mirror)
 
-    hot_update_status = await _hot_update_gateway_config(gateway_hot_update_payload)
-    if hot_update_status:
-        updated.append(hot_update_status)
-
     # --- Persist to config.yaml if requested ---
     if body.get("persist", False):
         config_path = os.environ.get(
@@ -13955,17 +13953,22 @@ async def api_config_update(request):
                 yaml.dump(runtime_config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
             updated.append("persisted_to_runtime_yaml")
             updated.append("config_yaml_left_untouched")
-        except Exception as e:
+            persistence["runtime_yaml"] = "saved"
+        except Exception:
             # The old fallback re-tried the runtime overlay here, which is now the
             # primary (and only) write target -- retrying it would just repeat the
             # same failure. Report instead of silently double-writing.
-            return JSONResponse(
-                {"error": f"runtime persist failed: {e}", "updated": updated},
-                status_code=500,
-            )
+            persistence["runtime_yaml"] = "failed"
+            if persistence["credentials"] == "pending":
+                persistence["credentials"] = "not_attempted"
+            return JSONResponse(config_save_result(
+                updated, persistence,
+                activation_receipt(state="unconfirmed", reason="persistence_failed"),
+                error="runtime_persist_failed",
+            ), status_code=500)
 
     if body.get("persist_env", False):
-        if "OMBRE_API_KEY" not in env_updates:
+        if "dehydration" in body and "OMBRE_API_KEY" not in env_updates:
             current_dehydration_key = str(config.get("dehydration", {}).get("api_key") or "").strip()
             if current_dehydration_key:
                 env_updates["OMBRE_API_KEY"] = current_dehydration_key
@@ -13975,13 +13978,34 @@ async def api_config_update(request):
             if env_updated:
                 updated.extend(env_updated)
                 updated.append("persisted_to_env")
-        except Exception as e:
-            return JSONResponse(
-                {"error": f"env persist failed: {e}", "updated": updated},
-                status_code=500,
-            )
+            persistence["credentials"] = "saved" if env_updated else "not_needed"
+        except Exception:
+            persistence["credentials"] = "failed"
+            return JSONResponse(config_save_result(
+                updated, persistence,
+                activation_receipt(state="unconfirmed", reason="persistence_failed"),
+                error="credential_persist_failed",
+            ), status_code=500)
 
-    return JSONResponse({"updated": updated, "ok": True})
+    # Gateway reads the shared overlay when handling this request. Persist first.
+    embedding_fields = [field for field in updated if field.startswith("embedding.")]
+    embedding_persisted = bool(embedding_fields) and all(
+        persistence["credentials" if field == "embedding.api_key" else "runtime_yaml"] == "saved"
+        for field in embedding_fields
+    )
+    activation = await _hot_update_gateway_config(
+        gateway_hot_update_payload, embedding_fields=embedding_fields,
+        embedding_persisted=embedding_persisted,
+        embedding_expected={
+            "enabled": bool(config.get("embedding", {}).get("enabled", False)),
+            "model": config.get("embedding", {}).get("model") or getattr(embedding_engine, "model", ""),
+            "base_url": config.get("embedding", {}).get("base_url") or getattr(embedding_engine, "base_url", ""),
+            "dimensions": config.get("embedding", {}).get("dimensions"),
+        } if embedding_fields else None,
+    )
+    if activation["state"] == "confirmed":
+        updated.append("gateway_hot_reloaded")
+    return JSONResponse(config_save_result(updated, persistence, activation))
 
 
 @mcp.custom_route("/api/status", methods=["GET"])

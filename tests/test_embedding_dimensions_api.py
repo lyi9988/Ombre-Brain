@@ -59,8 +59,8 @@ def api(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "embedding_engine", engine)
     monkeypatch.setattr(server, "_require_dashboard_auth", lambda _request: None)
 
-    async def no_gateway_update(_payload):
-        return None
+    async def no_gateway_update(_payload, **kwargs):
+        return server.activation_receipt(state="not_configured", reason="gateway_admin_not_configured")
 
     monkeypatch.setattr(server, "_hot_update_gateway_config", no_gateway_update)
     return SimpleNamespace(

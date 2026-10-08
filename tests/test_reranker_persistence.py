@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from dotenv import dotenv_values
 from reranker_engine import RerankerEngine
+from config_activation import activation_receipt, config_save_result
 
 
 class Request:
@@ -40,8 +41,8 @@ def route(tmp_path, monkeypatch):
     for key in ("OMBRE_RERANKER_API_KEY", "KEEP_ME"):
         monkeypatch.setenv(key, "fixture-original")
 
-    async def no_gateway(_payload):
-        return None
+    async def no_gateway(_payload, **kwargs):
+        return activation_receipt(state="not_configured", reason="gateway_admin_not_configured")
 
     namespace = {
         "__file__": str(source),
@@ -53,6 +54,8 @@ def route(tmp_path, monkeypatch):
         "_require_dashboard_auth": lambda _: None,
         "_dashboard_env_path": lambda: str(env_path),
         "_hot_update_gateway_config": no_gateway,
+        "activation_receipt": activation_receipt,
+        "config_save_result": config_save_result,
     }
     module = ast.fix_missing_locations(ast.Module(body=definitions, type_ignores=[]))
     exec(compile(module, str(source), "exec"), namespace)
