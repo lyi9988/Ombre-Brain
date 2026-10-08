@@ -103,6 +103,7 @@ from memory_edges import MemoryEdgeStore
 from entity_edges import EntityEdgeStore
 from memory_moments import MemoryMomentStore, parse_bucket_moments, preview_bucket_moment_chunks
 from memory_authority_view import MemoryAuthorityRecallView
+from recall_rerank_window import admission_evidence, select_natural_window
 from memory_relevance import (
     active_facets,
     content_terms_for_query,
@@ -16674,7 +16675,7 @@ class GatewayService:
             if not recall_input.get("local_only") and recall_input.get("allow_rerank", True):
                 pool = await self._rerank_scored_bucket_candidates(
                     recall_input.get("q_context") or query, pool, diagnostics=rerank_debug,
-                    documents_override=documents,
+                    documents_override=documents, natural_window=True,
                 )
         except asyncio.CancelledError:
             rerank_cancelled = True
@@ -16692,6 +16693,7 @@ class GatewayService:
                 provider_http_status=rerank_debug.get("provider_http_status"),
                 provider_latency_ms=rerank_debug.get("provider_latency_ms"),
                 provider_model=rerank_debug.get("provider_model"),
+                window=rerank_debug.get("window"),
                 cancelled=rerank_cancelled, cache=rerank_debug.get("cache", {}),
             )
         if rerank_debug.get("provider_failed"):
@@ -16719,8 +16721,15 @@ class GatewayService:
             else:
                 suppressed.append(item)
         selected = self._pick_dynamic_cards(accepted, query=query)
-        self._record_candidate_stage(stages, "natural.admit_candidates", len(pool), len(accepted),
-                                     rejection_evidence=self._rejected_bucket_evidence(suppressed))
+        self._record_candidate_stage(
+            stages, "natural.admit_candidates", len(pool), len(accepted),
+            rejection_evidence=self._rejected_bucket_evidence(suppressed),
+            candidate_evidence=admission_evidence(
+                pool, accepted, selected,
+                semantic_threshold=self.recall_policy.semantic_threshold,
+                rerank_threshold=self.recall_policy.rerank_threshold,
+            ),
+        )
         debug["final_bucket_ids"] = [str(item["bucket"]["id"]) for item in selected]
         recall_input["selected_buckets"] = debug["final_bucket_ids"]
         buckets = [self._bucket_with_recall_signal(item) for item in selected]
@@ -21317,6 +21326,7 @@ class GatewayService:
         *,
         diagnostics: dict[str, Any] | None = None,
         documents_override: dict[str, str] | None = None,
+        natural_window: bool = False,
     ) -> list[dict]:
         enabled = bool(getattr(self.reranker_engine, "enabled", False))
         if not scored_candidates or not enabled:
@@ -21331,11 +21341,23 @@ class GatewayService:
             len(scored_candidates),
             max(1, int(getattr(self.reranker_engine, "candidate_limit", 20) or 20)),
         )
-        ranked_pool = sorted(
-            enumerate(scored_candidates),
-            key=lambda pair: self._bucket_rerank_candidate_priority(query, pair[1]),
-        )
-        head_indices = {index for index, _item in ranked_pool[:candidate_limit]}
+        if natural_window:
+            priorities = [self._bucket_rerank_candidate_priority(query, item)
+                          for item in scored_candidates]
+            head_indices, notes, window = select_natural_window(
+                scored_candidates, candidate_limit, priorities,
+            )
+            scored_candidates = [dict(item, _rerank_window=note)
+                                 for item, note in zip(scored_candidates, notes)]
+            if isinstance(diagnostics, dict):
+                diagnostics["window"] = window
+        else:
+            # Explicit/legacy routes retain their existing selection behavior.
+            ranked_pool = sorted(
+                enumerate(scored_candidates),
+                key=lambda pair: self._bucket_rerank_candidate_priority(query, pair[1]),
+            )
+            head_indices = {index for index, _item in ranked_pool[:candidate_limit]}
         head_pairs = [(index, scored_candidates[index]) for index in range(len(scored_candidates)) if index in head_indices]
         tail = [item for index, item in enumerate(scored_candidates) if index not in head_indices]
         head = [item for _index, item in head_pairs]
@@ -21358,6 +21380,11 @@ class GatewayService:
                 "provider_model",
             )})
         if not results:
+            if natural_window:
+                for item in head:
+                    item["_rerank_window"]["status"] = (
+                        "provider_failed" if cache_debug.get("provider_failed") else "no_score"
+                    )
             if isinstance(diagnostics, dict):
                 diagnostics.update({
                     "provider_output_count": 0,
@@ -21378,6 +21405,10 @@ class GatewayService:
         for index, item in enumerate(head):
             new_item = dict(item)
             rerank_score = by_index.get(index)
+            if natural_window:
+                new_item["_rerank_window"] = dict(
+                    item["_rerank_window"], status="scored" if rerank_score is not None else "no_score",
+                )
             if rerank_score is None:
                 new_item["rerank_score"] = None
                 new_item["combined_score"] = item["score"]

@@ -255,7 +255,7 @@ def _natural_finish_service(monkeypatch, buckets, candidates_by_query, *, manual
         candidates = candidates_by_query.get(query, candidates_by_query.get("*", []))
         return [dict(item) for item in candidates], []
 
-    async def rerank(_query, items, *, diagnostics=None, documents_override=None):
+    async def rerank(_query, items, *, diagnostics=None, documents_override=None, natural_window=False):
         calls["rerank"].append({
             "ids": [str(item["bucket"].get("id") or "") for item in items],
             "documents": dict(documents_override or {}),
@@ -926,7 +926,7 @@ def test_failed_final_rerank_marks_natural_recall_incomplete_without_lowering_ad
         stages.append({"stage": stage, "before": before, "after": after, **kwargs})
     )
 
-    async def failed_rerank(_query, items, *, diagnostics, documents_override):
+    async def failed_rerank(_query, items, *, diagnostics, documents_override, natural_window=False):
         calls["rerank"].append([item["bucket"]["id"] for item in items])
         diagnostics.update(provider_input_count=len(items), provider_output_count=0,
                            provider_status="error", provider_failed=True,
