@@ -13037,6 +13037,13 @@ async def api_config_update(request):
             env_updates["OMBRE_RERANKER_API_KEY"] = reranker_cfg["api_key"]
             reranker_gateway_payload["api_key"] = reranker_cfg["api_key"]
             updated.append("reranker.api_key")
+        elif body.get("persist_env", False) and reranker_cfg.get("api_key"):
+            # An earlier runtime-only Apply clears the password input on reload.
+            # A later explicit save of this section must persist its own current
+            # credential, not silently leave the Gateway's old named key behind.
+            # Never take an embedding/dehydration fallback from the engine here.
+            env_updates["OMBRE_RERANKER_API_KEY"] = str(reranker_cfg["api_key"])
+            updated.append("reranker.api_key_from_runtime")
         if "base_url" in r:
             os.environ["OMBRE_RERANKER_BASE_URL"] = reranker_cfg.get("base_url", "")
         if "model" in r:
