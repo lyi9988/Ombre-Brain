@@ -63,6 +63,9 @@ def minimal_service(tmp_path):
     db_path = str(tmp_path / "state" / "gateway_state.db")
     store = GatewayStateStore(db_path)
     item = GatewayService.__new__(GatewayService)
+    # Phase/snapshot tests do not construct provider configuration. Runtime
+    # overlay reload has its own integration suite; don't read a local .env.
+    item._maybe_reload_runtime_overlay = lambda: None
     item.state_store = store
     item.persona_engine = SimpleNamespace(profile_id="jiajia-main")
     item.reminder_store = SimpleNamespace(mark_reminded=lambda *a, **k: None)

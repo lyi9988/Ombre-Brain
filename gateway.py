@@ -58,6 +58,7 @@ from embedding_engine import EmbeddingEngine
 from favorite_tags import has_favorite_memory_tag, is_flavor_tag
 from identity import identity_names
 from gateway_state import GatewayStateStore
+from turn_clock import use_clock, clock_metadata, reference_now
 from model_request_trace import ModelRequestTraceStore
 from prompt_plan_mirror import (
     PromptPlanMirrorConflict,
@@ -4103,6 +4104,7 @@ class GatewayService:
             "prompt_plan_sha256": prompt_plan_sha256,
             "prompt_binding_revision": prompt_binding_revision,
             "prompt_scope_group": prompt_scope_group,
+            "turn_clock": clock_metadata(),
             "input_options_sha256": payload_options_sha,
             "include_favorite_memory": bool(include_favorite_memory),
             "include_debug": bool(include_debug),
@@ -4380,6 +4382,26 @@ class GatewayService:
         return forward_payload, list(injected_ids), debug
 
     async def prepare_payload(
+        self, payload: dict, session_id: str, *,
+        include_favorite_memory: bool = False, include_debug: bool = False,
+        debug_detail: str = "full", continuation_phase: bool = False,
+        prompt_plan: dict[str, Any] | None = None, request: Request | None = None,
+        snapshot_identity: dict[str, Any] | None = None,
+    ):
+        # Authentication/canonical origin validation precedes this boundary.
+        # Reset in finally even on timeout; concurrent turns cannot share clocks.
+        scope = (payload.get("_ombre_trace_context") or {}).get("runtime_scope", "chat")
+        with use_clock(request, enabled=scope == "chat") as clock:
+            result = await self._prepare_payload_with_clock(
+                payload, session_id, include_favorite_memory=include_favorite_memory,
+                include_debug=include_debug, debug_detail=debug_detail,
+                continuation_phase=continuation_phase, prompt_plan=prompt_plan,
+                request=request, snapshot_identity=snapshot_identity)
+            if include_debug and len(result) == 3:
+                result[2]["time_context"] = clock_metadata(result[0].get("messages") or [])
+            return result
+
+    async def _prepare_payload_with_clock(
         self,
         payload: dict,
         session_id: str,
@@ -5688,6 +5710,7 @@ class GatewayService:
                 # The exact physical payload remains in raw_requests; this
                 # metadata explains where request preparation spent time.
                 "prepare_timing_debug": debug.get("prepare_timing_debug") or {},
+                "time_context": debug.get("time_context") or {},
                 "recall_input": (debug.get("prepare_timing_debug") or {}).get("recall_input", {}),
                 "recall_status": (debug.get("prepare_timing_debug") or {}).get("recall_status", {}),
                 "query_views": (debug.get("prepare_timing_debug") or {}).get("query_views", []),
@@ -10611,7 +10634,7 @@ class GatewayService:
                 session_id=session_id,
                 channel=channel,
                 round_id=next_round,
-                now=datetime.now(self.gateway_tz),
+                now=reference_now(self.gateway_tz),
                 limit=self.active_reminder_inject_limit,
             )
         except Exception as exc:
@@ -11400,10 +11423,11 @@ class GatewayService:
         text = str(query or "").strip()
         if not text:
             return None
-        return parse_human_date_reference(text, now=datetime.now(self.gateway_tz), tz=self.gateway_tz)
+        now = reference_now(self.gateway_tz)
+        return parse_human_date_reference(text, now=now, tz=now.tzinfo)
 
     def _date_recall_range(self, date_key: str) -> tuple[datetime, datetime]:
-        target = datetime.fromisoformat(f"{date_key}T00:00:00").replace(tzinfo=self.gateway_tz)
+        target = datetime.fromisoformat(f"{date_key}T00:00:00").replace(tzinfo=reference_now(self.gateway_tz).tzinfo)
         return target, target + timedelta(days=1)
 
     def _date_recall_topic_terms(self, query: str) -> list[str]:
@@ -11689,12 +11713,12 @@ class GatewayService:
         text = str(query or "").strip()
         if not text:
             return None
-        now = datetime.now(self.gateway_tz)
+        now = reference_now(self.gateway_tz)
         explicit = re.search(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?", text)
         if explicit:
             year, month, day = (int(part) for part in explicit.groups())
             try:
-                target = datetime(year, month, day, tzinfo=self.gateway_tz).date()
+                target = datetime(year, month, day, tzinfo=now.tzinfo).date()
             except ValueError:
                 return None
             return {"date": target.isoformat(), "label": target.isoformat()}
