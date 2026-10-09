@@ -1630,6 +1630,11 @@ def _bucket_metadata(meta: dict, bucket: dict) -> dict:
             "bucket_mentioned_date": meta.get("mentioned_date"),
             "bucket_recorded_at": meta.get("recorded_at"),
             "bucket_narrative": meta.get("narrative"),
+            "bucket_narrative_stale": bool(
+                isinstance(meta.get("narrative"), dict) and meta["narrative"].get("body_sha256")
+                and hashlib.sha256(str(bucket.get("content") or "").replace("\r\n", "\n").replace("\r", "\n").strip().encode("utf-8")).hexdigest()
+                != meta["narrative"]["body_sha256"]
+            ),
             "bucket_source": meta.get("source"),
             "bucket_from_daily_chat": meta.get("from_daily_chat"),
             "bucket_created": meta.get("created"),

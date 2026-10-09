@@ -113,7 +113,10 @@ def build_chat_narrative(candidate: dict, turns: list[dict], identity: dict, tz,
 
 
 def chat_commit_metadata(candidate: dict, recorded_at: str) -> dict:
-    narrative = _mapping(candidate.get("narrative"))
+    narrative = dict(_mapping(candidate.get("narrative")))
+    if narrative.get("version") == CONTRACT_VERSION:
+        body = str(candidate.get("content") or candidate.get("proposed_memory") or "")
+        narrative["body_sha256"] = narrative_body_hash(body)
     event = _mapping(narrative.get("event_time"))
     event_day = iso_day(event.get("value")) if event.get("precision") == "day" else ""
     return {
@@ -121,6 +124,11 @@ def chat_commit_metadata(candidate: dict, recorded_at: str) -> dict:
         "mentioned_date": iso_day(candidate.get("date")),
         "recorded_at": recorded_at,
     }
+
+
+def narrative_body_hash(body: str) -> str:
+    text = str(body or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def memory_context_labels(bucket: dict | None = None, moment: dict | None = None) -> list[str]:
@@ -140,6 +148,13 @@ def memory_context_labels(bucket: dict | None = None, moment: dict | None = None
         }
     narrative = _mapping(meta.get("narrative"))
     labels = []
+    stale = bool(mm.get("bucket_narrative_stale")) if not bucket else (
+        bool(narrative.get("body_sha256")) and "content" in bucket and
+        narrative_body_hash(bucket["content"]) != narrative["body_sha256"])
+    if stale:
+        explicit_date = iso_day(meta.get("date"))
+        return ["[正文已修订；旧叙述归属与原文时间标注不适用]",
+                f"[记忆日期字段:{explicit_date}；与修订正文的对应关系待核对]" if explicit_date else "[事件日期:未知]"]
     if narrative.get("version") == CONTRACT_VERSION:
         narrator = _mapping(narrative.get("narrator"))
         name = _label(narrator.get("name"))
@@ -150,7 +165,11 @@ def memory_context_labels(bucket: dict | None = None, moment: dict | None = None
             labels.append("[正文经主人编辑；人称按正文明确归属]")
         event = _mapping(narrative.get("event_time"))
         event_day = iso_day(event.get("value")) if event.get("precision") == "day" else ""
-        if event_day:
+        explicit_date = iso_day(meta.get("date"))
+        date_overridden = "date" in meta and explicit_date != event_day
+        if date_overridden:
+            labels.append(f"[事件日期:{explicit_date}；记忆日期字段]" if explicit_date else "[事件日期:未知；日期字段已清空]")
+        elif event_day:
             labels.append(f"[事件日期:{event_day}；依据原文陈述]")
         elif event.get("basis") == "source_expression" and event.get("expression"):
             labels.append(f"[事件时间原话:{_label(event['expression'], 60)}]")
@@ -181,7 +200,7 @@ def memory_context_labels(bucket: dict | None = None, moment: dict | None = None
             labels.append(f"[聊天整理日期:{mentioned}]")
         return labels
 
-    event_day = iso_day(meta.get("event_date") or meta.get("date") or mm.get("bucket_date") or mm.get("date"))
+    event_day = iso_day(meta.get("date") or meta.get("event_date") or mm.get("bucket_date") or mm.get("date"))
     if event_day:
         return [f"[date:{event_day}]"]
     created = iso_day(meta.get("created") or mm.get("bucket_created") or moment.get("created_at"))

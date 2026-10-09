@@ -234,3 +234,26 @@ def test_crash_after_commit_reuses_record_clock_and_revision(tmp_path, monkeypat
     assert len(projection.revisions) == 1
     assert projection.revisions[0]["metadata"]["recorded_at"] == recorded
     assert instance.memory_authority_store.get_candidate(item["id"])["status"] == "committed"
+
+
+def test_owner_date_field_edit_and_clear_take_precedence():
+    item = {**candidate(), "date": "2026-10-08"}
+    item["narrative"] = build_chat_narrative(item, [turn()], IDENTITY, TZ, "2026-10-08")
+    meta = chat_commit_metadata(item, "2026-10-09")
+    meta["date"] = "2025-12-04"
+    assert "事件日期:2025-12-04" in " ".join(memory_context_labels({"metadata": meta}))
+    meta["date"] = None
+    labels = " ".join(memory_context_labels({"metadata": meta}))
+    assert "事件日期:未知" in labels and "2025-12-03" not in labels
+
+
+def test_body_revision_cannot_reuse_stale_narrator_or_event_time():
+    from memory_moments import parse_bucket_moments
+    item = {**candidate(), "date": "2026-10-08"}
+    item["narrative"] = build_chat_narrative(item, [turn()], IDENTITY, TZ, "2026-10-08")
+    meta = chat_commit_metadata(item, "2026-10-09")
+    bucket = {"id": "m1", "content": "改为其他作者的原文，不能套用旧的我。", "metadata": meta}
+    labels = " ".join(memory_context_labels(bucket))
+    assert "正文已修订" in labels and "叙述者:测试叙述者" not in labels
+    for moment in parse_bucket_moments(bucket):
+        assert "正文已修订" in " ".join(memory_context_labels(moment=moment))
