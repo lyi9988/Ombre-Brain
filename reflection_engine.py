@@ -5471,7 +5471,15 @@ class ReflectionEngine:
                 continue
 
             key = str(candidate.get("date") or datetime.now(self.tz).date().isoformat())
-            created_at = datetime.now(timezone.utc).astimezone(self.tz).isoformat(timespec="seconds")
+            commit_key = f"daily-chat:{candidate_id}:candidate-revision:{row.get('revision')}"
+            prior_commit = self.memory_authority_store.get_commit_by_idempotency(commit_key)
+            prior_payload = (prior_commit or {}).get("payload") or {}
+            prior_metadata = prior_payload.get("metadata") or {}
+            # A process may stop after prepare/commit but before the candidate
+            # receipt. Keep the original write clock and expected revision on
+            # replay; wall-clock changes must not change an idempotent payload.
+            created_at = str(prior_metadata.get("recorded_at") or prior_metadata.get("created") or
+                             datetime.now(timezone.utc).astimezone(self.tz).isoformat(timespec="seconds"))
             narrative_metadata = chat_commit_metadata(candidate, created_at)
             metadata = {
                 "tags": list(candidate.get("tags") or []),
@@ -5498,6 +5506,8 @@ class ReflectionEngine:
             existing_memory = self.memory_authority_store.get_memory(candidate_id)
             was_existing = existing_memory is not None
             expected_revision = int(existing_memory.get("active_revision") or 0) if existing_memory else 0
+            if prior_commit:
+                expected_revision = int(prior_payload["expected_revision"])
             try:
                 commit = await service.commit_memory(
                     memory_id=candidate_id,
@@ -5507,7 +5517,7 @@ class ReflectionEngine:
                     metadata=metadata,
                     source_refs=self._daily_chat_memory_source_refs(candidate),
                     decision_source=("owner" if mode == "review" else "auto"),
-                    idempotency_key=f"daily-chat:{candidate_id}:candidate-revision:{row.get('revision')}",
+                    idempotency_key=commit_key,
                     actor=("owner" if mode == "review" else "daily_chat_memory"),
                 )
                 self._commit_candidate_aliases_best_effort(

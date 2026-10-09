@@ -202,3 +202,35 @@ def test_brain_and_gateway_use_same_labels():
     from gateway import GatewayService
     bucket = {"metadata": {"source": "daily_chat_memory", "date": "2026-10-08"}}
     assert server._bucket_date_meta_parts(bucket) == GatewayService._bucket_date_meta_parts(None, bucket)
+
+
+def test_crash_after_commit_reuses_record_clock_and_revision(tmp_path, monkeypatch):
+    import reflection_engine as module
+    instance = engine(tmp_path, "auto")
+    projection = attach_fake_commit_service(instance)
+    item = normalize(instance, mode="auto")[0]
+    item["mode"] = "auto"
+    decide = instance.memory_authority_store.decide_candidate
+
+    def interrupted(candidate_id, **kwargs):
+        if kwargs["action"] == "commit":
+            raise SystemExit("simulated process exit before candidate receipt")
+        return decide(candidate_id, **kwargs)
+
+    monkeypatch.setattr(instance.memory_authority_store, "decide_candidate", interrupted)
+    with pytest.raises(SystemExit):
+        asyncio.run(instance._write_daily_chat_memory_candidates([item], object()))
+    recorded = projection.revisions[0]["metadata"]["recorded_at"]
+    monkeypatch.setattr(instance.memory_authority_store, "decide_candidate", decide)
+
+    class LaterClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2030, 1, 1, tzinfo=timezone.utc).astimezone(tz)
+
+    monkeypatch.setattr(module, "datetime", LaterClock)
+    result = asyncio.run(instance._write_daily_chat_memory_candidates([item], object()))
+    assert result["failed"] == 0 and result["exists"] == 1
+    assert len(projection.revisions) == 1
+    assert projection.revisions[0]["metadata"]["recorded_at"] == recorded
+    assert instance.memory_authority_store.get_candidate(item["id"])["status"] == "committed"
