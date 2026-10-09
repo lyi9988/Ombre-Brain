@@ -32,12 +32,13 @@ class FixedPromptSource:
 
 
 def _spec(source_id: str, scope: str, ref: str, *, render: str = "plain",
-          required: tuple[str, ...] = ()) -> FixedPromptSource:
+          required: tuple[str, ...] = (), revision: str = "factory-v1") -> FixedPromptSource:
     module, attribute = ref.split(":", 1)
     return FixedPromptSource(
         source_id=source_id, scope=scope, module=module,
         attribute=attribute, render_mode=render,
         required_placeholders=required,
+        source_revision=revision,
     )
 
 
@@ -73,9 +74,10 @@ FIXED_PROMPT_SOURCES = {
               "reflection_engine:DIARY_MEMORY_PROMPT_TEMPLATE", render="domain_identity"),
         _spec("ombre.daily_chat_memory_prompt", "memory.daily_chat_review",
               "reflection_engine:DAILY_CHAT_MEMORY_PROMPT_TEMPLATE",
-              render="domain_identity", required=("{max_candidates}",)),
+              render="domain_identity", required=("{max_candidates}",), revision="factory-chat-narrative-v1"),
         _spec("ombre.daily_chat_summary_prompt", "memory.daily_chat_review",
-              "reflection_engine:DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE", render="identity"),
+              "reflection_engine:DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE", render="identity",
+              revision="factory-chat-narrative-v1"),
         _spec("ombre.daily_activity_summary_prompt", "memory.daily_chat_review",
               "reflection_engine:DAILY_ACTIVITY_SUMMARY_PROMPT_TEMPLATE", render="identity"),
         _spec("ombre.domain_sentinel_prompt", "memory.domain_sentinel",

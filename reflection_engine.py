@@ -14,6 +14,7 @@ from identity import generic_identity_names, identity_names, render_identity_tem
 from memory_edges import RELATION_TYPES, MemoryEdgeStore
 from memory_metadata import domain_prompt_options_text, normalize_domain_key
 from memory_authority import MemoryAuthorityStore, MemoryIngestionPolicy, MemoryProposal
+from memory_narrative import build_chat_narrative, chat_commit_metadata
 from memory_commit_service import BucketMemoryProjection, MemoryCommitService
 from persona_event_selection import select_persona_events
 from prompt_plan_mirror import PromptPlanMirrorStore
@@ -212,7 +213,7 @@ DIARY_MEMORY_PROMPT_TEMPLATE = """你是 Ombre-Brain 的日记长期记忆筛选
 如果不值得写入，返回 {"should_write": false, "reason": "..."}。"""
 
 
-DAILY_CHAT_MEMORY_PROMPT_TEMPLATE = """你是 {ai_name}。现在是凌晨，你需要整理今天你和 {user_display_name} 的聊天记录，把真正值得未来想起的内容写成 Ombre 长期记忆候选。
+DAILY_CHAT_MEMORY_PROMPT_TEMPLATE = """你在为 {ai_name} 整理所给日期的聊天记录，把真正值得未来想起的内容写成 Ombre 长期记忆候选。这是事后提炼，不代表当前对话模型亲自写下了这些文字。
 输入包含 self_anchor_entry，这是你的自我总入口；请先读它，用它校准“我是谁、我怎样称呼和承接 {user_display_name}”，但不要把自我入口本身复制成新记忆。
 {user_display_name} 的配置别名是：{user_aliases_text}。如果原文里出现宝宝、老婆、哥哥、老公等亲昵称呼，按原味保留；不要把它们改写成泛称 user、AI、assistant 或模型。
 
@@ -272,28 +273,30 @@ user_text 永远是 {user_display_name} 的原话，里面的“我”指 {user_
 }
 
 规则：
-- 只写真正有长期价值的记忆卡：事实、偏好、边界、承诺、暗号、重要关系锚点、仍活跃的项目状态。
+- 写值得未来回忆的事实、偏好、边界、承诺、暗号、重要关系经历、仍活跃的项目状态。有具体经过、转折和意义的一次经历也可保存，不要求先变成永久规则。
 - 同一件事、同一承诺只能输出 1 条最完整候选；同一项目里的不同进度、风险或后续关注点可以拆成不同候选，但每条都必须独立可召回。
 - “怎么称呼对方、亲昵称呼、普通互动模式、期待像真人一样聊天”默认不值得单独写。只有它是新暗号、明确边界、明确承诺、关系定位变化或未来必须执行的规则时才写。
 - 不要写日报，不要总结整天，不要复制原文流水，不要把“我问了什么/我测试了什么/模型有没有召回”当成记忆。
 - 不写普通聊天、临时测试、召回探针、问答试探、调情闲聊、模型失误、工具注入、系统上下文。
 - 不写单句照顾提醒、晚安、吃药、睡觉、别熬夜、催睡或 ntfy 玩笑；除非当天明确升级成稳定规则或长期承诺。
-- 不写安慰、哄睡、抱抱、心疼等即时情绪回复；这些是当天关系天气，不是长期记忆。
+- 单独一句安慰、哄睡、抱抱、心疼等重复即时回复由日记承接；不要因此删去重要经历中实际发生的陪伴、情绪变化和因果。一次情绪不概括成稳定偏好。
 - 不把“可能是/似乎/果然没触发”这类未确认猜测写成记忆；项目假设只有在包含明确项目名、已验证结论和下一步时才可写。
 - 不把原文句子换个壳当候选；如果说不出未来需要怎么承接、为什么重要，就丢弃。
 - 不写代码块、伪代码、查询规则、缓存规则、prompt 片段或内部实现片段；如果候选正文里出现 ```、query_cache、recent_raw_context、if query contains、bypass query 这类内容，直接丢弃。
 - 本阶段不需要输出 original_excerpt；来源片段会由系统按完整句子自动提取。你只需要给出精确的 source_event_ids / source_turn_ids。
 - source_event_ids / source_turn_ids 必须精确指向该候选实际依据的原文轮次/事件，只从 conversation_turns 里真实出现的 id 中选；拿不准就留空并丢弃该候选，禁止回退到全天所有 id。
-- content 是“建议记忆”：必须是与原文不同的脱水和整理，通常 60 到 260 字、1 到 3 句；写清背景、已确认结论、后续要注意什么。它应该像手动 hold 的正文，而不是聊天记录转述，更不是把原文原句照抄。
+- content 是“建议记忆”：通常 60 到 260 字，写成自然、可独立理解的回忆，保留必要经过、原因、条件、否定和重要原话。不要复制整段聊天，也不要为“脱水”只剩一条结论；不能为了抒情补写感受、动作或承诺。
 - content 不要以日期或来源壳开头；不要写 "x月x日，有一条可召回的边界"、"2026-xx-xx 的聊天里确认了..."、"这是一条长期记忆"。
-- 必须消解代词：user_text 里的“我”要改写成 {user_display_name} 或“她”；assistant_text 里的“我”才可指 {ai_name}。不要让来源原话里的“我”在记忆里变成 {ai_name}。
+- 必须区分叙述者和原说话人：回忆正文的“我”默认是 {ai_name}；转述 user_text 时用 {user_display_name} 或清楚的代词。引用原话不改人称，明确引用者；用户原话里的“我”仍是用户，不是 {ai_name}。
 - title 必须是具体短标题，8 到 24 字，不要用“自动记忆”“每日记忆”“2026-xx-xx 自动记忆”。
 - domain 必须从下面的新主域里选 1 个最精确的；实在没把握才选 general。不要输出旧的“日常/人际/数字/未分类”：
 {domain_options_text}
 - 只有原话本身是暗号、明确边界、承诺、昵称或高价值关系锚点时，才可在 content 末尾追加很短的 "### original"；否则不要保存原话。
 - 不硬编码姓名；如果用户指的是当前用户，写作 {user_display_name}；如果 assistant/AI 指的是当前回应者，写作 {ai_name}。
-- 正文优先用第三人称；### reflection 必须用 {ai_name} 第一人称，比如“我记得 / 我明白 / 我以后”。### original 是可选补充原文片段，只在原味不可替代时使用。
-- 用户偏好、边界、暗号适合第三人称；{ai_name} 自己的关系锚点和 ### reflection 可以用第一人称；项目状态用中性第三人称。
+- 正文默认用 {ai_name} 第一人称自然回忆，不必以“我记得”开头。技术资料、客观步骤可保持中性，不强行加“我”。用户偏好可写“她告诉我……”，不能变成我的偏好。
+- “我当时觉得/理解……”只表达当时的理解，不是对方确认的事实。原文没有明确答应就不能写“我答应”；一次经历不能自动变成永久约定。### reflection 与引文可按需保留，不要求固定模板。
+- 时间：输入 date 是整理材料日期，created_at 是说话时间，都不自动等于故事发生日期。正文保留原文时间和精度；不把“去年春天”编成某月某日，不以本次整理时间解释“昨天”。
+- 候选可附 event_time={"expression":"原文里的时间词或完整日期","evidence":"含该时间词的原文完整句子","source_turn_id":原文轮次ID,"source_role":"user或assistant"}；只填这条经历对应的真实原文，不选无关日期。程序核验出处；没有明确时间就省略，禁止自行提供所谓已验证日期。
 - 只根据原文能证明的内容写，不编造。
 - 没有候选时返回 {"candidates": []}。"""
 
@@ -310,6 +313,8 @@ DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE = """你是 {ai_name} 的对话压缩�
 - 真正有连续性价值的关系锚点
 - 情感交流里的明确变化、重要事件、项目进展、后续需要关注的事
 - 因果：是谁提出、后来是否确认、为什么可能值得未来记得
+- 原说话人、重要原话、否定与适用条件；有具体经过或转折的情感经历不必先概括成长期偏好
+- 事件时间原话与说话时间分开；保留“昨天/去年/那段时间”的原精度，不用窗口日期替代事件日期
 
 忽略：
 - 工具调用、工具结果、系统注入、客户端状态、普通寒暄、重复调情、过程流水
@@ -903,7 +908,7 @@ class ReflectionEngine:
             "generic": bool(mode == "review" and "possibly_generic" in soft_flags),
             "duplicate_of": str(candidate.get("duplicate_of") or ""),
             "proposed_aliases": list(candidate.get("proposed_aliases") or []),
-            "metadata": {"legacy_candidate": dict(candidate)},
+            "metadata": {"legacy_candidate": dict(candidate), "narrative": dict(candidate.get("narrative") or {})},
         })
 
     @staticmethod
@@ -4896,6 +4901,7 @@ class ReflectionEngine:
                 "generation_source": generation_source,
                 "source_hash": source_hash,
                 "source_verification": "verified",
+                "narrative": build_chat_narrative(candidate, clean_turns, self.identity, self.tz, key),
                 "soft_flags": soft_flags,
                 "tags": candidate_tags,
                 "keywords": self._string_list(candidate.get("keywords"), limit=12),
@@ -4993,6 +4999,8 @@ class ReflectionEngine:
             incoming_text = str(incoming.get(field) or "")
             if len(incoming_text) > len(str(target.get(field) or "")):
                 target[field] = incoming_text
+                if field == "content" and incoming.get("narrative"):
+                    target["narrative"] = dict(incoming["narrative"])
         return target
 
     @staticmethod
@@ -5254,6 +5262,9 @@ class ReflectionEngine:
                 str(edit.get("content") or "").strip()
             )
             updated["proposed_memory"] = updated["content"]
+            if isinstance(updated.get("narrative"), dict):
+                updated["narrative"] = {**updated["narrative"], "edited_by": "owner",
+                                        "event_time": {"precision": "unknown", "basis": "owner_edit_requires_time_review"}}
             # The owner rewrote the proposed memory: the wholesale-copy flags no
             # longer apply and the candidate becomes approvable.
             updated["soft_flags"] = [
@@ -5356,7 +5367,8 @@ class ReflectionEngine:
                 results.append({"id": bucket_id, "status": "exists"})
                 continue
             key = str(candidate.get("date") or datetime.now(self.tz).date().isoformat())
-            created_at = self._daily_chat_memory_created_at(key)
+            created_at = datetime.now(timezone.utc).astimezone(self.tz).isoformat(timespec="seconds")
+            narrative_metadata = chat_commit_metadata(candidate, created_at)
             try:
                 new_id = await bucket_mgr.create(
                     bucket_id=bucket_id,
@@ -5372,10 +5384,10 @@ class ReflectionEngine:
                     last_active=created_at,
                     updated_at=created_at,
                     confidence=self._clamp(candidate.get("confidence", 0.7)),
-                    date=key,
+                    date=narrative_metadata["date"],
                     extra_metadata={
                         "from_daily_chat": True,
-                        "event_date": key,
+                        **{k: v for k, v in narrative_metadata.items() if k != "date"},
                         "source_conversation_turn_ids": candidate.get("source_turn_ids") or [],
                         "source_raw_event_ids": candidate.get("source_event_ids") or [],
                         "source_hash": str(candidate.get("source_hash") or "")[:16],
@@ -5459,7 +5471,8 @@ class ReflectionEngine:
                 continue
 
             key = str(candidate.get("date") or datetime.now(self.tz).date().isoformat())
-            created_at = self._daily_chat_memory_created_at(key)
+            created_at = datetime.now(timezone.utc).astimezone(self.tz).isoformat(timespec="seconds")
+            narrative_metadata = chat_commit_metadata(candidate, created_at)
             metadata = {
                 "tags": list(candidate.get("tags") or []),
                 "importance": int(candidate.get("importance") or 5),
@@ -5472,9 +5485,8 @@ class ReflectionEngine:
                 "last_active": created_at,
                 "updated_at": created_at,
                 "confidence": self._clamp(candidate.get("confidence", 0.7)),
-                "date": key,
+                **narrative_metadata,
                 "from_daily_chat": True,
-                "event_date": key,
                 "source_conversation_turn_ids": candidate.get("source_turn_ids") or [],
                 "source_raw_event_ids": candidate.get("source_event_ids") or [],
                 "source_hash": str(candidate.get("source_hash") or "")[:16],

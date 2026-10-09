@@ -103,6 +103,7 @@ from memory_edges import MemoryEdgeStore
 from entity_edges import EntityEdgeStore
 from memory_moments import MemoryMomentStore, parse_bucket_moments, preview_bucket_moment_chunks
 from memory_authority_view import MemoryAuthorityRecallView
+from memory_narrative import memory_context_labels
 from recall_rerank_window import admission_evidence, select_natural_window
 from memory_relevance import (
     active_facets,
@@ -14653,23 +14654,7 @@ class GatewayService:
         return match.group(0) if match else text[:10]
 
     def _bucket_date_meta_parts(self, bucket: dict | None = None, moment: dict | None = None) -> list[str]:
-        bucket = bucket or {}
-        moment = moment or {}
-        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-        moment_meta = moment.get("metadata", {}) if isinstance(moment.get("metadata"), dict) else {}
-        event_date = self._date_yyyy_mm_dd(
-            meta.get("date")
-            or moment_meta.get("bucket_date")
-            or moment_meta.get("date")
-        )
-        if event_date:
-            return [f"[date:{event_date}]"]
-        created = self._date_yyyy_mm_dd(
-            meta.get("created")
-            or moment_meta.get("bucket_created")
-            or moment.get("created_at")
-        )
-        return [f"[created:{created}]"] if created else []
+        return memory_context_labels(bucket, moment)
 
     def _direct_bucket_header(self, bucket: dict, moment: dict) -> str:
         bucket_id = str(bucket.get("id") or moment.get("bucket_id") or "")

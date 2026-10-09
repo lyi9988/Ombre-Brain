@@ -117,6 +117,7 @@ from memory_layers import (
 )
 from memory_authority import MemoryAuthorityStore, MemoryProposal, PolicyDecision
 from memory_commit_service import BucketMemoryProjection, MemoryCommitService
+from memory_narrative import memory_context_labels
 from memory_projection_worker import MemoryProjectionWorker
 from memory_embedding_jobs import MemoryEmbeddingJobs, EmbeddingJobError
 from memory_index_lease import MemoryIndexLease
@@ -5304,23 +5305,7 @@ def _date_yyyy_mm_dd(value) -> str:
 
 
 def _bucket_date_meta_parts(bucket: dict | None = None, moment: dict | None = None) -> list[str]:
-    bucket = bucket or {}
-    moment = moment or {}
-    meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-    moment_meta = moment.get("metadata", {}) if isinstance(moment.get("metadata"), dict) else {}
-    event_date = _date_yyyy_mm_dd(
-        meta.get("date")
-        or moment_meta.get("bucket_date")
-        or moment_meta.get("date")
-    )
-    if event_date:
-        return [f"[date:{event_date}]"]
-    created = _date_yyyy_mm_dd(
-        meta.get("created")
-        or moment_meta.get("bucket_created")
-        or moment.get("created_at")
-    )
-    return [f"[created:{created}]"] if created else []
+    return memory_context_labels(bucket, moment)
 
 
 def _direct_bucket_header(bucket: dict, moment: dict) -> str:
