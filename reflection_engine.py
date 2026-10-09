@@ -3265,7 +3265,8 @@ class ReflectionEngine:
         if candidate:
             has_excerpt = bool(str(candidate.get("original_excerpt") or "").strip())
             verified = str(candidate.get("source_verification") or "").strip() == "verified"
-            has_source = bool(candidate.get("source_turn_ids") or candidate.get("source_event_ids"))
+            has_source = bool(candidate.get("source_turn_ids") or candidate.get("source_event_ids") or
+                              candidate.get("source_canonical_event_ids"))
             excerpt = str(candidate.get("original_excerpt") or "")
             proposed = str(candidate.get("proposed_memory") or candidate.get("content") or "")
             has_proposed = bool(proposed.strip())
@@ -3317,6 +3318,23 @@ class ReflectionEngine:
         rid = str(candidate_id or "").strip()
         if not rid:
             return {"status": "missing"}
+        row = self.memory_authority_store.get_candidate(rid) if self.memory_authority_store else None
+        if row and row.get("proposal", {}).get("source_type") == "chat_tool":
+            safe_offset, safe_limit = max(0, int(offset or 0)), max(256, min(20000, int(limit or 4000)))
+            sources = row["proposal"].get("metadata", {}).get("runtime_context", {}).get("sources", [])
+            events = []
+            for source in sources:
+                if source_id and source["event_id"] != str(source_id):
+                    continue
+                text = self._daily_chat_memory_owner_text(source["text"])
+                end = min(safe_offset + safe_limit, len(text))
+                events.append({"id": source["event_id"], "role": source["role"],
+                               "version_id": source["version_id"], "created_at": source["created_at"],
+                               "text": text[safe_offset:end], "full_length": len(text),
+                               "truncated": end < len(text), "continue_after": end if end < len(text) else -1})
+            return {"status": "ok", "candidate_id": rid, "source_authority": "aizizhu_canonical_snapshot",
+                    "offset": safe_offset, "limit": safe_limit, "events": events, "turns": [],
+                    "missing_event_ids": [source_id] if source_id and not events else [], "missing_turn_ids": []}
         item = next(
             (
                 candidate_item
@@ -3674,6 +3692,13 @@ class ReflectionEngine:
                 results.append({"id": candidate_id, "status": decided.get("status")})
                 continue
 
+            if row.get("proposal", {}).get("source_type") == "chat_tool":
+                from chat_memory_tool import ChatMemoryTool
+                candidate_result = await ChatMemoryTool(self, bucket_mgr).confirm(
+                    row, edit=safe_edits.get(candidate_id), request_id=f"{rid}:{candidate_id}")
+                created += int(candidate_result.get("status") == "created")
+                results.append(candidate_result)
+                continue
             candidate = self._apply_daily_chat_memory_candidate_edit(
                 candidate,
                 safe_edits.get(candidate_id),

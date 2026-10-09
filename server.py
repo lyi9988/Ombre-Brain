@@ -12281,6 +12281,42 @@ async def api_memory_authority_overview(request):
     })
 
 
+@mcp.custom_route("/api/memory-authority/chat-tool", methods=["POST"])
+@mcp.custom_route("/api/memory-authority/chat-tool/{operation_id}", methods=["GET"])
+async def api_chat_memory_tool(request):
+    """Internal Aiz ToolOperation transport; no provider call or second store."""
+    import json
+    from starlette.responses import JSONResponse
+    from chat_memory_tool import ChatMemoryTool, ChatMemoryValidationError, candidate_id, receipt
+    from memory_authority import IdempotencyConflict
+    headers = {"Cache-Control": "no-store"}
+    if not _authorized_memory_write(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401, headers=headers)
+    if (reflection_engine is None or memory_authority_store is None or
+            not reflection_engine.memory_authority_enabled or reflection_engine.memory_ingestion_policy is None):
+        return JSONResponse({"error": "memory_authority_unavailable"}, status_code=503, headers=headers)
+    try:
+        if request.method == "GET":
+            result = receipt(memory_authority_store, candidate_id(request.path_params["operation_id"]))
+        else:
+            raw = await request.body()
+            if len(raw) > 400000:
+                return JSONResponse({"error": "request_too_large"}, status_code=413, headers=headers)
+            try:
+                payload = json.loads(raw)
+            except (ValueError, UnicodeError):
+                raise ChatMemoryValidationError("invalid_json") from None
+            result = await ChatMemoryTool(reflection_engine, bucket_mgr).submit(payload)
+        return JSONResponse(result, headers=headers)
+    except IdempotencyConflict:
+        return JSONResponse({"error": "idempotency_conflict"}, status_code=409, headers=headers)
+    except ChatMemoryValidationError:
+        return JSONResponse({"error": "invalid_chat_memory_request"}, status_code=400, headers=headers)
+    except Exception as exc:
+        logger.warning("Chat Memory operation incomplete: %s", type(exc).__name__)
+        return JSONResponse({"error": "execution_outcome_unknown"}, status_code=503, headers=headers)
+
+
 @mcp.custom_route("/api/memory-authority/memories", methods=["GET"])
 async def api_memory_authority_memories(request):
     """Owner-only active/revisioned Memory list; body is opt-in."""

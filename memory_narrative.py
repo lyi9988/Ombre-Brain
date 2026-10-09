@@ -160,7 +160,8 @@ def memory_context_labels(bucket: dict | None = None, moment: dict | None = None
         name = _label(narrator.get("name"))
         if name and narrative.get("edited_by") != "owner":
             labels.append(f"[叙述者:{name}；正文的我指叙述者，引文按原说话人]")
-        labels.append("[来源:双方聊天的事后整理]")
+        labels.append("[来源:聊天模型当场写下的回忆；非主人逐项确认]" if narrative.get("generation_kind") == "chat_authored"
+                      else "[来源:双方聊天的事后整理]")
         if narrative.get("edited_by") == "owner":
             labels.append("[正文经主人编辑；人称按正文明确归属]")
         event = _mapping(narrative.get("event_time"))
