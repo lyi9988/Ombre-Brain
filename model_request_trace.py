@@ -540,6 +540,44 @@ class ModelRequestTraceStore:
                  and item["payload"].get("logical_request_id")),
                 f"{logical['request_id']}:model:{int(logical['request_ordinal'] or 1)}",
             )
+        # The trace metadata is the latest snapshot, not the first preparation.
+        # Derive immutable per-prepare timing from persisted events, including
+        # old traces. Do not copy debug prompt outlines into this projection.
+        preparations = []
+        active_prepare = None
+        prepare_ordinal = 0
+        for event in event_items:
+            payload = event.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            if event.get("type") == "request.started":
+                active_prepare = None
+                prepare_ordinal += 1
+                event_metadata = payload.get("metadata")
+                event_metadata = event_metadata if isinstance(event_metadata, dict) else {}
+                timing = event_metadata.get("prepare_timing_debug")
+                if isinstance(timing, dict):
+                    snapshot = timing.get("prepare_snapshot_cache")
+                    snapshot = snapshot if isinstance(snapshot, dict) else {}
+                    steps = timing.get("steps_ms")
+                    steps = steps if isinstance(steps, dict) else {}
+                    def duration(value):
+                        return value if (isinstance(value, (int, float))
+                                         and not isinstance(value, bool)
+                                         and 0 <= value < float("inf")) else None
+                    active_prepare = {
+                        "prepare_ordinal": prepare_ordinal,
+                        "created_at_ms": event["created_at_ms"],
+                        "total_ms": duration(timing.get("total_ms")),
+                        "steps_ms": {k: v for k, v in steps.items() if duration(v) is not None},
+                        "snapshot_status": (snapshot.get("status")
+                                            if snapshot.get("status") in ("hit", "miss", "bypass", "disabled") else None),
+                        "attempt_ids": [],
+                    }
+                    preparations.append(active_prepare)
+            elif event.get("type") == "attempt" and active_prepare is not None:
+                attempt_id = payload.get("attempt_id")
+                if attempt_id and attempt_id not in active_prepare["attempt_ids"]:
+                    active_prepare["attempt_ids"].append(attempt_id)
         result = {"trace_id": trace_id, "conversation_id": logical["conversation_id"],
                   "turn_id": logical["turn_id"], "request_id": logical["request_id"],
                   "logical_request_id": logical_request_id,
@@ -551,7 +589,7 @@ class ModelRequestTraceStore:
                   "attempts": [self._public(row, include_raw=include_raw,
                                              reasoning_visibility=settings["body_visibility"])
                                for row in attempts],
-                  "events": event_items,
+                  "events": event_items, "preparations": preparations,
                   "view": view, "settings_revision": settings["revision_no"]}
         if view == "resolved":
             result["resolved"] = metadata.get("resolved") or metadata
