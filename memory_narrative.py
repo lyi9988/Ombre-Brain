@@ -119,11 +119,16 @@ def chat_commit_metadata(candidate: dict, recorded_at: str) -> dict:
         narrative["body_sha256"] = narrative_body_hash(body)
     event = _mapping(narrative.get("event_time"))
     event_day = iso_day(event.get("value")) if event.get("precision") == "day" else ""
-    return {
+    metadata = {
         "narrative": narrative, "date": event_day or None, "event_date": event_day or None,
         "mentioned_date": iso_day(candidate.get("date")),
         "recorded_at": recorded_at,
     }
+    if isinstance(candidate.get("semantic_annotations"), dict):
+        from memory_semantics import guard_metadata
+        metadata["semantic_annotations"] = candidate["semantic_annotations"]
+        metadata = guard_metadata(metadata, str(candidate.get("content") or candidate.get("proposed_memory") or ""))
+    return metadata
 
 
 def narrative_body_hash(body: str) -> str:

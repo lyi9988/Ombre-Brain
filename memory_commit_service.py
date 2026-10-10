@@ -290,6 +290,8 @@ class MemoryCommitService:
         recall_policy: str = "enabled",
     ) -> dict[str, Any]:
         canonical_body = canonical_memory_body(body)
+        from memory_semantics import guard_metadata
+        metadata = guard_metadata(dict(metadata or {}), canonical_body)
         expected_hash = body_sha256(canonical_body)
         next_revision = int(expected_revision) + 1
         if isinstance(self.projection, BucketMemoryProjection):

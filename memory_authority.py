@@ -93,6 +93,7 @@ class MemoryProposal:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "MemoryProposal":
+        from memory_semantics import guard_metadata
         source_refs = payload.get("source_refs") or payload.get("source_event_ids") or []
         if isinstance(source_refs, str):
             source_refs = [source_refs]
@@ -115,15 +116,18 @@ class MemoryProposal:
             duplicate_of=str(payload.get("duplicate_of") or "").strip(),
             proposed_entities=tuple(item for item in entities if isinstance(item, Mapping)),
             proposed_aliases=tuple(item for item in aliases if isinstance(item, Mapping)),
-            metadata=dict(payload.get("metadata") or {}),
+            metadata=guard_metadata(dict(payload.get("metadata") or {}),
+                str(payload.get("proposed_body") or payload.get("proposed_memory") or payload.get("content") or "").strip()),
         )
 
     def payload(self) -> dict[str, Any]:
+        from memory_semantics import guard_metadata
         data = asdict(self)
         data["source_refs"] = list(self.source_refs)
         data["proposed_entities"] = [dict(item) for item in self.proposed_entities]
         data["proposed_aliases"] = [dict(item) for item in self.proposed_aliases]
-        data["metadata"] = dict(self.metadata)
+        # Direct dataclass construction and owner edits share the same guard.
+        data["metadata"] = guard_metadata(dict(self.metadata), self.proposed_body)
         return data
 
 
@@ -279,6 +283,14 @@ class MemoryAuthorityStore:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(candidate_id) REFERENCES candidates(candidate_id)
             );
+            CREATE TABLE IF NOT EXISTS candidate_source_index (
+                source_key TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                PRIMARY KEY(source_key, candidate_id),
+                FOREIGN KEY(candidate_id) REFERENCES candidates(candidate_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_candidate_source_owner
+                ON candidate_source_index(candidate_id);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_decision_request
                 ON candidate_decisions(request_id) WHERE request_id != '';
             CREATE TABLE IF NOT EXISTS candidate_revisions (
@@ -471,6 +483,7 @@ class MemoryAuthorityStore:
                 "created_at": now,
                 "updated_at": now,
             }
+            self._index_candidate_sources(conn, proposal_payload)
             conn.execute(
                 "INSERT INTO candidate_revisions(candidate_id,revision,status,proposal_sha256,proposal_json,"
                 "policy_json,actor,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -497,6 +510,38 @@ class MemoryAuthorityStore:
         row = conn.execute("SELECT * FROM candidates WHERE candidate_id=?", (str(candidate_id),)).fetchone()
         conn.close()
         return self._candidate_row(row)
+
+    @staticmethod
+    def _index_candidate_sources(conn, proposal: dict) -> None:
+        """Derived references only, in the same transaction as the proposal.
+
+        No startup backfill or read-time migration of historical records.
+        """
+        from memory_semantics import source_keys
+        candidate_id = proposal["proposal_id"]
+        conn.execute("DELETE FROM candidate_source_index WHERE candidate_id=?", (candidate_id,))
+        conn.executemany("INSERT INTO candidate_source_index(source_key,candidate_id) VALUES(?,?)",
+                         [(key, candidate_id) for key in source_keys(proposal)])
+
+    def find_candidates_by_sources(self, keys: Sequence[str], *, limit: int = 12) -> list[dict]:
+        """Bounded source-index lookup; never a scan of all Memory bodies."""
+        safe_keys = list(dict.fromkeys(k for k in keys if isinstance(k, str) and len(k) == 64))[:80]
+        if not safe_keys:
+            return []
+        conn = self._connect()
+        try:
+            slots = ",".join("?" for _ in safe_keys)
+            rows = conn.execute(
+                f"SELECT DISTINCT c.* FROM candidate_source_index i JOIN candidates c ON c.candidate_id=i.candidate_id "
+                "LEFT JOIN memories m ON m.memory_id=c.candidate_id "
+                f"WHERE i.source_key IN ({slots}) AND "
+                "(c.status!='committed' OR (m.state='active' AND m.recall_policy!='disabled' AND "
+                "m.body_sha256=json_extract(c.proposal_json,'$.metadata.semantic_annotations.body_sha256'))) "
+                "ORDER BY c.created_at DESC,c.candidate_id LIMIT ?", [*safe_keys, max(1, min(24, int(limit)))],
+            ).fetchall()
+            return [self._candidate_row(row) for row in rows]
+        finally:
+            conn.close()
 
     def get_candidate_decision(self, request_id: str) -> dict[str, Any] | None:
         """Read an idempotent edit receipt; never reapply an owner operation."""
@@ -532,6 +577,8 @@ class MemoryAuthorityStore:
         request_id: str,
         actor: str,
     ) -> dict[str, Any]:
+        if proposal.proposal_id != candidate_id:
+            raise ValueError("candidate identity cannot change during revision")
         payload = {
             "candidate_id": candidate_id,
             "expected_revision": int(expected_revision),
@@ -573,6 +620,7 @@ class MemoryAuthorityStore:
                 "UPDATE candidates SET revision=?,proposal_sha256=?,proposal_json=?,updated_at=? WHERE candidate_id=?",
                 (next_revision, proposal_sha, _json(proposal_payload), now, candidate_id),
             )
+            self._index_candidate_sources(conn, proposal_payload)
             conn.execute(
                 "INSERT INTO candidate_revisions(candidate_id,revision,status,proposal_sha256,proposal_json,"
                 "policy_json,actor,created_at) VALUES(?,?,?,?,?,?,?,?)",

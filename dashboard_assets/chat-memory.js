@@ -35,6 +35,13 @@
         revision: prior ? prior.revision : Number(card.getAttribute('data-revision')),
         expanded: card.getAttribute('data-editing') === 'true' });
     } else memoryDrafts.delete(id);
+    var semanticPanel = card.querySelector('.chat-memory-semantics');
+    if (semanticPanel) {
+      var wasOpen = Boolean(semanticPanel.querySelector('details[open]'));
+      semanticPanel.innerHTML = renderMemorySemantics(item, memoryDrafts.get(id));
+      var details = semanticPanel.querySelector('details');
+      if (details && wasOpen) details.open = true;
+    }
   }
 
   function captureMemoryDrafts() {
@@ -347,7 +354,7 @@
         '<div class="chat-memory-source-panel" hidden>' +
           '<div class="chat-memory-source-loading">读取完整原文...</div>' +
         '</div>' +
-        staleNote + blockedNote + editNote +
+        '<div class="chat-memory-semantics">' + renderMemorySemantics(item, draft) + '</div>' + staleNote + blockedNote + editNote +
         (draft ? '<p class="chat-memory-edit-needed">有未保存修改' + (item.draft_orphan || revision !== item.authority_revision ? '；服务器版本或状态已变化，请核对后再操作' : '') + '。</p>' : '') +
         '<div class="chat-memory-edit-panel"' + (draft && draft.expanded ? '' : ' hidden') + '>' +
           '<label class="chat-memory-edit-field">标题' +
@@ -397,6 +404,44 @@
           '<button type="button" class="danger" onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'reject\')">拒绝</button>' +
         '</div>' +
       '</div>';
+  }
+
+  function renderMemorySemantics(item, draft) {
+    var stored = (item.candidate || {}).semantic_annotations;
+    if (!stored || stored.version !== 'memory-semantics-v1') return '';
+    var summary = (item.display || {}).semantics || {};
+    if (summary.state !== 'current' || (draft && draft.edits && Object.prototype.hasOwnProperty.call(draft.edits, 'content'))) {
+      return '<p class="chat-memory-edit-needed">正文已改变：旧语义标注待复核，不继续作为当前标注使用。</p>';
+    }
+    var kinds = { preference: '偏好', boundary: '边界', commitment: '承诺', shared_experience: '共同经历', key_event: '重要事件', reflection: '理解与感想', project_state: '项目状态', identity: '身份提议' };
+    var bases = { owner_statement: '主人原话', assistant_commitment: '顾衍的承诺原话', shared_experience: '经历陈述', assistant_interpretation: '顾衍当时的理解' };
+    var states = { stated: '当时陈述', changed: '当时表达了变化', cancelled: '当时表达了取消', fulfilled: '当时表达了完成', uncertain: '不确定' };
+    var qualifiers = { topic: '主题', value: '取值／对象', conditions: '适用条件', exceptions: '例外', valid_time: '适用时间原话' };
+    var rows = (Array.isArray(stored.items) ? stored.items : []).filter(function (a) { return a && typeof a === 'object'; }).slice(0, 8).map(function (annotation) {
+      var role = (annotation.subject_ref || {}).role;
+      var subject = role === 'user' ? '主人' : (role === 'assistant' ? '顾衍' : '主体待核');
+      var parts = [subject + '的' + (kinds[annotation.semantic_kind] || '语义标注'), bases[annotation.assertion_basis] || '证据待核', states[annotation.assertion_state] || '当时陈述'];
+      Object.keys(qualifiers).forEach(function (key) {
+        var value = (annotation.qualifiers || {})[key];
+        if (value) parts.push(qualifiers[key] + '：' + value);
+      });
+      if (annotation.conditions_status === 'not_stated') parts.push('条件未说明，不代表永久或无条件');
+      var evidence = (annotation.evidence_refs || [])[0] || {};
+      if (evidence.event_id) parts.push((evidence.namespace === 'canonical_event' ? 'canonical 消息 ' : '原始来源 ') + evidence.event_id + (evidence.version_id ? '／' + evidence.version_id : ''));
+      return '<li>' + esc(parts.join(' · ')) + '</li>';
+    }).join('');
+    var links = (Array.isArray(stored.links) ? stored.links : []).filter(function (l) { return l && typeof l === 'object'; }).slice(0, 12).map(function (link) {
+      return '<li>' + esc('与 ' + link.target_candidate_id + ' 有共同来源；关联时状态 ' + link.target_status_at_link + '。不代表同一事实，未覆盖正文。') + '</li>';
+    }).join('');
+    var unresolved = Number(summary.unresolved_count || 0);
+    var coverage = Array.isArray(stored.source_coverage) ? stored.source_coverage : [];
+    var bridged = coverage.filter(function (s) { return s && s.bridge_status === 'exact_runtime_bridge'; }).length;
+    return '<details class="chat-memory-excerpt-details"><summary>语义与来源：' + Number(summary.annotation_count || 0) + ' 项标注 · ' + Number(summary.source_link_count || 0) + ' 个同源关联</summary>' +
+      '<p>引文位置已核对不等于事实已确认；这些标注不会创建任务，也不能证明任务当前已完成。</p>' +
+      (rows ? '<ul>' + rows + '</ul>' : '<p>未附语义标注，仍可按原规则审核记忆。</p>') +
+      (links ? '<ul>' + links + '</ul>' : '<p>尚无可证明的同源关联；不按相似文字合并。</p>') +
+      (bridged ? '<p>' + bridged + ' 条来源已按消息身份、版本和完整内容校验值跨入口对应。</p>' : '') +
+      (unresolved ? '<p>' + unresolved + ' 项标注未通过原句／说话人核对，未作为有效标注保存。</p>' : '') + '</details>';
   }
 
   function renderDailyChatMemorySourcePanel(data) {

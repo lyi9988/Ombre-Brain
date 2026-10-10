@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from memory_authority import MemoryProposal, IdempotencyConflict
 from memory_narrative import build_chat_narrative, chat_commit_metadata
 from memory_commit_service import ProjectionNotApplied
+from memory_source_provenance import canonical_source
+from memory_semantics import build_annotations, attach_source_links, owner_semantic_summary
 
 
 KINDS = {"preference", "boundary", "commitment", "shared_experience", "key_event",
@@ -39,7 +41,9 @@ def receipt(store, memory_id):
             "memory_id": memory_id if state == "committed" else None,
             "memory_status": state, "revision": row["revision"],
             "body_preserved": not bool(row["proposal"].get("metadata", {}).get("narrative", {}).get("edited_by")),
-            "recall_guaranteed": False}
+            "recall_guaranteed": False,
+            "semantics": owner_semantic_summary(row["proposal"].get("metadata") or {},
+                                                 row["proposal"].get("proposed_body") or "")}
 
 
 class ChatMemoryTool:
@@ -52,7 +56,7 @@ class ChatMemoryTool:
             raise ValueError("invalid_envelope")
         memory_id = candidate_id(envelope["operation_id"])
         args, context = envelope["arguments"], envelope["context"]
-        if not isinstance(args, dict) or set(args) - {"content", "title", "kind", "confidence", "sensitive", "event_time"}:
+        if not isinstance(args, dict) or set(args) - {"content", "title", "kind", "confidence", "sensitive", "event_time", "annotations"}:
             raise ValueError("invalid_arguments")
         if not isinstance(context, dict) or set(context) != {"conversation_id", "request_id", "turn_id", "sources"}:
             raise ValueError("invalid_source_context")
@@ -108,11 +112,17 @@ class ChatMemoryTool:
         # in the same candidate metadata for attribution and owner review.
         excerpt = "\n".join(f"{s['role']}: {s['text']}" for s in sources)[-3000:]
         excerpt = self.engine._daily_chat_memory_owner_text(excerpt).replace("<", "‹").replace(">", "›")
+        evidence_sources = [canonical_source(s, conversation_id=context["conversation_id"],
+                            profile_id=self.engine.memory_semantic_profile_id) for s in sources]
+        semantic = build_annotations(body=content, proposed=args.get("annotations"), sources=evidence_sources,
+                                     proposal_id=memory_id)
+        related = self.store.find_candidates_by_sources([s["source_key"] for s in evidence_sources])
+        semantic = attach_source_links(semantic, related, proposal_id=memory_id)
         legacy = {"id": memory_id, "title": title, "content": content.strip(), "proposed_memory": content.strip(),
                   "kind": kind, "date": narrative["mentioned_dates"][-1] if narrative["mentioned_dates"] else "",
                   "mode": self.engine.daily_chat_memory_mode, "source_verification": "verified",
                   "source_canonical_event_ids": [s["event_id"] for s in sources],
-                  "original_excerpt": excerpt, "narrative": narrative,
+                  "original_excerpt": excerpt, "narrative": narrative, "semantic_annotations": semantic,
                   "reason": "聊天模型当场写入；来源核对不代表主人确认全部事实", "tags": ["chat_authored", kind]}
         return MemoryProposal.from_mapping({
             "proposal_id": memory_id, "source_type": "chat_tool", "proposed_body": content,
@@ -120,7 +130,7 @@ class ChatMemoryTool:
             "source_refs": [f"canonical_event:{s['event_id']}@{s['version_id']}" for s in sources],
             "memory_type": kind, "confidence": confidence, "sensitive": args.get("sensitive", False),
             "requested_mode": self.engine.daily_chat_memory_mode, "owner_explicit": False,
-            "metadata": {"legacy_candidate": legacy, "narrative": narrative,
+            "metadata": {"legacy_candidate": legacy, "narrative": narrative, "semantic_annotations": semantic,
                          "runtime_context": context, "tool_operation_id": envelope["operation_id"],
                          "submission_fingerprint": self.store.fingerprint(envelope)},
         })
@@ -154,6 +164,7 @@ class ChatMemoryTool:
         proposal = row["proposal"]
         candidate = copy.deepcopy(proposal["metadata"]["legacy_candidate"])
         candidate.update(content=proposal["proposed_body"], narrative=proposal["metadata"]["narrative"])
+        candidate["semantic_annotations"] = proposal["metadata"].get("semantic_annotations")
         key = f"chat-tool:{memory_id}:candidate-revision:{row['revision']}"
         prior = self.store.get_commit_by_idempotency(key)
         prior_meta = ((prior or {}).get("payload") or {}).get("metadata") or {}

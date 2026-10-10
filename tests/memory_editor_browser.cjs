@@ -13,6 +13,7 @@ const styles = (html.match(/<style[^>]*>[\s\S]*?<\/style>/g) || []).join('\n');
   let passed = 0;
   async function fixture(width = 390) {
     const page = await browser.newPage({ viewport: { width, height: 844 } });
+    await page.route('**/*', route => route.abort());
     await page.setContent(styles + '<div class="content"><div class="bucket-bulk-message" id="daily-chat-memory-message"></div><div id="daily-chat-memory-pending"></div></div>');
     await page.evaluate(() => {
       window.BASE = ''; window.getActiveTab = () => 'other'; window.confirm = () => true;

@@ -1441,8 +1441,8 @@ def test_meaningful_day_produces_all_signal_categories(tmp_path):
         assert candidate["original_excerpt"]
 
 
-def test_duplicate_overlapping_windows_merged_most_complete_source(tmp_path):
-    """重叠窗口产生相同候选时合并，保留来源最完整的一条。"""
+def test_same_body_from_distinct_sources_remains_separate(tmp_path):
+    """同文不证明同一事实；不同来源保留各自候选，不按更长来源合并。"""
     engine = ReflectionEngine(make_config(tmp_path, mode="review"))
     turns = [
         {"id": 1, "session_id": "s", "created_at": "2026-08-14T10:00:00+08:00",
@@ -1479,10 +1479,10 @@ def test_duplicate_overlapping_windows_merged_most_complete_source(tmp_path):
     buckets = FakeBuckets()
     result = run_memory(engine, buckets, "review", turns=turns)
     assert result["status"] == "pending"
-    assert len(result["candidates"]) == 1, "重复候选应合并为一条"
-    merged = result["candidates"][0]
-    assert set(merged["source_turn_ids"]) == {1, 2}
-    assert merged["source_hash"]
+    assert len(result["candidates"]) == 2
+    assert {tuple(candidate["source_turn_ids"]) for candidate in result["candidates"]} == {(1,), (2,)}
+    assert len({candidate["id"] for candidate in result["candidates"]}) == 2
+    assert all(candidate["source_hash"] for candidate in result["candidates"])
 
 
 def test_extraction_windows_cover_beginning_middle_end(tmp_path):
