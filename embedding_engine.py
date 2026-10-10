@@ -26,6 +26,8 @@ from pathlib import Path
 
 import httpx
 
+from embedding_vector_cache import VectorDecodeCache
+
 logger = logging.getLogger("ombre_brain.embedding")
 
 
@@ -37,6 +39,9 @@ class EmbeddingEngine:
 
     REQUEST_BUDGET_SECONDS = 30.0
     MIN_FALLBACK_REMAINING_SECONDS = 0.25
+    # Retain at most four idle sockets across ordinary pauses in conversation.
+    # This is not a request timeout, heartbeat, probe or retry policy.
+    HTTP_KEEPALIVE_EXPIRY_SECONDS = 120.0
 
     def __init__(self, config: dict):
         dehy_cfg = config.get("dehydration", {})
@@ -68,6 +73,7 @@ class EmbeddingEngine:
         self._query_cache: dict[str, tuple[float, list[float]]] = {}
         self._query_inflight: dict[str, asyncio.Task] = {}
         self._query_batch_inflight: dict[tuple[str, ...], asyncio.Task] = {}
+        self._vector_decode_cache = VectorDecodeCache()
         self._runtime = {
             "last_operation": "none",
             "last_status": "not_requested",
@@ -107,6 +113,8 @@ class EmbeddingEngine:
             "model": self.model,
             "requested_dimension": getattr(self, "dimension", None),
             "base_url": self.base_url,
+            "http_keepalive_expiry_seconds": self.HTTP_KEEPALIVE_EXPIRY_SECONDS,
+            "vector_decode_cache": self._vector_decode_cache.snapshot(),
             "client_open": bool(
                 self.client is not None
                 and not getattr(self.client, "is_closed", False)
@@ -504,7 +512,7 @@ class EmbeddingEngine:
             limits=httpx.Limits(
                 max_connections=8,
                 max_keepalive_connections=4,
-                keepalive_expiry=30.0,
+                keepalive_expiry=self.HTTP_KEEPALIVE_EXPIRY_SECONDS,
             ),
         )
 
@@ -543,12 +551,21 @@ class EmbeddingEngine:
         if remaining <= 0:
             raise asyncio.TimeoutError("embedding_request_budget_exhausted")
         request_started = time.monotonic()
-        phase_started, metrics = {}, {"source": "httpcore_trace", "provider_attempts": 1}
+        phase_started, metrics = {}, {
+            "source": "httpcore_trace", "provider_attempts": 1,
+            "connection_reused": None,
+            "keepalive_expiry_seconds": self.HTTP_KEEPALIVE_EXPIRY_SECONDS,
+        }
 
         async def trace(event: str, _info: dict) -> None:
             # Never retain/log info: it can contain request headers/secrets.
             phase, _, state = event.rpartition(".")
             phase = phase.rsplit(".", 1)[-1]
+            if state == "started" and phase in {"connect_tcp", "start_tls"}:
+                metrics["connection_reused"] = False
+            elif state == "started" and phase == "send_request_headers":
+                if metrics["connection_reused"] is None:
+                    metrics["connection_reused"] = True
             fields = {"connect_tcp": "connect_tcp_ms", "start_tls": "tls_ms",
                       "receive_response_headers": "response_header_wait_ms",
                       "receive_response_body": "response_body_ms"}
@@ -606,6 +623,7 @@ class EmbeddingEngine:
                 **({"dimensions": dimensions} if dimensions is not None else {}),
             )
             metrics.update(source="connect_fallback", provider_attempts=2,
+                           connection_reused=False,
                            total_ms=round((time.monotonic() - request_started) * 1000))
             body = dict(body) if isinstance(body, dict) else {}
             body["_local_http_timing"] = metrics
@@ -641,6 +659,7 @@ class EmbeddingEngine:
 
     async def close(self) -> None:
         """Close the pooled client exactly once during service shutdown."""
+        self._vector_decode_cache.clear()
         with self._client_lock:
             client = self.client
             self.client = None
@@ -873,6 +892,8 @@ class EmbeddingEngine:
         index_read_ms = round((time.monotonic() - index_started) * 1000)
         filter_started = time.monotonic()
         valid, rejected = [], {}
+        decode_debug = {"hits": 0, "misses": 0, "invalid": 0,
+                        "bypassed": 0, "evictions": 0}
         for row in rows:
             row_id, payload, model, dimension, parent, memory_id, unit, revision, body_sha, prep, provider, truncated = row
             parent = str(parent or row_id)
@@ -894,11 +915,11 @@ class EmbeddingEngine:
             if not reason and prep and prep != snapshot["document_preparation"]:
                 reason = "embedding_preparation_mismatch"
             try:
-                vector = json.loads(payload)
-                if (model != snapshot["model"] or not isinstance(vector, list) or not vector
+                vector, vector_valid = self._vector_decode_cache.decode(
+                    payload, diagnostics=decode_debug)
+                if (model != snapshot["model"] or not vector_valid
                         or dimension != len(vector)
-                        or (snapshot.get("dimension") is not None and dimension != snapshot["dimension"])
-                        or any(type(v) not in (int, float) or not math.isfinite(v) for v in vector)):
+                        or (snapshot.get("dimension") is not None and dimension != snapshot["dimension"])):
                     reason = reason or "embedding_space_mismatch"
             except (ValueError, TypeError):
                 reason = reason or "invalid_stored_vector"
@@ -908,6 +929,9 @@ class EmbeddingEngine:
                 continue
             valid.append((parent, str(unit or row_id), vector, int(truncated or 0)))
         index_filter_ms = round((time.monotonic() - filter_started) * 1000)
+        if cache_debug is not None:
+            cache_debug["vector_decode_cache"] = {
+                **decode_debug, **self._vector_decode_cache.snapshot()}
         query_debug = {}
         if valid and chunks:
             try:
