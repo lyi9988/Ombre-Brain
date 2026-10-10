@@ -48,7 +48,7 @@ def test_clock_only_is_a_verified_full_clause(text):
 
 @pytest.mark.parametrize('text', ['几点？', '那天几点', '今天是什么日子', '今天是我的生日吗',
     '现在几点，记得我们约好了什么吗', '今天几号，我又难受了', '今天有约定吗', '又难受了',
-    '嗯', '你记得吗', '上次这个时间我们做了什么', '把“现在几点”翻译一下',
+    '嗯', '你记得吗', "what's the date?", '上次这个时间我们做了什么', '把“现在几点”翻译一下',
     '现在几点，帮我设置提醒', '几点了，昨天那件事呢', '现在几点，现在我不舒服',
     [{'type': 'text', 'text': '现在几点'}, {'type': 'image_url', 'image_url': {'url': 'fixture'}}]])
 def test_history_emotion_ambiguous_mixed_and_media_keep_recall(text):
@@ -239,6 +239,7 @@ def test_eligible_vector_read_is_bounded_and_preserves_tie_order(tmp_path, monke
         db.execute('INSERT INTO embeddings(bucket_id, embedding, model, dimension, updated_at) VALUES(?,?,?,?,?)',
                    ('legacy', '[1,0]', engine.model, 2, 'now'))
     ids.add('legacy')
+    assert len(asyncio.run(engine.get_embeddings(['legacy', *[f'unit-{i}' for i in range(1250)]]))) == 411
     async def query(texts, **kwargs): return [[1, 0] for _ in texts]
     engine.query_embeddings = query
     debug = {}

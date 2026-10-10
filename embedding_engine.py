@@ -750,13 +750,16 @@ class EmbeddingEngine:
         )
         if not unique_ids:
             return {}
-        placeholders = ",".join("?" for _ in unique_ids)
         conn = sqlite3.connect(self.db_path)
         try:
-            rows = conn.execute(
-                f"SELECT bucket_id, embedding, model, dimension FROM embeddings WHERE bucket_id IN ({placeholders})",
-                unique_ids,
-            ).fetchall()
+            rows = []
+            for offset in range(0, len(unique_ids), 400):
+                batch = unique_ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows.extend(conn.execute(
+                    f"SELECT bucket_id, embedding, model, dimension FROM embeddings WHERE bucket_id IN ({placeholders})",
+                    batch,
+                ).fetchall())
         finally:
             conn.close()
 

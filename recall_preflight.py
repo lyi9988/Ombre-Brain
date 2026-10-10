@@ -10,7 +10,8 @@ _CLOCK_CLAUSE = re.compile(
     r"|(?:现在|当前)(?:的)?时间(?:是)?多少"
     r"|今天(?:是)?(?:几[日号]|几月几[日号]|星期几|周几|什么日期)"
     r")(?:吗|呢|呀|啊)?"
-    r"|what(?:'s| is) the (?:time|date)(?: now| today)?"
+    r"|what(?:'s| is) the time(?: now)?"
+    r"|what(?:'s| is) the date today"
     r"|what time is it(?: now)?"
     r"|what (?:date|day of the week) is it today",
     re.IGNORECASE,
