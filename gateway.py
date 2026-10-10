@@ -164,6 +164,7 @@ from persona_event_selection import (
     select_persona_events,
 )
 from raw_events import RawEventStore, raw_event_text_looks_injected, strip_raw_client_context
+from memory_source_provenance import bridge_from_coverage, archive_bridge
 from reminder_store import ReminderStore
 from reranker_engine import RerankerEngine, RerankResult
 from self_anchor import is_self_anchor_bucket, is_self_anchor_metadata
@@ -2862,9 +2863,17 @@ class GatewayService:
         if self._runtime_scope_for_request(request) != "chat":
             state["status"] = "internal_scope"
             return payload, state
+        trace = self._trace_from_payload(payload)
+        coverage = trace.get("coverage") if isinstance(trace.get("coverage"), dict) else {}
+        origin_source = str(request.headers.get(CANONICAL_SOURCE_EVENT_ID_HEADER) or "")
+        if (origin_source and origin_source == coverage.get("current_user_source_event_id")
+                and trace.get("conversation_id") == coverage.get("conversation_id")):
+            state["memory_source_bridge"] = bridge_from_coverage(
+                coverage, payload.get("messages"),
+                profile_id=str(getattr(self.persona_engine, "profile_id", "") or "default"))
         if not self._canonical_continuation_active(session_id):
             return payload, state
-        state = {"enabled": True, "status": "preparing"}
+        state.update(enabled=True, status="preparing")
         channel_id, channel_selection = self._canonical_channel_for_request(request, session_id)
         request_id = self._canonical_request_id(request, payload, session_id)
         user_source_event_id = f"{channel_id}:{request_id}:user"
@@ -6928,6 +6937,7 @@ class GatewayService:
             client=client,
             route=route,
             canonical_key=canonical_key,
+            source_bridge=(canonical_state or {}).get("memory_source_bridge", []),
         )
         if isinstance(upstream_usage, dict) and upstream_usage:
             try:
@@ -6980,6 +6990,7 @@ class GatewayService:
         client: str,
         route: str,
         canonical_key: str = "",
+        source_bridge: list[dict] | None = None,
     ) -> None:
         if not user_message.strip():
             return
@@ -7059,6 +7070,7 @@ class GatewayService:
             model=model,
             client=client,
             route=route,
+            source_bridge=source_bridge,
         )
 
     def _is_recent_duplicate_conversation_turn(
@@ -7148,6 +7160,7 @@ class GatewayService:
         model: str,
         client: str,
         route: str,
+        source_bridge: list[dict] | None = None,
     ) -> None:
         profile_id = str(getattr(self.persona_engine, "profile_id", "") or "default")
         created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -7170,7 +7183,7 @@ class GatewayService:
                     "conversation_id": session_id,
                     "session_id": session_id,
                     "client": client,
-                    "metadata": metadata,
+                    "metadata": {**metadata, "canonical_source": archive_bridge(source_bridge, role="user", text=user_text)},
                 }
             )
         if assistant_text:
@@ -7184,7 +7197,7 @@ class GatewayService:
                     "conversation_id": session_id,
                     "session_id": session_id,
                     "client": client,
-                    "metadata": metadata,
+                    "metadata": {**metadata, "canonical_source": archive_bridge(source_bridge, role="assistant", text=assistant_text)},
                 }
             )
         if not events:
