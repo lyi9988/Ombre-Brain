@@ -910,14 +910,15 @@ class DreamEngine:
         has_affect = 0 <= valence <= 1 and 0 <= arousal <= 1
         return bool(is_session_start or has_query or has_affect)
 
-    async def _query_embedding(self, query: str, embedding_engine) -> list[float] | None:
+    async def _query_embedding(self, query: str, embedding_engine, *, config_snapshot=None) -> list[float] | None:
         if not query or not query.strip():
             return None
         if embedding_engine is None or not getattr(embedding_engine, "enabled", False):
             return None
         try:
             if hasattr(embedding_engine, "query_embedding"):
-                embedding = await embedding_engine.query_embedding(query)
+                embedding = await embedding_engine.query_embedding(
+                    query, **({"config_snapshot": config_snapshot} if config_snapshot is not None else {}))
             else:
                 embedding = await embedding_engine._generate_embedding(query, kind="query")
             return embedding or None
@@ -1035,15 +1036,39 @@ class DreamEngine:
         ]
         if not pending:
             return {"status": "skipped", "reason": "no_pending_dream"}
-        query_embedding = (
-            await self._query_embedding(query, embedding_engine)
-            if allow_semantic
-            else None
-        )
+        # Load existing compatible vectors once, before paying for a query
+        # embedding. Text/affect/spontaneous surfacing remains available even
+        # when these records have no usable vectors. No new vector writes.
+        stored_vectors = {}
+        config_snapshot = None
+        semantic_status = "not_requested"
+        if allow_semantic and query.strip() and embedding_engine is not None and getattr(embedding_engine, "enabled", False):
+            snapshot_reader = getattr(embedding_engine, "_query_config_snapshot", None)
+            config_snapshot = snapshot_reader() if callable(snapshot_reader) else None
+            kwargs = {"config_snapshot": config_snapshot} if config_snapshot is not None else {}
+            try:
+                batch_reader = getattr(embedding_engine, "get_embeddings", None)
+                if callable(batch_reader):
+                    stored_vectors = await batch_reader([record.dream_id for record in pending], **kwargs)
+                else:
+                    for record in pending:
+                        vector = await embedding_engine.get_embedding(record.dream_id, **kwargs)
+                        if vector:
+                            stored_vectors[record.dream_id] = vector
+            except Exception:
+                return {"status": "skipped", "reason": "dream_index_unavailable",
+                        "pending_count": len(pending)}
+            semantic_status = "query_requested" if stored_vectors else "no_compatible_dream_vectors"
+        query_embedding = (await self._query_embedding(query, embedding_engine, config_snapshot=config_snapshot)
+                           if stored_vectors else None)
+        semantic_debug = {"semantic_status": semantic_status, "pending_count": len(pending),
+                          "compatible_vector_count": len(stored_vectors)}
         evaluated = []
         for record in pending:
             affect = self._affect_score(record, valence, arousal)
-            cue = await self._cue_score(record, query, query_embedding, embedding_engine)
+            cue = max(self._cue_text_score(record, query),
+                      self._cosine(query_embedding, stored_vectors.get(record.dream_id))
+                      if query_embedding and stored_vectors.get(record.dream_id) else 0.0)
             score = max(affect, cue) + self.alpha_subordinate * min(affect, cue)
             evaluated.append({"record": record, "affect": affect, "cue": cue, "score": score, "top": max(affect, cue)})
 
@@ -1076,11 +1101,11 @@ class DreamEngine:
                 fd = os.open(str(claim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.close(fd)
             except FileExistsError:
-                return {"status": "skipped", "reason": "already_claimed"}
+                return {"status": "skipped", "reason": "already_claimed", **semantic_debug}
             surfaced_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             try:
                 if not record.path.exists():
-                    return {"status": "skipped", "reason": "record_missing"}
+                    return {"status": "skipped", "reason": "record_missing", **semantic_debug}
                 surfaced_record = self._write_record(
                     {**record.metadata, "surfaced": True, "surfaced_at": surfaced_at},
                     record.body,
@@ -1099,6 +1124,7 @@ class DreamEngine:
                 raw_source_bucket_ids = surfaced_record.metadata.get("source_bucket_ids")
                 source_bucket_ids = raw_source_bucket_ids if isinstance(raw_source_bucket_ids, list) else []
                 return {
+                    **semantic_debug,
                     "status": "injected",
                     "reason": "resonant",
                     "retained": bool(retain_after_surface),
@@ -1121,7 +1147,7 @@ class DreamEngine:
         for record in self.list_records():
             if not record.surfaced and int(record.metadata.get("surface_attempts", 0)) >= self.max_surface_attempts:
                 self._delete_record(record, f"unsurfaced_after_{self.max_surface_attempts}_attempts", embedding_engine)
-        return {"status": "skipped", "reason": "no_resonance"}
+        return {"status": "skipped", "reason": "no_resonance", **semantic_debug}
 
     def dashboard_records(self, limit: int = 30) -> list[dict]:
         entries: dict[str, dict] = {}

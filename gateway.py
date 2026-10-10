@@ -4479,10 +4479,6 @@ class GatewayService:
                     cache.pop(snapshot_key, None)
 
         stage_started_at = time.perf_counter()
-        all_buckets = await self._list_gateway_buckets(include_archive=False)
-        mark_step("list_all_buckets", stage_started_at)
-
-        stage_started_at = time.perf_counter()
         if continuation_phase:
             # Scheme P: a legal continuation request is a current user turn --
             # the backward scan skips tool results / assistant tool_calls /
@@ -4503,6 +4499,9 @@ class GatewayService:
         recall_context_debug = natural_input["metadata"]
         if not recall_context_debug.get("current_input_complete"):
             natural_input.setdefault("incomplete_reasons", []).append("current_input_not_fully_covered")
+        from recall_preflight import clock_preflight
+        preflight = clock_preflight(natural_input, messages, clock_metadata(messages))
+        pure_clock = preflight["skip_dynamic_recall"]
         has_handoff_context = self._messages_contain_handoff_context(messages)
         is_session_start = self.state_store.get_last_success_at(session_id) is None
         just_now_context_requested = (
@@ -4530,11 +4529,25 @@ class GatewayService:
             handoff_skip_reason = ""
         needs_handoff_first = bool(handoff_skip_reason)
         date_recall_requested = (
-            self.date_recall_enabled
+            not pure_clock and self.date_recall_enabled
             and self._query_requests_date_recall(current_user_query)
         )
         low_signal_auto_recall = self._auto_recall_low_signal_query(recall_query)
         mark_step("classify_request", stage_started_at)
+
+        # Preserve scheduled core/relationship/favorite sources. Only a verified
+        # clock-only request with no such consumer can avoid the full bucket read.
+        clock_needs_buckets = pure_clock and (
+            self._should_inject_interval(session_id, self.core_memory_interval_rounds)
+            or self._should_inject_interval(session_id, self.relationship_weather_interval_rounds)
+            or self._should_inject_interval(session_id, self.favorite_memory_interval_rounds)
+            or include_favorite_memory
+        )
+        stage_started_at = time.perf_counter()
+        all_buckets = (await self._list_gateway_buckets(include_archive=False)
+                       if not pure_clock or clock_needs_buckets else [])
+        preflight["bucket_read"] = "loaded" if not pure_clock or clock_needs_buckets else "not_needed"
+        mark_step("list_all_buckets", stage_started_at)
 
         persona_block = ""
         core_memory = ""
@@ -4587,7 +4600,8 @@ class GatewayService:
             )
             mark_step("targeted_skip_check", stage_started_at)
             stage_started_at = time.perf_counter()
-            memory_sentinel_debug = await self._route_memory_sentinel(
+            memory_sentinel_debug = ({"route": "skip", "route_reason_codes": ["pure_current_clock"]}
+                                    if pure_clock else await self._route_memory_sentinel(
                 recall_query,
                 session_id,
                 all_buckets,
@@ -4595,20 +4609,24 @@ class GatewayService:
                 just_now_context_requested=just_now_context_requested,
                 date_recall_requested=date_recall_requested,
                 targeted_detail_skip=skip_for_targeted_detail,
-            )
+            ))
             memory_sentinel_debug["query_context"] = recall_context_debug
             memory_sentinel_debug["hint_route"] = memory_sentinel_debug.get("route")
             composer_recall_enabled = self._composer_live_recall_enabled(prompt_plan)
             natural_input["composer_recall_enabled"] = composer_recall_enabled
             auto_enabled = getattr(self, "automatic_recall_enabled", True) and composer_recall_enabled
-            ordinary = bool(auto_enabled and recall_query and not self._memory_sentinel_obvious_skip_query(recall_query))
+            ordinary = bool(auto_enabled and recall_query and not pure_clock
+                            and not self._memory_sentinel_obvious_skip_query(recall_query))
             memory_sentinel_debug["route"] = "ordinary" if ordinary else "skip"
             natural_input["route"] = "ordinary" if ordinary else "local"
             if not ordinary:
                 natural_input["skip_reason"] = (
                     "composer_live_recall_disabled" if not composer_recall_enabled
                     else "automatic_recall_disabled" if not getattr(self, "automatic_recall_enabled", True)
+                    else "pure_current_clock" if pure_clock
                     else "empty_current_input" if not recall_query else "obvious_acknowledgement")
+                if pure_clock:
+                    natural_input["semantic_debug"] = {"provider_requests": 0, "status": "not_needed"}
             mark_step("memory_sentinel", stage_started_at)
             sentinel_route = str(memory_sentinel_debug.get("route") or "")
             recall_execution = self._recall_route_execution_options(sentinel_route, ordinary=ordinary)
@@ -4963,7 +4981,10 @@ class GatewayService:
                         has_reliable_dynamic_context=reliable_dynamic_context,
                     )
             stage_started_at = time.perf_counter()
-            if has_handoff_context or needs_handoff_first:
+            if pure_clock:
+                dream_context = ""
+                dream_context_status = {"status": "skipped", "reason": "pure_current_clock"}
+            elif has_handoff_context or needs_handoff_first:
                 dream_context = ""
                 dream_context_status = {"status": "skipped", "reason": "handoff_context"}
             else:
@@ -5151,6 +5172,7 @@ class GatewayService:
             "recall_route": str(memory_sentinel_debug.get("route") or ""),
             "recall_query_context": recall_context_debug,
             "recall_input": recall_context_debug,
+            "recall_preflight": preflight,
             "query_views": recall_context_debug.get("query_views", []),
             "recall_status": recall_status,
             "selected_memory_ids": memory_recall_projection.get("selected_memory_ids", []),

@@ -722,7 +722,7 @@ class EmbeddingEngine:
         conn.commit()
         conn.close()
 
-    async def get_embedding(self, bucket_id: str) -> list[float] | None:
+    async def get_embedding(self, bucket_id: str, *, config_snapshot: dict | None = None) -> list[float] | None:
         """Retrieve stored embedding for a bucket. Returns None if not found."""
         conn = sqlite3.connect(self.db_path)
         row = conn.execute(
@@ -732,14 +732,14 @@ class EmbeddingEngine:
         if row:
             try:
                 embedding = json.loads(row[0])
-                if not self._row_matches_current_model(row[1], row[2], embedding):
+                if not self._row_matches_current_model(row[1], row[2], embedding, config_snapshot=config_snapshot):
                     return None
                 return embedding
             except json.JSONDecodeError:
                 return None
         return None
 
-    async def get_embeddings(self, bucket_ids: list[str]) -> dict[str, list[float]]:
+    async def get_embeddings(self, bucket_ids: list[str], *, config_snapshot: dict | None = None) -> dict[str, list[float]]:
         """Retrieve stored embeddings for several buckets with one SQLite read."""
         unique_ids = list(
             dict.fromkeys(
@@ -766,7 +766,7 @@ class EmbeddingEngine:
                 embedding = json.loads(payload)
             except (json.JSONDecodeError, TypeError):
                 continue
-            if self._row_matches_current_model(model, dimension, embedding):
+            if self._row_matches_current_model(model, dimension, embedding, config_snapshot=config_snapshot):
                 output[str(bucket_id)] = embedding
         return output
 
@@ -844,15 +844,31 @@ class EmbeddingEngine:
             for offset in range(0, len(text), chunk_size):
                 chunks.append(text[offset:offset + chunk_size])
                 owners.append(view)
+        index_started = time.monotonic()
+        # Restrict the payload read to authority-eligible parents. Preserve
+        # original row order for ties; bounded SQL parameters also work on
+        # SQLite builds with a 999-variable limit. No cross-turn candidate cache.
         conn = sqlite3.connect(self.db_path)
         try:
-            rows = conn.execute(
-                "SELECT bucket_id,embedding,model,dimension,parent_bucket_id,"
-                "parent_memory_id,source_unit_id,source_revision,source_sha256,"
-                "preparation_sha256,provider,input_truncated_chars FROM embeddings"
-            ).fetchall()
+            rows_by_id = {}
+            ids = sorted(eligible_ids)
+            for offset in range(0, len(ids), 400):
+                batch = ids[offset:offset + 400]
+                placeholders = ','.join('?' for _ in batch)
+                rows = conn.execute(
+                    "SELECT rowid,bucket_id,embedding,model,dimension,parent_bucket_id,"
+                    "parent_memory_id,source_unit_id,source_revision,source_sha256,"
+                    "preparation_sha256,provider,input_truncated_chars FROM embeddings "
+                    f"WHERE parent_bucket_id IN ({placeholders}) OR "
+                    f"((parent_bucket_id IS NULL OR parent_bucket_id='') AND bucket_id IN ({placeholders}))",
+                    [*batch, *batch],
+                ).fetchall()
+                rows_by_id.update({row[0]: row[1:] for row in rows})
+            rows = [rows_by_id[key] for key in sorted(rows_by_id)]
         finally:
             conn.close()
+        index_read_ms = round((time.monotonic() - index_started) * 1000)
+        filter_started = time.monotonic()
         valid, rejected = [], {}
         for row in rows:
             row_id, payload, model, dimension, parent, memory_id, unit, revision, body_sha, prep, provider, truncated = row
@@ -888,6 +904,7 @@ class EmbeddingEngine:
                 rejected[reason] = rejected.get(reason, 0) + 1
                 continue
             valid.append((parent, str(unit or row_id), vector, int(truncated or 0)))
+        index_filter_ms = round((time.monotonic() - filter_started) * 1000)
         query_debug = {}
         if valid and chunks:
             try:
@@ -912,6 +929,7 @@ class EmbeddingEngine:
         else:
             vectors = []
             query_debug.update(status="no_compatible_index", provider_requests=0)
+        similarity_started = time.monotonic()
         combined = {}
         for view in range(len(queries)):
             matches = {}
@@ -938,6 +956,9 @@ class EmbeddingEngine:
             cache_debug.update(
                 **query_debug,
                 query_view_count=len(queries), query_chunk_count=len(chunks),
+                index_rows_read=len(rows), index_read_ms=index_read_ms,
+                index_filter_ms=index_filter_ms,
+                similarity_ms=round((time.monotonic() - similarity_started) * 1000),
                 valid_unit_count=len(valid), indexed_bucket_count=len(covered),
                 eligible_bucket_count=len(eligible_ids), missing_bucket_count=len(eligible_ids - covered),
                 index_rejections=rejected, total_ms=round((time.monotonic() - started) * 1000),
@@ -955,7 +976,8 @@ class EmbeddingEngine:
 
     def _row_matches_current_model(self, model: str | None, dimension: int | None, embedding: list[float],
                                    *, config_snapshot: dict | None = None) -> bool:
-        if not embedding:
+        if (not isinstance(embedding, list) or not embedding
+                or any(type(v) not in (int, float) or not math.isfinite(v) for v in embedding)):
             return False
         if model != (config_snapshot["model"] if config_snapshot is not None else self.model):
             return False
