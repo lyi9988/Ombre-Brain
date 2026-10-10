@@ -3457,6 +3457,7 @@ class ReflectionEngine:
         reject_reason: str | None = None,
         reject_note: str | None = None,
         now: datetime | None = None,
+        expected_revisions: dict[str, int] | None = None,
     ) -> dict:
         if self.memory_authority_enabled and self.memory_authority_store:
             return await self._confirm_daily_chat_memory_authority(
@@ -3469,7 +3470,10 @@ class ReflectionEngine:
                 reject_reason=reject_reason,
                 reject_note=reject_note,
                 now=now,
+                expected_revisions=expected_revisions,
             )
+        if expected_revisions is not None:
+            return {"status": "conflict", "reason": "memory_authority_unavailable", "results": []}
         ids = {str(candidate_id or "").strip() for candidate_id in candidate_ids if str(candidate_id or "").strip()}
         if not ids:
             return {
@@ -3632,6 +3636,7 @@ class ReflectionEngine:
         reject_reason: str | None = None,
         reject_note: str | None = None,
         now: datetime | None = None,
+        expected_revisions: dict[str, int] | None = None,
     ) -> dict:
         ids = {str(value or "").strip() for value in candidate_ids if str(value or "").strip()}
         if not ids:
@@ -3643,7 +3648,13 @@ class ReflectionEngine:
             f"{safe_action}|{sorted(ids)}|{datetime.now(timezone.utc).isoformat(timespec='seconds')}".encode("utf-8")
         ).hexdigest()[:24]
         prior = self._request_ledger_lookup(rid)
+        request_hash = self.memory_authority_store.fingerprint({
+            "ids": sorted(ids), "action": safe_action, "edits": safe_edits,
+            "expected_revisions": expected_revisions,
+            "reject_reason": reject_reason, "reject_note": reject_note})
         if prior:
+            if expected_revisions is not None and prior.get("request_hash") != request_hash:
+                return {"status": "conflict", "reason": "idempotency_conflict", "results": []}
             return {**prior, "idempotent_replay": True, "request_id": rid}
         action_time = now or datetime.now(timezone.utc)
         if not self._confirm_rate_limit_ok(action_time):
@@ -3659,105 +3670,117 @@ class ReflectionEngine:
             row = self.memory_authority_store.get_candidate(candidate_id)
             if not row:
                 missing += 1
+                results.append({"id": candidate_id, "status": "missing"})
                 continue
-            item = self._authority_candidate_legacy_item(row)
-            candidate = dict(item.get("candidate") or {})
-            if safe_action in {"defer", "reject"}:
-                if row.get("status") not in {"pending", "deferred", "rejected"}:
-                    results.append({"id": candidate_id, "status": row.get("status") or "skipped"})
-                    continue
-                target_action = "defer" if safe_action == "defer" else "reject"
-                if row.get("status") == ("deferred" if target_action == "defer" else "rejected"):
-                    results.append({"id": candidate_id, "status": row.get("status")})
-                    continue
-                reason_codes = []
-                if target_action == "reject":
-                    reason_codes.append(
-                        f"OWNER_REJECTED_{self._normalize_daily_chat_memory_reject_reason(reject_reason).upper()}"
+            if expected_revisions is not None and expected_revisions.get(candidate_id) != row["revision"]:
+                results.append({"id": candidate_id, "status": "revision_conflict",
+                                "current_revision": row["revision"]})
+                continue
+            from memory_authority import RevisionConflict, InvalidTransition, IdempotencyConflict
+            try:
+                item = self._authority_candidate_legacy_item(row)
+                candidate = dict(item.get("candidate") or {})
+                if safe_action in {"defer", "reject"}:
+                    if row.get("status") not in {"pending", "deferred", "rejected"}:
+                        results.append({"id": candidate_id, "status": row.get("status") or "skipped"})
+                        continue
+                    target_action = "defer" if safe_action == "defer" else "reject"
+                    if row.get("status") == ("deferred" if target_action == "defer" else "rejected"):
+                        results.append({"id": candidate_id, "status": row.get("status")})
+                        continue
+                    reason_codes = []
+                    if target_action == "reject":
+                        reason_codes.append(
+                            f"OWNER_REJECTED_{self._normalize_daily_chat_memory_reject_reason(reject_reason).upper()}"
+                        )
+                        if reject_note:
+                            reason_codes.append("OWNER_REJECT_NOTE_RECORDED")
+                    decided = self.memory_authority_store.decide_candidate(
+                        candidate_id,
+                        action=target_action,
+                        expected_revision=int(row.get("revision") or 1),
+                        request_id=f"{rid}:{candidate_id}:{target_action}",
+                        actor="owner",
+                        reason_codes=reason_codes,
                     )
-                    if reject_note:
-                        reason_codes.append("OWNER_REJECT_NOTE_RECORDED")
-                decided = self.memory_authority_store.decide_candidate(
-                    candidate_id,
-                    action=target_action,
-                    expected_revision=int(row.get("revision") or 1),
-                    request_id=f"{rid}:{candidate_id}:{target_action}",
-                    actor="owner",
-                    reason_codes=reason_codes,
-                )
-                if decided.get("status") == "deferred":
-                    deferred += 1
-                else:
-                    rejected += 1
-                results.append({"id": candidate_id, "status": decided.get("status")})
-                continue
+                    if decided.get("status") == "deferred":
+                        deferred += 1
+                    else:
+                        rejected += 1
+                    results.append({"id": candidate_id, "status": decided.get("status")})
+                    continue
 
-            if row.get("proposal", {}).get("source_type") == "chat_tool":
-                from chat_memory_tool import ChatMemoryTool
-                candidate_result = await ChatMemoryTool(self, bucket_mgr).confirm(
-                    row, edit=safe_edits.get(candidate_id), request_id=f"{rid}:{candidate_id}")
-                created += int(candidate_result.get("status") == "created")
+                if row.get("proposal", {}).get("source_type") == "chat_tool":
+                    from chat_memory_tool import ChatMemoryTool
+                    candidate_result = await ChatMemoryTool(self, bucket_mgr).confirm(
+                        row, edit=safe_edits.get(candidate_id), request_id=f"{rid}:{candidate_id}")
+                    created += int(candidate_result.get("status") == "created")
+                    results.append(candidate_result)
+                    continue
+                candidate = self._apply_daily_chat_memory_candidate_edit(
+                    candidate,
+                    safe_edits.get(candidate_id),
+                )
+                candidate.update({"mode": "review", "status": "pending"})
+                if not self._daily_chat_memory_candidate_source_ok(candidate):
+                    reason = (
+                        "legacy_candidate_missing_source"
+                        if str(candidate.get("source_verification") or "").strip() != "verified"
+                        else "candidate_source_invalid"
+                    )
+                    results.append({"id": candidate_id, "status": "invalid_source", "reason": reason})
+                    continue
+                soft_flags = set(candidate.get("soft_flags") or [])
+                if "needs_owner_edit" in soft_flags and not safe_edits.get(candidate_id):
+                    results.append({
+                        "id": candidate_id,
+                        "status": "needs_owner_edit",
+                        "reason": "candidate_requires_edit",
+                    })
+                    continue
+
+                proposal = self._daily_chat_memory_proposal(
+                    candidate,
+                    mode="review",
+                    owner_explicit=True,
+                )
+                proposal_sha = self.memory_authority_store.fingerprint(proposal.payload())
+                if row.get("proposal_sha256") != proposal_sha:
+                    row = self.memory_authority_store.revise_candidate(
+                        candidate_id,
+                        expected_revision=int(row.get("revision") or 1),
+                        proposal=proposal,
+                        request_id=f"{rid}:{candidate_id}:edit:{proposal_sha[:16]}",
+                        actor="owner",
+                    )
+                if row.get("status") in {"pending", "deferred", "commit_failed"}:
+                    row = self.memory_authority_store.decide_candidate(
+                        candidate_id,
+                        action="accept",
+                        expected_revision=int(row.get("revision") or 1),
+                        request_id=f"{rid}:{candidate_id}:accept",
+                        actor="owner",
+                        reason_codes=["OWNER_ACCEPTED"],
+                    )
+                write_result = await self._write_daily_chat_memory_candidates(
+                    [{**candidate, "mode": "review", "status": row.get("status")}],
+                    bucket_mgr,
+                    embedding_engine=embedding_engine,
+                )
+                candidate_result = (write_result.get("results") or [{}])[0]
+                if candidate_result.get("status") in {"created", "exists"}:
+                    created += 1 if candidate_result.get("status") == "created" else 0
                 results.append(candidate_result)
-                continue
-            candidate = self._apply_daily_chat_memory_candidate_edit(
-                candidate,
-                safe_edits.get(candidate_id),
-            )
-            candidate.update({"mode": "review", "status": "pending"})
-            if not self._daily_chat_memory_candidate_source_ok(candidate):
-                reason = (
-                    "legacy_candidate_missing_source"
-                    if str(candidate.get("source_verification") or "").strip() != "verified"
-                    else "candidate_source_invalid"
-                )
-                results.append({"id": candidate_id, "status": "invalid_source", "reason": reason})
-                continue
-            soft_flags = set(candidate.get("soft_flags") or [])
-            if "needs_owner_edit" in soft_flags and not safe_edits.get(candidate_id):
-                results.append({
-                    "id": candidate_id,
-                    "status": "needs_owner_edit",
-                    "reason": "candidate_requires_edit",
-                })
-                continue
 
-            proposal = self._daily_chat_memory_proposal(
-                candidate,
-                mode="review",
-                owner_explicit=True,
-            )
-            proposal_sha = self.memory_authority_store.fingerprint(proposal.payload())
-            if row.get("proposal_sha256") != proposal_sha:
-                row = self.memory_authority_store.revise_candidate(
-                    candidate_id,
-                    expected_revision=int(row.get("revision") or 1),
-                    proposal=proposal,
-                    request_id=f"{rid}:{candidate_id}:edit:{proposal_sha[:16]}",
-                    actor="owner",
-                )
-            if row.get("status") in {"pending", "deferred", "commit_failed"}:
-                row = self.memory_authority_store.decide_candidate(
-                    candidate_id,
-                    action="accept",
-                    expected_revision=int(row.get("revision") or 1),
-                    request_id=f"{rid}:{candidate_id}:accept",
-                    actor="owner",
-                    reason_codes=["OWNER_ACCEPTED"],
-                )
-            write_result = await self._write_daily_chat_memory_candidates(
-                [{**candidate, "mode": "review", "status": row.get("status")}],
-                bucket_mgr,
-                embedding_engine=embedding_engine,
-            )
-            candidate_result = (write_result.get("results") or [{}])[0]
-            if candidate_result.get("status") in {"created", "exists"}:
-                created += 1 if candidate_result.get("status") == "created" else 0
-            results.append(candidate_result)
+            except (RevisionConflict, InvalidTransition, IdempotencyConflict):
+                # A concurrent edit must never cause adoption of an unseen version.
+                results.append({"id": candidate_id, "status": "revision_conflict"})
 
         result = {
             "status": "ok", "action": safe_action, "created": created,
             "rejected": rejected, "deferred": deferred, "missing": missing,
             "request_id": rid, "candidate_ids": sorted(ids), "results": results,
+            "request_hash": request_hash,
         }
         self._request_ledger_record(rid, result)
         return result

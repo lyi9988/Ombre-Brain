@@ -498,6 +498,16 @@ class MemoryAuthorityStore:
         conn.close()
         return self._candidate_row(row)
 
+    def get_candidate_decision(self, request_id: str) -> dict[str, Any] | None:
+        """Read an idempotent edit receipt; never reapply an owner operation."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT fingerprint,result_json FROM candidate_decisions WHERE request_id=?",
+                               (str(request_id),)).fetchone()
+            return {"fingerprint": row["fingerprint"], "result": _loads(row["result_json"], {})} if row else None
+        finally:
+            conn.close()
+
     def list_candidates(self, *, status: str = "pending", limit: int = 100) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []

@@ -1,4 +1,153 @@
 (function () {
+  var memoryItems = new Map();
+  var memoryDrafts = new Map();
+  var memoryRequests = new Map();
+  var memoryLoadEpoch = 0;
+  var memoryBusy = false;
+
+  function splitTerms(value) {
+    return Array.from(new Set(String(value || '').split(/[,，\n]/).map(function (v) { return v.trim(); }).filter(Boolean)));
+  }
+
+  function itemFields(item) {
+    var c = item.candidate || {};
+    var time = (c.narrative || {}).event_time || {};
+    return { title: c.title || item.id || '', content: c.proposed_memory || c.content || '',
+      kind: c.kind || 'memory', domain: splitTerms(listText(c.domain)), tags: splitTerms(listText(c.tags)),
+      importance: Number(c.importance || 5), confidence: Number(c.confidence == null ? 0.7 : c.confidence),
+      event_date: time.precision === 'day' ? (time.value || '') : '' };
+  }
+
+  function captureMemoryDraft(card) {
+    if (!card) return;
+    var id = card.getAttribute('data-candidate-id');
+    var item = memoryItems.get(id);
+    if (!item) return;
+    var prior = memoryDrafts.get(id);
+    var base = prior ? prior.base : itemFields(item);
+    var fields = readDailyChatMemoryEdits(card);
+    var edits = {};
+    Object.keys(fields).forEach(function (key) {
+      if (JSON.stringify(fields[key]) !== JSON.stringify(base[key])) edits[key] = fields[key];
+    });
+    if (Object.keys(edits).length) {
+      memoryDrafts.set(id, { base: base, fields: fields, edits: edits,
+        revision: prior ? prior.revision : Number(card.getAttribute('data-revision')),
+        expanded: card.getAttribute('data-editing') === 'true' });
+    } else memoryDrafts.delete(id);
+  }
+
+  function captureMemoryDrafts() {
+    document.querySelectorAll('.chat-memory-card').forEach(captureMemoryDraft);
+  }
+
+  function stableMemoryRequest(key, body) {
+    var signature = JSON.stringify(body);
+    var prior = memoryRequests.get(key);
+    if (prior && prior.signature !== signature) throw new Error('上次操作结果尚未确认，请先重试原操作；草稿已保留。');
+    if (!prior) {
+      prior = { signature: signature, body: Object.assign({}, body, { request_id: newDailyChatMemoryRequestId() }) };
+      memoryRequests.set(key, prior);
+    }
+    return prior.body;
+  }
+
+  function pendingMemoryAction(id) {
+    return Array.from(memoryRequests.entries()).find(function (entry) {
+      return entry[0].indexOf('edit:') !== 0 && (entry[1].body.candidate_ids || []).includes(id);
+    });
+  }
+
+  function syncUncertainLocks() {
+    document.querySelectorAll('.chat-memory-card').forEach(function (card) {
+      var id = card.getAttribute('data-candidate-id');
+      var locked = memoryRequests.has('edit:' + id) || Boolean(pendingMemoryAction(id));
+      card.querySelectorAll('input[data-field], textarea[data-field]').forEach(function (el) {
+        if (locked) { el.disabled = true; el.setAttribute('data-uncertain-lock', 'true'); }
+        else if (el.hasAttribute('data-uncertain-lock')) { el.disabled = false; el.removeAttribute('data-uncertain-lock'); }
+      });
+    });
+  }
+
+  async function saveMemoryDraft(id) {
+    if (pendingMemoryAction(id)) throw new Error('采用或审核结果尚未确认，请先重试原操作；暂不修改候选。');
+    var draft = memoryDrafts.get(id);
+    if (!draft) return;
+    var key = 'edit:' + id;
+    var body = stableMemoryRequest(key, { candidate_id: id, edit: draft.edits, expected_revision: draft.revision });
+    var res = await authFetch(dailyChatMemoryApiBase() + '/api/daily-chat-memory/edit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!res) throw new Error('未确认保存结果，请恢复连接后重试；草稿已保留。');
+    var data = await res.json();
+    if (!res.ok) {
+      if (res.status >= 400 && res.status < 500) memoryRequests.delete(key);
+      throw new Error(data.error === 'revision_conflict' ? '候选已在其他页面修改，请核对新版本；草稿已保留。' : (data.error || '保存失败'));
+    }
+    if (data.status !== 'saved' || data.adopted !== false || !data.item) throw new Error('保存回执不完整，请重试核对。');
+    memoryItems.set(id, data.item);
+    memoryDrafts.delete(id);
+    memoryRequests.delete(key);
+    var card = Array.from(document.querySelectorAll('.chat-memory-card')).find(function (c) { return c.getAttribute('data-candidate-id') === id; });
+    if (card) {
+      card.setAttribute('data-revision', String(data.item.authority_revision));
+      var savedFields = itemFields(data.item);
+      Object.keys(savedFields).forEach(function (field) {
+        var input = card.querySelector('[data-field="' + field + '"]');
+        if (input) input.value = Array.isArray(savedFields[field]) ? savedFields[field].join(', ') : String(savedFields[field]);
+      });
+      var bodyEl = card.querySelector('.chat-memory-card-body');
+      if (bodyEl) bodyEl.textContent = data.item.candidate.proposed_memory || data.item.candidate.content;
+      var titleEl = card.querySelector('.chat-memory-card-head strong');
+      if (titleEl) titleEl.textContent = savedFields.title;
+    }
+  }
+
+  async function saveDailyChatMemoryEdit(button) {
+    if (memoryBusy) return;
+    captureMemoryDrafts();
+    var card = button.closest('.chat-memory-card');
+    var id = card.getAttribute('data-candidate-id');
+    if (!memoryDrafts.has(id)) { setDailyChatMemoryMessage('没有未保存的修改。', 'ok'); return; }
+    memoryBusy = true;
+    setMemoryControlsBusy(true);
+    try {
+      await saveMemoryDraft(id);
+      setDailyChatMemoryMessage('修改已保存，仍待审核；没有采用入库。', 'ok');
+    } catch (e) { setDailyChatMemoryMessage(e.message, 'error'); }
+    finally { memoryBusy = false; setMemoryControlsBusy(false); }
+  }
+
+  function setMemoryControlsBusy(value) {
+    document.querySelectorAll('#daily-chat-memory-pending input, #daily-chat-memory-pending textarea, #daily-chat-memory-pending button, #daily-chat-memory-pending select').forEach(function (el) {
+      if (value) { el.setAttribute('data-was-disabled', el.disabled && !el.hasAttribute('data-uncertain-lock') ? 'true' : 'false'); el.disabled = true; }
+      else {
+        el.disabled = el.getAttribute('data-was-disabled') === 'true';
+        el.removeAttribute('data-was-disabled');
+        el.removeAttribute('data-uncertain-lock');
+      }
+    });
+    if (!value) syncUncertainLocks();
+  }
+
+  function discardDailyChatMemoryDraft(button) {
+    if (memoryBusy) return;
+    var id = button.closest('.chat-memory-card').getAttribute('data-candidate-id');
+    if (memoryRequests.has('edit:' + id) || pendingMemoryAction(id)) { setDailyChatMemoryMessage('操作结果尚未确认，请先重试原操作。', 'error'); return; }
+    if (!confirm('放弃这条未保存修改，重新读取服务器版本？')) return;
+    memoryDrafts.delete(id);
+    var card = button.closest('.chat-memory-card');
+    card.remove();
+    loadDailyChatMemoryPending();
+  }
+
+  if (document.addEventListener) document.addEventListener('input', function (event) {
+    var card = event.target.closest && event.target.closest('.chat-memory-card');
+    if (card) captureMemoryDraft(card);
+  });
+  if (window.addEventListener) window.addEventListener('beforeunload', function (event) {
+    captureMemoryDrafts();
+    if (memoryDrafts.size || memoryBusy || memoryRequests.size) { event.preventDefault(); event.returnValue = ''; }
+  });
   function dailyChatMemoryApiBase() {
     return typeof BASE !== 'undefined' ? BASE : '';
   }
@@ -68,19 +217,35 @@
 
   function loadDailyChatMemoryPending() {
     var target = document.getElementById('daily-chat-memory-pending');
-    if (!target) return;
-    target.innerHTML = '<div class="loading">读取候选...</div>';
+    if (!target || memoryBusy) return;
+    captureMemoryDrafts();
+    var epoch = ++memoryLoadEpoch;
     return authFetch(dailyChatMemoryApiBase() + '/api/daily-chat-memory/pending?limit=100')
       .then(function (res) {
-        if (!res) return;
+        if (!res) throw new Error('未连接，保留当前内容和草稿');
+        if (!res.ok) throw new Error('读取失败 (HTTP ' + res.status + ')');
         return res.json();
       })
       .then(function (data) {
         if (data && data.error) throw new Error(data.error || '读取失败');
-        target.innerHTML = renderDailyChatMemoryPending((data && data.items) || []);
+        if (epoch !== memoryLoadEpoch || memoryBusy) return;
+        captureMemoryDrafts();
+        var items = (data && data.items) || [];
+        var seen = new Set(items.map(function (item) { return item.id; }));
+        memoryDrafts.forEach(function (draft, id) {
+          if (!seen.has(id) && memoryItems.has(id)) { items.push(Object.assign({}, memoryItems.get(id), { draft_orphan: true })); seen.add(id); }
+        });
+        memoryRequests.forEach(function (request) {
+          (request.body.candidate_ids || []).forEach(function (id) {
+            if (!seen.has(id) && memoryItems.has(id)) { items.push(Object.assign({}, memoryItems.get(id), { draft_orphan: true })); seen.add(id); }
+          });
+        });
+        items.forEach(function (item) { memoryItems.set(item.id, item); });
+        target.innerHTML = renderDailyChatMemoryPending(items);
+        syncUncertainLocks();
       })
       .catch(function (e) {
-        target.innerHTML = '<div class="loading">读取失败: ' + esc(e.message) + '</div>';
+      if (epoch === memoryLoadEpoch) setDailyChatMemoryMessage('读取失败，草稿保留: ' + e.message, 'error');
       });
   }
 
@@ -117,8 +282,12 @@
   }
 
   function renderDailyChatMemoryCard(item) {
-    var candidate = item.candidate || {};
+    var candidate = Object.assign({}, item.candidate || {});
     var id = item.id || '';
+    var draft = memoryDrafts.get(id);
+    var revision = draft ? draft.revision : Number(item.authority_revision || candidate.authority_revision || 0);
+    var fields = draft ? draft.fields : itemFields(item);
+    Object.assign(candidate, fields, { proposed_memory: fields.content });
     var legacy = legacyNoOriginal(item);
     var blocked = confirmBlocked(item);
     var editRequired = needsOwnerEdit(item);
@@ -149,7 +318,7 @@
       ? '<button type="button" class="chat-memory-source-btn" onclick="toggleDailyChatMemorySource(this, \'' + jsString(id) + '\')">查看完整原文</button>'
       : '';
     return '' +
-      '<div class="chat-memory-card' + (editRequired ? ' chat-memory-card-edit-needed' : '') + '" data-candidate-id="' + escAttr(id) + '"' + (editRequired ? ' data-needs-edit="true"' : '') + '>' +
+      '<div class="chat-memory-card' + (editRequired ? ' chat-memory-card-edit-needed' : '') + '" data-candidate-id="' + escAttr(id) + '" data-revision="' + escAttr(revision) + '" data-editing="' + (draft && draft.expanded ? 'true' : 'false') + '"' + (editRequired ? ' data-needs-edit="true"' : '') + '>' +
         '<div class="chat-memory-card-head">' +
           '<label class="chat-memory-select">' +
             '<input type="checkbox" data-select="' + escAttr(id) + '" onchange="refreshDailyChatMemorySelection()" />' +
@@ -170,7 +339,7 @@
             '</details>' +
             '<div class="chat-memory-card-source">' + esc(sourceText) + '</div>' +
             '<div class="chat-memory-card-meta">' +
-              esc((candidate.kind || candidate.candidate_type || 'memory') + ' · ' + (item.date || '') + ' · confidence ' + (candidate.confidence || '')) +
+              esc((candidate.kind || candidate.candidate_type || 'memory') + ' · ' + (item.date || '') + ' · confidence ' + (candidate.confidence == null ? '' : candidate.confidence)) +
               (sourceHash ? ' · src ' + esc(sourceHash) : '') +
             '</div>' +
           '</div>' +
@@ -179,12 +348,13 @@
           '<div class="chat-memory-source-loading">读取完整原文...</div>' +
         '</div>' +
         staleNote + blockedNote + editNote +
-        '<div class="chat-memory-edit-panel" hidden>' +
+        (draft ? '<p class="chat-memory-edit-needed">有未保存修改' + (item.draft_orphan || revision !== item.authority_revision ? '；服务器版本或状态已变化，请核对后再操作' : '') + '。</p>' : '') +
+        '<div class="chat-memory-edit-panel"' + (draft && draft.expanded ? '' : ' hidden') + '>' +
           '<label class="chat-memory-edit-field">标题' +
-            '<input type="text" data-field="title" value="' + escAttr(candidate.title || id) + '" />' +
+            '<input type="text" data-field="title" maxlength="100" value="' + escAttr(candidate.title || id) + '" />' +
           '</label>' +
           '<label class="chat-memory-edit-field">正文（建议记忆，写入记忆桶的内容）' +
-            '<textarea data-field="content" rows="4">' + esc(proposed) + '</textarea>' +
+            '<textarea data-field="content" maxlength="12000" rows="6">' + esc(proposed) + '</textarea><small>最多 12,000 字符；保存修改不会采用入库。离开页面前请保存。</small>' +
           '</label>' +
           '<div class="chat-memory-edit-grid">' +
             '<label class="chat-memory-edit-field">类型' +
@@ -200,14 +370,19 @@
               '<input type="number" min="1" max="10" data-field="importance" value="' + escAttr(candidate.importance || '') + '" />' +
             '</label>' +
             '<label class="chat-memory-edit-field">置信度' +
-              '<input type="number" min="0" max="1" step="0.01" data-field="confidence" value="' + escAttr(candidate.confidence || '') + '" />' +
+              '<input type="number" min="0" max="1" step="0.01" data-field="confidence" value="' + escAttr(candidate.confidence) + '" />' +
+            '</label>' +
+            '<label class="chat-memory-edit-field">事件日期（可选；不是入库日期）' +
+              '<input type="date" data-field="event_date" value="' + escAttr(fields.event_date) + '" /><small>未改此字段会保留原时间依据；改正文后旧时间需复核。</small>' +
             '</label>' +
           '</div>' +
         '</div>' +
         '<div class="chat-memory-card-actions">' +
           '<button type="button" onclick="toggleDailyChatMemoryEdit(this)">编辑</button>' +
+          '<button type="button" onclick="saveDailyChatMemoryEdit(this)">保存修改（仍待审核）</button>' +
+          '<button type="button" onclick="discardDailyChatMemoryDraft(this)">放弃修改／载入新版</button>' +
           sourcePreviewButton +
-          '<button type="button"' + confirmDisabled + ' onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'confirm\')">写入</button>' +
+          '<button type="button"' + confirmDisabled + ' onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'confirm\')">采用并入库</button>' +
           '<button type="button" onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'defer\')">暂缓</button>' +
           '<label class="chat-memory-reject-reason">拒绝原因' +
             '<select id="reject-reason-' + escAttr(id) + '">' +
@@ -348,8 +523,9 @@
       title: dailyChatMemoryField(card, 'title'),
       content: dailyChatMemoryField(card, 'content'),
       kind: dailyChatMemoryField(card, 'kind'),
-      domain: dailyChatMemoryField(card, 'domain'),
-      tags: dailyChatMemoryField(card, 'tags'),
+      domain: splitTerms(dailyChatMemoryField(card, 'domain')),
+      tags: splitTerms(dailyChatMemoryField(card, 'tags')),
+      event_date: dailyChatMemoryField(card, 'event_date'),
     };
     var importance = dailyChatMemoryField(card, 'importance');
     var confidence = dailyChatMemoryField(card, 'confidence');
@@ -359,12 +535,14 @@
   }
 
   function toggleDailyChatMemoryEdit(button) {
+    if (memoryBusy) return;
     var card = button && button.closest ? button.closest('.chat-memory-card') : null;
     var panel = card && card.querySelector ? card.querySelector('.chat-memory-edit-panel') : null;
     if (!panel) return;
     panel.hidden = !panel.hidden;
     if (card) card.setAttribute('data-editing', panel.hidden ? 'false' : 'true');
     button.textContent = panel.hidden ? '编辑' : '收起编辑';
+    captureMemoryDraft(card);
   }
 
   function openDailyChatMemoryEdit(card) {
@@ -389,7 +567,9 @@
     if (!res.ok && !data) throw new Error('操作失败 (HTTP ' + res.status + ')');
     if (!res.ok) {
       data = data || {};
-      throw new Error(data.error || data.reason || '操作失败 (HTTP ' + res.status + ')');
+      var error = new Error(data.error || data.reason || '操作失败 (HTTP ' + res.status + ')');
+      error.definiteRejection = res.status >= 400 && res.status < 500;
+      throw error;
     }
     return data;
   }
@@ -397,55 +577,7 @@
   async function confirmDailyChatMemory(buttonOrId, idOrAction, maybeAction) {
     var button = typeof buttonOrId === 'object' ? buttonOrId : null;
     var id = button ? idOrAction : buttonOrId;
-    var action = button ? maybeAction : idOrAction;
-    var isReject = action === 'reject';
-    var isDefer = action === 'defer';
-    var verbText = isDefer ? '暂缓' : (isReject ? '拒绝' : '写入');
-    if (!confirm(verbText + '这条候选？' + (isDefer ? '（暂缓不等同拒绝，之后可再处理）' : ''))) return;
-    var card = button && button.closest ? button.closest('.chat-memory-card') : null;
-    var body = {
-      candidate_ids: [id],
-      action: action,
-      confirm: isReject ? 'REJECT' : (isDefer ? 'DEFER' : 'WRITE'),
-      request_id: newDailyChatMemoryRequestId(),
-    };
-    if (isReject) {
-      var reasonSelect = document.getElementById('reject-reason-' + id);
-      var noteInput = document.getElementById('reject-note-' + id);
-      if (reasonSelect) body.reason = reasonSelect.value;
-      if (noteInput && noteInput.value.trim()) body.reason_note = noteInput.value.trim();
-    } else if (!isDefer) {
-      var edits = card && card.getAttribute('data-editing') === 'true' ? readDailyChatMemoryEdits(card) : null;
-      if (edits) {
-        body.edits = {};
-        body.edits[id] = edits;
-      }
-    }
-    try {
-      var data = await postDailyChatMemoryConfirm(body);
-      if (!data) return;
-      if (data.status === 'rate_limited') {
-        setDailyChatMemoryMessage('操作太频繁，请稍后再试。', 'error');
-        return;
-      }
-      var needsEdit = (data.results || []).filter(function (r) { return r.status === 'needs_owner_edit'; });
-      var invalid = (data.results || []).filter(function (r) { return r.status === 'invalid_source'; });
-      if (needsEdit.length && !isReject && !isDefer) {
-        setDailyChatMemoryMessage('这条候选的建议记忆与原文高度重叠：请先编辑成可读记忆后再写入。', 'error');
-        openDailyChatMemoryEdit(card);
-        return;
-      }
-      if (invalid.length) {
-        setDailyChatMemoryMessage('候选来源无法核对，未写入；请拒绝这些候选。', 'error');
-        loadDailyChatMemoryPending();
-        return;
-      }
-      setDailyChatMemoryMessage('已' + verbText + '候选。', 'ok');
-      loadDailyChatMemoryPending();
-      if (!isReject && !isDefer) loadBuckets();
-    } catch (e) {
-      setDailyChatMemoryMessage('操作失败: ' + e.message, 'error');
-    }
+    return performMemoryAction([id], button ? maybeAction : idOrAction, false);
   }
 
   async function batchDailyChatMemoryConfirm(button, action) {
@@ -454,44 +586,71 @@
       setDailyChatMemoryMessage('请先勾选要操作的候选。', 'error');
       return;
     }
-    var isReject = action === 'reject';
-    var isDefer = action === 'defer';
-    var verb = isDefer ? '暂缓' : (isReject ? '拒绝' : '写入');
-    if (!confirm('确认批量' + verb + ' ' + ids.length + ' 条候选？此操作不可撤销。')) return;
-    var body = {
-      candidate_ids: ids,
-      action: action,
-      confirm: isReject ? 'REJECT' : (isDefer ? 'DEFER' : 'WRITE'),
-      request_id: newDailyChatMemoryRequestId(),
-    };
-    if (isReject) {
-      var reasonSelect = document.getElementById('daily-chat-memory-batch-reason');
-      var noteInput = document.getElementById('daily-chat-memory-batch-note');
-      if (reasonSelect) body.reason = reasonSelect.value;
-      if (noteInput && noteInput.value.trim()) body.reason_note = noteInput.value.trim();
-    }
-    button.disabled = true;
+    return performMemoryAction(ids, action, true);
+  }
+
+  async function performMemoryAction(ids, action, batch) {
+    if (memoryBusy) return;
+    captureMemoryDrafts();
+    ids = ids.slice().sort();
+    var isReject = action === 'reject', isDefer = action === 'defer';
+    var verb = isReject ? '拒绝' : (isDefer ? '暂缓' : '采用并入库');
+    if (!confirm(verb + ' ' + ids.length + ' 条候选？' + (isReject ? '这些条目的未保存修改将放弃。' : '先保存所选条目的修改；保存本身不代表入库。'))) return;
+    memoryBusy = true;
+    ++memoryLoadEpoch;
+    setMemoryControlsBusy(true);
+    var refresh = false;
+    var key = action + ':' + ids.join(',');
     try {
+      ids.forEach(function (id) {
+        var pending = pendingMemoryAction(id);
+        if (pending && pending[0] !== key) throw new Error('该候选上次审核结果尚未确认，请先重试原操作。');
+        if (isReject && memoryRequests.has('edit:' + id)) throw new Error('保存结果尚未确认，请先重试保存。');
+      });
+      var retry = memoryRequests.get(key);
+      if (!retry && !isReject) for (var id of ids) await saveMemoryDraft(id);
+      var revisions = {};
+      if (!retry) ids.forEach(function (id) {
+        var item = memoryItems.get(id);
+        if (!item || !Number.isInteger(item.authority_revision) || item.draft_orphan) throw new Error('候选版本不可用，请重新读取并核对。');
+        revisions[id] = item.authority_revision;
+      });
+      var input = { candidate_ids: ids, action: action, expected_revisions: revisions,
+        confirm: isReject ? 'REJECT' : (isDefer ? 'DEFER' : 'WRITE') };
+      if (isReject) {
+        var reason = document.getElementById(batch ? 'daily-chat-memory-batch-reason' : 'reject-reason-' + ids[0]);
+        var note = document.getElementById(batch ? 'daily-chat-memory-batch-note' : 'reject-note-' + ids[0]);
+        if (reason) input.reason = reason.value;
+        if (note && note.value.trim()) input.reason_note = note.value.trim();
+      }
+      var body = retry ? retry.body : stableMemoryRequest(key, input);
       var data = await postDailyChatMemoryConfirm(body);
-      if (!data) return;
-      if (data.status === 'rate_limited') {
-        setDailyChatMemoryMessage('操作太频繁，请稍后再试。', 'error');
-        return;
+      if (!data) throw new Error('结果未确认，请重试原操作，不要重新创建候选。');
+      if (data.status === 'rate_limited') { memoryRequests.delete(key); throw new Error('操作太频繁，请稍后重试。'); }
+      if (data.status === 'conflict') { memoryRequests.delete(key); throw new Error('版本或请求冲突，请核对候选。'); }
+      var expected = isReject ? ['rejected'] : (isDefer ? ['deferred'] : ['created', 'exists']);
+      var results = data.results || [];
+      var applied = results.filter(function (r) { return expected.includes(r.status); });
+      var complete = results.length === ids.length && new Set(results.map(function (r) { return r.id; })).size === ids.length && results.every(function (r) {
+        return ids.includes(r.id) && (expected.includes(r.status) || ['revision_conflict', 'needs_owner_edit', 'invalid_source', 'missing', 'rejected', 'deferred', 'commit_failed'].includes(r.status));
+      });
+      if (complete) {
+        memoryRequests.delete(key);
+        applied.forEach(function (r) { memoryDrafts.delete(r.id); memoryItems.delete(r.id); });
       }
-      var invalid = (data.results || []).filter(function (r) { return r.status === 'invalid_source'; });
-      var needsEdit = (data.results || []).filter(function (r) { return r.status === 'needs_owner_edit'; });
-      var applied = (data.results || []).filter(function (r) { return r.status === 'created' || r.status === 'exists' || r.status === 'rejected' || r.status === 'deferred'; }).length;
-      if (invalid.length || needsEdit.length) {
-        setDailyChatMemoryMessage('批量完成：成功 ' + applied + ' 条；' + invalid.length + ' 条来源无法核对、' + needsEdit.length + ' 条需先编辑，请单独处理。', 'error');
-      } else {
-        setDailyChatMemoryMessage('批量' + verb + '完成：' + applied + ' 条。', 'ok');
-      }
-      loadDailyChatMemoryPending();
-      if (!isReject && !isDefer) loadBuckets();
+      var failed = results.filter(function (r) { return !expected.includes(r.status); });
+      var detail = failed.some(function (r) { return r.status === 'revision_conflict'; }) ? '版本已变化，请载入新版核对。'
+        : failed.some(function (r) { return r.status === 'needs_owner_edit'; }) ? '部分候选需要实际修改正文后才能采用。'
+        : '其余未成功或结果未确认，请核对；已保存的修改仍然保留。';
+      setDailyChatMemoryMessage(verb + '成功 ' + applied.length + '／' + ids.length + ' 条。' + (applied.length === ids.length ? '' : detail), applied.length === ids.length ? 'ok' : 'error');
+      refresh = applied.length === ids.length || !memoryRequests.has(key);
     } catch (e) {
-      setDailyChatMemoryMessage('批量操作失败: ' + e.message, 'error');
+      if (e.definiteRejection) memoryRequests.delete(key);
+      setDailyChatMemoryMessage('未完成：' + e.message, 'error');
     } finally {
-      button.disabled = false;
+      memoryBusy = false;
+      setMemoryControlsBusy(false);
+      if (refresh) loadDailyChatMemoryPending();
     }
   }
 
@@ -587,6 +746,8 @@
   window.confirmDailyChatMemory = confirmDailyChatMemory;
   window.batchDailyChatMemoryConfirm = batchDailyChatMemoryConfirm;
   window.toggleDailyChatMemoryEdit = toggleDailyChatMemoryEdit;
+  window.saveDailyChatMemoryEdit = saveDailyChatMemoryEdit;
+  window.discardDailyChatMemoryDraft = discardDailyChatMemoryDraft;
   window.toggleDailyChatMemorySelectAll = toggleDailyChatMemorySelectAll;
   window.refreshDailyChatMemorySelection = refreshDailyChatMemorySelection;
   window.toggleDailyChatMemorySource = toggleDailyChatMemorySource;

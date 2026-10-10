@@ -12461,6 +12461,10 @@ async def api_daily_chat_memory_confirm(request):
     reason = str(body.get("reason") or "").strip().lower()
     if reason and reason not in allowed_reasons:
         return JSONResponse({"error": f"reason must be one of: {sorted(allowed_reasons)}"}, status_code=400)
+    revisions = body.get("expected_revisions")
+    if revisions is not None and (not isinstance(revisions, dict) or any(
+            type(revisions.get(str(item))) is not int or revisions[str(item)] < 1 for item in ids)):
+        return JSONResponse({"error": "invalid_expected_revisions"}, status_code=400)
     result = await reflection_engine.confirm_daily_chat_memory(
         [str(item or "") for item in ids],
         bucket_mgr,
@@ -12470,6 +12474,7 @@ async def api_daily_chat_memory_confirm(request):
         request_id=str(body.get("request_id") or "").strip() or None,
         reject_reason=reason or None,
         reject_note=str(body.get("reason_note") or "").strip() or None,
+        expected_revisions=revisions,
     )
     if result.get("status") == "rate_limited":
         return JSONResponse(result, status_code=429)
@@ -12479,6 +12484,34 @@ async def api_daily_chat_memory_confirm(request):
     if invalid_sources and not any(item.get("status") in {"created", "exists", "rejected"} for item in (result.get("results") or [])):
         return JSONResponse(result, status_code=409)
     return JSONResponse(result)
+
+
+@mcp.custom_route("/api/daily-chat-memory/edit", methods=["POST"])
+async def api_daily_chat_memory_edit(request):
+    """Save an owner revision without approving it or invoking a model/index."""
+    from starlette.responses import JSONResponse
+    from memory_candidate_edit import save_owner_candidate
+    from memory_authority import MemoryAuthorityError
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    if not reflection_engine.memory_authority_enabled or reflection_engine.memory_authority_store is None:
+        return JSONResponse({"error": "memory_authority_unavailable"}, status_code=503)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or set(body) != {"candidate_id", "edit", "expected_revision", "request_id"}:
+            raise ValueError("invalid_edit_request")
+        candidate_id = body["candidate_id"]
+        if not isinstance(candidate_id, str) or not MEMORY_ID_RE.fullmatch(candidate_id):
+            raise ValueError("invalid_candidate_id")
+        row = save_owner_candidate(reflection_engine.memory_authority_store, candidate_id,
+            edit=body["edit"], expected_revision=body["expected_revision"], request_id=body["request_id"])
+        return JSONResponse({"status": "saved", "adopted": False,
+            "item": reflection_engine._authority_candidate_legacy_item(row)}, headers={"Cache-Control": "no-store"})
+    except MemoryAuthorityError as exc:
+        return JSONResponse({"error": exc.code}, status_code=404 if exc.code == "candidate_not_found" else 409)
+    except (ValueError, TypeError, KeyError):
+        return JSONResponse({"error": "invalid_edit_request"}, status_code=400)
 
 
 @mcp.custom_route("/dashboard", methods=["GET"])
