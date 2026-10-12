@@ -213,6 +213,8 @@ darkroom_store = DarkroomStore(config)                  # Private reflection roo
 gateway_state_store = GatewayStateStore(os.path.join(config["buckets_dir"], "gateway_state.db"))
 raw_event_store = RawEventStore(config)                  # Raw dialogue archive / 原文保险箱
 reminder_store = ReminderStore(config)                    # Standalone care memos / 独立照顾备忘
+from care_action_links import CareActionLinks, CareLinkError
+care_action_links = CareActionLinks(reminder_store)
 memory_projection_worker = (
     MemoryProjectionWorker(
         config=config,
@@ -11399,6 +11401,53 @@ async def api_todo_writeback(request):
         {"error": "todo writeback is disabled; use /api/reminders instead"},
         status_code=410,
     )
+
+
+@mcp.custom_route("/api/care-memos", methods=["GET"])
+async def api_care_memos(request):
+    from starlette.responses import JSONResponse
+    error = _require_dashboard_auth(request)
+    if error:
+        return error
+    try:
+        result = care_action_links.list(scope=request.query_params.get('scope', ''),
+            session_id=request.query_params.get('session_id', ''),
+            offset=int(request.query_params.get('offset', '0')),
+            limit=int(request.query_params.get('limit', '20')))
+        return JSONResponse(result)
+    except ValueError:
+        return JSONResponse({'error': 'invalid_care_page'}, status_code=400)
+
+
+@mcp.custom_route("/api/care-memos/{reminder_id}", methods=["GET"])
+async def api_care_memo_read(request):
+    from starlette.responses import JSONResponse
+    error = _require_dashboard_auth(request)
+    if error:
+        return error
+    try:
+        result = care_action_links.read(request.path_params['reminder_id'],
+            scope=request.query_params.get('scope', ''), session_id=request.query_params.get('session_id', ''))
+        return JSONResponse({'memo': result})
+    except CareLinkError:
+        return JSONResponse({'error': 'care_memo_not_found'}, status_code=404)
+
+
+@mcp.custom_route("/api/care-memos/{reminder_id}/action", methods=["PUT"])
+async def api_care_memo_action(request):
+    from starlette.responses import JSONResponse
+    error = _require_dashboard_auth(request)
+    if error:
+        return error
+    try:
+        fields = await request.json()
+        if not isinstance(fields, dict) or fields.get('reminder_id') != request.path_params['reminder_id']:
+            raise CareLinkError('invalid_care_link')
+        return JSONResponse(care_action_links.sync(fields))
+    except CareLinkError as exc:
+        return JSONResponse({'error': str(exc)}, status_code=409)
+    except ValueError:
+        return JSONResponse({'error': 'invalid_json'}, status_code=400)
 
 
 @mcp.custom_route("/api/reminders", methods=["GET"])
