@@ -132,3 +132,32 @@ def test_invalid_protocol_fails_before_mutation(service,changes):
     store,links=service;before=store.get('fixture')
     with pytest.raises(CareLinkError):links.sync(fields(links,**changes))
     assert before==store.get('fixture')
+
+
+@pytest.mark.parametrize('header,cookie,configured,expected',[
+    ('Bearer fixture',False,True,True),('bearer fixture',False,True,True),
+    ('Bearer wrong',False,True,False),('',False,True,False),
+    ('Bearer fixture',False,False,False),('',True,False,True),
+    ('Basic fixture',False,True,False),('Bearer 合成',False,True,False)])
+def test_actual_service_auth_helper_without_initializing_private_brain(monkeypatch,header,cookie,configured,expected):
+    import ast,hmac,os
+    from pathlib import Path
+    from types import SimpleNamespace
+    root=Path(__file__).resolve().parents[1]
+    tree=ast.parse((root/'server.py').read_text(encoding='utf-8'))
+    node=next(x for x in tree.body if isinstance(x,ast.FunctionDef) and x.name=='_require_owner_or_internal_care_access')
+    namespace={'os':os,'hmac':hmac,'config':{},'_dashboard_authenticated':lambda request:cookie,
+        '_require_dashboard_auth':lambda request:'unauthorized'}
+    if configured:monkeypatch.setenv('OMBRE_GATEWAY_TOKEN','fixture')
+    else:monkeypatch.delenv('OMBRE_GATEWAY_TOKEN',raising=False)
+    exec(compile(ast.Module(body=[node],type_ignores=[]),'<actual-care-auth>','exec'),namespace)
+    result=namespace[node.name](SimpleNamespace(headers={'authorization':header}))
+    assert (result is None)==expected
+    # This helper must be used by all three new routes, while the old write
+    # routes remain on their existing Dashboard authentication.
+    names={'api_care_memos','api_care_memo_read','api_care_memo_action'}
+    for route in tree.body:
+        if isinstance(route,ast.AsyncFunctionDef) and route.name in names:
+            assert any(isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id==node.name for n in ast.walk(route))
+        if isinstance(route,ast.AsyncFunctionDef) and route.name in {'api_reminder_create','api_reminder_update'}:
+            assert any(isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=='_require_dashboard_auth' for n in ast.walk(route))

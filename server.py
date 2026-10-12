@@ -11403,10 +11403,26 @@ async def api_todo_writeback(request):
     )
 
 
+def _require_owner_or_internal_care_access(request):
+    """Only the new care-link boundary accepts the existing internal bearer.
+
+    Dashboard sessions retain owner control. Original reminders/Dashboard
+    routes keep their original cookie authentication and write semantics.
+    """
+    if _dashboard_authenticated(request):
+        return None
+    token = os.environ.get('OMBRE_GATEWAY_TOKEN') or str(config.get('gateway', {}).get('token') or '')
+    header = request.headers.get('authorization', '')
+    supplied = header.split(' ', 1)[1].strip() if header.lower().startswith('bearer ') else ''
+    if token and supplied and hmac.compare_digest(supplied.encode(), token.encode()):
+        return None
+    return _require_dashboard_auth(request)
+
+
 @mcp.custom_route("/api/care-memos", methods=["GET"])
 async def api_care_memos(request):
     from starlette.responses import JSONResponse
-    error = _require_dashboard_auth(request)
+    error = _require_owner_or_internal_care_access(request)
     if error:
         return error
     try:
@@ -11422,7 +11438,7 @@ async def api_care_memos(request):
 @mcp.custom_route("/api/care-memos/{reminder_id}", methods=["GET"])
 async def api_care_memo_read(request):
     from starlette.responses import JSONResponse
-    error = _require_dashboard_auth(request)
+    error = _require_owner_or_internal_care_access(request)
     if error:
         return error
     try:
@@ -11436,7 +11452,7 @@ async def api_care_memo_read(request):
 @mcp.custom_route("/api/care-memos/{reminder_id}/action", methods=["PUT"])
 async def api_care_memo_action(request):
     from starlette.responses import JSONResponse
-    error = _require_dashboard_auth(request)
+    error = _require_owner_or_internal_care_access(request)
     if error:
         return error
     try:
