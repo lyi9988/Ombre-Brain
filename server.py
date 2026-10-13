@@ -205,6 +205,7 @@ memory_commit_service = (
     if memory_authority_store is not None
     else None
 )
+decay_engine.memory_state_service = memory_commit_service
 portrait_engine = DailyPortraitMaintainer(config, prompt_plan_mirror)  # Daily portrait state / 每日画像状态
 dream_engine = DreamEngine(config, prompt_plan_mirror) # Night dream worker / 夜梦
 identity_semantic_store = IdentitySemanticStore(config) # Private relationship alias index / 私有关系语义索引

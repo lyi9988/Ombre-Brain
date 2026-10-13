@@ -1535,9 +1535,25 @@ class MemoryAuthorityStore:
         recall_policy: str,
         idempotency_key: str,
         actor: str,
+        expected_revision: int | None = None,
+        expected_state: str | None = None,
+        expected_state_generation: str | None = None,
     ) -> dict[str, Any]:
         state = str(state or "").strip().lower()
         recall_policy = str(recall_policy or "").strip().lower()
+        if expected_revision is not None:
+            if isinstance(expected_revision, bool):
+                raise ValueError("invalid expected memory revision")
+            try:
+                expected_revision = int(expected_revision)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid expected memory revision") from exc
+            if expected_revision < 0:
+                raise ValueError("invalid expected memory revision")
+        if expected_state is not None:
+            expected_state = str(expected_state or "").strip().lower()
+            if expected_state not in {"active", "archived", "tombstoned"}:
+                raise ValueError("invalid expected memory state")
         if state not in {"active", "archived", "tombstoned"}:
             raise ValueError("invalid memory state")
         if recall_policy not in {"enabled", "manual_only", "disabled"}:
@@ -1548,12 +1564,21 @@ class MemoryAuthorityStore:
             "recall_policy": recall_policy,
             "actor": actor,
         }
+        # Keep legacy callers' fingerprints unchanged unless they opt into CAS.
+        if expected_revision is not None:
+            payload["expected_revision"] = expected_revision
+        if expected_state is not None:
+            payload["expected_state"] = expected_state
+        if expected_state_generation is not None:
+            payload["expected_state_generation"] = str(expected_state_generation)
         fingerprint = self.fingerprint(payload)
         operation_id = f"memory-state:{uuid.uuid4().hex}"
         now = _now()
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # Idempotent retries return the original operation before checking
+            # current state, which may already reflect this same operation.
             prior = conn.execute("SELECT * FROM commit_log WHERE idempotency_key=?", (idempotency_key,)).fetchone()
             if prior:
                 if str(prior["fingerprint"]) != fingerprint:
@@ -1563,6 +1588,20 @@ class MemoryAuthorityStore:
             memory = conn.execute("SELECT * FROM memories WHERE memory_id=?", (memory_id,)).fetchone()
             if not memory:
                 raise MemoryNotFound(memory_id)
+            current_revision = int(memory["active_revision"] or 0)
+            current_state = str(memory["state"] or "").strip().lower()
+            if expected_revision is not None and current_revision != expected_revision:
+                raise RevisionConflict(
+                    f"expected revision {expected_revision}, current {current_revision}"
+                )
+            if expected_state is not None and current_state != expected_state:
+                raise RevisionConflict(
+                    f"expected state {expected_state}, current {current_state}"
+                )
+            if expected_state_generation is not None:
+                generation = self._memory_state_generation(conn, memory_id)
+                if generation != str(expected_state_generation):
+                    raise RevisionConflict("memory lifecycle generation changed")
             conn.execute(
                 "INSERT INTO commit_log(operation_id,idempotency_key,fingerprint,operation_kind,aggregate_id,status,"
                 "payload_json,result_json,error_code,created_at,updated_at) VALUES(?,?,?,?,?,'committed',?,'{}','',?,?)",
@@ -1593,11 +1632,50 @@ class MemoryAuthorityStore:
         finally:
             conn.close()
 
+    @staticmethod
+    def _memory_state_generation(conn, memory_id: str) -> str:
+        row = conn.execute(
+            "SELECT operation_id FROM commit_log "
+            "WHERE aggregate_id=? AND operation_kind='memory_state' AND status='committed' "
+            "ORDER BY rowid DESC LIMIT 1", (str(memory_id),),
+        ).fetchone()
+        return str(row["operation_id"]) if row else ""
+
+    def get_memory_state_snapshot(self, memory_id: str) -> tuple[dict[str, Any] | None, str]:
+        """Read body/state and lifecycle generation from one SQLite snapshot."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            row = conn.execute("SELECT * FROM memories WHERE memory_id=?", (memory_id,)).fetchone()
+            return (dict(row) if row else None, self._memory_state_generation(conn, memory_id))
+        finally:
+            conn.rollback()
+            conn.close()
+
     def get_memory(self, memory_id: str) -> dict[str, Any] | None:
         conn = self._connect()
         row = conn.execute("SELECT * FROM memories WHERE memory_id=?", (memory_id,)).fetchone()
         conn.close()
         return dict(row) if row else None
+
+    def get_memory_state_generation(self, memory_id: str) -> str | None:
+        """Return the latest committed lifecycle operation id for idempotency.
+
+        State transitions can share the same second-resolution ``updated_at``
+        value. The durable operation id distinguishes an owner restore from an
+        earlier archive of the same body revision.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT operation_id FROM commit_log "
+                "WHERE aggregate_id=? AND operation_kind='memory_state' AND status='committed' "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (str(memory_id),),
+            ).fetchone()
+            return str(row["operation_id"]) if row else None
+        finally:
+            conn.close()
 
     def list_memories(
         self,

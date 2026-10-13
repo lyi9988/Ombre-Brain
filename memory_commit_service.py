@@ -458,6 +458,9 @@ class MemoryCommitService:
         recall_policy: str,
         idempotency_key: str,
         actor: str,
+        expected_revision: int | None = None,
+        expected_state: str | None = None,
+        expected_state_generation: str | None = None,
     ) -> dict[str, Any]:
         memory = self.authority.get_memory(memory_id)
         if not memory:
@@ -468,6 +471,9 @@ class MemoryCommitService:
             recall_policy=recall_policy,
             idempotency_key=idempotency_key,
             actor=actor,
+            expected_revision=expected_revision,
+            expected_state=expected_state,
+            expected_state_generation=expected_state_generation,
         )
         if not result.get("outbox_event_id"):
             return result

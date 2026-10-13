@@ -36,7 +36,7 @@ class DecayEngine:
     计算衰减得分，将低活跃桶自动归档，模拟自然遗忘。
     """
 
-    def __init__(self, config: dict, bucket_mgr):
+    def __init__(self, config: dict, bucket_mgr, memory_state_service=None):
         # --- Load decay parameters / 加载衰减参数 ---
         decay_cfg = config.get("decay", {})
         self.decay_lambda = decay_cfg.get("lambda", 0.05)
@@ -50,6 +50,11 @@ class DecayEngine:
         self.arousal_boost = emotion_cfg.get("arousal_boost", 0.8)
 
         self.bucket_mgr = bucket_mgr
+        self.memory_state_service = memory_state_service
+        authority_cfg = config.get("memory_authority", {})
+        if not isinstance(authority_cfg, dict):
+            authority_cfg = {}
+        self.memory_authority_enabled = bool(authority_cfg.get("enabled", False))
 
         # --- Background task control / 后台任务控制 ---
         self._task: asyncio.Task | None = None
@@ -178,6 +183,101 @@ class DecayEngine:
 
         return round(base_score * resolved_factor * urgency_boost, 4)
 
+    def _authority_memories_by_bucket(self) -> dict[str, dict]:
+        """Read managed rows once, keyed by their physical bucket id."""
+        service = self.memory_state_service
+        if service is None:
+            if self.memory_authority_enabled:
+                raise RuntimeError("memory_state_service_unavailable")
+            return {}
+        authority = getattr(service, "authority", None)
+        if authority is None:
+            raise RuntimeError("memory_authority_unavailable")
+        list_memories = getattr(authority, "list_memories", None)
+        if not callable(list_memories):
+            raise RuntimeError("memory_authority_lookup_unavailable")
+
+        output: dict[str, dict] = {}
+        limit = 1000
+        offset = 0
+        while True:
+            rows = list_memories(state="all", limit=limit, offset=offset)
+            if not isinstance(rows, list):
+                raise RuntimeError("memory_authority_lookup_invalid")
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                bucket_id = str(row.get("bucket_id") or "").strip()
+                memory_id = str(row.get("memory_id") or "").strip()
+                if not bucket_id or not memory_id:
+                    continue
+                prior = output.get(bucket_id)
+                if prior is not None and str(prior.get("memory_id")) != memory_id:
+                    raise RuntimeError("memory_authority_bucket_ambiguous")
+                output[bucket_id] = row
+            if len(rows) < limit:
+                return output
+            offset += len(rows)
+
+    async def _archive_for_decay(
+        self, bucket_id: str, authority_memories: dict[str, dict] | None
+    ) -> tuple[bool, str]:
+        """Archive managed buckets through authority and preserve legacy fallback."""
+        if self.memory_state_service is None and not self.memory_authority_enabled:
+            return bool(await self.bucket_mgr.archive(bucket_id)), "legacy"
+        if authority_memories is None:
+            return False, "authority_unavailable"
+
+        listed = authority_memories.get(bucket_id)
+        if listed is None:
+            # A successful authority lookup proves this bucket is legacy.
+            return bool(await self.bucket_mgr.archive(bucket_id)), "legacy"
+
+        memory_id = str(listed.get("memory_id") or "").strip()
+        authority = getattr(self.memory_state_service, "authority", None)
+        get_snapshot = getattr(authority, "get_memory_state_snapshot", None)
+        if not memory_id or not callable(get_snapshot):
+            return False, "authority_unavailable"
+        memory, generation = get_snapshot(memory_id)
+        if not memory or str(memory.get("bucket_id") or "") != bucket_id:
+            return False, "authority_unavailable"
+
+        state = str(memory.get("state") or "").strip().lower()
+        if state == "archived":
+            return False, "already_archived"
+        if state != "active":
+            return False, "not_active"
+
+        revision = int(memory.get("active_revision") or 0)
+        recall_policy = str(memory.get("recall_policy") or "enabled")
+        idempotency_key = (
+            f"decay-archive:{memory_id}:r{revision}:g{generation}"
+        )
+        try:
+            await self.memory_state_service.change_memory_state(
+                memory_id=memory_id,
+                state="archived",
+                recall_policy=recall_policy,
+                idempotency_key=idempotency_key,
+                actor="decay",
+                expected_revision=revision,
+                expected_state="active",
+                expected_state_generation=generation,
+            )
+            return True, "authority"
+        except Exception as exc:
+            # Keep failure logs free of memory names and body text.
+            from memory_authority import RevisionConflict
+
+            if isinstance(exc, RevisionConflict):
+                logger.info("Decay archive skipped: authority CAS conflict")
+                return False, "cas_conflict"
+            logger.warning(
+                "Decay archive blocked: authority transition failed (%s)",
+                type(exc).__name__,
+            )
+            return False, "authority_failed"
+
     # ---------------------------------------------------------
     # Execute one decay cycle
     # 执行一轮衰减周期
@@ -202,6 +302,16 @@ class DecayEngine:
         archived = 0
         auto_resolved = 0
         lowest_score = float("inf")
+        authority_memories: dict[str, dict] | None = {}
+        if self.memory_state_service is not None or self.memory_authority_enabled:
+            try:
+                authority_memories = self._authority_memories_by_bucket()
+            except Exception as exc:
+                authority_memories = None
+                logger.warning(
+                    "Decay archive blocked: authority lookup failed (%s)",
+                    type(exc).__name__,
+                )
 
         for bucket in buckets:
             meta = bucket.get("metadata", {})
@@ -250,19 +360,18 @@ class DecayEngine:
             # --- 低于阈值 → 归档（模拟遗忘）---
             if score < self.threshold:
                 try:
-                    success = await self.bucket_mgr.archive(bucket["id"])
+                    bucket_id = str(bucket.get("id") or "")
+                    success, archive_path = await self._archive_for_decay(
+                        bucket_id, authority_memories
+                    )
                     if success:
                         archived += 1
                         logger.info(
-                            f"Decay archived / 衰减归档: "
-                            f"{meta.get('name', bucket['id'])} "
-                            f"(score={score:.4f}, threshold={self.threshold})"
+                            "Decay archived: bucket_id=%s path=%s score=%.4f threshold=%.4f",
+                            bucket_id, archive_path, score, self.threshold,
                         )
                 except Exception as e:
-                    logger.warning(
-                        f"Archive failed for {bucket.get('id', '?')} / "
-                        f"归档失败: {e}"
-                    )
+                    logger.warning("Decay archive failed (%s)", type(e).__name__)
 
         result = {
             "checked": checked,

@@ -51,6 +51,16 @@ class FakeEmbedding:
         self.delete_calls.append(memory_id)
 
 
+class ArchivedMemoryEmbedding(FakeEmbedding):
+    def __init__(self):
+        super().__init__()
+        self.generate_attempts = 0
+
+    async def generate_and_store(self, memory_id, text, **kwargs):
+        self.generate_attempts += 1
+        raise AssertionError("archived memory must not call the embedding provider")
+
+
 class RevisionAwareFakeEmbedding(FakeEmbedding):
     provider = "test-provider"
     model = "test-embedding-model"
@@ -341,6 +351,42 @@ def test_revision_outbox_all_projectors_projected_and_status_has_exact_revision_
     )
     assert identity_status["status"] == "projected"
     assert identity_status["details"]["authority"] == "memory_authority"
+
+
+def test_archived_memory_event_deletes_indexes_without_provider_work(tmp_path):
+    authority = _authority(tmp_path)
+    _commit_memory(authority, memory_state="archived", recall_policy="enabled")
+    embedding = ArchivedMemoryEmbedding()
+    worker, bucket_manager, _embedding, moments, node, entity, _word_map = _worker(
+        authority, tmp_path, embedding=embedding,
+    )
+
+    result = asyncio.run(worker.run_once())
+
+    assert result["projected"] == 1
+    assert result["degraded"] == 0
+    assert embedding.generate_attempts == 0
+    assert embedding.generate_calls == []
+    assert embedding.delete_calls == ["memory-1"]
+    assert bucket_manager.get_calls == []
+    assert moments.upsert_calls == []
+    assert node.upsert_calls == []
+    assert entity.replace_calls == []
+
+
+def test_active_manual_only_memory_remains_indexable_for_manual_recall(tmp_path):
+    authority = _authority(tmp_path)
+    _commit_memory(authority, memory_state="active", recall_policy="manual_only")
+    worker, _bucket_manager, embedding, moments, node, _entity, _word_map = _worker(
+        authority, tmp_path,
+    )
+
+    result = asyncio.run(worker.run_once())
+
+    assert result["projected"] == 1
+    assert len(embedding.generate_calls) == 1
+    assert [item["id"] for item in moments.upsert_calls] == ["memory-1"]
+    assert [item["id"] for item in node.upsert_calls] == ["memory-1"]
 
 
 def test_embedding_projection_carries_committed_revision_and_content_unit_metadata(tmp_path):
