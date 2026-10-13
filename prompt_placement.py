@@ -8,10 +8,13 @@ def place_context_messages(messages, blocks, coverage=None):
     coverage = coverage or {}
     taken, combined = set(), list(blocks)
     for row in coverage.get('prompt_blocks', []):
-        if not (isinstance(row, list) and len(row) == 6 and type(row[0]) is int
+        if not (isinstance(row, list) and len(row) in {6, 7} and type(row[0]) is int
                 and 0 <= row[0] < len(wire) and row[0] not in taken):
             continue
-        index, anchor, order, block_id, digest, depth = row
+        index, anchor, order, block_id, digest, depth = row[:6]
+        priority = row[6] if len(row) == 7 else 0
+        if type(priority) is not int:
+            continue
         item = wire[index]
         body = item.get('content')
         if (not isinstance(body, str) or item.get('tool_calls')
@@ -20,7 +23,8 @@ def place_context_messages(messages, blocks, coverage=None):
             continue
         taken.add(index)
         combined.append({'block_id':block_id, 'anchor':anchor, 'order':order,
-                         'history_depth':depth, 'role':item['role'], 'content':body})
+                         'priority':priority, 'history_depth':depth,
+                         'role':item['role'], 'content':body})
     remap, original = {}, []
     for index, item in enumerate(wire):
         if index not in taken:
@@ -56,7 +60,11 @@ def place_context_messages(messages, blocks, coverage=None):
     ranks = {'instructions.start':10, 'instructions.end':20, 'gateway.after_first_system':25,
              'history.start':30, 'history.depth':40, 'current_user.before':50,
              'current_user.prefix':60, 'gateway.current_user_prefix':60, 'current_user.after':110}
-    combined.sort(key=lambda x:(ranks.get(x.get('anchor'), 50), int(x.get('order') or 0), str(x.get('block_id') or '')))
+    combined.sort(key=lambda x:(
+        ranks.get(x.get('anchor'), 50),
+        -int(x.get('history_depth') or 0) if x.get('anchor') == 'history.depth' else 0,
+        int(x.get('order') or 0), int(x.get('priority') or 0),
+        str(x.get('block_id') or '')))
     for block in combined:
         anchor = block.get('anchor')
         role = block.get('role', 'system')

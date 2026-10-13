@@ -23590,7 +23590,7 @@ class GatewayService:
             placement_messages.append({
                 'block_id':block.get('block_id'), 'source_id':source_id,
                 'role':block.get('role', 'system'), 'anchor':block.get('anchor'),
-                'order':block.get('order', 0),
+                'order':block.get('order', 0), 'priority':block.get('priority', 0),
                 'history_depth':block.get('history_depth', 0), 'content':section,
             })
             instruction_lane = (
@@ -23602,7 +23602,7 @@ class GatewayService:
                 "block_id": block.get("block_id"), "source_id": source_id,
                 "mode": mode, "role": block.get("role"),
                 "lane": block.get("lane"), "anchor": block.get("anchor"),
-                "order": block.get("order"),
+                "order": block.get("order"), "priority": block.get("priority", 0),
                 "history_depth": block.get("history_depth", 0),
                 "model_message_sha256": hashlib.sha256(section.encode("utf-8")).hexdigest(),
                 "content_sha256": hashlib.sha256(

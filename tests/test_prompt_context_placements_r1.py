@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway import GatewayService
+from prompt_placement import place_context_messages
 from prompt_source_registry import fixed_prompt_source
 from utils import count_tokens_approx
 
@@ -28,7 +29,7 @@ def _block(source_id: str, *, role: str, anchor: str, order: int,
            lane: str | None = None, mode: str = "live_source",
            owner_body: str = "", wrapper_text: str = "",
            token_budget: int | None = None, history_depth: int = 0,
-           enabled: bool = True) -> dict:
+           enabled: bool = True, priority: int | None = None) -> dict:
     return {
         "block_id": f"r1:{order}:{source_id}",
         "source_id": source_id,
@@ -40,7 +41,7 @@ def _block(source_id: str, *, role: str, anchor: str, order: int,
         "anchor": anchor,
         "history_depth": history_depth,
         "order": order,
-        "priority": order,
+        "priority": order if priority is None else priority,
         "enabled": enabled,
         "owner_body": owner_body,
         "frozen_body": "",
@@ -343,6 +344,37 @@ def test_history_depth_cannot_split_a_tool_call_from_two_results():
     assert result_b == result_a + 1
 
 
+def test_legacy_six_field_coverage_and_clamped_history_depth_order():
+    deep_body = "LEGACY_PROMPT_DEPTH_10"
+    messages = [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "user", "content": deep_body},
+        {"role": "user", "content": "HISTORY_ONLY"},
+        {"role": "user", "content": "CURRENT"},
+    ]
+    coverage = {
+        "history_message_ranges": [[2, 3]],
+        "current_user_message_ranges": [[3, 4]],
+        # Legacy six-field SDK descriptors default to priority zero.
+        "prompt_blocks": [[
+            1, "history.depth", 90, "legacy:depth10",
+            hashlib.sha256(deep_body.encode("utf-8")).hexdigest(), 10,
+        ]],
+    }
+    shallow = {
+        "block_id": "gateway:depth5", "anchor": "history.depth",
+        "order": 10, "priority": 0, "history_depth": 5,
+        "role": "assistant", "content": "GATEWAY_DEPTH_5",
+    }
+
+    result = place_context_messages(messages, [shallow], coverage)
+
+    assert [row["content"] for row in result] == [
+        "SYSTEM", "LEGACY_PROMPT_DEPTH_10", "GATEWAY_DEPTH_5",
+        "HISTORY_ONLY", "CURRENT",
+    ]
+
+
 def test_legacy_none_injection_keeps_the_existing_message_text_exactly():
     service = _service()
     messages = [
@@ -574,11 +606,11 @@ wrapper = next(row for row in plan["blocks"]
                if row["source_id"] == "emotion.behavior_wrapper")
 wrapper.update(mode="owner_override", owner_body="OWNER_EMOTION_WRAPPER_R17",
                role="user", lane="message", anchor="history.depth",
-               history_depth=1, order=10)
+               history_depth=1, order=20, priority=20)
 state = next(row for row in plan["blocks"]
              if row["source_id"] == "emotion.current_state")
 state.update(role="assistant", lane="message", anchor="history.depth",
-             history_depth=1, order=30)
+             history_depth=1, order=20, priority=30)
 worldbook = next(row for row in plan["blocks"]
                  if row["source_id"] == "worldbook.entries")
 worldbook.update(history_depth=1, order=25)
@@ -754,15 +786,16 @@ def test_real_aiz_sdk_input_flows_through_gateway_without_provider_call(
         str(row.get("content") or "") for row in artifact["discovery_input"])
 
     prompt_blocks = coverage["prompt_blocks"]
-    assert all(isinstance(row, list) and len(row) == 6 for row in prompt_blocks)
+    assert all(isinstance(row, list) and len(row) == 7 for row in prompt_blocks)
     assert "OWNER_EMOTION_WRAPPER_R17" not in json.dumps(coverage, ensure_ascii=False)
     assert "CURRENT_STATE=" not in json.dumps(coverage, ensure_ascii=False)
     assert "AIZ_FIXED_INSTRUCTION_R1" not in json.dumps(coverage, ensure_ascii=False)
     assert "WORLD_BOOK_ALPHA" not in json.dumps(coverage, ensure_ascii=False)
-    for index, _anchor, _order, _block_id, digest, _depth in prompt_blocks:
+    for index, _anchor, _order, _block_id, digest, _depth, priority in prompt_blocks:
         body = messages[index].get("content")
         assert isinstance(body, str)
         assert hashlib.sha256(body.encode("utf-8")).hexdigest() == digest
+        assert isinstance(priority, int)
 
 
 def test_cross_stage_same_anchor_aiz_gateway_a_b_c_off_worldbook_and_snapshot(
@@ -787,10 +820,12 @@ def test_cross_stage_same_anchor_aiz_gateway_a_b_c_off_worldbook_and_snapshot(
     state_refs = state["_prompt_projection"]["source_refs"]
     wrapper_row = descriptors[wrapper_refs["block_id"]]
     state_row = descriptors[state_refs["block_id"]]
-    assert wrapper_row[1:3] == ["history.depth", 10]
+    assert wrapper_row[1:3] == ["history.depth", 20]
     assert wrapper_row[5] == 1
-    assert state_row[1:3] == ["history.depth", 30]
+    assert wrapper_row[6] == wrapper_refs["priority"] == 20
+    assert state_row[1:3] == ["history.depth", 20]
     assert state_row[5] == 1
+    assert state_row[6] == state_refs["priority"] == 30
     assert not (worldbook_block_ids & set(descriptors))
     wrapper_body, wrapper_role = wrapper["content"], wrapper["role"]
     state_body, state_role = state["content"], state["role"]
@@ -813,6 +848,7 @@ def test_cross_stage_same_anchor_aiz_gateway_a_b_c_off_worldbook_and_snapshot(
         role="assistant",
         anchor="history.depth",
         order=20,
+        priority=10,
         history_depth=1,
     )
     plan = _plan(gateway_block)
@@ -826,6 +862,8 @@ def test_cross_stage_same_anchor_aiz_gateway_a_b_c_off_worldbook_and_snapshot(
     placements = debug.pop("_placement_messages")
     assert len(placements) == 1
     assert placements[0]["order"] == 20
+    assert placements[0]["priority"] == 10
+    assert debug["resolved_blocks"][0]["priority"] == 10
     outgoing_model_input = copy.deepcopy(model_input)
     outgoing_model_input["messages"] = service._inject_context_messages(
         messages,
@@ -844,9 +882,9 @@ def test_cross_stage_same_anchor_aiz_gateway_a_b_c_off_worldbook_and_snapshot(
     memory = next(row for row in final_messages
                   if "SELECTED_MEMORY_R1" in str(row.get("content") or ""))
     assert memory["role"] == "assistant"
-    assert _index(final_messages, wrapper_body) < _index(
-        final_messages, "SELECTED_MEMORY_R1")
     assert _index(final_messages, "SELECTED_MEMORY_R1") < _index(
+        final_messages, wrapper_body)
+    assert _index(final_messages, wrapper_body) < _index(
         final_messages, state_body)
     assert final_messages.index(memory) < _index(final_messages, "HISTORY_NEW")
     assert _index(final_messages, "WORLD_BOOK_ALPHA") < _index(final_messages, "WORLD_BOOK_BETA")
@@ -941,9 +979,9 @@ def test_cross_stage_same_anchor_aiz_gateway_a_b_c_off_worldbook_and_snapshot(
     )
     replay_messages = replayed["messages"]
     assert injected_ids == ["memory-r1"]
-    assert _index(replay_messages, wrapper_body) < _index(
-        replay_messages, "SELECTED_MEMORY_R1")
     assert _index(replay_messages, "SELECTED_MEMORY_R1") < _index(
+        replay_messages, wrapper_body)
+    assert _index(replay_messages, wrapper_body) < _index(
         replay_messages, state_body)
     assert sum("SELECTED_MEMORY_R1" in str(row.get("content") or "")
                for row in replay_messages) == 1
