@@ -4169,6 +4169,7 @@ class GatewayService:
         dynamic_context: str,
         injected_ids: list[str] | None,
         debug_payload: dict[str, Any] | None,
+        composed_messages: list[dict] | None = None,
     ) -> None:
         ttl = max(
             0.0,
@@ -4207,6 +4208,7 @@ class GatewayService:
             "base_forward_messages": deepcopy(base_forward_messages),
             "stable_context": str(stable_context or ""),
             "dynamic_context": str(dynamic_context or ""),
+            "composed_messages": deepcopy(composed_messages),
             "injected_ids": list(injected_ids or []),
             "debug_payload": deepcopy(debug_payload) if debug_payload is not None else None,
         }
@@ -4297,6 +4299,8 @@ class GatewayService:
                 forward_messages,
                 stable_context,
                 dynamic_context,
+                composed_messages=entry.get("composed_messages"),
+                coverage=(payload.get('_ombre_trace_context') or {}).get('coverage'),
             )
             self._apply_prompt_cache_hints(
                 forward_payload,
@@ -4331,6 +4335,8 @@ class GatewayService:
                 forward_messages,
                 stable_context,
                 dynamic_context,
+                composed_messages=entry.get("composed_messages"),
+                coverage=(payload.get('_ombre_trace_context') or {}).get('coverage'),
             )
             self._apply_prompt_cache_hints(
                 forward_payload,
@@ -5079,6 +5085,7 @@ class GatewayService:
         # the same editable status into their existing direct-recall carrier;
         # do not mutate the preset, its role/order, or its component toggles.
         self._project_legacy_recall_status(prompt_plan, context_args, recall_status)
+        composed_messages = None
         if prompt_plan is None or prompt_plan.get("fallback_legacy"):
             stable_context, dynamic_context = (
                 self._build_injected_context_messages(**context_args))
@@ -5099,6 +5106,7 @@ class GatewayService:
                     **context_args,
                     memory_recall_projection=memory_recall_projection,
                 ))
+            composed_messages = prompt_composer_debug.pop('_placement_messages', [])
         mark_step("build_context_messages", stage_started_at)
 
         stage_started_at = time.perf_counter()
@@ -5124,10 +5132,19 @@ class GatewayService:
                 "Operit Activity Context",
                 operit_activity_context,
             )
+            if composed_messages is not None:
+                for text, role, anchor in (
+                    (operit_stable_context, 'system', 'gateway.after_first_system'),
+                    (operit_activity_context, 'user', 'gateway.current_user_prefix'),
+                ):
+                    if str(text or '').strip():
+                        composed_messages.append({'role':role, 'anchor':anchor, 'content':text})
         forward_payload["messages"] = self._inject_context_messages(
             messages_for_forward,
             stable_context,
             dynamic_context,
+            composed_messages=composed_messages,
+            coverage=(payload.get('_ombre_trace_context') or {}).get('coverage'),
         )
         self._reconcile_memory_recall_injection(
             memory_recall_projection, stable_context, dynamic_context,
@@ -5314,6 +5331,7 @@ class GatewayService:
                     dynamic_context=dynamic_context,
                     injected_ids=injected_ids,
                     debug_payload=debug_payload,
+                    composed_messages=composed_messages,
                 )
             log_prepare_timing()
             return forward_payload, injected_ids, debug_payload
@@ -5327,6 +5345,7 @@ class GatewayService:
                 dynamic_context=dynamic_context,
                 injected_ids=injected_ids,
                 debug_payload=None,
+                composed_messages=composed_messages,
             )
         return forward_payload, injected_ids
 
@@ -16541,6 +16560,12 @@ class GatewayService:
             recall_input["authority_missing_source_count"] = len(missing_sources)
             if missing_sources:
                 recall_input.setdefault("incomplete_reasons", []).append("committed_memory_source_projection_unavailable")
+                resolver = getattr(view, 'auto_recallable_source_projection', None)
+                if callable(resolver):
+                    source_state = resolver(missing_sources)
+                    recall_input['authority_source_reason_counts'] = {
+                        kind:len(ids) for kind,ids in source_state.get('unavailable_bucket_ids_by_reason', {}).items()
+                    }
         valid = []
         for bucket in all_buckets:
             meta = metadata_map.get(str(bucket.get("id") or ""))
@@ -23196,6 +23221,7 @@ class GatewayService:
                 "embedding_request_count": semantic.get("provider_requests"),
                 "embedding_timing": semantic.get("http_timing"),
                 "authority_missing_source_count": natural_input.get("authority_missing_source_count", 0),
+                "authority_source_reason_counts": natural_input.get("authority_source_reason_counts", {}),
                 "disabled_reason": natural_input.get("skip_reason") if status == "disabled" else None,
             }
             if status != "disabled":
@@ -23512,6 +23538,8 @@ class GatewayService:
         stable_sections: list[str] = []
         dynamic_sections: list[str] = []
         resolved = []
+        placement_messages = []
+        remaining_budget = self.inject_total_budget
         facts = {
             "gateway.scope": scope,
             "gateway.context_mode": context_mode,
@@ -23546,8 +23574,6 @@ class GatewayService:
                 body = render_runtime_placeholders(source_id, body, runtime_values)
             body = body.strip()
             budget = block.get("token_budget")
-            if body and isinstance(budget, int) and budget > 0:
-                body = self._trim_text(body, budget)
             wrapper = str(block.get("wrapper_text") or "")
             if body and wrapper:
                 body = (wrapper.replace("{{content}}", body)
@@ -23557,6 +23583,16 @@ class GatewayService:
             if not body:
                 continue
             section = f"{title}\n{body}" if title else body
+            cost = count_tokens_approx(section)
+            if (isinstance(budget, int) and cost > budget) or cost > remaining_budget:
+                continue
+            remaining_budget -= cost
+            placement_messages.append({
+                'block_id':block.get('block_id'), 'source_id':source_id,
+                'role':block.get('role', 'system'), 'anchor':block.get('anchor'),
+                'order':block.get('order', 0),
+                'history_depth':block.get('history_depth', 0), 'content':section,
+            })
             instruction_lane = (
                 block.get("lane") == "instruction"
                 or block.get("role") in {"system", "developer"}
@@ -23567,41 +23603,16 @@ class GatewayService:
                 "mode": mode, "role": block.get("role"),
                 "lane": block.get("lane"), "anchor": block.get("anchor"),
                 "order": block.get("order"),
+                "history_depth": block.get("history_depth", 0),
+                "model_message_sha256": hashlib.sha256(section.encode("utf-8")).hexdigest(),
                 "content_sha256": hashlib.sha256(
                     body.encode("utf-8")).hexdigest(),
                 "token_count": count_tokens_approx(body),
             })
-        # Older owner plans may predate the typed preface blocks.  Preserve
-        # their legacy payload, but when a block exists (including off or a
-        # moved override) the Canvas order is authoritative and no hidden
-        # duplicate is inserted.
-        configured_source_ids = {
-            str(item.get("source_id") or "")
-            for item in gateway_slice.get("blocks") or []
-            if isinstance(item, dict) and item.get("scope") in scope_chain
-        }
-        if (stable_sections
-                and "ombre.gateway_stable_preface_prompt"
-                not in configured_source_ids):
-            stable_sections.insert(0, self._resolve_gateway_fixed_prompt(
-                "ombre.gateway_stable_preface_prompt"))
-        if (dynamic_sections
-                and "ombre.gateway_dynamic_preface_prompt"
-                not in configured_source_ids):
-            dynamic_sections.insert(0, self._resolve_gateway_fixed_prompt(
-                "ombre.gateway_dynamic_preface_prompt"))
+        # An explicitly applied plan owns inclusion. Missing/off prefaces are
+        # not silently reintroduced; the uncomposed legacy path is unchanged.
         stable_context = "\n\n".join(stable_sections).strip()
         dynamic_context = "\n\n".join(dynamic_sections).strip()
-        stable_tokens = count_tokens_approx(stable_context)
-        dynamic_tokens = count_tokens_approx(dynamic_context)
-        if stable_tokens + dynamic_tokens > self.inject_total_budget:
-            if stable_tokens >= self.inject_total_budget:
-                stable_context = self._trim_text(
-                    stable_context, self.inject_total_budget)
-                dynamic_context = ""
-            else:
-                dynamic_context = self._trim_text(
-                    dynamic_context, self.inject_total_budget - stable_tokens)
         return stable_context, dynamic_context, {
             "status": "applied", "scope": scope,
             "preset_id": gateway_plan.get("preset_id"),
@@ -23611,6 +23622,7 @@ class GatewayService:
             "binding_revision": (gateway_plan.get("binding") or {}).get(
                 "aiz_binding_revision"),
             "resolved_blocks": resolved,
+            '_placement_messages': placement_messages,
         }
 
     def _memory_reading_policy_context(self) -> str:
@@ -25339,7 +25351,11 @@ class GatewayService:
         messages: list[dict],
         stable_context: str,
         dynamic_context: str,
+        *, composed_messages: list[dict] | None = None, coverage: dict | None = None,
     ) -> list[dict]:
+        if composed_messages is not None:
+            from prompt_placement import place_context_messages
+            return place_context_messages(messages, composed_messages, coverage)
         new_messages = deepcopy(messages)
         if stable_context.strip():
             stable_message = {"role": "system", "content": stable_context}

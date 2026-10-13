@@ -320,7 +320,7 @@ class MemoryProjectionWorker:
                 "projections": statuses,
             }
 
-        if memory.get("state") == "tombstoned" or memory.get("recall_policy") == "disabled":
+        if memory.get("state") != "active" or memory.get("recall_policy") == "disabled":
             statuses.extend(await self._delete_indexes(
                 memory_id, str(memory.get("bucket_id") or memory_id), revision, source_sha,
             ))

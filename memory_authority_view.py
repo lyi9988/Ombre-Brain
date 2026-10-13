@@ -5,7 +5,9 @@ import os
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+
+import yaml
 
 from memory_authority import normalize_alias
 
@@ -15,6 +17,8 @@ class MemoryAuthorityRecallView:
         authority_cfg = config.get("memory_authority", {}) if isinstance(
             config.get("memory_authority", {}), dict) else {}
         state_dir = str(config.get("state_dir") or config.get("buckets_dir") or "state")
+        buckets_dir = str(config.get("buckets_dir") or "").strip()
+        self.buckets_dir = Path(buckets_dir).resolve() if buckets_dir else None
         self.enabled = bool(authority_cfg.get("enabled", False))
         self.path = Path(
             str(authority_cfg.get("db_path") or os.path.join(state_dir, "memory_authority.sqlite3"))
@@ -74,6 +78,122 @@ class MemoryAuthorityRecallView:
             if conn is not None:
                 conn.close()
         return self._auto_bucket_ids
+
+    @staticmethod
+    def _read_bucket_projection_markers(path: Path) -> dict[str, str] | None:
+        """Read only Bucket frontmatter identity/type, never its body."""
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                if handle.readline().strip() != "---":
+                    return None
+                header: list[str] = []
+                header_bytes = 0
+                for line in handle:
+                    if line.strip() in {"---", "..."}:
+                        value = yaml.safe_load("".join(header)) or {}
+                        if not isinstance(value, dict):
+                            return None
+                        return {
+                            "id": str(value.get("id") or "").strip(),
+                            "type": str(value.get("type") or value.get("bucket_type") or "").strip().lower(),
+                        }
+                    header_bytes += len(line.encode("utf-8", errors="replace"))
+                    if header_bytes > 64 * 1024:
+                        return None
+                    header.append(line)
+        except (OSError, UnicodeError, yaml.YAMLError):
+            return None
+        return None
+
+    def auto_recallable_source_projection(
+        self, bucket_ids: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Compare authoritative auto-recall claims with physical Bucket lifecycle.
+
+        Authority remains the policy source. This read-only view qualifies a
+        committed source only when one non-archived projection is present under
+        permanent/dynamic/feel. It reports stale archived/missing claims instead
+        of deleting them from the authority set, so callers can keep Recall
+        incomplete visible without reviving archived files or rewriting facts.
+        """
+        authority_ids = frozenset(self.auto_recallable_bucket_ids())
+        if bucket_ids is None:
+            checked_ids = authority_ids
+        else:
+            requested_ids = frozenset(
+                str(value or "").strip() for value in bucket_ids if str(value or "").strip()
+            )
+            checked_ids = authority_ids & requested_ids
+        by_id: dict[str, list[tuple[str, str]]] = {bucket_id: [] for bucket_id in checked_ids}
+        uncertain: set[str] = set()
+        if not checked_ids or self.buckets_dir is None:
+            return {
+                "authority_bucket_ids": authority_ids,
+                "checked_bucket_ids": checked_ids,
+                "recallable_bucket_ids": frozenset(),
+                "unavailable_bucket_ids_by_reason": {
+                    "missing": checked_ids,
+                    "archived": frozenset(),
+                    "ambiguous": frozenset(),
+                },
+            }
+
+        for category in ("permanent", "dynamic", "feel", "archive"):
+            directory = self.buckets_dir / category
+            if not directory.is_dir():
+                continue
+            try:
+                files = directory.rglob("*.md")
+                for path in files:
+                    stem = path.stem
+                    candidates = [
+                        bucket_id for bucket_id in checked_ids
+                        if stem == bucket_id or stem.endswith(f"_{bucket_id}")
+                    ]
+                    markers = self._read_bucket_projection_markers(path)
+                    if markers is None or not markers.get("id"):
+                        uncertain.update(candidates)
+                        continue
+                    actual_id = markers["id"]
+                    if actual_id in checked_ids:
+                        if actual_id not in candidates:
+                            # BucketManager can list this file, but its lookup by
+                            # ID cannot locate it from the filename convention.
+                            uncertain.add(actual_id)
+                        by_id[actual_id].append((category, markers.get("type", "")))
+                    elif candidates:
+                        uncertain.update(candidates)
+            except OSError:
+                # A partial walk cannot prove an ID is absent or active.
+                uncertain.update(checked_ids)
+
+        recallable: set[str] = set()
+        archived: set[str] = set()
+        ambiguous = set(uncertain)
+        for bucket_id, locations in by_id.items():
+            if bucket_id in uncertain:
+                continue
+            categories = {category for category, _ in locations}
+            archived_marker = any(kind == "archived" for _, kind in locations)
+            active_categories = categories & {"permanent", "dynamic", "feel"}
+            if len(locations) > 1 or (active_categories and "archive" in categories):
+                ambiguous.add(bucket_id)
+            elif "archive" in categories or archived_marker:
+                archived.add(bucket_id)
+            elif len(active_categories) == 1 and len(locations) == 1:
+                recallable.add(bucket_id)
+
+        missing = set(checked_ids) - recallable - archived - ambiguous
+        return {
+            "authority_bucket_ids": authority_ids,
+            "checked_bucket_ids": checked_ids,
+            "recallable_bucket_ids": frozenset(recallable),
+            "unavailable_bucket_ids_by_reason": {
+                "archived": frozenset(archived),
+                "missing": frozenset(missing),
+                "ambiguous": frozenset(ambiguous),
+            },
+        }
 
     def trusted_aliases(self) -> list[dict[str, Any]]:
         stamp = self._file_stamp()
