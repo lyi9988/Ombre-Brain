@@ -50,6 +50,188 @@ def test_auto_body_time_provenance_and_same_operation_replay(tmp_path):
     asyncio.run(run())
 
 
+def test_chat_l1_body_over_request_limit_has_specific_error_without_slicing(tmp_path):
+    tool, _projection = service(tmp_path)
+    document = {
+        "entry": {"form": "episode"},
+        "narrative": {"title": "超限正文", "body": "界" * (512 * 1024 + 1)},
+        "entities": [], "scenes": [], "statements": [],
+        "retrieval": {"keywords": [], "tags": []}, "relations": [], "attributes": [],
+    }
+    request = envelope()
+    request["arguments"] = {"document": document}
+    with pytest.raises(ValueError, match="l1_narrative_body_too_large"):
+        tool._proposal(request)
+
+
+def test_chat_source_current_requires_the_actual_user_turn(tmp_path):
+    tool, _projection = service(tmp_path)
+    document = {
+        "entry": {"form": "episode"},
+        "narrative": {"title": "当前来源", "body": "保留当前说法。"},
+        "entities": [], "scenes": [], "statements": [],
+        "retrieval": {"keywords": [], "tags": []}, "relations": [], "attributes": [],
+    }
+    request = envelope()
+    request["arguments"] = {"document": document}
+    request["context"]["sources"][-1]["role"] = "assistant"
+    with pytest.raises(ValueError, match="current_user_source_must_be_last"):
+        tool._proposal(request)
+
+
+def test_aiz_catalog_adapter_commits_first_pass_l1_through_temporary_brain_route(tmp_path, monkeypatch):
+    """Use Aiz's real catalog/adapter and Brain's real handler with isolated stores."""
+    import ast
+    import httpx
+    import hmac
+    import logging
+    import os
+    import sys
+    from pathlib import Path
+    from types import SimpleNamespace
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    brain_root = Path(__file__).resolve().parents[1]
+    aiz_root = brain_root.parent / "aizizhu-memory-p2-r1"
+    monkeypatch.syspath_prepend(str(aiz_root))
+    monkeypatch.syspath_prepend(str(aiz_root / "tests"))
+    from core.conversation_service import ConversationService, current_turn_context
+    from core.conversation_store import ConversationStore
+    from core.memory_tool import MemoryToolAdapter
+    from core.sdk_tools import SdkToolCatalog
+    from core.tool_operations import ToolOperationStore, ToolOperationManager
+    from core.tool_registry import default_tool_registry
+    from test_tool_write_r1 import _settings
+
+    config = reflection_config(tmp_path, mode="auto")
+    engine = ReflectionEngine(config)
+    bucket_manager = __import__("bucket_manager").BucketManager(config)
+    engine._memory_authority_service = lambda manager: __import__("memory_commit_service").MemoryCommitService(
+        engine.memory_authority_store,
+        __import__("memory_commit_service").BucketMemoryProjection(config, bucket_manager=manager),
+    )
+
+    server_source = (brain_root / "server.py").read_text(encoding="utf-8")
+    tree = ast.parse(server_source, filename=str(brain_root / "server.py"))
+    selected = []
+    for node in tree.body:
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in {"_memory_write_token", "_authorized_memory_write", "api_chat_memory_tool"}):
+            node.decorator_list = []
+            selected.append(node)
+    namespace = {
+        "__name__": "temporary_brain_chat_memory_route",
+        "os": os,
+        "hmac": hmac,
+        "config": config,
+        "reflection_engine": engine,
+        "memory_authority_store": engine.memory_authority_store,
+        "bucket_mgr": bucket_manager,
+        "logger": logging.getLogger("test.temporary_brain_chat_memory"),
+    }
+    assert {node.name for node in selected} == {"_memory_write_token", "_authorized_memory_write", "api_chat_memory_tool"}
+    monkeypatch.setenv("OMBRE_MEMORY_WRITE_TOKEN", "temporary-brain-token")
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(brain_root / "server.py"), "exec"), namespace)
+    brain_app = Starlette(routes=[
+        Route("/api/memory-authority/chat-tool", namespace["api_chat_memory_tool"], methods=["POST"]),
+        Route("/api/memory-authority/chat-tool/{operation_id}", namespace["api_chat_memory_tool"], methods=["GET"]),
+    ])
+    transport = httpx.ASGITransport(app=brain_app)
+
+    import core.memory_tool as aiz_memory_tool_module
+    real_async_client = httpx.AsyncClient
+
+    class RoutedAsyncClient:
+        def __init__(self, **kwargs):
+            self.client = real_async_client(transport=transport, base_url="http://brain.test", **kwargs)
+
+        async def __aenter__(self):
+            await self.client.__aenter__()
+            return self
+
+        async def __aexit__(self, *args):
+            return await self.client.__aexit__(*args)
+
+        async def request(self, *args, **kwargs):
+            return await self.client.request(*args, **kwargs)
+
+    monkeypatch.setattr(aiz_memory_tool_module, "httpx", SimpleNamespace(AsyncClient=RoutedAsyncClient))
+
+    registry = default_tool_registry()
+    settings = _settings(tmp_path, registry, enabled=["memory.write", "memory.status"], permission="allow")
+    operations = ToolOperationStore(tmp_path / "aiz-operations.sqlite3")
+    operation_manager = ToolOperationManager(store=operations, registry=registry, settings=settings)
+    conversation_store = ConversationStore(tmp_path / "aiz-conversation.sqlite3")
+    adapter = MemoryToolAdapter(conversation_store,
+        credentials=lambda: ("http://brain.test", "temporary-brain-token"))
+    operation_manager.register_adapter("memory.write", adapter)
+    catalog = SdkToolCatalog({}, settings=settings, registry=registry, operation_manager=operation_manager)
+    catalog.register_executor("memory.status", adapter.status)
+    observed = []
+    status_observed = []
+    document = {
+        "entry": {"form": "episode"},
+        "narrative": {"title": "一段被认真记住的经历", "body": "我记得这次谈话里那份明确的请求。" * 800},
+        "entities": [], "scenes": [],
+        "statements": [],
+        "retrieval": {"keywords": ["请求"], "tags": ["shared_experience"]},
+        "relations": [], "attributes": [],
+    }
+    from memory_l1_schema import statement_template
+    statement = statement_template()
+    statement.pop("statement_revision_id")
+    statement["statement_id"] = "new:statement"
+    statement["content"] = "主人希望这段谈话被认真记住。"
+    statement["evidence_refs"] = ["source:current"]
+    document["statements"] = [statement]
+    original_source = "我希望你把这次谈话认真记住。"
+
+    async def generate(_messages):
+        context = current_turn_context()
+        event = context["user_event"]
+        catalog.bind_turn("logical-request", conversation_id=event["conversation_id"], turn_id=event["id"])
+        catalog.bind_tool_call("l1-write-call")
+        result = await catalog.execute("memory.write", {"document": document, "kind": "key_event"}, explicit_intent=True)
+        observed.append(result)
+        catalog.bind_tool_call("l1-status-call")
+        status_result = await catalog.execute(
+            "memory.status", {"operation_id": result["operation_id"]}, explicit_intent=True)
+        status_observed.append(status_result)
+        return "我会记住这段经历。"
+
+    turn = asyncio.run(ConversationService(conversation_store, generate).handle_inbound(
+        "temporary-conversation", source="app", source_event_id="temporary-ingress", content=original_source))
+    assert turn["status"] == "completed", (turn.get("failure_event"), observed)
+    assert observed[0].get("ok"), observed[0]
+    assert observed[0]["result"]["memory_status"] == "committed"
+    assert observed[0]["result"]["l1_state"] == "current"
+    assert observed[0]["result"]["l1_complete"] is True
+    assert status_observed[0]["memory_status"] == "committed"
+    assert status_observed[0]["l1_state"] == "current" and status_observed[0]["l1_complete"] is True
+    rows = engine.memory_authority_store.list_candidates(status="all", limit=10)
+    row = next(item for item in rows if item["proposal"].get("source_type") == "chat_tool")
+    candidate_id_value = row["candidate_id"]
+    proposal = row["proposal"]
+    assert len(proposal["proposed_body"]) > 12000
+    assert proposal["proposed_body"] == document["narrative"]["body"]
+    semantic = proposal["metadata"]["memory_l1"]
+    assert semantic["generation"]["origin"] == "first_pass_model"
+    assert semantic["generation"]["prompt_revision"] is None
+    assert semantic["generation"]["model_route_revision"] is None
+    assert semantic["generation"]["task_id"] == proposal["metadata"]["tool_operation_id"]
+    assert semantic["evidence_bindings"][0]["binding_id"] == "source:1"
+    assert semantic["evidence_bindings"][0]["source_namespace"] == "snapshot.aiz.canonical_event"
+    assert semantic["statements"][0]["evidence_refs"] == ["source:1"]
+    revision = engine.memory_authority_store.get_memory_revision(candidate_id_value, 1)
+    committed_bucket = asyncio.run(bucket_manager.get(candidate_id_value))
+    assert committed_bucket["content"] == document["narrative"]["body"]
+    assert revision["metadata"]["memory_l1"] == semantic
+    assert revision["metadata"]["memory_l1_content_sha256"]
+    assert not revision["metadata"].get("semantic_annotations")
+    assert original_source in proposal["metadata"]["runtime_context"]["sources"][0]["text"]
+
+
 @pytest.mark.parametrize('mode', ['review', 'off'])
 def test_policy_not_bypassed(tmp_path, mode):
     tool, projection = service(tmp_path, mode)
@@ -80,6 +262,53 @@ def test_owner_edit_and_unknown_time(tmp_path):
         await tool.confirm(row, edit={'content': '主人修改后的正文'}, request_id='edit')
         assert receipt(tool.store, result['candidate_id'])['body_preserved'] is False
         assert tool.store.get_candidate(result['candidate_id'])['proposal']['proposed_body'] == '主人修改后的正文'
+    asyncio.run(run())
+
+
+def test_review_l1_candidate_owner_edit_uses_revision_service_before_commit(tmp_path):
+    tool, _fake_projection = service(tmp_path, 'review')
+    from bucket_manager import BucketManager
+    from memory_commit_service import BucketMemoryProjection, MemoryCommitService
+    from memory_l1_schema import join_document, statement_template
+    config = tool.engine.config
+    bucket_manager = BucketManager(config)
+    tool.bucket_mgr = bucket_manager
+    tool.engine._memory_authority_service = lambda manager: MemoryCommitService(
+        tool.store, BucketMemoryProjection(config, bucket_manager=manager))
+
+    document = {
+        'entry': {'form': 'episode'},
+        'narrative': {'title': '聊天中的长期回忆', 'body': '初始完整正文，保持原文。'},
+        'entities': [], 'scenes': [], 'statements': [],
+        'retrieval': {'keywords': ['聊天'], 'tags': []}, 'relations': [], 'attributes': [],
+    }
+    statement = statement_template()
+    statement.pop('statement_revision_id')
+    statement['statement_id'] = 'new:statement'
+    statement['content'] = '主人希望保留这段谈话。'
+    statement['evidence_refs'] = ['source:current']
+    document['statements'] = [statement]
+
+    async def run():
+        request = envelope()
+        request['arguments'] = {'document': document, 'kind': 'key_event'}
+        submitted = await tool.submit(request)
+        assert submitted['memory_status'] == 'pending'
+        row = tool.store.get_candidate(submitted['candidate_id'])
+        owner_document = join_document(row['proposal']['proposed_body'], row['proposal']['metadata']['memory_l1'])
+        owner_document['narrative']['body'] = '主人审核后的正文已完整保留。'
+        owner_document['retrieval']['tags'] = ['owner-reviewed']
+        confirmed = await tool.confirm(row, edit={'document': owner_document}, request_id='owner-l1-confirm')
+        final = tool.store.get_candidate(submitted['candidate_id'])
+        semantic = final['proposal']['metadata']['memory_l1']
+        assert confirmed['status'] == 'created' and final['status'] == 'committed'
+        assert final['proposal']['proposed_body'] == '主人审核后的正文已完整保留。'
+        assert semantic['retrieval']['tags'] == ['owner-reviewed']
+        assert semantic['generation']['origin'] == 'owner_edit'
+        assert receipt(tool.store, submitted['candidate_id'])['l1_state'] == 'current'
+        bucket = await bucket_manager.get(submitted['candidate_id'])
+        assert bucket['content'] == '主人审核后的正文已完整保留。'
+
     asyncio.run(run())
 
 
@@ -154,7 +383,9 @@ def test_server_auth_read_status_and_validation(tmp_path, monkeypatch):
         assert result.status_code == 200 and result.headers['Cache-Control'] == 'no-store'
         response = await server.api_chat_memory_tool(request('GET'))
         assert json.loads(response.body)['memory_status'] == 'pending'
-        assert b'content' not in response.body and not projection.revisions
+        assert b'"proposed_body"' not in response.body
+        assert envelope()['arguments']['content'].encode() not in response.body
+        assert not projection.revisions
     asyncio.run(run())
 
 

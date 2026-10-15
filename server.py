@@ -116,6 +116,7 @@ from memory_layers import (
     normalize_write_classification,
 )
 from memory_authority import MemoryAuthorityStore, MemoryProposal, PolicyDecision
+from memory_l1_runtime import GENERATION_OPTIONS, task_options
 from memory_commit_service import BucketMemoryProjection, MemoryCommitService
 from memory_narrative import memory_context_labels
 from memory_projection_worker import MemoryProjectionWorker
@@ -8527,6 +8528,7 @@ async def hold(
     date: str = "",
     domain: str = "",
     idempotency_key: str = "",
+    source_metadata: dict | None = None,
 ) -> str:
     """写一条长期记忆。单个事实/承诺/偏好用 hold；旧记忆的新感受用 comment_bucket；悄悄话用 whisper=True。date 可传事件日期；title 可选，传了就用给定标题，不传则自动生成。普通记忆不用填写 domain，系统会自动判断；维护自我锚点等特殊桶时可显式传 domain。显式 valence/arousal 会覆盖自动情绪。普通记忆 content 的最小写入就是正文；只有确实需要结构化时才按需使用 ### moment、### original、### reflection。需要之后轻轻提醒/照顾备忘的事项用 reminder_create，不写进长期记忆。feel=True/whisper=True 时 content 只写第一人称感受，不写分段标题。"""
     await decay_engine.ensure_started()
@@ -8534,6 +8536,21 @@ async def hold(
     # --- Input validation / 输入校验 ---
     if not content or not content.strip():
         return "内容为空，无法存储。"
+
+    source_descriptor = None
+    if source_metadata is not None:
+        from memory_l1_contract import canonical_json
+        allowed = {"schema", "namespace", "source_id", "source_revision", "content_sha256", "author", "coverage", "source_scope"}
+        if (not whisper or not isinstance(source_metadata, dict) or set(source_metadata) != allowed
+                or source_metadata.get("schema") != "aiz.memory-source-ref-v1"
+                or source_metadata.get("namespace") not in {"snapshot.aiz.diary.private", "snapshot.aiz.diary.digest"}
+                or any(not isinstance(source_metadata.get(k), str) or not source_metadata[k]
+                       for k in ("source_id", "source_revision", "content_sha256"))
+                or source_metadata["content_sha256"] != hashlib.sha256(content.encode("utf-8")).hexdigest()):
+            return "来源描述无效，未写入。"
+        canonical_json(source_metadata)
+        # A provider's descriptor is not a current source observation.
+        source_descriptor = {"descriptor": source_metadata, "observation": "not_checked", "eligible_source": None}
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
@@ -8557,6 +8574,7 @@ async def hold(
                     "arousal": whisper_arousal,
                     "bucket_type": "feel",
                     "date": event_date or None,
+                    **({"aiz_source_descriptor": source_descriptor} if source_descriptor else {}),
                 },
                 memory_type="whisper",
                 source="hold_whisper",
@@ -12366,7 +12384,7 @@ async def api_chat_memory_tool(request):
             result = receipt(memory_authority_store, candidate_id(request.path_params["operation_id"]))
         else:
             raw = await request.body()
-            if len(raw) > 400000:
+            if len(raw) > 524288:
                 return JSONResponse({"error": "request_too_large"}, status_code=413, headers=headers)
             try:
                 payload = json.loads(raw)
@@ -12390,6 +12408,55 @@ def _memory_l1_revision_service():
         snapshot = configuration(merge_config(config, read_overlay(runtime_overlay_path(config))))
         return snapshot["values"]["catalog"], snapshot["revision"]
     return MemoryL1RevisionService(memory_authority_store, memory_commit_service, bucket_mgr, catalog_provider)
+
+
+@mcp.custom_route("/api/memory-authority/action-source", methods=["POST"])
+@mcp.custom_route("/api/memory-authority/source-tasks", methods=["GET"])
+@mcp.custom_route("/api/memory-authority/source-tasks/{task_id}/retry", methods=["POST"])
+async def api_memory_l1_source_tasks(request):
+    """Source IDs and task receipts only; this endpoint never invokes a model."""
+    from starlette.responses import JSONResponse
+    import json
+    from memory_l1_source_tasks import MemoryL1SourceTasks
+    from memory_l1_service import L1OwnerError
+    from memory_authority import IdempotencyConflict
+    headers = {"Cache-Control": "no-store"}
+    # A dedicated ID-only preparation endpoint for the existing Memory writer;
+    # this does not make other owner Dashboard writes available to that token.
+    if not (_dashboard_authenticated(request) or _authorized_memory_write(request)):
+        return _require_dashboard_auth(request)
+    if memory_authority_store is None:
+        return JSONResponse({"error": "memory_authority_unavailable"}, status_code=503, headers=headers)
+    try:
+        tasks = MemoryL1SourceTasks(memory_authority_store)
+        task_id = request.path_params.get("task_id")
+        if request.method == "GET":
+            if set(request.query_params) - {"limit"} or len(request.query_params.getlist("limit")) > 1:
+                raise L1OwnerError("invalid_task_query", field_path="query")
+            value = request.query_params.get("limit", "100")
+            if not value.isascii() or not value.isdigit(): raise L1OwnerError("invalid_task_page_limit", field_path="limit")
+            return JSONResponse({"status": "ok", "tasks": tasks.list(limit=int(value)),
+                "adoption_is_separate": True}, headers=headers)
+        raw = await request.body()
+        if len(raw) > 8192: return JSONResponse({"error": "request_too_large"}, status_code=413, headers=headers)
+        payload = json.loads(raw)
+        if task_id:
+            # Repeating generation is an explicit owner operation. It never
+            # retries the source action or changes its completion status.
+            if not isinstance(payload, dict) or set(payload) != {"expected_phase"} or payload["expected_phase"] not in {"failed", "generating"}:
+                raise L1OwnerError("invalid_source_task_retry", field_path="expected_phase")
+            if getattr(reflection_engine, "_daily_chat_memory_run_lock", False):
+                raise L1OwnerError("memory_preparation_in_progress", status=409, field_path="task_id")
+            row = tasks.transition(str(task_id), payload["expected_phase"], "queued")
+            if row is None: raise L1OwnerError("task_phase_changed", status=409, field_path="expected_phase")
+            return JSONResponse({"status": "queued", "task": row, "action_reexecuted": False}, headers=headers)
+        return JSONResponse(tasks.enqueue_action(payload), status_code=202, headers=headers)
+    except IdempotencyConflict:
+        return JSONResponse({"error": "idempotency_conflict"}, status_code=409, headers=headers)
+    except L1OwnerError as exc:
+        return JSONResponse({"error": exc.code, "field_path": exc.field_path}, status_code=exc.status, headers=headers)
+    except (ValueError, TypeError, UnicodeError):
+        return JSONResponse({"error": "invalid_source_task_request"}, status_code=400, headers=headers)
 
 
 @mcp.custom_route("/api/memory-authority/schema", methods=["GET"])
@@ -12438,13 +12505,9 @@ async def api_memory_l1_revision(request):
 
 
 def _memory_l1_reads():
-    from memory_l0_sources import MemoryL0Sources, McpDiarySourceAdapter
     from memory_l1_reads import MemoryL1Reads
-    adapters = []
-    if reflection_engine.diary_mcp_url:
-        adapters.append(McpDiarySourceAdapter(reflection_engine.diary_mcp_url, reflection_engine._read_diary_for_date))
     service = _memory_l1_revision_service()
-    return MemoryL1Reads(service, MemoryL0Sources(memory_authority_store, adapters))
+    return MemoryL1Reads(service, reflection_engine._memory_l1_sources())
 
 
 @mcp.custom_route("/api/memory-authority/memories/{memory_id}/statements", methods=["GET"])
@@ -12685,12 +12748,18 @@ async def api_daily_chat_memory_edit(request):
         if not isinstance(candidate_id, str) or not MEMORY_ID_RE.fullmatch(candidate_id):
             raise ValueError("invalid_candidate_id")
         row = save_owner_candidate(reflection_engine.memory_authority_store, candidate_id,
-            edit=body["edit"], expected_revision=body["expected_revision"], request_id=body["request_id"])
+            edit=body["edit"], expected_revision=body["expected_revision"], request_id=body["request_id"],
+            revision_service=_memory_l1_revision_service())
         return JSONResponse({"status": "saved", "adopted": False,
             "item": reflection_engine._authority_candidate_legacy_item(row)}, headers={"Cache-Control": "no-store"})
     except MemoryAuthorityError as exc:
         return JSONResponse({"error": exc.code}, status_code=404 if exc.code == "candidate_not_found" else 409)
-    except (ValueError, TypeError, KeyError):
+    except (ValueError, TypeError, KeyError) as exc:
+        from memory_l1_contract import L1ContractError
+        from memory_l1_service import L1OwnerError
+        if isinstance(exc, (L1ContractError, L1OwnerError)):
+            return JSONResponse({"error": exc.code, "field_path": getattr(exc, "field_path", getattr(exc, "path", ""))},
+                status_code=getattr(exc, "status", 400))
         return JSONResponse({"error": "invalid_edit_request"}, status_code=400)
 
 
@@ -13055,6 +13124,10 @@ async def api_config_get(request):
                     getattr(reflection_engine, "daily_chat_memory_max_per_day", 3),
                 )
             ),
+            **task_options(config),
+            "diary_l1_source_kind": reflection_cfg.get("diary_l1_source_kind", "mcp"),
+            "generation_parameter_bounds": {key: {"minimum": spec[1], "maximum": spec[2]}
+                for key, spec in GENERATION_OPTIONS.items()},
             "model": getattr(reflection_engine, "model", reflection_cfg.get("model", "")),
             "thinking_mode": str(reflection_cfg.get("thinking_mode") or getattr(reflection_engine, "thinking_mode", "") or ""),
             "base_url": str(reflection_cfg.get("base_url") or ""),
@@ -13604,7 +13677,26 @@ async def api_config_update(request):
     # --- Reflection config ---
     if "reflection" in body:
         r = body["reflection"]
+        from memory_l1_runtime import GENERATION_OPTIONS, task_options
+        from memory_l1_service import L1OwnerError
+        if not isinstance(r, dict):
+            return JSONResponse({"error": "object_required", "field_path": "reflection"}, status_code=400)
+        if "diary_l1_source_kind" in r and r["diary_l1_source_kind"] not in ("mcp", "private", "digest"):
+            return JSONResponse({"error": "invalid_source_kind", "field_path": "reflection.diary_l1_source_kind"}, status_code=400)
+        generation_candidate = deepcopy(config)
+        generation_candidate.setdefault("reflection", {}).update({key: r[key] for key in GENERATION_OPTIONS if key in r})
+        try:
+            generation_values = task_options(generation_candidate)
+        except L1OwnerError as exc:
+            return JSONResponse({"error": exc.code, "field_path": exc.field_path}, status_code=400)
         reflection_cfg = config.setdefault("reflection", {})
+        if "diary_l1_source_kind" in r:
+            reflection_cfg["diary_l1_source_kind"] = r["diary_l1_source_kind"]
+            updated.append("reflection.diary_l1_source_kind")
+        for key in GENERATION_OPTIONS:
+            if key in r:
+                reflection_cfg[key] = generation_values[key]
+                updated.append("reflection." + key)
         for key in (
             "enabled",
             "auto_enabled",
@@ -13677,14 +13769,6 @@ async def api_config_update(request):
                 10000,
             )
             updated.append("reflection.daily_chat_memory_turn_limit")
-        if "daily_chat_memory_max_per_day" in r:
-            reflection_cfg["daily_chat_memory_max_per_day"] = _int_between(
-                r.get("daily_chat_memory_max_per_day"),
-                3,
-                0,
-                10,
-            )
-            updated.append("reflection.daily_chat_memory_max_per_day")
         if "thinking_mode" in r:
             thinking_mode = str(r.get("thinking_mode") or "").strip().lower()
             if thinking_mode not in {"", "enabled", "disabled"}:
@@ -14128,13 +14212,13 @@ async def api_config_update(request):
                         0,
                         10000,
                     )
-                if "daily_chat_memory_max_per_day" in body["reflection"]:
-                    sc_reflection["daily_chat_memory_max_per_day"] = _int_between(
-                        body["reflection"].get("daily_chat_memory_max_per_day"),
-                        3,
-                        0,
-                        10,
-                    )
+                # Persist the exact same validated generation values used by
+                # the live engine. Do not re-clamp saved counts to old limits.
+                for key in GENERATION_OPTIONS:
+                    if key in body["reflection"]:
+                        sc_reflection[key] = generation_values[key]
+                if "diary_l1_source_kind" in body["reflection"]:
+                    sc_reflection["diary_l1_source_kind"] = reflection_cfg["diary_l1_source_kind"]
                 if "thinking_mode" in body["reflection"]:
                     thinking_mode = str(body["reflection"].get("thinking_mode") or "").strip().lower()
                     if thinking_mode not in {"", "enabled", "disabled"}:

@@ -16,6 +16,7 @@ from memory_narrative import build_chat_narrative, chat_commit_metadata
 from memory_commit_service import ProjectionNotApplied
 from memory_source_provenance import canonical_source
 from memory_semantics import build_annotations, attach_source_links, owner_semantic_summary
+from memory_l1_wire_schema import MEMORY_WRITE_MAX_BODY_BYTES
 
 
 KINDS = {"preference", "boundary", "commitment", "shared_experience", "key_event",
@@ -37,13 +38,35 @@ def receipt(store, memory_id):
     if not row or row["proposal"].get("source_type") != "chat_tool":
         return {"ok": False, "memory_status": "not_found", "candidate_id": memory_id}
     state = row["status"]
+    proposal = row["proposal"]
+    metadata = proposal.get("metadata") or {}
+    l1 = metadata.get("memory_l1")
+    l1_complete = isinstance(l1, dict)
+    l1_state = "not_prepared"
+    l1_digest = ""
+    if l1_complete:
+        from memory_l1_contract import l1_content_sha256, semantic_sha256
+        l1_digest = l1_content_sha256(proposal.get("proposed_body") or "", l1)
+        l1_state = "prepared"
+        if state == "committed":
+            memory = store.get_memory(memory_id)
+            active = int((memory or {}).get("active_revision") or 0)
+            revision = store.get_memory_revision(memory_id, active) if active else None
+            committed_metadata = (revision or {}).get("metadata") or {}
+            if (committed_metadata.get("memory_l1") == l1
+                    and committed_metadata.get("memory_l1_semantic_sha256") == semantic_sha256(l1)
+                    and committed_metadata.get("memory_l1_content_sha256") == l1_digest):
+                l1_state = "current"
+            else:
+                l1_state = "mismatch"
     return {"ok": True, "candidate_id": memory_id,
             "memory_id": memory_id if state == "committed" else None,
             "memory_status": state, "revision": row["revision"],
-            "body_preserved": not bool(row["proposal"].get("metadata", {}).get("narrative", {}).get("edited_by")),
+            "body_preserved": not bool(metadata.get("narrative", {}).get("edited_by")),
             "recall_guaranteed": False,
-            "semantics": owner_semantic_summary(row["proposal"].get("metadata") or {},
-                                                 row["proposal"].get("proposed_body") or "")}
+            "l1_state": l1_state, "l1_complete": l1_complete,
+            "l1_content_sha256": l1_digest,
+            "semantics": owner_semantic_summary(metadata, proposal.get("proposed_body") or "")}
 
 
 class ChatMemoryTool:
@@ -56,21 +79,51 @@ class ChatMemoryTool:
             raise ValueError("invalid_envelope")
         memory_id = candidate_id(envelope["operation_id"])
         args, context = envelope["arguments"], envelope["context"]
-        if not isinstance(args, dict) or set(args) - {"content", "title", "kind", "confidence", "sensitive", "event_time", "annotations"}:
+        if not isinstance(args, dict) or set(args) - {"document", "content", "title", "kind", "confidence", "sensitive", "event_time", "annotations"}:
             raise ValueError("invalid_arguments")
+        document_input = args.get("document")
+        if document_input is not None:
+            if any(key in args for key in ("title", "content", "annotations", "event_time")):
+                raise ValueError("document_and_legacy_fields_mixed")
+            if not isinstance(document_input, dict):
+                raise ValueError("invalid_l1_document")
+            if set(document_input) != {"entry", "narrative", "entities", "scenes", "statements", "retrieval", "relations", "attributes"}:
+                raise ValueError("invalid_l1_document_fields")
+            kind = args.get("kind", "key_event")
+            confidence = args.get("confidence", 0.7)
+            if kind not in KINDS:
+                raise ValueError("invalid_memory_kind")
+            if type(confidence) not in (float, int) or not 0 <= confidence <= 1:
+                raise ValueError("invalid_policy_fields")
+            if type(args.get("sensitive", False)) is not bool:
+                raise ValueError("invalid_policy_fields")
+            incoming_narrative = document_input.get("narrative")
+            if not isinstance(incoming_narrative, dict) or set(incoming_narrative) != {"title", "body"}:
+                raise ValueError("invalid_l1_narrative")
+            title = incoming_narrative["title"]
+            content = incoming_narrative["body"]
+            if not isinstance(title, str) or not isinstance(content, str) or not content.strip():
+                raise ValueError("invalid_l1_narrative")
+            try:
+                body_size = len(content.encode("utf-8", errors="strict"))
+            except UnicodeError as exc:
+                raise ValueError("invalid_l1_narrative_unicode") from exc
+            if body_size > MEMORY_WRITE_MAX_BODY_BYTES:
+                raise ValueError("l1_narrative_body_too_large")
+        else:
+            content, title, kind = args.get("content"), args.get("title"), args.get("kind")
+            if not isinstance(content, str) or not content.strip() or len(content) > 12000:
+                raise ValueError("invalid_memory_body")
+            if not isinstance(title, str) or not title.strip() or len(title) > 100 or kind not in KINDS:
+                raise ValueError("invalid_memory_kind_or_title")
+            confidence = args.get("confidence", 0.7)
+            if type(confidence) not in (float, int) or not 0 <= confidence <= 1 or type(args.get("sensitive", False)) is not bool:
+                raise ValueError("invalid_policy_fields")
         if not isinstance(context, dict) or set(context) != {"conversation_id", "request_id", "turn_id", "sources"}:
             raise ValueError("invalid_source_context")
         if any(not isinstance(context.get(key), str) or not context[key] or len(context[key]) > 200
                for key in ("conversation_id", "request_id", "turn_id")):
             raise ValueError("invalid_source_identity")
-        content, title, kind = args.get("content"), args.get("title"), args.get("kind")
-        if not isinstance(content, str) or not content.strip() or len(content) > 12000:
-            raise ValueError("invalid_memory_body")
-        if not isinstance(title, str) or not title.strip() or len(title) > 100 or kind not in KINDS:
-            raise ValueError("invalid_memory_kind_or_title")
-        confidence = args.get("confidence", 0.7)
-        if type(confidence) not in (float, int) or not 0 <= confidence <= 1 or type(args.get("sensitive", False)) is not bool:
-            raise ValueError("invalid_policy_fields")
         sources = context["sources"]
         if not isinstance(sources, list) or not 1 <= len(sources) <= 16:
             raise ValueError("source_missing")
@@ -91,6 +144,8 @@ class ChatMemoryTool:
                           f"{source['role']}_text": source["text"]})
         if sum(len(s["text"]) for s in sources) > 60000 or context["turn_id"] not in seen:
             raise ValueError("source_coverage_invalid")
+        if document_input is not None and (sources[-1]["event_id"] != context["turn_id"] or sources[-1]["role"] != "user"):
+            raise ValueError("current_user_source_must_be_last")
         temporal = args.get("event_time") or {}
         if not isinstance(temporal, dict) or set(temporal) - {"expression", "evidence"}:
             raise ValueError("invalid_event_time")
@@ -98,10 +153,11 @@ class ChatMemoryTool:
             raise ValueError("invalid_event_time")
         matches = [s for s in sources if temporal.get("evidence") and temporal["evidence"] in s["text"]]
         time_candidate = {}
-        if len(matches) == 1:
+        if document_input is None and len(matches) == 1:
             time_candidate["event_time"] = {**temporal, "source_turn_id": matches[0]["event_id"], "source_role": matches[0]["role"]}
         narrative = build_chat_narrative(time_candidate, turns, self.engine.identity, self.engine.tz, "")
-        narrative.update(generation_kind="chat_authored", source_kind="chat_tool", provenance_only=True)
+        narrative.update(generation_kind=("chat_authored_l1" if document_input is not None else "chat_authored"),
+                         source_kind="chat_tool", provenance_only=True)
         versions = {s["event_id"]: s["version_id"] for s in sources}
         for item in narrative["sources"]:
             event_id = item["source_ref"].split(":", 1)[1]
@@ -114,26 +170,65 @@ class ChatMemoryTool:
         excerpt = self.engine._daily_chat_memory_owner_text(excerpt).replace("<", "‹").replace(">", "›")
         evidence_sources = [canonical_source(s, conversation_id=context["conversation_id"],
                             profile_id=self.engine.memory_semantic_profile_id) for s in sources]
-        semantic = build_annotations(body=content, proposed=args.get("annotations"), sources=evidence_sources,
-                                     proposal_id=memory_id)
-        related = self.store.find_candidates_by_sources([s["source_key"] for s in evidence_sources])
-        semantic = attach_source_links(semantic, related, proposal_id=memory_id)
+        l1_semantic = None
+        semantic = None
+        if document_input is not None:
+            source_text = {f"source:{index + 1}": source["text"] for index, source in enumerate(sources)}
+            source_text["source:current"] = sources[-1]["text"]
+            for scene in document_input.get("scenes") or []:
+                if not isinstance(scene, dict):
+                    raise ValueError("invalid_l1_scene")
+                scene_sources = scene.get("source_refs", [])
+                scene_ranges = scene.get("source_ranges", [])
+                if not isinstance(scene_sources, list) or not isinstance(scene_ranges, list):
+                    raise ValueError("invalid_l1_scene_sources")
+                if any(not isinstance(ref, str) or ref not in source_text for ref in scene_sources):
+                    raise ValueError("invalid_l1_scene_source_ref")
+                for span in scene_ranges:
+                    if (not isinstance(span, dict) or set(span) != {"source_ref", "start", "end"}
+                            or span["source_ref"] not in source_text
+                            or type(span["start"]) is not int or type(span["end"]) is not int
+                            or not 0 <= span["start"] < span["end"] <= len(source_text[span["source_ref"]])):
+                        raise ValueError("invalid_l1_scene_source_range")
+            from memory_l1_ingestion import prepare_model_document
+            from memory_l1_schema import split_document
+            revisions = self.engine._memory_l1_revisions(self.bucket_mgr)
+            prepared_document = prepare_model_document(
+                revisions, memory_id=memory_id, document=document_input, sources=evidence_sources,
+                generation={"prompt_revision": None, "model_route_revision": None,
+                            "task_id": envelope["operation_id"], "actor": "chat_model"},
+                request_id=envelope["operation_id"], previous=None)
+            content, l1_semantic = split_document(prepared_document)
+            title = str(prepared_document["narrative"]["title"])
+        else:
+            semantic = build_annotations(body=content, proposed=args.get("annotations"), sources=evidence_sources,
+                                         proposal_id=memory_id)
+            related = self.store.find_candidates_by_sources([s["source_key"] for s in evidence_sources])
+            semantic = attach_source_links(semantic, related, proposal_id=memory_id)
         legacy = {"id": memory_id, "title": title, "content": content.strip(), "proposed_memory": content.strip(),
                   "kind": kind, "date": narrative["mentioned_dates"][-1] if narrative["mentioned_dates"] else "",
                   "mode": self.engine.daily_chat_memory_mode, "source_verification": "verified",
                   "source_canonical_event_ids": [s["event_id"] for s in sources],
-                  "original_excerpt": excerpt, "narrative": narrative, "semantic_annotations": semantic,
-                  "reason": "聊天模型当场写入；来源核对不代表主人确认全部事实", "tags": ["chat_authored", kind]}
-        return MemoryProposal.from_mapping({
+                  "original_excerpt": excerpt, "narrative": narrative,
+                  "reason": ("聊天模型生成完整第一遍 L1；来源绑定由运行时核对" if l1_semantic is not None
+                             else "聊天模型当场写入；来源核对不代表主人确认全部事实"),
+                  "tags": ["chat_authored", kind]}
+        payload = {
             "proposal_id": memory_id, "source_type": "chat_tool", "proposed_body": content,
             "original_excerpt": excerpt, "source_status": "verified",
             "source_refs": [f"canonical_event:{s['event_id']}@{s['version_id']}" for s in sources],
             "memory_type": kind, "confidence": confidence, "sensitive": args.get("sensitive", False),
             "requested_mode": self.engine.daily_chat_memory_mode, "owner_explicit": False,
-            "metadata": {"legacy_candidate": legacy, "narrative": narrative, "semantic_annotations": semantic,
+            "metadata": {"legacy_candidate": legacy, "narrative": narrative,
                          "runtime_context": context, "tool_operation_id": envelope["operation_id"],
                          "submission_fingerprint": self.store.fingerprint(envelope)},
-        })
+        }
+        if l1_semantic is not None:
+            payload["metadata"]["memory_l1"] = l1_semantic
+        if semantic is not None:
+            legacy["semantic_annotations"] = semantic
+            payload["metadata"]["semantic_annotations"] = semantic
+        return MemoryProposal.from_mapping(payload)
 
     async def submit(self, envelope):
         try:
@@ -174,12 +269,15 @@ class ChatMemoryTool:
                     "domain": candidate.get("domain") or [],
                     "created": recorded, "last_active": recorded,
                     **chat_commit_metadata(candidate, recorded)}
+        if isinstance(proposal.get("metadata", {}).get("memory_l1"), dict):
+            metadata["memory_l1"] = copy.deepcopy(proposal["metadata"]["memory_l1"])
         try:
             committed = await self.engine._memory_authority_service(self.bucket_mgr).commit_memory(
                 memory_id=memory_id, bucket_id=memory_id, expected_revision=0,
                 body=proposal["proposed_body"], metadata=metadata, source_refs=proposal["source_refs"],
                 decision_source="owner" if proposal.get("owner_explicit") else "auto",
-                idempotency_key=key, actor="chat_tool")
+                idempotency_key=key, actor="chat_tool",
+                l1_write_intent=isinstance(proposal.get("metadata", {}).get("memory_l1"), dict))
         except ProjectionNotApplied:
             self.store.decide_candidate(memory_id, action="commit_failed", expected_revision=row["revision"],
                                         request_id=key + ":not-applied", actor="commit_service",
@@ -212,37 +310,46 @@ class ChatMemoryTool:
         payload = copy.deepcopy(row["proposal"])
         payload.update(owner_explicit=True, requested_mode="review")
         if edit:
-            if not isinstance(edit, dict) or set(edit) - {"title", "content", "kind", "tags", "domain", "importance", "confidence", "reason"}:
+            if not isinstance(edit, dict):
                 raise ValueError("invalid_owner_edit")
-            if "content" in edit:
-                content = edit["content"]
-                if not isinstance(content, str) or not content.strip() or len(content) > 12000:
-                    raise ValueError("invalid_memory_body")
-                payload["proposed_body"] = content.strip()
-                payload["metadata"]["narrative"].update(edited_by="owner", event_time={"precision": "unknown", "basis": "owner_edit_requires_time_review"})
-            if "title" in edit:
-                payload["metadata"]["legacy_candidate"]["title"] = str(edit["title"])[:100]
-            if "kind" in edit:
-                if edit["kind"] not in KINDS:
-                    raise ValueError("invalid_memory_kind")
-                payload["memory_type"] = edit["kind"]
-            for field in ("tags", "domain"):
-                if field in edit:
-                    value = edit[field]
-                    if not isinstance(value, list) or len(value) > 12 or any(not isinstance(v, str) or len(v) > 100 for v in value):
+            if isinstance(payload.get("metadata", {}).get("memory_l1"), dict):
+                from memory_candidate_edit import owner_edit_payload
+                payload = owner_edit_payload(
+                    row, edit, revision_service=self.engine._memory_l1_revisions(self.bucket_mgr),
+                    request_id=request_id)
+                payload.update(owner_explicit=True, requested_mode="review")
+            else:
+                if set(edit) - {"title", "content", "kind", "tags", "domain", "importance", "confidence", "reason"}:
+                    raise ValueError("invalid_owner_edit")
+                if "content" in edit:
+                    content = edit["content"]
+                    if not isinstance(content, str) or not content.strip() or len(content) > 12000:
+                        raise ValueError("invalid_memory_body")
+                    payload["proposed_body"] = content.strip()
+                    payload["metadata"]["narrative"].update(edited_by="owner", event_time={"precision": "unknown", "basis": "owner_edit_requires_time_review"})
+                if "title" in edit:
+                    payload["metadata"]["legacy_candidate"]["title"] = str(edit["title"])[:100]
+                if "kind" in edit:
+                    if edit["kind"] not in KINDS:
+                        raise ValueError("invalid_memory_kind")
+                    payload["memory_type"] = edit["kind"]
+                for field in ("tags", "domain"):
+                    if field in edit:
+                        value = edit[field]
+                        if not isinstance(value, list) or len(value) > 12 or any(not isinstance(v, str) or len(v) > 100 for v in value):
+                            raise ValueError("invalid_owner_edit")
+                        payload["metadata"]["legacy_candidate"][field] = value
+                if "importance" in edit:
+                    if type(edit["importance"]) is not int or not 1 <= edit["importance"] <= 10:
                         raise ValueError("invalid_owner_edit")
-                    payload["metadata"]["legacy_candidate"][field] = value
-            if "importance" in edit:
-                if type(edit["importance"]) is not int or not 1 <= edit["importance"] <= 10:
-                    raise ValueError("invalid_owner_edit")
-                payload["metadata"]["legacy_candidate"]["importance"] = edit["importance"]
-            if "confidence" in edit:
-                value = edit["confidence"]
-                if type(value) not in (int, float) or not 0 <= value <= 1:
-                    raise ValueError("invalid_owner_edit")
-                payload["confidence"] = value
-            if "reason" in edit:
-                payload["metadata"]["legacy_candidate"]["reason"] = str(edit["reason"])[:160]
+                    payload["metadata"]["legacy_candidate"]["importance"] = edit["importance"]
+                if "confidence" in edit:
+                    value = edit["confidence"]
+                    if type(value) not in (int, float) or not 0 <= value <= 1:
+                        raise ValueError("invalid_owner_edit")
+                    payload["confidence"] = value
+                if "reason" in edit:
+                    payload["metadata"]["legacy_candidate"]["reason"] = str(edit["reason"])[:160]
         proposal = MemoryProposal.from_mapping(payload)
         revised = self.store.revise_candidate(memory_id, expected_revision=row["revision"], proposal=proposal,
                                               request_id=request_id + ":edit", actor="owner")

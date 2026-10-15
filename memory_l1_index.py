@@ -9,7 +9,7 @@ import json
 
 from memory_l1_contract import L1ContractError, canonical_json, semantic_sha256
 
-INDEX_VERSION = "memory-l1-members-v1"
+INDEX_VERSION = "memory-l1-members-v2"
 
 
 def scene_memory_id(memory_id, scene_id):
@@ -49,6 +49,8 @@ def initialize(conn):
         );
         CREATE INDEX IF NOT EXISTS idx_l1_source_identity ON memory_l1_source_members(namespace,source_id,source_revision_json);
     """)
+    from memory_l1_features import initialize as initialize_features
+    initialize_features(conn)
 
 
 def project(conn, memory_id, revision, metadata):
@@ -81,6 +83,8 @@ def project(conn, memory_id, revision, metadata):
     for item in semantic["evidence_bindings"]:
         conn.execute("INSERT INTO memory_l1_source_members VALUES(?,?,?,?,?,?)", (memory_id, revision,
                      item["binding_id"], item["source_namespace"], item["source_id"], canonical_json(item["source_revision"])))
+    from memory_l1_features import project as project_features
+    project_features(conn, memory_id, revision, semantic)
 
 
 class MemoryL1Index:

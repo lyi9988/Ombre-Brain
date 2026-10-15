@@ -29,7 +29,9 @@ class MemoryL1RevisionService:
 
     def schema(self):
         catalog, revision = self.catalog_provider()
-        return {"status": "ok", "schema_version": "memory-l1-v1", "catalog": catalog_with_defaults(catalog),
+        from memory_l1_wire_schema import MODEL_DOCUMENT_SCHEMA, tool_parameters
+        return {"status": "ok", "schema_version": "memory-l1-v1", "catalog_revision": revision, "catalog": catalog_with_defaults(catalog),
+                "model_document_schema": MODEL_DOCUMENT_SCHEMA, "native_tool_schema": tool_parameters(),
                 "template": document_template(catalog=catalog, catalog_revision=revision),
                 "templates": {"statement": statement_template(),
                               "scene": scene_template(catalog, revision),

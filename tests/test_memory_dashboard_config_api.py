@@ -73,3 +73,33 @@ def test_missing_revision_and_bad_limits_do_not_mutate_runtime_or_persist(tmp_pa
         assert response.status_code == 400
         assert config == before and pushes == []
     assert not (tmp_path / "runtime.yaml").exists()
+
+
+def test_generation_settings_survive_reload_and_runtime_uses_saved_values(tmp_path):
+    from reflection_engine import ReflectionEngine
+    from memory_commit_service import BucketMemoryProjection, MemoryCommitService
+    from memory_system_config import merge_config
+    from memory_l1_runtime import task_options
+    route, config, pushes = route_for(tmp_path)
+    config.update(buckets_dir=str(tmp_path / 'buckets'), memory_authority={'enabled': True})
+    route.__globals__.update(ReflectionEngine=ReflectionEngine, prompt_plan_mirror=None,
+        bucket_mgr=None, MemoryCommitService=MemoryCommitService, BucketMemoryProjection=BucketMemoryProjection)
+    values = {'daily_chat_memory_max_per_day': 47, 'daily_chat_memory_review_max_per_day': 0,
+        'diary_l1_input_window_chars': 12345, 'diary_l1_max_windows': 73,
+        'diary_l1_scene_limit': 0, 'diary_l1_max_tokens': 19000, 'diary_l1_scene_min_value': 0.27,
+        'daily_chat_memory_candidate_max_tokens': 21000, 'daily_chat_memory_max_windows_per_run': 37,
+        'daily_chat_memory_window_max_input_chars': 34567, 'action_l1_jobs_per_run': 0,
+        'diary_l1_source_kind': 'private'}
+    saved = asyncio.run(route(Request({'reflection': values, 'persist': True})))
+    assert saved.status_code == 200, saved.body
+    overlay = read_overlay(tmp_path / 'runtime.yaml')
+    for key, value in values.items(): assert overlay['reflection'][key] == value
+    reloaded = merge_config({'state_dir': str(tmp_path), 'buckets_dir': str(tmp_path / 'buckets')}, overlay)
+    engine = ReflectionEngine(reloaded)
+    assert task_options(engine.config) == {key: value for key, value in values.items() if key != 'diary_l1_source_kind'}
+    assert engine.daily_chat_memory_max_per_day == 47 and engine.daily_chat_memory_review_max_per_day == 0
+    assert engine.config['reflection']['diary_l1_source_kind'] == 'private'
+    before = copy.deepcopy(config), (tmp_path / 'runtime.yaml').read_bytes()
+    invalid = asyncio.run(route(Request({'reflection': {'diary_l1_max_windows': True}, 'persist': True})))
+    assert invalid.status_code == 400
+    assert config == before[0] and (tmp_path / 'runtime.yaml').read_bytes() == before[1]

@@ -3,7 +3,49 @@
   var memoryDrafts = new Map();
   var memoryRequests = new Map();
   var memoryLoadEpoch = 0;
+  var memorySourceLoadEpoch = 0;
   var memoryBusy = false;
+  var memoryStateRestored = false;
+  var MEMORY_STATE_KEY = 'guyan.ombre.daily-chat-memory-review.v1';
+
+  function cloneValue(value) {
+    return value == null ? value : JSON.parse(JSON.stringify(value));
+  }
+
+  function persistMemoryState() {
+    try {
+      if (!window.sessionStorage) return;
+      var drafts = Array.from(memoryDrafts.entries());
+      var requests = Array.from(memoryRequests.entries());
+      if (!drafts.length && !requests.length) {
+        window.sessionStorage.removeItem(MEMORY_STATE_KEY);
+        return;
+      }
+      window.sessionStorage.setItem(MEMORY_STATE_KEY, JSON.stringify({ version: 1, drafts: drafts, requests: requests }));
+    } catch (_) { /* Session storage may be unavailable in a restricted browser context. */ }
+  }
+
+  function restoreMemoryState() {
+    if (memoryStateRestored) return;
+    memoryStateRestored = true;
+    try {
+      if (!window.sessionStorage) return;
+      var raw = window.sessionStorage.getItem(MEMORY_STATE_KEY);
+      if (!raw) return;
+      var saved = JSON.parse(raw);
+      if (!saved || saved.version !== 1) return;
+      (Array.isArray(saved.drafts) ? saved.drafts : []).forEach(function (pair) {
+        if (Array.isArray(pair) && typeof pair[0] === 'string' && pair[1] && typeof pair[1] === 'object') {
+          memoryDrafts.set(pair[0], pair[1]);
+        }
+      });
+      (Array.isArray(saved.requests) ? saved.requests : []).forEach(function (pair) {
+        if (Array.isArray(pair) && typeof pair[0] === 'string' && pair[1] && pair[1].body) {
+          memoryRequests.set(pair[0], pair[1]);
+        }
+      });
+    } catch (_) { /* Ignore malformed session-only draft state; server data remains authoritative. */ }
+  }
 
   function splitTerms(value) {
     return Array.from(new Set(String(value || '').split(/[,，\n]/).map(function (v) { return v.trim(); }).filter(Boolean)));
@@ -18,12 +60,105 @@
       event_date: time.precision === 'day' ? (time.value || '') : '' };
   }
 
+  function itemL1Document(item) {
+    var candidate = item && item.candidate && typeof item.candidate === 'object' ? item.candidate : {};
+    var document = candidate.l1_document || candidate.memory_l1_document ||
+      item && item.l1_document || candidate.memory_l1 || item && item.memory_l1;
+    if (!document || typeof document !== 'object' || Array.isArray(document)) return null;
+    try { document = cloneValue(document); } catch (_) { return null; }
+    if (!document.narrative || typeof document.narrative !== 'object' || Array.isArray(document.narrative)) return null;
+    if (typeof document.narrative.body !== 'string') {
+      document.narrative.body = String(candidate.proposed_memory || candidate.content || item.body || '');
+    }
+    return document;
+  }
+
+  function itemSceneBodies(item) {
+    var candidate = item && item.candidate && typeof item.candidate === 'object' ? item.candidate : {};
+    var metadata = candidate.metadata && typeof candidate.metadata === 'object' ? candidate.metadata : {};
+    var bundle = candidate.diary_l1_bundle || metadata.diary_l1_bundle || item && item.diary_l1_bundle || {};
+    var value = candidate.scene_bodies || (bundle && bundle.scene_bodies) || item && item.scene_bodies || {};
+    return value && typeof value === 'object' && !Array.isArray(value) ? cloneValue(value) : {};
+  }
+
+  function itemIsDiary(item) {
+    var candidate = item && item.candidate && typeof item.candidate === 'object' ? item.candidate : {};
+    var metadata = candidate.metadata && typeof candidate.metadata === 'object' ? candidate.metadata : {};
+    return candidate.source_type === 'diary' || item && item.source_type === 'diary' ||
+      Boolean(candidate.diary_l1_bundle || metadata.diary_l1_bundle || item && item.diary_l1_bundle);
+  }
+
+  function sameValue(left, right) {
+    return JSON.stringify(left) === JSON.stringify(right);
+  }
+
+  function l1DraftChanged(draft) {
+    return Boolean(draft && (draft.invalidJson || !sameValue(draft.document, draft.baseDocument) ||
+      !sameValue(draft.sceneBodies || {}, draft.baseSceneBodies || {})));
+  }
+
+  function sameDraft(left, right) {
+    if (!left || !right || left.type !== right.type) return left === right;
+    if (left.type === 'l1') return !l1DraftChanged({
+      invalidJson: left.invalidJson,
+      document: left.document,
+      baseDocument: right.document,
+      sceneBodies: left.sceneBodies,
+      baseSceneBodies: right.sceneBodies,
+    });
+    return sameValue(left.fields, right.fields);
+  }
+
   function captureMemoryDraft(card) {
     if (!card) return;
     var id = card.getAttribute('data-candidate-id');
     var item = memoryItems.get(id);
     if (!item) return;
     var prior = memoryDrafts.get(id);
+    var l1Document = itemL1Document(item);
+    if (l1Document) {
+      var baseDocument = prior && prior.type === 'l1' ? prior.baseDocument : l1Document;
+      var document = prior && prior.type === 'l1' ? cloneValue(prior.document) : cloneValue(l1Document);
+      var baseSceneBodies = prior && prior.type === 'l1' ? prior.baseSceneBodies : itemSceneBodies(item);
+      var sceneBodies = prior && prior.type === 'l1' ? cloneValue(prior.sceneBodies || {}) : cloneValue(baseSceneBodies || {});
+      var mode = card.getAttribute('data-l1-editor-mode') || (prior && prior.mode) || 'body';
+      var invalidJson = false;
+      var rawJson = '';
+      if (mode === 'json') {
+        var jsonInput = card.querySelector('[data-l1-json]');
+        rawJson = jsonInput ? String(jsonInput.value || '') : JSON.stringify(document, null, 2);
+        try {
+          var parsed = JSON.parse(rawJson);
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+              !parsed.narrative || typeof parsed.narrative !== 'object' || typeof parsed.narrative.body !== 'string') {
+            throw new Error('invalid_l1_document');
+          }
+          document = parsed;
+        } catch (_) { invalidJson = true; }
+      } else {
+        var titleInput = card.querySelector('[data-l1-title]');
+        var bodyInput = card.querySelector('[data-l1-body]');
+        if (titleInput) document.narrative.title = String(titleInput.value || '');
+        if (bodyInput) document.narrative.body = String(bodyInput.value || '');
+        rawJson = JSON.stringify(document, null, 2);
+      }
+      card.querySelectorAll('[data-scene-body], [data-orphan-scene-body]').forEach(function (input) {
+        var field = input.hasAttribute('data-scene-body') ? 'data-scene-body' : 'data-orphan-scene-body';
+        sceneBodies[input.getAttribute(field)] = String(input.value || '');
+      });
+      if (mode === 'json' && !invalidJson) refreshDiarySceneBodies(card, document, sceneBodies);
+      var changed = invalidJson || !sameValue(document, baseDocument) || !sameValue(sceneBodies, baseSceneBodies || {});
+      if (changed) {
+        memoryDrafts.set(id, { type: 'l1', baseDocument: cloneValue(baseDocument), document: document,
+          rawJson: rawJson, sceneBodies: sceneBodies, baseSceneBodies: cloneValue(baseSceneBodies || {}),
+          invalidJson: invalidJson, mode: mode, revision: prior ? prior.revision : Number(card.getAttribute('data-revision')),
+          expanded: card.getAttribute('data-editing') === 'true' });
+      } else memoryDrafts.delete(id);
+      var error = card.querySelector('[data-l1-json-error]');
+      if (error) error.textContent = invalidJson ? 'JSON 尚未解析成功；草稿已保留，修复 JSON 后才能保存或采用。' : '';
+      persistMemoryState();
+      return;
+    }
     var base = prior ? prior.base : itemFields(item);
     var fields = readDailyChatMemoryEdits(card);
     var edits = {};
@@ -35,6 +170,7 @@
         revision: prior ? prior.revision : Number(card.getAttribute('data-revision')),
         expanded: card.getAttribute('data-editing') === 'true' });
     } else memoryDrafts.delete(id);
+    persistMemoryState();
     var semanticPanel = card.querySelector('.chat-memory-semantics');
     if (semanticPanel) {
       var wasOpen = Boolean(semanticPanel.querySelector('details[open]'));
@@ -55,6 +191,7 @@
     if (!prior) {
       prior = { signature: signature, body: Object.assign({}, body, { request_id: newDailyChatMemoryRequestId() }) };
       memoryRequests.set(key, prior);
+      persistMemoryState();
     }
     return prior.body;
   }
@@ -69,11 +206,174 @@
     document.querySelectorAll('.chat-memory-card').forEach(function (card) {
       var id = card.getAttribute('data-candidate-id');
       var locked = memoryRequests.has('edit:' + id) || Boolean(pendingMemoryAction(id));
-      card.querySelectorAll('input[data-field], textarea[data-field]').forEach(function (el) {
+      card.querySelectorAll('input[data-field], textarea[data-field], [data-l1-title], [data-l1-body], [data-l1-json], [data-scene-body]').forEach(function (el) {
         if (locked) { el.disabled = true; el.setAttribute('data-uncertain-lock', 'true'); }
         else if (el.hasAttribute('data-uncertain-lock')) { el.disabled = false; el.removeAttribute('data-uncertain-lock'); }
       });
     });
+  }
+
+  function draftSnapshot(draft) {
+    return draft && draft.type === 'l1'
+      ? { type: 'l1', document: cloneValue(draft.document), sceneBodies: cloneValue(draft.sceneBodies || {}) }
+      : { type: 'legacy', fields: cloneValue(draft && draft.fields || {}) };
+  }
+
+  function l1RequestEdit(draft, item) {
+    if (draft.invalidJson) throw new Error('L1 JSON 尚未解析成功，修复后才能保存。');
+    var edit = { document: cloneValue(draft.document) };
+    if (itemIsDiary(item)) edit.scene_bodies = cloneValue(draft.sceneBodies || {});
+    return edit;
+  }
+
+  function remapL1IdentityReferences(document, mapping) {
+    function map(value) { return typeof value === 'string' && mapping[value] ? mapping[value] : value; }
+    function visit(node, key) {
+      if (Array.isArray(node)) {
+        if (key === 'statement_refs' || key === 'shared_statement_refs') {
+          return node.map(map);
+        }
+        return node.map(function (child) { return visit(child, ''); });
+      }
+      if (!node || typeof node !== 'object') return node;
+      Object.keys(node).forEach(function (childKey) {
+        var value = node[childKey];
+        if (['entity_id', 'statement_id', 'scene_id', 'relation_id'].includes(childKey)) node[childKey] = map(value);
+        else if (childKey === 'object_id' && node.object_type) node[childKey] = map(value);
+        else if (childKey === 'value' && node.state === 'known') node[childKey] = map(value);
+        else node[childKey] = visit(value, childKey);
+      });
+      return node;
+    }
+    return visit(document, '');
+  }
+
+  function l1ReadbackMatches(submitted, readback) {
+    if (!submitted || !readback || !submitted.narrative || !readback.narrative) return false;
+    var expected = cloneValue(submitted);
+    var mapping = {};
+    [['entities', 'entity_id'], ['statements', 'statement_id'], ['scenes', 'scene_id'], ['relations', 'relation_id']].forEach(function (entry) {
+      var module = entry[0], field = entry[1];
+      var before = submitted[module] || [];
+      var after = readback[module] || [];
+      for (var index = 0; index < Math.min(before.length, after.length); index++) {
+        if (before[index] && after[index] && before[index][field] && after[index][field]) mapping[before[index][field]] = after[index][field];
+      }
+    });
+    expected = remapL1IdentityReferences(expected, mapping);
+    if (!sameValue(expected.evidence_bindings, readback.evidence_bindings)) return false;
+    var managedEntry = ['parent_ref', 'document_group_id', 'derived_from_revision', 'scene_ref', 'shared_statement_refs'];
+    if (!expected.entry || !readback.entry || expected.entry.form !== readback.entry.form ||
+        !managedEntry.every(function (key) { return sameValue(expected.entry[key], readback.entry[key]); })) return false;
+    expected.generation = cloneValue(readback.generation);
+    (expected.scenes || []).forEach(function (scene, index) {
+      if (readback.scenes && readback.scenes[index]) scene.generation = cloneValue(readback.scenes[index].generation);
+    });
+    (expected.relations || []).forEach(function (relation, index) {
+      if (readback.relations && readback.relations[index]) relation.origin = readback.relations[index].origin;
+    });
+    return sameValue(expected, readback);
+  }
+
+  function rebaseL1Draft(savedItem, submitted, currentDraft) {
+    var savedDocument = itemL1Document(savedItem);
+    if (!savedDocument) throw new Error('保存回执未读回完整L1文档，草稿保留并等待重试核对。');
+    var nextDocument = cloneValue(savedDocument);
+    var mapping = {};
+    [['entities', 'entity_id'], ['statements', 'statement_id'], ['scenes', 'scene_id'], ['relations', 'relation_id']].forEach(function (entry) {
+      var module = entry[0], field = entry[1];
+      var before = submitted.document && submitted.document[module] || [];
+      var after = savedDocument[module] || [];
+      for (var index = 0; index < Math.min(before.length, after.length); index++) {
+        if (before[index] && after[index] && before[index][field] && after[index][field]) mapping[before[index][field]] = after[index][field];
+      }
+      if (!sameValue(currentDraft.document && currentDraft.document[module], submitted.document && submitted.document[module])) {
+        nextDocument[module] = cloneValue(currentDraft.document[module] || []);
+      }
+    });
+    Object.keys(currentDraft.document || {}).forEach(function (key) {
+      if (['generation', 'evidence_bindings', 'entry'].includes(key)) return;
+      if (!sameValue(currentDraft.document[key], submitted.document && submitted.document[key])) {
+        nextDocument[key] = cloneValue(currentDraft.document[key]);
+      }
+    });
+    nextDocument = remapL1IdentityReferences(nextDocument, mapping);
+    nextDocument.generation = cloneValue(savedDocument.generation);
+    nextDocument.evidence_bindings = cloneValue(savedDocument.evidence_bindings);
+    nextDocument.entry = cloneValue(savedDocument.entry);
+
+    var savedSceneBodies = itemSceneBodies(savedItem);
+    var nextSceneBodies = cloneValue(savedSceneBodies);
+    var oldScenes = submitted.document && submitted.document.scenes || [];
+    var newScenes = savedDocument.scenes || [];
+    var sceneMap = {};
+    for (var i = 0; i < Math.min(oldScenes.length, newScenes.length); i++) {
+      if (oldScenes[i] && newScenes[i]) sceneMap[oldScenes[i].scene_id] = newScenes[i].scene_id;
+    }
+    Object.keys(currentDraft.sceneBodies || {}).forEach(function (sceneId) {
+      if (!sameValue(currentDraft.sceneBodies[sceneId], (submitted.sceneBodies || {})[sceneId])) {
+        var targetId = sceneMap[sceneId] || sceneId;
+        nextSceneBodies[targetId] = currentDraft.sceneBodies[sceneId];
+      }
+    });
+    return {
+      type: 'l1', baseDocument: savedDocument, document: nextDocument,
+      rawJson: currentDraft.mode === 'json' ? JSON.stringify(nextDocument, null, 2) : JSON.stringify(nextDocument, null, 2),
+      sceneBodies: nextSceneBodies, baseSceneBodies: savedSceneBodies,
+      invalidJson: false, mode: currentDraft.mode || 'body',
+      revision: Number(savedItem.authority_revision), expanded: currentDraft.expanded,
+    };
+  }
+
+  function updateCardFromSavedItem(card, item, draft) {
+    if (!card) return;
+    card.setAttribute('data-revision', String(item.authority_revision));
+    var l1Document = itemL1Document(item);
+    if (l1Document) {
+      var bodyEl = card.querySelector('.chat-memory-card-body');
+      var titleEl = card.querySelector('.chat-memory-card-head strong');
+      if (bodyEl) bodyEl.textContent = l1Document.narrative.body;
+      if (titleEl) titleEl.textContent = l1Document.narrative.title;
+      var semantics = card.querySelector('.chat-memory-semantics');
+      if (semantics) semantics.innerHTML = renderL1ReviewDetails(item, l1Document);
+      var editor = card.querySelector('.chat-memory-l1-editor');
+      if (editor) {
+        var mode = draft && draft.type === 'l1' ? draft.mode : 'body';
+        editor.setAttribute('data-l1-editor-mode', mode);
+        card.setAttribute('data-l1-editor-mode', mode);
+        var bodyView = card.querySelector('[data-l1-body-view]');
+        var jsonView = card.querySelector('[data-l1-json-view]');
+        if (bodyView) bodyView.hidden = mode !== 'body';
+        if (jsonView) jsonView.hidden = mode !== 'json';
+        if (draft && draft.type === 'l1') {
+          syncL1Form(card, draft.document, draft.sceneBodies);
+          var json = card.querySelector('[data-l1-json]');
+          if (json) json.value = draft.rawJson || JSON.stringify(draft.document, null, 2);
+          var error = card.querySelector('[data-l1-json-error]');
+          if (error) error.textContent = draft.invalidJson ? 'JSON 尚未解析成功；草稿已保留，修复 JSON 后才能保存或采用。' : '';
+        } else {
+          syncL1Form(card, l1Document, itemSceneBodies(item));
+          var savedJson = card.querySelector('[data-l1-json]');
+          if (savedJson) savedJson.value = JSON.stringify(l1Document, null, 2);
+        }
+      }
+      return;
+    }
+    var savedFields = itemFields(item);
+    Object.keys(savedFields).forEach(function (field) {
+      var input = card.querySelector('[data-field="' + field + '"]');
+      if (input) input.value = Array.isArray(savedFields[field]) ? savedFields[field].join(', ') : String(savedFields[field]);
+    });
+    if (draft && draft.type !== 'l1') {
+      Object.keys(draft.fields || {}).forEach(function (field) {
+        var input = card.querySelector('[data-field="' + field + '"]');
+        if (input) input.value = Array.isArray(draft.fields[field]) ? draft.fields[field].join(', ') : String(draft.fields[field]);
+      });
+    }
+    var legacyBody = card.querySelector('.chat-memory-card-body');
+    if (legacyBody) legacyBody.textContent = item.candidate.proposed_memory || item.candidate.content;
+    var legacyTitle = card.querySelector('.chat-memory-card-head strong');
+    if (legacyTitle) legacyTitle.textContent = savedFields.title;
   }
 
   async function saveMemoryDraft(id) {
@@ -81,32 +381,65 @@
     var draft = memoryDrafts.get(id);
     if (!draft) return;
     var key = 'edit:' + id;
-    var body = stableMemoryRequest(key, { candidate_id: id, edit: draft.edits, expected_revision: draft.revision });
+    var item = memoryItems.get(id);
+    var priorRequest = memoryRequests.get(key);
+    var snapshot = priorRequest && priorRequest.snapshot ? priorRequest.snapshot : draftSnapshot(draft);
+    if (!priorRequest && draft.type === 'l1' && draft.invalidJson) throw new Error('L1 JSON 尚未解析成功，修复后才能保存。');
+    var requestEdit = priorRequest ? null : (draft.type === 'l1' ? l1RequestEdit(draft, item) : draft.edits);
+    var body = priorRequest ? priorRequest.body : stableMemoryRequest(key, {
+      candidate_id: id, edit: requestEdit, expected_revision: draft.revision,
+    });
+    var request = memoryRequests.get(key);
+    if (request && !request.snapshot) { request.snapshot = snapshot; persistMemoryState(); }
+    snapshot = request && request.snapshot || snapshot;
     var res = await authFetch(dailyChatMemoryApiBase() + '/api/daily-chat-memory/edit', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     if (!res) throw new Error('未确认保存结果，请恢复连接后重试；草稿已保留。');
     var data = await res.json();
     if (!res.ok) {
-      if (res.status >= 400 && res.status < 500) memoryRequests.delete(key);
+      if (res.status >= 400 && res.status < 500) { memoryRequests.delete(key); persistMemoryState(); }
       throw new Error(data.error === 'revision_conflict' ? '候选已在其他页面修改，请核对新版本；草稿已保留。' : (data.error || '保存失败'));
     }
     if (data.status !== 'saved' || data.adopted !== false || !data.item) throw new Error('保存回执不完整，请重试核对。');
+    if (!['pending', 'deferred'].includes(data.item.status) || Number(data.item.authority_revision) !== Number(body.expected_revision) + 1) {
+      throw new Error('保存回执中的候选状态或CAS版本不一致；草稿已保留。');
+    }
+    if (draft.type === 'l1') {
+      var readback = itemL1Document(data.item);
+      if (!readback || !l1ReadbackMatches(body.edit.document, readback)) {
+        throw new Error('保存回执没有读回一致的完整L1正文与语义；草稿已保留。');
+      }
+    }
     memoryItems.set(id, data.item);
-    memoryDrafts.delete(id);
     memoryRequests.delete(key);
     var card = Array.from(document.querySelectorAll('.chat-memory-card')).find(function (c) { return c.getAttribute('data-candidate-id') === id; });
-    if (card) {
-      card.setAttribute('data-revision', String(data.item.authority_revision));
+    var currentDraft = memoryDrafts.get(id);
+    if (!currentDraft || sameDraft(currentDraft, snapshot)) {
+      memoryDrafts.delete(id);
+      currentDraft = null;
+    } else if (currentDraft.type === 'l1' && snapshot.type === 'l1') {
+      currentDraft = rebaseL1Draft(data.item, snapshot, currentDraft);
+      if (l1DraftChanged(currentDraft)) memoryDrafts.set(id, currentDraft);
+      else { memoryDrafts.delete(id); currentDraft = null; }
+    } else if (currentDraft.type !== 'l1' && snapshot.type !== 'l1') {
       var savedFields = itemFields(data.item);
-      Object.keys(savedFields).forEach(function (field) {
-        var input = card.querySelector('[data-field="' + field + '"]');
-        if (input) input.value = Array.isArray(savedFields[field]) ? savedFields[field].join(', ') : String(savedFields[field]);
+      var lateFields = {};
+      Object.keys(currentDraft.fields || {}).forEach(function (field) {
+        lateFields[field] = sameValue(currentDraft.fields[field], snapshot.fields[field])
+          ? savedFields[field] : currentDraft.fields[field];
       });
-      var bodyEl = card.querySelector('.chat-memory-card-body');
-      if (bodyEl) bodyEl.textContent = data.item.candidate.proposed_memory || data.item.candidate.content;
-      var titleEl = card.querySelector('.chat-memory-card-head strong');
-      if (titleEl) titleEl.textContent = savedFields.title;
+      var lateEdits = {};
+      Object.keys(lateFields).forEach(function (field) {
+        if (!sameValue(lateFields[field], savedFields[field])) lateEdits[field] = lateFields[field];
+      });
+      if (Object.keys(lateEdits).length) {
+        currentDraft = { type: 'legacy', base: savedFields, fields: lateFields, edits: lateEdits,
+          revision: Number(data.item.authority_revision), expanded: currentDraft.expanded };
+        memoryDrafts.set(id, currentDraft);
+      } else { memoryDrafts.delete(id); currentDraft = null; }
     }
+    persistMemoryState();
+    updateCardFromSavedItem(card, data.item, currentDraft);
   }
 
   async function saveDailyChatMemoryEdit(button) {
@@ -119,13 +452,15 @@
     setMemoryControlsBusy(true);
     try {
       await saveMemoryDraft(id);
-      setDailyChatMemoryMessage('修改已保存，仍待审核；没有采用入库。', 'ok');
+      setDailyChatMemoryMessage(memoryDrafts.has(id)
+        ? '已保存提交时的版本；提交期间新增的修改仍留在草稿。候选仍待审核，没有采用入库。'
+        : '修改已保存，仍待审核；没有采用入库。', 'ok');
     } catch (e) { setDailyChatMemoryMessage(e.message, 'error'); }
     finally { memoryBusy = false; setMemoryControlsBusy(false); }
   }
 
   function setMemoryControlsBusy(value) {
-    document.querySelectorAll('#daily-chat-memory-pending input, #daily-chat-memory-pending textarea, #daily-chat-memory-pending button, #daily-chat-memory-pending select').forEach(function (el) {
+    document.querySelectorAll('#daily-chat-memory-pending button, #daily-chat-memory-pending select, #daily-chat-memory-pending input[type="checkbox"]').forEach(function (el) {
       if (value) { el.setAttribute('data-was-disabled', el.disabled && !el.hasAttribute('data-uncertain-lock') ? 'true' : 'false'); el.disabled = true; }
       else {
         el.disabled = el.getAttribute('data-was-disabled') === 'true';
@@ -142,6 +477,7 @@
     if (memoryRequests.has('edit:' + id) || pendingMemoryAction(id)) { setDailyChatMemoryMessage('操作结果尚未确认，请先重试原操作。', 'error'); return; }
     if (!confirm('放弃这条未保存修改，重新读取服务器版本？')) return;
     memoryDrafts.delete(id);
+    persistMemoryState();
     var card = button.closest('.chat-memory-card');
     card.remove();
     loadDailyChatMemoryPending();
@@ -222,9 +558,206 @@
     }).join('') + '</div>';
   }
 
+  function displayValue(value) {
+    if (value == null || value === '') return '—';
+    if (typeof value === 'string') return value;
+    try { return JSON.stringify(value); } catch (_) { return String(value); }
+  }
+
+  function renderL1ReviewDetails(item, document) {
+    var candidate = item && item.candidate && typeof item.candidate === 'object' ? item.candidate : {};
+    var metadata = candidate.metadata && typeof candidate.metadata === 'object' ? candidate.metadata : {};
+    var bundle = candidate.diary_l1_bundle || metadata.diary_l1_bundle || item && item.diary_l1_bundle || {};
+    var display = item && item.display && typeof item.display === 'object' ? item.display : {};
+    var sourceState = candidate.l0_source_state || candidate.source_state || candidate.source_status ||
+      item && (item.source_state || item.source_status) || display.source_state || candidate.source_verification || '未提供';
+    var bindings = Array.isArray(document.evidence_bindings) ? document.evidence_bindings : [];
+    var sourceRefs = candidate.source_refs || item && item.source_refs || [];
+    if (!Array.isArray(sourceRefs)) sourceRefs = [sourceRefs];
+    var bindingRows = bindings.map(function (binding) {
+      if (!binding || typeof binding !== 'object') return '<li>' + esc(displayValue(binding)) + '</li>';
+      var label = [binding.source_namespace || binding.namespace || binding.source_type || binding.type,
+        binding.source_id || binding.id, binding.source_revision || binding.revision,
+        binding.author_ref || binding.speaker_ref, binding.text_view_id,
+        binding.content_sha256 || binding.source_content_sha256].filter(Boolean).join(' · ');
+      return '<li>' + esc(label || displayValue(binding)) + '</li>';
+    }).join('');
+    var refRows = sourceRefs.map(function (value) { return '<li>' + esc(displayValue(value)) + '</li>'; }).join('');
+    var generation = document.generation || candidate.generation || {};
+    var generationRows = Object.keys(generation).sort().map(function (key) {
+      return '<li><strong>' + esc(key) + '：</strong>' + esc(displayValue(generation[key])) + '</li>';
+    }).join('');
+    var coverage = bundle && bundle.coverage || candidate.coverage || item && item.coverage;
+    return '<details class="chat-memory-excerpt-details chat-memory-l1-details">' +
+      '<summary>来源状态与生成版本</summary>' +
+      '<p><strong>来源状态：</strong>' + esc(displayValue(sourceState)) + '</p>' +
+      (coverage ? '<p><strong>覆盖：</strong>' + esc(displayValue(coverage)) + '</p>' : '') +
+      '<p><strong>L1来源绑定：</strong>' + bindings.length + ' 项</p>' +
+      (bindingRows ? '<ul>' + bindingRows + '</ul>' : '<p>当前文档没有来源绑定；不代表来源已验证。</p>') +
+      (refRows ? '<p><strong>候选来源引用：</strong></p><ul>' + refRows + '</ul>' : '') +
+      '<p><strong>generation：</strong></p>' +
+      (generationRows ? '<ul>' + generationRows + '</ul>' : '<p>未提供生成版本信息。</p>') +
+      '</details>';
+  }
+
+  function renderL1EditPanel(item, document, draft) {
+    var current = draft && draft.type === 'l1' ? draft.document : document;
+    var mode = draft && draft.type === 'l1' ? draft.mode : 'body';
+    var rawJson = draft && draft.type === 'l1' ? draft.rawJson : JSON.stringify(current, null, 2);
+    var sceneBodies = draft && draft.type === 'l1' ? draft.sceneBodies : itemSceneBodies(item);
+    var bodyFields = '<label class="chat-memory-edit-field">L1标题' +
+      '<input type="text" data-l1-title value="' + escAttr((current.narrative || {}).title || '') + '" />' +
+      '</label>' +
+      '<label class="chat-memory-edit-field">第一遍完整正文' +
+      '<textarea data-l1-body rows="9">' + esc((current.narrative || {}).body || '') + '</textarea>' +
+      '</label>';
+    var scenes = itemIsDiary(item) ? renderDiarySceneBodies(current, sceneBodies) : '';
+    return '<div class="chat-memory-l1-editor" data-l1-editor-mode="' + escAttr(mode) + '">' +
+      '<div class="chat-memory-card-actions">' +
+        '<button type="button" onclick="toggleDailyChatMemoryL1Mode(this, \'body\')">正文与场景</button>' +
+        '<button type="button" onclick="toggleDailyChatMemoryL1Mode(this, \'json\')">完整L1 JSON</button>' +
+      '</div>' +
+      '<p class="chat-memory-edit-needed">完整L1与正文共用一份草稿。来源绑定、身份、父子引用和generation由服务端保护；修改这些字段会返回明确错误。</p>' +
+      '<p data-l1-json-error class="chat-memory-stale">' + (draft && draft.invalidJson ? 'JSON 尚未解析成功；草稿已保留，修复 JSON 后才能保存或采用。' : '') + '</p>' +
+      '<div data-l1-body-view' + (mode === 'json' ? ' hidden' : '') + '>' + bodyFields + '</div>' +
+      '<label class="chat-memory-edit-field" data-l1-json-view' + (mode === 'json' ? '' : ' hidden') + '>完整L1 JSON' +
+        '<textarea data-l1-json rows="22" spellcheck="false" style="font-family:ui-monospace,Consolas,monospace;white-space:pre">' + esc(rawJson || '') + '</textarea>' +
+        '<small>JSON包含正文、主体、场景、陈述、分类、时间条件、关系、属性与检索字段。保存会完整提交，服务端校验受保护的机器字段。</small>' +
+      '</label>' +
+      (scenes ? '<div class="chat-memory-l1-scenes"><strong>日记场景正文</strong><div data-l1-scenes>' + scenes + '</div></div>' : '') +
+    '</div>';
+  }
+
+  function renderDiarySceneBodies(document, sceneBodies, selectedTargets) {
+    sceneBodies = sceneBodies && typeof sceneBodies === 'object' ? sceneBodies : {};
+    selectedTargets = selectedTargets && typeof selectedTargets === 'object' ? selectedTargets : {};
+    var scenes = Array.isArray(document && document.scenes) ? document.scenes : [];
+    var known = new Set();
+    var html = scenes.map(function (scene) {
+      if (!scene || typeof scene !== 'object') return '';
+      var id = String(scene.scene_id || '');
+      known.add(id);
+      return '<label class="chat-memory-edit-field">日记场景正文 · ' + esc(scene.title || id) +
+        '<textarea data-scene-body="' + escAttr(id) + '" rows="6">' + esc(Object.prototype.hasOwnProperty.call(sceneBodies, id) ? sceneBodies[id] : '') +
+        '</textarea><small>场景正文会随同一候选保存；边界沿用scene身份时保留这段完整正文。</small></label>';
+    }).join('');
+    Object.keys(sceneBodies).filter(function (id) { return !known.has(id); }).forEach(function (id) {
+      var options = scenes.filter(function (scene) { return scene && scene.scene_id; }).map(function (scene) {
+        return '<option value="' + escAttr(scene.scene_id) + '"' + (selectedTargets[id] === scene.scene_id ? ' selected' : '') + '>' + esc(scene.title || scene.scene_id) + '</option>';
+      }).join('');
+      html += '<div class="chat-memory-edit-field chat-memory-edit-needed">未映射的旧场景正文 · ' + esc(id) +
+        '<textarea data-orphan-scene-body="' + escAttr(id) + '" rows="6">' + esc(sceneBodies[id]) + '</textarea>' +
+        '<div class="chat-memory-card-actions"><select data-orphan-scene-target><option value="">选择要保留正文的当前场景</option>' + options + '</select>' +
+        '<button type="button" onclick="mapDailyChatMemorySceneBody(this)">复制到所选场景并移除旧项</button>' +
+        '<button type="button" class="danger" onclick="discardDailyChatMemorySceneBody(this)">确认移除旧场景正文</button></div>' +
+        '<small>旧正文会一直保留到你明确复制或移除；保存仍会要求每段正文对应当前场景。</small></div>';
+    });
+    return html;
+  }
+
+  function refreshDiarySceneBodies(card, document, sceneBodies) {
+    var container = card && card.querySelector('[data-l1-scenes]');
+    if (!container) return;
+    var selectedTargets = {};
+    container.querySelectorAll('[data-orphan-scene-target]').forEach(function (select) {
+      var wrapper = select.closest('.chat-memory-edit-field');
+      var source = wrapper && wrapper.querySelector('[data-orphan-scene-body]');
+      if (source && select.value) selectedTargets[source.getAttribute('data-orphan-scene-body')] = select.value;
+    });
+    container.innerHTML = renderDiarySceneBodies(document, sceneBodies, selectedTargets);
+  }
+
+  function syncL1Form(card, document, sceneBodies) {
+    var title = card.querySelector('[data-l1-title]');
+    var body = card.querySelector('[data-l1-body]');
+    if (title) title.value = String((document.narrative || {}).title || '');
+    if (body) body.value = String((document.narrative || {}).body || '');
+    refreshDiarySceneBodies(card, document, sceneBodies);
+  }
+
+  function ensureL1Draft(card, item) {
+    var id = card.getAttribute('data-candidate-id');
+    var draft = memoryDrafts.get(id);
+    if (!draft || draft.type !== 'l1') {
+      var current = itemL1Document(item);
+      if (!current) return null;
+      var scenes = itemSceneBodies(item);
+      draft = { type: 'l1', baseDocument: cloneValue(current), document: cloneValue(current),
+        rawJson: JSON.stringify(current, null, 2), sceneBodies: scenes, baseSceneBodies: cloneValue(scenes),
+        invalidJson: false, mode: card.getAttribute('data-l1-editor-mode') || 'body',
+        revision: Number(card.getAttribute('data-revision')), expanded: true };
+      memoryDrafts.set(id, draft);
+    }
+    return draft;
+  }
+
+  function mapDailyChatMemorySceneBody(button) {
+    var card = button.closest('.chat-memory-card');
+    var item = card && memoryItems.get(card.getAttribute('data-candidate-id'));
+    if (!card || !item) return;
+    var source = button.closest('.chat-memory-edit-field').querySelector('[data-orphan-scene-body]');
+    var target = button.closest('.chat-memory-edit-field').querySelector('[data-orphan-scene-target]');
+    var sourceId = source && source.getAttribute('data-orphan-scene-body');
+    var sourceBody = source && source.value;
+    var targetId = target && target.value;
+    captureMemoryDraft(card);
+    var draft = ensureL1Draft(card, item);
+    if (!draft || draft.invalidJson) { setDailyChatMemoryMessage('先修复完整L1 JSON，再映射场景正文。', 'error'); return; }
+    if (!sourceId || !targetId) { setDailyChatMemoryMessage('请选择要保留正文的当前场景。', 'error'); return; }
+    draft.sceneBodies[targetId] = sourceBody;
+    delete draft.sceneBodies[sourceId];
+    refreshDiarySceneBodies(card, draft.document, draft.sceneBodies);
+    captureMemoryDraft(card);
+    setDailyChatMemoryMessage('旧场景正文已复制到当前场景草稿；保存后仍待审核。', 'ok');
+  }
+
+  function discardDailyChatMemorySceneBody(button) {
+    var card = button.closest('.chat-memory-card');
+    var item = card && memoryItems.get(card.getAttribute('data-candidate-id'));
+    if (!card || !item || !confirm('确认从这份待审草稿中移除这段旧场景正文？')) return;
+    var source = button.closest('.chat-memory-edit-field').querySelector('[data-orphan-scene-body]');
+    var sourceId = source && source.getAttribute('data-orphan-scene-body');
+    captureMemoryDraft(card);
+    var draft = ensureL1Draft(card, item);
+    if (!draft) return;
+    if (sourceId) delete draft.sceneBodies[sourceId];
+    refreshDiarySceneBodies(card, draft.document, draft.sceneBodies);
+    captureMemoryDraft(card);
+    setDailyChatMemoryMessage('旧场景正文已从草稿移除；保存仍待审核。', 'ok');
+  }
+
+  function toggleDailyChatMemoryL1Mode(button, nextMode) {
+    var card = button && button.closest ? button.closest('.chat-memory-card') : null;
+    var editor = card && card.querySelector('.chat-memory-l1-editor');
+    var item = card && memoryItems.get(card.getAttribute('data-candidate-id'));
+    if (!editor || !item || !['body', 'json'].includes(nextMode)) return;
+    captureMemoryDraft(card);
+    var id = card.getAttribute('data-candidate-id');
+    var draft = memoryDrafts.get(id);
+    if (draft && draft.type === 'l1' && draft.invalidJson && nextMode !== 'json') {
+      setDailyChatMemoryMessage('JSON 尚未解析成功；修复后再切换视图，草稿仍保留。', 'error');
+      return;
+    }
+    var document = draft && draft.type === 'l1' ? draft.document : itemL1Document(item);
+    var sceneBodies = draft && draft.type === 'l1' ? draft.sceneBodies : itemSceneBodies(item);
+    if (nextMode === 'body') syncL1Form(card, document, sceneBodies);
+    var json = card.querySelector('[data-l1-json]');
+    if (json && nextMode === 'json' && !(draft && draft.type === 'l1' && draft.invalidJson)) {
+      json.value = JSON.stringify(document, null, 2);
+    }
+    var bodyView = card.querySelector('[data-l1-body-view]');
+    var jsonView = card.querySelector('[data-l1-json-view]');
+    if (bodyView) bodyView.hidden = nextMode !== 'body';
+    if (jsonView) jsonView.hidden = nextMode !== 'json';
+    editor.setAttribute('data-l1-editor-mode', nextMode);
+    card.setAttribute('data-l1-editor-mode', nextMode);
+    captureMemoryDraft(card);
+  }
+
   function loadDailyChatMemoryPending() {
     var target = document.getElementById('daily-chat-memory-pending');
     if (!target || memoryBusy) return;
+    loadMemorySourceTasks(target);
     captureMemoryDrafts();
     var epoch = ++memoryLoadEpoch;
     return authFetch(dailyChatMemoryApiBase() + '/api/daily-chat-memory/pending?limit=100')
@@ -236,6 +769,7 @@
       .then(function (data) {
         if (data && data.error) throw new Error(data.error || '读取失败');
         if (epoch !== memoryLoadEpoch || memoryBusy) return;
+        restoreMemoryState();
         captureMemoryDrafts();
         var items = (data && data.items) || [];
         var seen = new Set(items.map(function (item) { return item.id; }));
@@ -254,6 +788,58 @@
       .catch(function (e) {
       if (epoch === memoryLoadEpoch) setDailyChatMemoryMessage('读取失败，草稿保留: ' + e.message, 'error');
       });
+  }
+
+  function loadMemorySourceTasks(target) {
+    var panel = document.getElementById('memory-source-tasks');
+    if (!panel) {
+      panel = document.createElement('details'); panel.id = 'memory-source-tasks';
+      var summary = document.createElement('summary'); summary.textContent = '行动结果的记忆准备状态'; panel.appendChild(summary);
+      var refresh = document.createElement('button'); refresh.textContent = '刷新准备状态';
+      refresh.addEventListener('click', function() { loadMemorySourceTasks(target); }); panel.appendChild(refresh);
+      var notice = document.createElement('p'); notice.setAttribute('data-source-task-notice', ''); notice.setAttribute('role', 'status'); panel.appendChild(notice);
+      var content = document.createElement('div'); content.setAttribute('data-source-task-list', ''); panel.appendChild(content);
+      target.parentNode.insertBefore(panel, target);
+    }
+    var list = panel.querySelector('[data-source-task-list]');
+    var notice = panel.querySelector('[data-source-task-notice]');
+    var epoch = ++memorySourceLoadEpoch; notice.textContent = '正在刷新准备状态…';
+    authFetch(dailyChatMemoryApiBase() + '/api/memory-authority/source-tasks?limit=100').then(function(res) {
+      if (!res || !res.ok) throw new Error('暂不可读'); return res.json();
+    }).then(function(data) {
+      if (epoch !== memorySourceLoadEpoch) return;
+      if (!data || !Array.isArray(data.tasks)) throw new Error('回执格式不符');
+      notice.textContent = '准备状态已刷新。';
+      list.replaceChildren();
+      var help = document.createElement('p'); help.textContent = '来源提交与记忆采用分开。后台按预算整理，也可用原补扫入口处理；这里只显示前100条任务。'; list.appendChild(help);
+      data.tasks.forEach(function(task) {
+        var row = document.createElement('div'); row.className = 'chat-memory-card';
+        var status = document.createElement('p');
+        var labels = {queued:'等待整理', generating:'处理中', prepared:'候选已生成', failed:'整理失败'};
+        status.textContent = (labels[task.phase] || task.phase) + ' · ' + task.action_id; row.appendChild(status);
+        if (task.issue) { var issue = document.createElement('code'); issue.textContent = task.issue.code || '未完成'; row.appendChild(issue); }
+        if (task.candidate_ids && task.candidate_ids.length) {
+          var refs = document.createElement('p'); refs.textContent = '对应候选：' + task.candidate_ids.join('、') + '；采用状态以候选和正式记忆回执为准。'; row.appendChild(refs);
+        }
+        if (task.phase === 'failed' || task.phase === 'generating') {
+          var retry = document.createElement('button'); retry.textContent = task.phase === 'failed' ? '重试整理' : '中断后恢复整理';
+          retry.addEventListener('click', async function() {
+            if (!window.confirm('重新排队整理此来源；可能再次调用已配置模型，不会重新执行原行动。')) return;
+            retry.disabled = true;
+            try {
+              var res = await authFetch(dailyChatMemoryApiBase() + '/api/memory-authority/source-tasks/' + encodeURIComponent(task.task_id) + '/retry',
+                {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({expected_phase:task.phase})});
+              if (!res || !res.ok) throw new Error('未重新排队，请刷新核对任务状态');
+              loadMemorySourceTasks(target);
+            } catch (error) { status.textContent = error.message; retry.disabled = false; }
+          }); row.appendChild(retry);
+        }
+        list.appendChild(row);
+      });
+    }).catch(function() {
+      if (epoch !== memorySourceLoadEpoch) return;
+      notice.textContent = '准备状态刷新失败；以下保留上次回执，可能已过期。已有候选和草稿保持。';
+    });
   }
 
   function renderDailyChatMemoryPending(items) {
@@ -293,14 +879,21 @@
     var id = item.id || '';
     var draft = memoryDrafts.get(id);
     var revision = draft ? draft.revision : Number(item.authority_revision || candidate.authority_revision || 0);
-    var fields = draft ? draft.fields : itemFields(item);
-    Object.assign(candidate, fields, { proposed_memory: fields.content });
+    var l1Document = itemL1Document(item);
+    var l1Draft = draft && draft.type === 'l1' ? draft : null;
+    var fields = draft && draft.type !== 'l1' ? draft.fields : itemFields(item);
+    if (!l1Document) Object.assign(candidate, fields, { proposed_memory: fields.content });
     var legacy = legacyNoOriginal(item);
     var blocked = confirmBlocked(item);
     var editRequired = needsOwnerEdit(item);
     var hasSource = hasSourcePreview(item);
     var excerpt = String(candidate.original_excerpt || '').trim() || (legacy ? '历史候选无原文摘录' : '（无来源片段）');
-    var proposed = String(candidate.proposed_memory || candidate.content || '').trim() || '（缺少建议记忆）';
+    var proposed = String((l1Draft ? l1Draft.document : l1Document || {}).narrative
+      ? (l1Draft ? l1Draft.document : l1Document).narrative.body
+      : (candidate.proposed_memory || candidate.content || '')).trim() || '（缺少建议记忆）';
+    var cardTitle = String((l1Draft ? l1Draft.document : l1Document || {}).narrative
+      ? (l1Draft ? l1Draft.document : l1Document).narrative.title
+      : (candidate.title || id));
     var flags = (item.display && item.display.soft_flags) || candidate.soft_flags || [];
     var sourceParts = [];
     if (candidate.source_event_ids && candidate.source_event_ids.length) {
@@ -325,12 +918,12 @@
       ? '<button type="button" class="chat-memory-source-btn" onclick="toggleDailyChatMemorySource(this, \'' + jsString(id) + '\')">查看完整原文</button>'
       : '';
     return '' +
-      '<div class="chat-memory-card' + (editRequired ? ' chat-memory-card-edit-needed' : '') + '" data-candidate-id="' + escAttr(id) + '" data-revision="' + escAttr(revision) + '" data-editing="' + (draft && draft.expanded ? 'true' : 'false') + '"' + (editRequired ? ' data-needs-edit="true"' : '') + '>' +
+      '<div class="chat-memory-card' + (editRequired ? ' chat-memory-card-edit-needed' : '') + '" data-candidate-id="' + escAttr(id) + '" data-revision="' + escAttr(revision) + '" data-editing="' + (draft && draft.expanded ? 'true' : 'false') + '"' + (l1Document ? ' data-l1-editor-mode="' + escAttr(l1Draft && l1Draft.mode || 'body') + '"' : '') + (editRequired ? ' data-needs-edit="true"' : '') + '>' +
         '<div class="chat-memory-card-head">' +
           '<label class="chat-memory-select">' +
             '<input type="checkbox" data-select="' + escAttr(id) + '" onchange="refreshDailyChatMemorySelection()" />' +
           '</label>' +
-          '<strong>' + esc(candidate.title || id) + '</strong>' +
+          '<strong>' + esc(cardTitle || id) + '</strong>' +
           renderSoftFlagChips(flags) +
         '</div>' +
         '<div class="chat-memory-card-grid">' +
@@ -354,35 +947,36 @@
         '<div class="chat-memory-source-panel" hidden>' +
           '<div class="chat-memory-source-loading">读取完整原文...</div>' +
         '</div>' +
-        '<div class="chat-memory-semantics">' + renderMemorySemantics(item, draft) + '</div>' + staleNote + blockedNote + editNote +
+        '<div class="chat-memory-semantics">' + (l1Document ? renderL1ReviewDetails(item, l1Document) : renderMemorySemantics(item, draft)) + '</div>' + staleNote + blockedNote + editNote +
         (draft ? '<p class="chat-memory-edit-needed">有未保存修改' + (item.draft_orphan || revision !== item.authority_revision ? '；服务器版本或状态已变化，请核对后再操作' : '') + '。</p>' : '') +
         '<div class="chat-memory-edit-panel"' + (draft && draft.expanded ? '' : ' hidden') + '>' +
-          '<label class="chat-memory-edit-field">标题' +
-            '<input type="text" data-field="title" maxlength="100" value="' + escAttr(candidate.title || id) + '" />' +
-          '</label>' +
-          '<label class="chat-memory-edit-field">正文（建议记忆，写入记忆桶的内容）' +
-            '<textarea data-field="content" maxlength="12000" rows="6">' + esc(proposed) + '</textarea><small>最多 12,000 字符；保存修改不会采用入库。离开页面前请保存。</small>' +
-          '</label>' +
-          '<div class="chat-memory-edit-grid">' +
-            '<label class="chat-memory-edit-field">类型' +
-              '<input type="text" data-field="kind" value="' + escAttr(candidate.kind || 'memory') + '" />' +
+          (l1Document ? renderL1EditPanel(item, l1Document, l1Draft) :
+            '<label class="chat-memory-edit-field">标题' +
+              '<input type="text" data-field="title" maxlength="100" value="' + escAttr(candidate.title || id) + '" />' +
             '</label>' +
-            '<label class="chat-memory-edit-field">域' +
-              '<input type="text" data-field="domain" value="' + escAttr(listText(candidate.domain)) + '" />' +
+            '<label class="chat-memory-edit-field">正文（建议记忆，写入记忆桶的内容）' +
+              '<textarea data-field="content" maxlength="12000" rows="6">' + esc(proposed) + '</textarea><small>最多 12,000 字符；保存修改不会采用入库。离开页面前请保存。</small>' +
             '</label>' +
-            '<label class="chat-memory-edit-field">标签' +
-              '<input type="text" data-field="tags" value="' + escAttr(listText(candidate.tags)) + '" />' +
-            '</label>' +
-            '<label class="chat-memory-edit-field">重要度' +
-              '<input type="number" min="1" max="10" data-field="importance" value="' + escAttr(candidate.importance || '') + '" />' +
-            '</label>' +
-            '<label class="chat-memory-edit-field">置信度' +
-              '<input type="number" min="0" max="1" step="0.01" data-field="confidence" value="' + escAttr(candidate.confidence) + '" />' +
-            '</label>' +
-            '<label class="chat-memory-edit-field">事件日期（可选；不是入库日期）' +
-              '<input type="date" data-field="event_date" value="' + escAttr(fields.event_date) + '" /><small>未改此字段会保留原时间依据；改正文后旧时间需复核。</small>' +
-            '</label>' +
-          '</div>' +
+            '<div class="chat-memory-edit-grid">' +
+              '<label class="chat-memory-edit-field">类型' +
+                '<input type="text" data-field="kind" value="' + escAttr(candidate.kind || 'memory') + '" />' +
+              '</label>' +
+              '<label class="chat-memory-edit-field">域' +
+                '<input type="text" data-field="domain" value="' + escAttr(listText(candidate.domain)) + '" />' +
+              '</label>' +
+              '<label class="chat-memory-edit-field">标签' +
+                '<input type="text" data-field="tags" value="' + escAttr(listText(candidate.tags)) + '" />' +
+              '</label>' +
+              '<label class="chat-memory-edit-field">重要度' +
+                '<input type="number" min="1" max="10" data-field="importance" value="' + escAttr(candidate.importance || '') + '" />' +
+              '</label>' +
+              '<label class="chat-memory-edit-field">置信度' +
+                '<input type="number" min="0" max="1" step="0.01" data-field="confidence" value="' + escAttr(candidate.confidence) + '" />' +
+              '</label>' +
+              '<label class="chat-memory-edit-field">事件日期（可选；不是入库日期）' +
+                '<input type="date" data-field="event_date" value="' + escAttr(fields.event_date) + '" /><small>未改此字段会保留原时间依据；改正文后旧时间需复核。</small>' +
+              '</label>' +
+            '</div>') +
         '</div>' +
         '<div class="chat-memory-card-actions">' +
           '<button type="button" onclick="toggleDailyChatMemoryEdit(this)">编辑</button>' +
@@ -653,7 +1247,10 @@
         if (isReject && memoryRequests.has('edit:' + id)) throw new Error('保存结果尚未确认，请先重试保存。');
       });
       var retry = memoryRequests.get(key);
-      if (!retry && !isReject) for (var id of ids) await saveMemoryDraft(id);
+      if (!retry && !isReject) for (var id of ids) {
+        await saveMemoryDraft(id);
+        if (memoryDrafts.has(id)) throw new Error('保存期间又有新修改，已保留草稿；请保存这些修改后再采用。');
+      }
       var revisions = {};
       if (!retry) ids.forEach(function (id) {
         var item = memoryItems.get(id);
@@ -671,8 +1268,8 @@
       var body = retry ? retry.body : stableMemoryRequest(key, input);
       var data = await postDailyChatMemoryConfirm(body);
       if (!data) throw new Error('结果未确认，请重试原操作，不要重新创建候选。');
-      if (data.status === 'rate_limited') { memoryRequests.delete(key); throw new Error('操作太频繁，请稍后重试。'); }
-      if (data.status === 'conflict') { memoryRequests.delete(key); throw new Error('版本或请求冲突，请核对候选。'); }
+      if (data.status === 'rate_limited') { memoryRequests.delete(key); persistMemoryState(); throw new Error('操作太频繁，请稍后重试。'); }
+      if (data.status === 'conflict') { memoryRequests.delete(key); persistMemoryState(); throw new Error('版本或请求冲突，请核对候选。'); }
       var expected = isReject ? ['rejected'] : (isDefer ? ['deferred'] : ['created', 'exists']);
       var results = data.results || [];
       var applied = results.filter(function (r) { return expected.includes(r.status); });
@@ -682,6 +1279,7 @@
       if (complete) {
         memoryRequests.delete(key);
         applied.forEach(function (r) { memoryDrafts.delete(r.id); memoryItems.delete(r.id); });
+        persistMemoryState();
       }
       var failed = results.filter(function (r) { return !expected.includes(r.status); });
       var detail = failed.some(function (r) { return r.status === 'revision_conflict'; }) ? '版本已变化，请载入新版核对。'
@@ -690,7 +1288,7 @@
       setDailyChatMemoryMessage(verb + '成功 ' + applied.length + '／' + ids.length + ' 条。' + (applied.length === ids.length ? '' : detail), applied.length === ids.length ? 'ok' : 'error');
       refresh = applied.length === ids.length || !memoryRequests.has(key);
     } catch (e) {
-      if (e.definiteRejection) memoryRequests.delete(key);
+      if (e.definiteRejection) { memoryRequests.delete(key); persistMemoryState(); }
       setDailyChatMemoryMessage('未完成：' + e.message, 'error');
     } finally {
       memoryBusy = false;
@@ -791,6 +1389,9 @@
   window.confirmDailyChatMemory = confirmDailyChatMemory;
   window.batchDailyChatMemoryConfirm = batchDailyChatMemoryConfirm;
   window.toggleDailyChatMemoryEdit = toggleDailyChatMemoryEdit;
+  window.toggleDailyChatMemoryL1Mode = toggleDailyChatMemoryL1Mode;
+  window.mapDailyChatMemorySceneBody = mapDailyChatMemorySceneBody;
+  window.discardDailyChatMemorySceneBody = discardDailyChatMemorySceneBody;
   window.saveDailyChatMemoryEdit = saveDailyChatMemoryEdit;
   window.discardDailyChatMemoryDraft = discardDailyChatMemoryDraft;
   window.toggleDailyChatMemorySelectAll = toggleDailyChatMemorySelectAll;

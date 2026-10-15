@@ -23,6 +23,7 @@ BASE_CATALOG = {
     "definitions": [],
 }
 GENERATION_FIELDS = {"origin", "prompt_revision", "catalog_revision", "model_route_revision", "task_id", "actor", "catalog_snapshot"}
+MAX_PREDICATE_DEPTH = 8
 
 
 def fail(code, path):
@@ -149,13 +150,15 @@ def _date_value(value, path, *, bound=False):
     except (ValueError, OverflowError): fail("invalid_iso_time", path + ".value")
 
 
-def _predicate(node, definitions, path, entity_ids):
+def _predicate(node, definitions, path, entity_ids, *, depth=0):
     if not isinstance(node, dict): fail("object_required", path)
     op = node.get("op")
     if op in ("all", "any", "not"):
+        if depth >= MAX_PREDICATE_DEPTH: fail("predicate_depth_exceeded", path)
         shape(node, {"op", "args"}, path)
         if not isinstance(node["args"], list) or not node["args"] or (op == "not" and len(node["args"]) != 1): fail("invalid_predicate_arity", path)
-        for i, child in enumerate(node["args"]): _predicate(child, definitions, f"{path}.args[{i}]", entity_ids)
+        for i, child in enumerate(node["args"]):
+            _predicate(child, definitions, f"{path}.args[{i}]", entity_ids, depth=depth + 1)
         return
     if op not in ("eq", "in", "lt", "le", "gt", "ge"): fail("unsupported_predicate", path)
     shape(node, {"op", "field", "value"}, path)

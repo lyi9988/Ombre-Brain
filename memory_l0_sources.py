@@ -66,10 +66,11 @@ class McpDiarySourceAdapter:
 
 
 class MemoryL0Sources:
-    def __init__(self, authority, adapters=(), *, read_timeout_seconds=20.0):
+    def __init__(self, authority, adapters=(), *, read_timeout_seconds=20.0, diary_namespace=DIARY_NAMESPACE):
         self.authority = authority
         self.adapters = {adapter.namespace: adapter for adapter in adapters}
         self.read_timeout_seconds = read_timeout_seconds
+        self.diary_namespace = diary_namespace
 
     def retain_copy(self, snapshot):
         """Called only with a program reader result, not owner/model JSON."""
@@ -100,7 +101,7 @@ class MemoryL0Sources:
             conn.close()
 
     async def capture_diary(self, day, *, binding_id):
-        adapter = self.adapters.get(DIARY_NAMESPACE)
+        adapter = self.adapters.get(self.diary_namespace)
         if adapter is None:
             raise L1ContractError("diary_reader_unconfigured", "source")
         snapshot = await asyncio.wait_for(adapter.capture(day), timeout=self.read_timeout_seconds)

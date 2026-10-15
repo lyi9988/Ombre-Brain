@@ -3973,6 +3973,70 @@
         <input type="number" id="cfg-reflection-chat-memory-turns" min="0" max="10000" />
       </div>
       <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">默认 0；0 表示按日期读取当天全部原文，只影响自动记忆候选</div>
+      <div style="margin:14px 0 8px;padding:10px 12px;background:var(--surface);border-radius:8px;font-size:12px;color:var(--text-dim);line-height:1.7;">
+        <strong>后台 L1 候选生成预算</strong><br />以下值控制后台整理任务的输入窗口、模型调用与候选数量；它们不控制最终记忆召回或 Prompt 注入条数。后者在“记忆浮现”页单独配置。保存值以服务器配置回读为准。
+      </div>
+      <div class="config-row">
+        <label>Diary 输入字符</label>
+        <input type="number" id="cfg-reflection-diary-l1-input-window-chars" step="1" placeholder="从服务器配置读取" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">diary L1 每个输入窗口的字符上限（256–2,000,000）</div>
+      <div class="config-row">
+        <label>Diary 最大窗口</label>
+        <input type="number" id="cfg-reflection-diary-l1-max-windows" step="1" placeholder="从服务器配置读取" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">每次 diary L1 后台任务的窗口上限（1–10,000）</div>
+      <div class="config-row">
+        <label>日记来源</label>
+        <select id="cfg-reflection-diary-l1-source-kind">
+          <option value="mcp">现有日记 MCP 视图</option>
+          <option value="private">Aiz 私人日记精确版本</option>
+          <option value="digest">Aiz 每日摘要精确版本</option>
+        </select>
+      </div>
+      <div class="config-row">
+        <label>行动整理任务</label>
+        <input type="number" id="cfg-reflection-action-l1-jobs-per-run" step="1" placeholder="从服务器配置读取" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">每次既有记忆后台任务最多整理多少条已完成行动结果；0暂停。整理使用已配置模型，来源提交本身不调用模型，也不会重执行行动。</div>
+      <div class="config-row">
+        <label>Diary 场景上限</label>
+        <input type="number" id="cfg-reflection-diary-l1-scene-limit" step="1" placeholder="从服务器配置读取" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">0 表示不设人为场景条数上限；允许值 0–10,000</div>
+      <div class="config-row">
+        <label>Diary 最大 tokens</label>
+        <input type="number" id="cfg-reflection-diary-l1-max-tokens" step="1" placeholder="从服务器配置读取" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">diary L1 后台生成预算（512–200,000 tokens）</div>
+      <div class="config-row">
+        <label>场景价值提示</label>
+        <input type="number" id="cfg-reflection-diary-l1-scene-min-value" step="0.01" placeholder="从服务器配置读取" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">0–1，仅作为提取提示参考；不是已部署的本地评分公式</div>
+      <div style="margin:14px 0 8px;padding:10px 12px;background:var(--surface);border-radius:8px;font-size:12px;color:var(--text-dim);line-height:1.7;">
+        <strong>Daily chat 候选生成预算</strong><br />以下控制每日后台候选生成和 Review 队列规模，不是最终 Recall 或注入数量；保存后以服务端读回值显示。
+      </div>
+      <div class="config-row">
+        <label>候选最大 tokens</label>
+        <input type="number" id="cfg-reflection-chat-memory-candidate-max-tokens" step="1" placeholder="从服务器配置读取" />
+      </div>
+      <div class="config-row">
+        <label>每次最大窗口</label>
+        <input type="number" id="cfg-reflection-chat-memory-max-windows" step="1" placeholder="从服务器配置读取" />
+      </div>
+      <div class="config-row">
+        <label>窗口输入字符</label>
+        <input type="number" id="cfg-reflection-chat-memory-window-max-input-chars" step="1" placeholder="从服务器配置读取" />
+      </div>
+      <div class="config-row">
+        <label>每日候选上限</label>
+        <input type="number" id="cfg-reflection-chat-memory-max-per-day" step="1" placeholder="从服务器配置读取" />
+      </div>
+      <div class="config-row">
+        <label>每日 Review 上限</label>
+        <input type="number" id="cfg-reflection-chat-memory-review-max-per-day" step="1" placeholder="从服务器配置读取" />
+      </div>
       <div class="config-row">
         <label>普通记忆和弦</label>
         <select id="cfg-reflection-memory-anchor"><option value="true">开启</option><option value="false">关闭</option></select>
@@ -4095,8 +4159,23 @@ let reflectionSelectedDate = formatLocalDate(new Date());
 let reflectionCurrentMonth = monthStart(new Date());
 let configSnapshot = null;
 let memoryConfigDraftSnapshot = null;
+let reflectionConfigDraftSnapshot = null;
+let reflectionGenerationParameterBounds = {};
 let memoryConfigurationRevision = null;
 let memoryConfigConflict = false;
+const reflectionConfigFormIds = [
+  'cfg-reflection-enabled', 'cfg-reflection-auto', 'cfg-reflection-daily',
+  'cfg-reflection-daily-min-memory', 'cfg-reflection-daily-turns',
+  'cfg-reflection-chat-memory-mode', 'cfg-reflection-chat-memory-turns',
+  'cfg-reflection-memory-anchor', 'cfg-reflection-weather-anchor',
+  'cfg-reflection-diary-l1-input-window-chars', 'cfg-reflection-diary-l1-max-windows',
+  'cfg-reflection-diary-l1-scene-limit', 'cfg-reflection-diary-l1-max-tokens',
+  'cfg-reflection-diary-l1-scene-min-value',
+  'cfg-reflection-diary-l1-source-kind', 'cfg-reflection-action-l1-jobs-per-run',
+  'cfg-reflection-chat-memory-candidate-max-tokens', 'cfg-reflection-chat-memory-max-windows',
+  'cfg-reflection-chat-memory-window-max-input-chars', 'cfg-reflection-chat-memory-max-per-day',
+  'cfg-reflection-chat-memory-review-max-per-day',
+];
 const memoryConfigFormIds = [
   'cfg-recent-context-enabled', 'cfg-gateway-cooldown', 'cfg-gateway-rounds',
   'cfg-recent-context-cooldown', 'cfg-recent-context-reentry', 'cfg-recent-context-budget',
@@ -8490,6 +8569,15 @@ async function loadConfig(explicitMemoryConflictReload) {
         }
       });
     }
+    var preservedReflectionConfigDraft = {};
+    if (reflectionConfigDraftSnapshot) {
+      reflectionConfigFormIds.forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el && String(el.value) !== String(reflectionConfigDraftSnapshot[id])) {
+          preservedReflectionConfigDraft[id] = el.value;
+        }
+      });
+    }
     configSnapshot = JSON.parse(JSON.stringify(cfg || {}));
     gatewayUpstreams = (((cfg.gateway || {}).upstreams) || []).map(normalizeGatewayUpstream);
     renderGatewayUpstreams();
@@ -8627,6 +8715,43 @@ async function loadConfig(explicitMemoryConflictReload) {
       (cfg.reflection && cfg.reflection.memory_affect_anchor_enabled) === false ? 'false' : 'true';
     document.getElementById('cfg-reflection-weather-anchor').value =
       (cfg.reflection && cfg.reflection.relationship_weather_affect_anchor_enabled) === false ? 'false' : 'true';
+    var reflectionConfigServerValues = {};
+    var reflectionConfigFields = {
+      'cfg-reflection-diary-l1-input-window-chars': 'diary_l1_input_window_chars',
+      'cfg-reflection-diary-l1-max-windows': 'diary_l1_max_windows',
+      'cfg-reflection-diary-l1-scene-limit': 'diary_l1_scene_limit',
+      'cfg-reflection-diary-l1-max-tokens': 'diary_l1_max_tokens',
+      'cfg-reflection-diary-l1-scene-min-value': 'diary_l1_scene_min_value',
+      'cfg-reflection-action-l1-jobs-per-run': 'action_l1_jobs_per_run',
+      'cfg-reflection-chat-memory-candidate-max-tokens': 'daily_chat_memory_candidate_max_tokens',
+      'cfg-reflection-chat-memory-max-windows': 'daily_chat_memory_max_windows_per_run',
+      'cfg-reflection-chat-memory-window-max-input-chars': 'daily_chat_memory_window_max_input_chars',
+      'cfg-reflection-chat-memory-max-per-day': 'daily_chat_memory_max_per_day',
+      'cfg-reflection-chat-memory-review-max-per-day': 'daily_chat_memory_review_max_per_day',
+    };
+    reflectionGenerationParameterBounds =
+      (cfg.reflection && cfg.reflection.generation_parameter_bounds) || cfg.generation_parameter_bounds || {};
+    Object.keys(reflectionConfigFields).forEach(function(id) {
+      var value = cfg.reflection && cfg.reflection[reflectionConfigFields[id]];
+      var input = document.getElementById(id);
+      var bounds = reflectionGenerationParameterBounds[reflectionConfigFields[id]] || {};
+      input.value = value === undefined || value === null ? '' : String(value);
+      if (bounds.minimum !== undefined && bounds.minimum !== null && Number.isFinite(Number(bounds.minimum))) input.min = String(bounds.minimum);
+      else input.removeAttribute('min');
+      if (bounds.maximum !== undefined && bounds.maximum !== null && Number.isFinite(Number(bounds.maximum))) input.max = String(bounds.maximum);
+      else input.removeAttribute('max');
+    });
+    document.getElementById('cfg-reflection-diary-l1-source-kind').value =
+      (cfg.reflection && cfg.reflection.diary_l1_source_kind) || 'mcp';
+    reflectionConfigFormIds.forEach(function(id) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      reflectionConfigServerValues[id] = el.value;
+      if (Object.prototype.hasOwnProperty.call(preservedReflectionConfigDraft, id)) {
+        el.value = preservedReflectionConfigDraft[id];
+      }
+    });
+    reflectionConfigDraftSnapshot = reflectionConfigServerValues;
     document.getElementById('cfg-reflection-model').value = (cfg.reflection && cfg.reflection.model) || '';
     document.getElementById('cfg-reflection-thinking').value = (cfg.reflection && cfg.reflection.thinking_mode) || '';
     document.getElementById('cfg-reflection-url').value = (cfg.reflection && cfg.reflection.base_url) || '';
@@ -8765,6 +8890,33 @@ async function saveConfig(persist, persistEnv) {
     }
     return value;
   }
+  function boundedDecimalValue(id, label, minimum, maximum) {
+    var raw = String(document.getElementById(id).value ?? '').trim();
+    var value = raw && /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw) : NaN;
+    if (!Number.isFinite(value) || value < minimum || value > maximum) {
+      setConfigStatus('<span style="color:var(--negative)">✗ ' + label + '须为 ' + minimum + '–' + maximum + ' 的数字；本次未提交，草稿已保留。</span>');
+      return null;
+    }
+    return value;
+  }
+  function generationParameterBounds(key) {
+    var bounds = reflectionGenerationParameterBounds[key];
+    var minimum = bounds && Number(bounds.minimum);
+    var maximum = bounds && Number(bounds.maximum);
+    if (!bounds || !Number.isFinite(minimum) || !Number.isFinite(maximum) || minimum > maximum) {
+      setConfigStatus('<span style="color:var(--negative)">服务器未返回 ' + key + ' 的有效范围；请重新读取配置，草稿已保留。</span>');
+      return null;
+    }
+    return {minimum: minimum, maximum: maximum};
+  }
+  function generationIntegerValue(id, label, key) {
+    var bounds = generationParameterBounds(key);
+    return bounds ? boundedIntegerValue(id, label, bounds.minimum, bounds.maximum) : null;
+  }
+  function generationDecimalValue(id, label, key) {
+    var bounds = generationParameterBounds(key);
+    return bounds ? boundedDecimalValue(id, label, bounds.minimum, bounds.maximum) : null;
+  }
   function sameConfigValue(left, right) {
     if (left === right) return true;
     if (left === '' && (right === undefined || right === null)) return true;
@@ -8818,6 +8970,20 @@ async function saveConfig(persist, persistEnv) {
   var candidate = {};
   var upstreamKeyValueCounts = [];
   if (activeTarget === 'config') {
+    var generationConfig = {
+      diary_l1_input_window_chars: generationIntegerValue('cfg-reflection-diary-l1-input-window-chars', 'Diary 输入字符', 'diary_l1_input_window_chars'),
+      diary_l1_max_windows: generationIntegerValue('cfg-reflection-diary-l1-max-windows', 'Diary 最大窗口', 'diary_l1_max_windows'),
+      diary_l1_scene_limit: generationIntegerValue('cfg-reflection-diary-l1-scene-limit', 'Diary 场景上限', 'diary_l1_scene_limit'),
+      diary_l1_max_tokens: generationIntegerValue('cfg-reflection-diary-l1-max-tokens', 'Diary 最大 tokens', 'diary_l1_max_tokens'),
+      diary_l1_scene_min_value: generationDecimalValue('cfg-reflection-diary-l1-scene-min-value', '场景价值提示', 'diary_l1_scene_min_value'),
+      action_l1_jobs_per_run: generationIntegerValue('cfg-reflection-action-l1-jobs-per-run', '行动整理任务', 'action_l1_jobs_per_run'),
+      daily_chat_memory_candidate_max_tokens: generationIntegerValue('cfg-reflection-chat-memory-candidate-max-tokens', 'Daily 候选最大 tokens', 'daily_chat_memory_candidate_max_tokens'),
+      daily_chat_memory_max_windows_per_run: generationIntegerValue('cfg-reflection-chat-memory-max-windows', 'Daily 每次最大窗口', 'daily_chat_memory_max_windows_per_run'),
+      daily_chat_memory_window_max_input_chars: generationIntegerValue('cfg-reflection-chat-memory-window-max-input-chars', 'Daily 窗口输入字符', 'daily_chat_memory_window_max_input_chars'),
+      daily_chat_memory_max_per_day: generationIntegerValue('cfg-reflection-chat-memory-max-per-day', 'Daily 每日候选上限', 'daily_chat_memory_max_per_day'),
+      daily_chat_memory_review_max_per_day: generationIntegerValue('cfg-reflection-chat-memory-review-max-per-day', 'Daily Review 上限', 'daily_chat_memory_review_max_per_day'),
+    };
+    if (Object.keys(generationConfig).some(function(key) { return generationConfig[key] === null; })) return;
     candidate.dehydration = {
       model: document.getElementById('cfg-dehy-model').value,
       base_url: document.getElementById('cfg-dehy-url').value,
@@ -8865,6 +9031,18 @@ async function saveConfig(persist, persistEnv) {
       daily_conversation_turn_limit: numberValue('cfg-reflection-daily-turns', 12),
       daily_chat_memory_mode: document.getElementById('cfg-reflection-chat-memory-mode').value || 'review',
       daily_chat_memory_turn_limit: numberValue('cfg-reflection-chat-memory-turns', 0),
+      diary_l1_input_window_chars: generationConfig.diary_l1_input_window_chars,
+      diary_l1_max_windows: generationConfig.diary_l1_max_windows,
+      diary_l1_scene_limit: generationConfig.diary_l1_scene_limit,
+      diary_l1_max_tokens: generationConfig.diary_l1_max_tokens,
+      diary_l1_scene_min_value: generationConfig.diary_l1_scene_min_value,
+      action_l1_jobs_per_run: generationConfig.action_l1_jobs_per_run,
+      diary_l1_source_kind: document.getElementById('cfg-reflection-diary-l1-source-kind').value,
+      daily_chat_memory_candidate_max_tokens: generationConfig.daily_chat_memory_candidate_max_tokens,
+      daily_chat_memory_max_windows_per_run: generationConfig.daily_chat_memory_max_windows_per_run,
+      daily_chat_memory_window_max_input_chars: generationConfig.daily_chat_memory_window_max_input_chars,
+      daily_chat_memory_max_per_day: generationConfig.daily_chat_memory_max_per_day,
+      daily_chat_memory_review_max_per_day: generationConfig.daily_chat_memory_review_max_per_day,
       memory_affect_anchor_enabled: document.getElementById('cfg-reflection-memory-anchor').value === 'true',
       relationship_weather_affect_anchor_enabled: document.getElementById('cfg-reflection-weather-anchor').value === 'true',
     };
@@ -9263,7 +9441,7 @@ function loadDashboardModule(path) {
   document.body.appendChild(script);
 }
 
-loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261010-semantics-r1');
+loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261016-p2c');
 </script>
 </body>
 </html>
