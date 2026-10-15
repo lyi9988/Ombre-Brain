@@ -3303,6 +3303,34 @@
       </div>
       <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">默认 220；设 0 可关闭 Gateway 的 Diffused Memory 注入</div>
       <div class="config-row">
+        <label>最终经历条数</label>
+        <input type="number" id="cfg-inject-max-cards" min="0" max="200" step="1" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">控制本轮最终可注入的经历数量；设 0 停止经历注入。数量与下面的 token 预算分别生效。</div>
+      <div class="config-row">
+        <label>扩散经历条数</label>
+        <input type="number" id="cfg-diffusion-inject-max-items" min="0" max="200" step="1" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">控制最终注入的扩散经历数量；设 0 停止扩散经历注入。数量与 token 预算分别生效。</div>
+      <div class="config-row">
+        <label>总注入预算</label>
+        <input type="number" id="cfg-inject-total-budget" min="0" max="1000000" step="1" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">记忆注入总 token 上限；设 0 停止记忆注入。条数限制与 token 预算相互独立。</div>
+      <div class="config-row">
+        <label>本地候选数</label>
+        <input type="number" id="cfg-dynamic-top-k" min="1" max="200" step="1" />
+      </div>
+      <div class="config-row">
+        <label>向量候选数</label>
+        <input type="number" id="cfg-semantic-candidate-top-k" min="1" max="200" step="1" />
+      </div>
+      <div class="config-row">
+        <label>场景候选数</label>
+        <input type="number" id="cfg-moment-search-limit" min="1" max="200" step="1" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">本地、向量和场景候选池分别限制各自通道的搜索量；它们与最终注入条数和 token 预算独立生效。</div>
+      <div class="config-row">
         <label>细节二次取回</label>
         <select id="cfg-memory-detail-recall-enabled">
           <option value="false">关闭</option>
@@ -3312,13 +3340,13 @@
       <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">开启后非流式回复可用已注入 bucket_id 做一次内部细节 retry；Targeted Memory Detail 不依赖这个开关</div>
       <div class="config-row">
         <label>细节条数</label>
-        <input type="number" id="cfg-memory-detail-recall-max-ids" min="1" max="3" />
+        <input type="number" id="cfg-memory-detail-recall-max-ids" min="0" max="200" step="1" />
       </div>
       <div class="config-row">
         <label>细节预算</label>
-        <input type="number" id="cfg-memory-detail-recall-budget" min="200" max="4000" />
+        <input type="number" id="cfg-memory-detail-recall-budget" min="0" max="1000000" step="1" />
       </div>
-      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">默认最多 3 条、1200 token；只接受本轮已经注入过的 bucket_id</div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">数量 0 停止细节读取；预算 0 不提供细节 token。默认值从当前配置读取；只接受本轮已经注入过的 bucket_id。</div>
       <div class="config-row">
         <label>直命中形状</label>
         <select id="cfg-direct-render-mode">
@@ -3409,6 +3437,9 @@
       <button class="btn-secondary" onclick="saveConfig(true, true)">应用并保存密钥到 .env</button>
     </div>
     <div id="memory-config-status" style="margin-top:16px;font-size:13px;"></div>
+    <div id="memory-config-conflict-actions" style="display:none;margin-top:10px;">
+      <button class="btn-secondary" onclick="reloadMemoryConfigurationAfterConflict()">确认用服务器新版替换本页草稿</button>
+    </div>
   </div>
 </div>
 
@@ -4063,6 +4094,22 @@ let dashboardAiAuthor = 'Haven';
 let reflectionSelectedDate = formatLocalDate(new Date());
 let reflectionCurrentMonth = monthStart(new Date());
 let configSnapshot = null;
+let memoryConfigDraftSnapshot = null;
+let memoryConfigurationRevision = null;
+let memoryConfigConflict = false;
+const memoryConfigFormIds = [
+  'cfg-recent-context-enabled', 'cfg-gateway-cooldown', 'cfg-gateway-rounds',
+  'cfg-recent-context-cooldown', 'cfg-recent-context-reentry', 'cfg-recent-context-budget',
+  'cfg-recalled-memory-budget', 'cfg-related-memory-budget', 'cfg-inject-max-cards',
+  'cfg-diffusion-inject-max-items', 'cfg-inject-total-budget', 'cfg-dynamic-top-k',
+  'cfg-semantic-candidate-top-k', 'cfg-moment-search-limit',
+  'cfg-memory-detail-recall-enabled', 'cfg-memory-detail-recall-max-ids',
+  'cfg-memory-detail-recall-budget', 'cfg-persona-context-enabled', 'cfg-persona-context-rounds',
+  'cfg-direct-render-mode', 'cfg-retrieval-mode', 'cfg-operit-context-rewrite-enabled',
+  'cfg-word-map-hint-enabled', 'cfg-query-planner-enabled', 'cfg-query-resurface-enabled',
+  'cfg-diffusion-enabled', 'cfg-diffusion-topk', 'cfg-diffusion-min', 'cfg-chain-walk',
+  'cfg-chain-hops', 'cfg-chain-confidence', 'cfg-chain-frontier',
+];
 let gatewayUpstreams = [];
 let todoStatusFilter = 'active';
 let todoItems = [];
@@ -8417,11 +8464,32 @@ function collectGatewayUpstreamsForSave(includeKeyValues) {
   }
 }
 
-async function loadConfig() {
+async function loadConfig(explicitMemoryConflictReload) {
   try {
     var res = await authFetch(BASE + '/api/config');
     if (!res) return;
     var cfg = await res.json();
+    if (memoryConfigConflict && !explicitMemoryConflictReload) {
+      // A background/tab-triggered GET must not rebase a stale CAS revision.
+    } else {
+      memoryConfigurationRevision = /^mc-[a-f0-9]{64}$/.test(cfg.memory_configuration_revision || '')
+        ? cfg.memory_configuration_revision : null;
+      if (explicitMemoryConflictReload) {
+        memoryConfigConflict = false;
+        memoryConfigDraftSnapshot = null;
+        var conflictActions = document.getElementById('memory-config-conflict-actions');
+        if (conflictActions) conflictActions.style.display = 'none';
+      }
+    }
+    var preservedMemoryConfigDraft = {};
+    if (memoryConfigDraftSnapshot) {
+      memoryConfigFormIds.forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el && String(el.value) !== String(memoryConfigDraftSnapshot[id])) {
+          preservedMemoryConfigDraft[id] = el.value;
+        }
+      });
+    }
     configSnapshot = JSON.parse(JSON.stringify(cfg || {}));
     gatewayUpstreams = (((cfg.gateway || {}).upstreams) || []).map(normalizeGatewayUpstream);
     renderGatewayUpstreams();
@@ -8483,6 +8551,18 @@ async function loadConfig() {
       (cfg.gateway && cfg.gateway.recalled_memory_budget) ?? 900;
     document.getElementById('cfg-related-memory-budget').value =
       (cfg.gateway && cfg.gateway.related_memory_budget) ?? 220;
+    document.getElementById('cfg-inject-max-cards').value =
+      (cfg.gateway && cfg.gateway.inject_max_cards) ?? 2;
+    document.getElementById('cfg-diffusion-inject-max-items').value =
+      (cfg.gateway && cfg.gateway.diffusion_inject_max_items) ?? 2;
+    document.getElementById('cfg-inject-total-budget').value =
+      (cfg.gateway && cfg.gateway.inject_total_budget) ?? 1800;
+    document.getElementById('cfg-dynamic-top-k').value =
+      (cfg.gateway && cfg.gateway.dynamic_top_k) ?? 10;
+    document.getElementById('cfg-semantic-candidate-top-k').value =
+      (cfg.gateway && cfg.gateway.semantic_candidate_top_k) ?? 50;
+    document.getElementById('cfg-moment-search-limit').value =
+      (cfg.gateway && cfg.gateway.moment_search_limit) ?? 50;
     document.getElementById('cfg-memory-detail-recall-enabled').value =
       (cfg.gateway && cfg.gateway.memory_detail_recall_enabled) ? 'true' : 'false';
     document.getElementById('cfg-memory-detail-recall-max-ids').value =
@@ -8519,6 +8599,16 @@ async function loadConfig() {
     document.getElementById('cfg-chain-hops').value = diffusion.chain_max_hops ?? 6;
     document.getElementById('cfg-chain-confidence').value = diffusion.chain_min_confidence ?? 0.72;
     document.getElementById('cfg-chain-frontier').value = diffusion.chain_max_frontier ?? 24;
+    var memoryConfigServerValues = {};
+    memoryConfigFormIds.forEach(function(id) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      memoryConfigServerValues[id] = el.value;
+      if (Object.prototype.hasOwnProperty.call(preservedMemoryConfigDraft, id)) {
+        el.value = preservedMemoryConfigDraft[id];
+      }
+    });
+    memoryConfigDraftSnapshot = memoryConfigServerValues;
     document.getElementById('cfg-reflection-enabled').value =
       (cfg.reflection && cfg.reflection.enabled) === false ? 'false' : 'true';
     document.getElementById('cfg-reflection-auto').value =
@@ -8578,6 +8668,12 @@ async function loadConfig() {
   } catch (e) {
     setConfigStatus('<span style="color:var(--negative)">加载失败: ' + esc(e.message) + '</span>');
   }
+}
+
+function reloadMemoryConfigurationAfterConflict() {
+  if (!memoryConfigConflict) return;
+  if (!confirm('服务器配置已更新。确认后将用服务器新版替换本页未保存草稿，并按新版本重新保存。是否继续？')) return;
+  return loadConfig(true);
 }
 
 function setConfigStatus(html) {
@@ -8660,6 +8756,15 @@ async function saveConfig(persist, persistEnv) {
     var n = parseFloat(document.getElementById(id).value);
     return Number.isFinite(n) ? n : fallback;
   }
+  function boundedIntegerValue(id, label, minimum, maximum) {
+    var raw = String(document.getElementById(id).value ?? '').trim();
+    var value = /^\d+$/.test(raw) ? Number(raw) : NaN;
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+      setConfigStatus('<span style="color:var(--negative)">✗ ' + label + '须为 ' + minimum + '–' + maximum + ' 的整数；本次未提交，草稿已保留。</span>');
+      return null;
+    }
+    return value;
+  }
   function sameConfigValue(left, right) {
     if (left === right) return true;
     if (left === '' && (right === undefined || right === null)) return true;
@@ -8688,6 +8793,28 @@ async function saveConfig(persist, persistEnv) {
 
   var activeTab = document.querySelector('.tab.active');
   var activeTarget = activeTab ? activeTab.dataset.tab : '';
+  var memoryLimitValues = null;
+  if (activeTarget === 'memory-config') {
+    if (memoryConfigConflict) {
+      setConfigStatus('<span style="color:var(--negative)">配置版本冲突；当前草稿和原版本号已保留。请确认重载服务器新版后再保存。</span>');
+      return;
+    }
+    if (!memoryConfigurationRevision) {
+      setConfigStatus('<span style="color:var(--negative)">当前配置没有有效版本号；请刷新配置页后再保存，草稿已保留。</span>');
+      return;
+    }
+    memoryLimitValues = {
+      inject_max_cards: boundedIntegerValue('cfg-inject-max-cards', '最终经历条数', 0, 200),
+      diffusion_inject_max_items: boundedIntegerValue('cfg-diffusion-inject-max-items', '扩散经历条数', 0, 200),
+      inject_total_budget: boundedIntegerValue('cfg-inject-total-budget', '总注入预算', 0, 1000000),
+      dynamic_top_k: boundedIntegerValue('cfg-dynamic-top-k', '本地候选数', 1, 200),
+      semantic_candidate_top_k: boundedIntegerValue('cfg-semantic-candidate-top-k', '向量候选数', 1, 200),
+      moment_search_limit: boundedIntegerValue('cfg-moment-search-limit', '场景候选数', 1, 200),
+      memory_detail_recall_max_ids: boundedIntegerValue('cfg-memory-detail-recall-max-ids', '细节条数', 0, 200),
+      memory_detail_recall_budget: boundedIntegerValue('cfg-memory-detail-recall-budget', '细节预算', 0, 1000000),
+    };
+    if (Object.keys(memoryLimitValues).some(function(key) { return memoryLimitValues[key] === null; })) return;
+  }
   var candidate = {};
   var upstreamKeyValueCounts = [];
   if (activeTarget === 'config') {
@@ -8808,9 +8935,15 @@ async function saveConfig(persist, persistEnv) {
       recent_context_budget: recentContextBudget,
       recalled_memory_budget: numberValue('cfg-recalled-memory-budget', 900),
       related_memory_budget: numberValue('cfg-related-memory-budget', 220),
+      inject_max_cards: memoryLimitValues.inject_max_cards,
+      diffusion_inject_max_items: memoryLimitValues.diffusion_inject_max_items,
+      inject_total_budget: memoryLimitValues.inject_total_budget,
+      dynamic_top_k: memoryLimitValues.dynamic_top_k,
+      semantic_candidate_top_k: memoryLimitValues.semantic_candidate_top_k,
+      moment_search_limit: memoryLimitValues.moment_search_limit,
       memory_detail_recall_enabled: document.getElementById('cfg-memory-detail-recall-enabled').value === 'true',
-      memory_detail_recall_max_ids: numberValue('cfg-memory-detail-recall-max-ids', 3),
-      memory_detail_recall_budget: numberValue('cfg-memory-detail-recall-budget', 1200),
+      memory_detail_recall_max_ids: memoryLimitValues.memory_detail_recall_max_ids,
+      memory_detail_recall_budget: memoryLimitValues.memory_detail_recall_budget,
       current_inner_state_interval_rounds: personaContextRounds,
       direct_render_mode: document.getElementById('cfg-direct-render-mode').value,
       retrieval_mode: document.getElementById('cfg-retrieval-mode').value,
@@ -8836,6 +8969,9 @@ async function saveConfig(persist, persistEnv) {
     persist: persist,
     persist_env: !!persistEnv,
   };
+  if (activeTarget === 'memory-config' || (candidate.reranker && 'candidate_limit' in candidate.reranker)) {
+    body.expected_memory_revision = memoryConfigurationRevision;
+  }
   var forceSections = {};
   if (persist) {
     // Persist writes should mirror the visible tab even if runtime state already changed.
@@ -8915,6 +9051,13 @@ async function saveConfig(persist, persistEnv) {
     });
     if (!res) return;
     var result = await res.json();
+    if (activeTarget === 'memory-config' && res.status === 409) {
+      memoryConfigConflict = true;
+      var conflictActions = document.getElementById('memory-config-conflict-actions');
+      if (conflictActions) conflictActions.style.display = '';
+      setConfigStatus('<span style="color:var(--negative)">配置版本冲突（409）；本次未应用。草稿和原版本号已保留。</span>');
+      return;
+    }
     var presentation = configSavePresentation(result);
     var statusText = presentation.text;
     if (result.ok) {
@@ -8926,7 +9069,10 @@ async function saveConfig(persist, persistEnv) {
     }
     setConfigStatus('<span style="color:var(--' + presentation.tone + ')">' + esc(statusText) + '</span>');
     // A warning must not erase a newly entered key before the owner can retry.
-    if (presentation.refresh) loadConfig();
+    if (presentation.refresh) {
+      memoryConfigDraftSnapshot = null;
+      loadConfig();
+    }
   } catch (e) {
     setConfigStatus('<span style="color:var(--negative)">请求失败，生效未确认；输入已保留</span>');
   }

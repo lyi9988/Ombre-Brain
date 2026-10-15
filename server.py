@@ -12669,6 +12669,7 @@ async def api_dream_detail(request):
 async def api_config_get(request):
     """Get current runtime config (safe fields only, API key masked)."""
     from starlette.responses import JSONResponse
+    from memory_system_config import LIMITS as memory_limits, configuration, merge_config, read_overlay, runtime_overlay_path, values_from_config
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -12679,7 +12680,11 @@ async def api_config_get(request):
     dehy = config.get("dehydration", {})
     emb = config.get("embedding", {})
     rerank = config.get("reranker", {}) if isinstance(config.get("reranker", {}), dict) else {}
-    gateway_cfg = config.get("gateway", {}) if isinstance(config.get("gateway", {}), dict) else {}
+    # Gateway owner edits share the runtime overlay. Do not serve a stale
+    # Brain in-memory copy as a competing configuration authority.
+    effective_memory_config = merge_config(config, read_overlay(runtime_overlay_path(config)))
+    effective_memory_limits = values_from_config(effective_memory_config)["limits"]
+    gateway_cfg = effective_memory_config.get("gateway", {})
     recall_cfg = config.get("recall", {}) if isinstance(config.get("recall", {}), dict) else {}
     diffusion_options = diffusion_options_from_config(config)
     persona_cfg = config.get("persona", {}) if isinstance(config.get("persona", {}), dict) else {}
@@ -12741,10 +12746,12 @@ async def api_config_get(request):
             "api_ready": bool(getattr(reranker_engine, "api_key", "") or rerank.get("api_key", "")),
             "has_own_api_key": bool(rerank.get("api_key", "")),
             "timeout_seconds": getattr(reranker_engine, "timeout", rerank.get("timeout_seconds", 12)),
-            "candidate_limit": getattr(reranker_engine, "candidate_limit", rerank.get("candidate_limit", 20)),
+            "candidate_limit": effective_memory_config.get("reranker", {}).get("candidate_limit", getattr(reranker_engine, "candidate_limit", 20)),
             "score_weight": getattr(reranker_engine, "score_weight", rerank.get("score_weight", 0.65)),
         },
+        "memory_configuration_revision": configuration(effective_memory_config)["revision"],
         "gateway": {
+            **{key: effective_memory_limits[key] for key, row in memory_limits.items() if row[0] == "gateway"},
             "cooldown_hours": gateway_cfg.get("cooldown_hours", 6),
             "skip_recent_rounds": gateway_cfg.get("skip_recent_rounds", 5),
             "recent_context_cooldown_hours": gateway_cfg.get("recent_context_cooldown_hours", 6),
@@ -12754,7 +12761,7 @@ async def api_config_get(request):
             "date_persona_trace_budget": gateway_cfg.get("date_persona_trace_budget", 220),
             "date_persona_trace_max_events": gateway_cfg.get("date_persona_trace_max_events", 5),
             "date_persona_trace_include_daily": _bool_value(gateway_cfg.get("date_persona_trace_include_daily"), True),
-            "recalled_memory_budget": gateway_cfg.get("recalled_memory_budget", 400),
+            "recalled_memory_budget": gateway_cfg.get("recalled_memory_budget", 900),
             "related_memory_budget": gateway_cfg.get("related_memory_budget", 220),
             "memory_sentinel_enabled": _bool_value(gateway_cfg.get("memory_sentinel_enabled"), True),
             "domain_sentinel_enabled": _bool_value(gateway_cfg.get("domain_sentinel_enabled"), True),
@@ -12982,6 +12989,9 @@ async def api_config_update(request):
     """Hot-update runtime config. Optionally persist to config.yaml."""
     from starlette.responses import JSONResponse
     import yaml
+    from memory_system_config import (ConfigurationError, LIMITS as memory_limits, configuration,
+                                     merge_config, read_overlay, runtime_overlay_path, update_overlay, validate_limit)
+    from copy import deepcopy
     global dream_engine, persona_engine, portrait_engine, reflection_engine, reranker_engine
     global memory_authority_store, memory_commit_service
     err = _require_dashboard_auth(request)
@@ -12995,6 +13005,30 @@ async def api_config_update(request):
     # Validate before mutating any runtime section or persisting a partial save.
     if not isinstance(body, dict):
         return JSONResponse({"error": "invalid config object"}, status_code=400)
+    memory_config_base = deepcopy(config)
+    memory_expected = body.get("expected_memory_revision")
+    if "gateway" in body:
+        if not isinstance(body["gateway"], dict):
+            return JSONResponse({"error": "invalid gateway config"}, status_code=400)
+        try:
+            for key, row in memory_limits.items():
+                if row[0] == "gateway" and key in body["gateway"]:
+                    validate_limit(key, body["gateway"][key])
+        except ConfigurationError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status)
+    memory_touched = any(key in body.get("gateway", {}) for key, row in memory_limits.items() if row[0] == "gateway")
+    rerank_touched = isinstance(body.get("reranker"), dict) and "candidate_limit" in body["reranker"]
+    if memory_touched or rerank_touched:
+        try:
+            if rerank_touched:
+                validate_limit("rerank_candidate_limit", body["reranker"]["candidate_limit"])
+            if not isinstance(memory_expected, str) or not re.fullmatch(r"mc-[0-9a-f]{64}", memory_expected):
+                raise ConfigurationError("expected_memory_revision_required")
+            observed = configuration(merge_config(memory_config_base, read_overlay(runtime_overlay_path(config))))["revision"]
+            if observed != memory_expected:
+                raise ConfigurationError("configuration_revision_conflict", status=409, current_revision=observed)
+        except ConfigurationError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status)
     if "embedding" in body:
         if not isinstance(body["embedding"], dict):
             return JSONResponse({"error": "invalid embedding config"}, status_code=400)
@@ -13380,13 +13414,21 @@ async def api_config_update(request):
             gateway_hot_update_body["memory_detail_recall_enabled"] = gateway_cfg["memory_detail_recall_enabled"]
             updated.append("gateway.memory_detail_recall_enabled")
         if "memory_detail_recall_max_ids" in g:
-            gateway_cfg["memory_detail_recall_max_ids"] = _int_between(g["memory_detail_recall_max_ids"], 3, 1, 3)
+            gateway_cfg["memory_detail_recall_max_ids"] = g["memory_detail_recall_max_ids"]
             gateway_hot_update_body["memory_detail_recall_max_ids"] = gateway_cfg["memory_detail_recall_max_ids"]
             updated.append("gateway.memory_detail_recall_max_ids")
         if "memory_detail_recall_budget" in g:
-            gateway_cfg["memory_detail_recall_budget"] = _int_between(g["memory_detail_recall_budget"], 1200, 200, 4000)
+            gateway_cfg["memory_detail_recall_budget"] = g["memory_detail_recall_budget"]
             gateway_hot_update_body["memory_detail_recall_budget"] = gateway_cfg["memory_detail_recall_budget"]
             updated.append("gateway.memory_detail_recall_budget")
+        # The same public limits as the owner configuration API; no legacy
+        # detail/expansion clamp may override an explicitly validated value.
+        for key, row in memory_limits.items():
+            if row[0] == "gateway" and key in g:
+                gateway_cfg[key] = g[key]
+                gateway_hot_update_body[key] = g[key]
+                if "gateway." + key not in updated:
+                    updated.append("gateway." + key)
         if gateway_hot_update_body:
             gateway_hot_update_payload["gateway"] = gateway_hot_update_body
 
@@ -13659,6 +13701,10 @@ async def api_config_update(request):
 
         def _apply_dashboard_config(save_config: dict) -> dict:
             save_config = save_config or {}
+            if memory_expected:
+                observed = configuration(merge_config(memory_config_base, save_config))["revision"]
+                if observed != memory_expected:
+                    raise ConfigurationError("configuration_revision_conflict", status=409, current_revision=observed)
             if "dehydration" in body:
                 sc_dehy = save_config.setdefault("dehydration", {})
                 for key in ("model", "base_url", "max_tokens", "temperature"):
@@ -13870,19 +13916,9 @@ async def api_config_update(request):
                         False,
                     )
                 if "memory_detail_recall_max_ids" in body["gateway"]:
-                    sc_gateway["memory_detail_recall_max_ids"] = _int_between(
-                        body["gateway"]["memory_detail_recall_max_ids"],
-                        3,
-                        1,
-                        3,
-                    )
+                    sc_gateway["memory_detail_recall_max_ids"] = body["gateway"]["memory_detail_recall_max_ids"]
                 if "memory_detail_recall_budget" in body["gateway"]:
-                    sc_gateway["memory_detail_recall_budget"] = _int_between(
-                        body["gateway"]["memory_detail_recall_budget"],
-                        1200,
-                        200,
-                        4000,
-                    )
+                    sc_gateway["memory_detail_recall_budget"] = body["gateway"]["memory_detail_recall_budget"]
 
             if "self_anchor" in body and isinstance(body["self_anchor"], dict):
                 sc_self_anchor = save_config.setdefault("self_anchor", {})
@@ -14051,6 +14087,9 @@ async def api_config_update(request):
                     if key in body["dream"]:
                         sc_dream[key] = body["dream"][key]
                 # Never persist api_key to yaml (use env var)
+            for key, row in memory_limits.items():
+                if row[0] == "gateway" and key in body.get("gateway", {}):
+                    save_config.setdefault("gateway", {})[key] = body["gateway"][key]
             return save_config
 
         try:
@@ -14063,17 +14102,16 @@ async def api_config_update(request):
             # documentation. The runtime overlay is merged last and wins over
             # config.yaml anyway, so persisting there has identical effect on
             # behaviour while leaving the hand-written file untouched.
-            runtime_config = {}
-            if os.path.exists(runtime_config_path):
-                with open(runtime_config_path, "r", encoding="utf-8") as f:
-                    runtime_config = yaml.safe_load(f) or {}
-            runtime_config = _apply_dashboard_config(runtime_config)
-            os.makedirs(os.path.dirname(runtime_config_path), exist_ok=True)
-            with open(runtime_config_path, "w", encoding="utf-8") as f:
-                yaml.dump(runtime_config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            # Shares a cross-process lock with Gateway owner edits, merges
+            # the latest overlay, and replaces it atomically.
+            update_overlay(runtime_config_path, _apply_dashboard_config)
             updated.append("persisted_to_runtime_yaml")
             updated.append("config_yaml_left_untouched")
             persistence["runtime_yaml"] = "saved"
+        except ConfigurationError as exc:
+            config.clear()
+            config.update(memory_config_base)
+            return JSONResponse(exc.payload(), status_code=exc.status)
         except Exception:
             # The old fallback re-tried the runtime overlay here, which is now the
             # primary (and only) write target -- retrying it would just repeat the
