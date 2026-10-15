@@ -38,6 +38,10 @@ LIMITS = {
 VALUE_TYPES = {"number", "boolean", "string"}
 _ID = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _FUNCTIONS = {"min", "max", "clamp", "coalesce", "exp", "abs"}
+CATALOG_AXES = ("subjects", "kinds", "topics", "stabilities", "modalities", "bases",
+                "entity_types", "relation_types")
+EXTENDED_CATALOG_AXES = ("stabilities", "modalities", "bases", "entity_types", "relation_types", "definitions")
+DEFINITION_AXES = frozenset(CATALOG_AXES)
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 REQUEST_CONFIGURATION = ContextVar("memory_request_configuration", default=None)
@@ -129,6 +133,29 @@ def defaults():
             "subjects": ["user", "assistant", "third_party", "object"],
             "kinds": ["experience", "state", "fact", "preference", "boundary", "intention", "interpretation", "procedure"],
             "topics": [], "attributes": [],
+            "stabilities": ["episode", "phase", "stable"],
+            "modalities": ["assertion", "request", "wish", "plan", "commitment", "hypothesis", "question"],
+            "bases": ["direct_expression", "record", "reported", "interpretation", "hypothesis"],
+            "entity_types": ["user", "assistant", "third_party", "object"],
+            "relation_types": ["same_event", "supplements", "revises", "limits", "supersedes",
+                               "possible_conflict", "split_from", "merged_from"],
+            "definitions": [
+                {"axis": "stabilities", "id": "episode", "label": "单次", "description": "限于一次事件或短时状态。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "stabilities", "id": "phase", "label": "阶段", "description": "在明确阶段内持续。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "stabilities", "id": "stable", "label": "相对稳定", "description": "跨阶段相对稳定，仍可修订。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "modalities", "id": "assertion", "label": "陈述", "description": "表达一个主张或情况。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "modalities", "id": "request", "label": "请求", "description": "向他人提出请求。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "modalities", "id": "wish", "label": "愿望", "description": "表达希望但未必计划执行。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "modalities", "id": "plan", "label": "计划", "description": "表达拟采取的行动。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "modalities", "id": "commitment", "label": "承诺", "description": "表达承担履行义务。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "modalities", "id": "hypothesis", "label": "假设", "description": "尚待确认的解释或推测。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "modalities", "id": "question", "label": "疑问", "description": "提出问题或待确认事项。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "direct_expression", "label": "当事人表达", "description": "来源中的当事人直接表达。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "record", "label": "实际记录", "description": "来源直接记录的事件或行为。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "reported", "label": "转述", "description": "由来源转述的信息。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "interpretation", "label": "理解", "description": "基于材料形成的理解。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "hypothesis", "label": "假设", "description": "尚待材料支持或确认的假设。", "aliases": [], "examples": [], "parent_id": None},
+            ],
         },
         "features": [{"id": "relevance", "label": "文本相关性", "value_type": "number",
                       "source": "runtime", "missing": "unknown", "expression": "",
@@ -166,7 +193,10 @@ def values_from_config(config):
     if isinstance(configured, dict):
         for key in values:
             if key in configured:
-                values[key] = copy.deepcopy(configured[key])
+                if key == "catalog" and isinstance(configured[key], dict):
+                    values[key] = merge_config(values[key], configured[key])
+                else:
+                    values[key] = copy.deepcopy(configured[key])
     limits = {}
     for name, (section, key, _lo, _hi, fallback, _label) in LIMITS.items():
         source = config.get(section, {})
@@ -224,15 +254,18 @@ def validate_values(values):
     limits = _object(values["limits"], LIMITS, "limits", LIMITS)
     for key, value in limits.items():
         validate_limit(key, value)
-    catalog = _object(values["catalog"], {"subjects", "kinds", "topics", "attributes"}, "catalog",
-                      {"subjects", "kinds", "topics", "attributes"})
-    for name in ("subjects", "kinds", "topics"):
+    catalog = _object(values["catalog"], set(CATALOG_AXES) | {"attributes", "definitions"}, "catalog",
+                      set(CATALOG_AXES) | {"attributes", "definitions"})
+    for name in CATALOG_AXES:
         rows = catalog[name]
         if not isinstance(rows, list) or len(rows) > 512:
             _fail("invalid_catalog_list", "catalog." + name)
         seen = set()
         for item in rows:
-            _text(item, "catalog." + name, maximum=120)
+            if name in EXTENDED_CATALOG_AXES:
+                _id(item, "catalog." + name)
+            else:
+                _text(item, "catalog." + name, maximum=120)
             if item in seen:
                 _fail("duplicate_catalog_value", "catalog." + name)
             seen.add(item)
@@ -241,16 +274,72 @@ def validate_values(values):
             _fail("invalid_attribute_list", "catalog." + key)
         seen = set()
         for item in catalog[key]:
-            _object(item, {"id", "label", "value_type", "description"}, "attributes", {"id", "value_type"})
+            _object(item, {"id", "label", "value_type", "description", "options", "scope"}, "attributes", {"id", "value_type"})
             ident = _id(item["id"], "attributes.id")
             if ident in seen:
                 _fail("duplicate_identifier", "attributes.id")
             seen.add(ident)
-            if item["value_type"] not in VALUE_TYPES:
+            if not isinstance(item["value_type"], str) or item["value_type"] not in VALUE_TYPES | {"integer", "enum", "entity_ref"}:
                 _fail("invalid_value_type", "attributes.value_type")
+            if "scope" in item and (not isinstance(item["scope"], str) or item["scope"] not in {"memory", "scene", "statement", "any"}):
+                _fail("invalid_attribute_scope", "attributes.scope")
+            if "options" in item:
+                if not isinstance(item["options"], list) or any(not isinstance(v, str) or not v for v in item["options"]):
+                    _fail("invalid_enum_options", "attributes.options")
+                if len(set(item["options"])) != len(item["options"]):
+                    _fail("duplicate_enum_option", "attributes.options")
+            if item["value_type"] == "enum" and not item.get("options"):
+                _fail("enum_options_required", "attributes.options")
             for name in ("label", "description"):
                 if name in item:
                     _text(item[name], "attributes." + name, empty=True)
+    definitions = catalog["definitions"]
+    if not isinstance(definitions, list) or len(definitions) > 2048:
+        _fail("invalid_catalog_definitions", "catalog.definitions")
+    definition_ids = {}
+    parents = {}
+    for item in definitions:
+        _object(item, {"id", "axis", "label", "description", "aliases", "examples", "parent_id"},
+                "catalog.definitions", {"id", "axis", "label", "description", "aliases", "examples", "parent_id"})
+        axis = item["axis"]
+        if axis not in DEFINITION_AXES:
+            _fail("invalid_definition_axis", "catalog.definitions.axis")
+        ident = _id(item["id"], "catalog.definitions.id")
+        key = (axis, ident)
+        if key in definition_ids:
+            _fail("duplicate_definition", "catalog.definitions.id", axis=axis, id=ident)
+        if ident not in catalog[axis]:
+            _fail("definition_value_missing", "catalog.definitions.id", axis=axis, id=ident)
+        _text(item["label"], "catalog.definitions.label", empty=True)
+        _text(item["description"], "catalog.definitions.description", empty=True)
+        for field in ("aliases", "examples"):
+            rows = item[field]
+            if not isinstance(rows, list) or len(rows) > 128:
+                _fail("invalid_definition_list", "catalog.definitions." + field)
+            for value in rows:
+                _text(value, "catalog.definitions." + field, empty=True, maximum=500)
+        parent = item["parent_id"]
+        if parent is not None:
+            parent = _id(parent, "catalog.definitions.parent_id")
+            parents[key] = (axis, parent)
+        definition_ids[key] = True
+    for key, parent in parents.items():
+        if parent[1] not in catalog[parent[0]]:
+            _fail("definition_parent_missing", "catalog.definitions.parent_id", axis=key[0], id=parent[1])
+    visited, active = set(), set()
+    def visit_definition(key):
+        if key in active:
+            _fail("definition_parent_cycle", "catalog.definitions.parent_id", axis=key[0], id=key[1])
+        if key in visited:
+            return
+        active.add(key)
+        parent = parents.get(key)
+        if parent and parent in definition_ids:
+            visit_definition(parent)
+        active.remove(key)
+        visited.add(key)
+    for key in definition_ids:
+        visit_definition(key)
     features = values["features"]
     if not isinstance(features, list) or len(features) > 256:
         _fail("invalid_features", "features")
@@ -547,12 +636,26 @@ def save_configuration(path, base_config, payload):
     if not re.fullmatch(r"mc-[0-9a-f]{64}", expected):
         _fail("invalid_configuration_revision", "expected_revision")
     request_id = _text(payload["request_id"], "request_id", maximum=128)
-    values = validate_values(payload["values"])
-    fingerprint = revision(values)
+    submitted_values = copy.deepcopy(payload["values"])
+    if not isinstance(submitted_values, dict):
+        _fail("invalid_configuration_fields", "values")
+    fingerprint = revision(submitted_values)
     outcome = {}
     def change(overlay):
         effective = merge_config(base_config, overlay)
         current = configuration(effective)
+        values = copy.deepcopy(submitted_values)
+        catalog = values.get("catalog")
+        if not isinstance(catalog, dict):
+            _fail("invalid_configuration_fields", "catalog")
+        supplied_extended = set(catalog) & set(EXTENDED_CATALOG_AXES)
+        if supplied_extended and supplied_extended != set(EXTENDED_CATALOG_AXES):
+            _fail("incomplete_extended_catalog", "catalog", required=list(EXTENDED_CATALOG_AXES))
+        effective_values = values_from_config(effective)
+        for name in EXTENDED_CATALOG_AXES:
+            if name not in catalog:
+                catalog[name] = copy.deepcopy(effective_values["catalog"][name])
+        values = validate_values(values)
         metadata = overlay.setdefault("memory_system_meta", {})
         receipts = metadata.setdefault("receipts", {})
         prior = receipts.get(request_id)
