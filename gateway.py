@@ -6123,6 +6123,36 @@ class GatewayService:
             logger.warning("Memory L1 transport failed: %s", type(exc).__name__)
             return JSONResponse({"error": {"code": "memory_l1_unavailable"}}, status_code=503, headers=headers)
 
+    async def handle_memory_l1_parts(self, request: Request) -> JSONResponse:
+        """Read-only transport of fixed-revision members; no source URL input."""
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None: return auth_result
+        from urllib.parse import quote
+        headers = {"Cache-Control": "no-store"}
+        base = os.environ.get("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://ombre-brain:8000").rstrip("/")
+        token = os.environ.get("OMBRE_MEMORY_WRITE_TOKEN") or self.gateway_token
+        if not base or not token:
+            return JSONResponse({"error": {"code": "memory_l1_unconfigured"}}, status_code=503, headers=headers)
+        tail = request.url.path.rstrip("/").split("/")
+        section = tail[-2] if request.path_params.get("object_id") is not None else tail[-1]
+        if section not in ("scenes", "statements", "sources"):
+            return JSONResponse({"error": {"code": "memory_part_not_found"}}, status_code=404, headers=headers)
+        path = "/api/memory-authority/memories/" + quote(str(request.path_params["memory_id"]), safe="") + "/" + section
+        if request.path_params.get("object_id") is not None:
+            path += "/" + quote(str(request.path_params["object_id"]), safe="")
+        try:
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+                upstream = await client.get(base + path, params=list(request.query_params.multi_items()),
+                                            headers={"Authorization": "Bearer " + token})
+            if upstream.status_code not in {200, 400, 404, 409, 503}:
+                raise ValueError("unexpected_part_status")
+            value = upstream.json()
+            if not isinstance(value, dict): raise ValueError("invalid_part_response")
+            return JSONResponse(value, status_code=upstream.status_code, headers=headers)
+        except Exception as exc:
+            logger.warning("Memory L1 part transport failed: %s", type(exc).__name__)
+            return JSONResponse({"error": {"code": "memory_part_unavailable"}}, status_code=503, headers=headers)
+
     async def handle_memory_authority_read(self, request: Request) -> JSONResponse:
         """Owner-safe Memory projection served on the Gateway transport.
 
@@ -27179,6 +27209,9 @@ def create_gateway_app(
     async def memory_l1_revision_route(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_memory_l1_revision(request)
 
+    async def memory_l1_parts_route(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_memory_l1_parts(request)
+
     async def memory_authority_detail(request: Request) -> Response:
         request.path_params["resource"] = "memory_detail"
         return await request.app.state.gateway_service.handle_memory_authority_read(request)
@@ -27213,6 +27246,11 @@ def create_gateway_app(
             Route("/api/memory-authority/embedding-index/{action}", memory_embedding_index,
                   methods=["POST"], name="embedding-index-action"),
             Route("/api/memory-authority/schema", memory_l1_revision_route, methods=["GET"], name="memory-l1-schema"),
+            Route("/api/memory-authority/memories/{memory_id}/statements", memory_l1_parts_route, methods=["GET"], name="memory-l1-statements"),
+            Route("/api/memory-authority/memories/{memory_id}/scenes", memory_l1_parts_route, methods=["GET"], name="memory-l1-scenes"),
+            Route("/api/memory-authority/memories/{memory_id}/scenes/{object_id}", memory_l1_parts_route, methods=["GET"], name="memory-l1-scene"),
+            Route("/api/memory-authority/memories/{memory_id}/sources", memory_l1_parts_route, methods=["GET"], name="memory-l1-sources"),
+            Route("/api/memory-authority/memories/{memory_id}/sources/{object_id}", memory_l1_parts_route, methods=["GET"], name="memory-l1-source"),
             Route("/api/memory-authority/memories/{memory_id}/revisions", memory_l1_revision_route, methods=["POST"], name="memory-l1-save"),
             Route("/api/memory-authority/memories/{memory_id}/revisions/{revision}", memory_l1_revision_route, methods=["GET"], name="memory-l1-history"),
             Route("/api/memory-authority/memories/{memory_id}", memory_authority_detail,

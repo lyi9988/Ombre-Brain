@@ -108,7 +108,8 @@ def scene_template(catalog=None, catalog_revision=None):
 
 def document_template(body="", title="", *, catalog=None, catalog_revision=None):
     return {"schema_version": SCHEMA_VERSION,
-            "entry": {"form": "episode", "parent_ref": None, "document_group_id": None, "derived_from_revision": None},
+            "entry": {"form": "episode", "parent_ref": None, "document_group_id": None, "derived_from_revision": None,
+                      "scene_ref": None, "shared_statement_refs": []},
             "narrative": {"title": title, "body": body}, "entities": [], "scenes": [], "statements": [],
             "retrieval": {"keywords": [], "tags": []}, "evidence_bindings": [], "relations": [], "attributes": [],
             "generation": generation_template(catalog, catalog_revision)}
@@ -216,7 +217,8 @@ def validate_l1_document(document: Any, *, catalog=None) -> dict:
         fail("catalog_snapshot_mismatch", "generation.catalog_snapshot")
     definitions = {item["id"]: item for item in c["attributes"] if isinstance(item, dict) and "id" in item}
     d = copy.deepcopy(document)
-    shape(d["entry"], {"form", "parent_ref", "document_group_id", "derived_from_revision"}, "entry")
+    shape(d["entry"], {"form", "parent_ref", "document_group_id", "derived_from_revision", "scene_ref", "shared_statement_refs"},
+          "entry", optional={"scene_ref", "shared_statement_refs"})
     entry = d["entry"]
     if entry["form"] not in ("episode", "diary_full", "diary_scene", "reference"): fail("invalid_entry_form", "entry.form")
     if entry["parent_ref"] is not None:
@@ -226,6 +228,16 @@ def validate_l1_document(document: Any, *, catalog=None) -> dict:
     if entry["form"] == "diary_scene" and entry["parent_ref"] is None: fail("scene_parent_required", "entry.parent_ref")
     _nullable_text(entry["document_group_id"], "entry.document_group_id")
     _revision(entry["derived_from_revision"], "entry.derived_from_revision", nullable=True)
+    if entry.get("scene_ref") is not None:
+        shape(entry["scene_ref"], {"scene_id", "scene_revision_id"}, "entry.scene_ref")
+        text(entry["scene_ref"]["scene_id"], "entry.scene_ref.scene_id")
+        _revision(entry["scene_ref"]["scene_revision_id"], "entry.scene_ref.scene_revision_id")
+        if entry["form"] != "diary_scene" or entry["parent_ref"] is None:
+            fail("scene_parent_required", "entry.scene_ref")
+        if d["statements"]: fail("shared_statements_must_not_be_duplicated", "statements")
+    strings(entry.get("shared_statement_refs", []), "entry.shared_statement_refs")
+    if entry.get("shared_statement_refs"):
+        if entry.get("scene_ref") is None: fail("shared_statement_parent_required", "entry.shared_statement_refs")
     shape(d["narrative"], {"title", "body"}, "narrative")
     text(d["narrative"]["title"], "narrative.title", empty=True)
     canonical_l1_body(d["narrative"]["body"])
