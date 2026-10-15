@@ -799,7 +799,9 @@ class MemoryAuthorityStore:
         finally:
             conn.close()
 
-    def record_body_written(self, operation_id: str, *, observed_body_sha256: str) -> dict[str, Any]:
+    def record_body_written(self, operation_id: str, *, observed_body_sha256: str,
+                            observed_semantic_sha256: str | None = None,
+                            observed_l1_content_sha256: str | None = None) -> dict[str, Any]:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -809,6 +811,12 @@ class MemoryAuthorityStore:
             payload = _loads(row["payload_json"], {})
             if str(payload.get("body_sha256") or "") != str(observed_body_sha256 or ""):
                 raise BodyHashMismatch("written Bucket hash differs from prepared body hash")
+            metadata = payload.get("metadata") or {}
+            if "memory_l1" in metadata:
+                if (not observed_semantic_sha256 or not observed_l1_content_sha256
+                        or observed_semantic_sha256 != metadata.get("memory_l1_semantic_sha256")
+                        or observed_l1_content_sha256 != metadata.get("memory_l1_content_sha256")):
+                    raise BodyHashMismatch("written L1 semantic content differs from prepared revision")
             if row["status"] == "committed":
                 conn.commit()
                 return dict(row)
@@ -871,6 +879,11 @@ class MemoryAuthorityStore:
                 "revision": revision, "body_sha256": payload["body_sha256"],
                 "source_refs": payload["source_refs"],
             }
+            if "memory_l1" in payload["metadata"]:
+                outbox_payload.update({key: payload["metadata"][key] for key in
+                    ("memory_l1_semantic_sha256", "memory_l1_content_sha256")})
+                outbox_payload["l2_preparation"] = {"state": "waiting_for_consumer", "consumer": "P4",
+                    "dependency": payload["metadata"]["memory_l1_content_sha256"]}
             conn.execute(
                 "INSERT INTO outbox(event_id,operation_id,event_type,aggregate_id,aggregate_revision,payload_json,"
                 "status,attempts,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,'pending',0,'',?,?)",
@@ -879,6 +892,9 @@ class MemoryAuthorityStore:
             )
             result = {"memory_id": memory_id, "bucket_id": payload["bucket_id"], "revision": revision,
                       "body_sha256": payload["body_sha256"], "outbox_event_id": event_id}
+            if "memory_l1" in payload["metadata"]:
+                result.update({"semantic_sha256": payload["metadata"]["memory_l1_semantic_sha256"],
+                               "l1_content_sha256": payload["metadata"]["memory_l1_content_sha256"]})
             conn.execute(
                 "UPDATE commit_log SET status='committed',result_json=?,updated_at=? WHERE operation_id=?",
                 (_json(result), now, operation_id),

@@ -12383,6 +12383,60 @@ async def api_chat_memory_tool(request):
         return JSONResponse({"error": "execution_outcome_unknown"}, status_code=503, headers=headers)
 
 
+def _memory_l1_revision_service():
+    from memory_l1_service import MemoryL1RevisionService
+    from memory_system_config import configuration, merge_config, read_overlay, runtime_overlay_path
+    def catalog_provider():
+        snapshot = configuration(merge_config(config, read_overlay(runtime_overlay_path(config))))
+        return snapshot["values"]["catalog"], snapshot["revision"]
+    return MemoryL1RevisionService(memory_authority_store, memory_commit_service, bucket_mgr, catalog_provider)
+
+
+@mcp.custom_route("/api/memory-authority/schema", methods=["GET"])
+@mcp.custom_route("/api/memory-authority/memories/{memory_id}/revisions", methods=["POST"])
+@mcp.custom_route("/api/memory-authority/memories/{memory_id}/revisions/{revision}", methods=["GET"])
+async def api_memory_l1_revision(request):
+    import json
+    from starlette.responses import JSONResponse
+    from memory_authority import IdempotencyConflict, MemoryNotFound, RevisionConflict
+    from memory_l1_contract import L1ContractError
+    from memory_l1_service import L1OwnerError
+    err = _require_owner_or_internal_index_maintenance(request)
+    if err: return err
+    headers = {"Cache-Control": "no-store"}
+    if memory_authority_store is None or memory_commit_service is None:
+        return JSONResponse({"error": {"code": "memory_authority_unavailable"}}, status_code=503, headers=headers)
+    memory_id = str(request.path_params.get("memory_id") or "")
+    try:
+        service = _memory_l1_revision_service()
+        if request.method == "GET" and not memory_id:
+            result = service.schema()
+        elif request.method == "GET":
+            revision = str(request.path_params.get("revision") or "")
+            if not revision.isdigit() or int(revision) <= 0: raise L1OwnerError("invalid_revision", field_path="revision")
+            result = await service.detail(memory_id, int(revision))
+        else:
+            raw = await request.body()
+            if len(raw) > 524288: return JSONResponse({"error": {"code": "request_too_large"}}, status_code=413, headers=headers)
+            try: payload = json.loads(raw)
+            except (ValueError, UnicodeError): raise L1OwnerError("invalid_json") from None
+            result = await service.save(memory_id, payload)
+        return JSONResponse(result, headers=headers)
+    except (RevisionConflict, IdempotencyConflict) as exc:
+        current = memory_authority_store.get_memory(memory_id)
+        return JSONResponse({"error": {"code": "revision_conflict" if isinstance(exc, RevisionConflict) else "idempotency_conflict", "field_path": "expected_revision"},
+                             "current_revision": (current or {}).get("active_revision")}, status_code=409, headers=headers)
+    except MemoryNotFound:
+        return JSONResponse({"error": {"code": "memory_not_found"}}, status_code=404, headers=headers)
+    except L1ContractError as exc:
+        return JSONResponse({"error": {"code": exc.code, "field_path": exc.path}}, status_code=400, headers=headers)
+    except L1OwnerError as exc:
+        return JSONResponse({"error": {"code": exc.code, "field_path": exc.field_path}}, status_code=exc.status, headers=headers)
+    except Exception as exc:
+        logger.warning("Owner L1 revision incomplete: %s", type(exc).__name__)
+        return JSONResponse({"error": {"code": "revision_outcome_unknown"}}, status_code=503, headers=headers)
+
+
 @mcp.custom_route("/api/memory-authority/memories", methods=["GET"])
 async def api_memory_authority_memories(request):
     """Owner-only active/revisioned Memory list; body is opt-in."""
@@ -12419,6 +12473,13 @@ async def api_memory_authority_memory_detail(request):
     memory = memory_authority_store.get_memory(memory_id)
     if not memory:
         return JSONResponse({"error": "memory not found"}, status_code=404)
+    current_revision = memory_authority_store.get_memory_revision(memory_id, int(memory["active_revision"]))
+    if current_revision and "memory_l1" in current_revision.get("metadata", {}):
+        from memory_l1_service import L1OwnerError
+        try:
+            return JSONResponse(await _memory_l1_revision_service().detail(memory_id))
+        except L1OwnerError as exc:
+            return JSONResponse({"error": {"code": exc.code, "field_path": exc.field_path}}, status_code=exc.status)
     bucket = await bucket_mgr.get(str(memory.get("bucket_id") or ""))
     return JSONResponse({
         "status": "ok",
@@ -12427,6 +12488,9 @@ async def api_memory_authority_memory_detail(request):
         "revisions": memory_authority_store.list_memory_revisions(memory_id, limit=200),
         "rings": memory_authority_store.list_memory_rings(memory_id, state="all", limit=200),
         "projection_status": memory_authority_store.list_projection_status(memory_id),
+        "l1": {"state": "legacy", "document": _memory_l1_revision_service().schema()["template"] | {
+            "narrative": {"title": str(((bucket or {}).get("metadata") or {}).get("name") or ""),
+                          "body": str((bucket or {}).get("content") or "")}}},
     })
 
 

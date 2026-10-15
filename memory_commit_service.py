@@ -33,6 +33,8 @@ class BucketProjectionResult:
     operation_id: str
     body_sha256: str
     snapshot_path: str
+    semantic_sha256: str | None = None
+    l1_content_sha256: str | None = None
 
 
 class MemoryProjection(Protocol):
@@ -173,6 +175,10 @@ class BucketMemoryProjection:
             raise BodyHashMismatch("projected Bucket body hash differs")
         if str(current_metadata.get("memory_operation_id") or "") != operation_id:
             raise CommitStateError("projected Bucket operation marker differs")
+        if current_metadata.get("memory_revision") != int(revision):
+            raise CommitStateError("projected Bucket revision marker differs")
+        from memory_l1_schema import verify_l1_metadata
+        verify_l1_metadata(canonical_body, metadata, current_metadata)
 
         raw_path = Path(str(current["path"]))
         raw_text = raw_path.read_text(encoding="utf-8")
@@ -193,6 +199,8 @@ class BucketMemoryProjection:
             operation_id=operation_id,
             body_sha256=observed_hash,
             snapshot_path=str(target_snapshot),
+            semantic_sha256=current_metadata.get("memory_l1_semantic_sha256"),
+            l1_content_sha256=current_metadata.get("memory_l1_content_sha256"),
         )
 
     async def append_ring(
@@ -288,10 +296,18 @@ class MemoryCommitService:
         actor: str,
         memory_state: str = "active",
         recall_policy: str = "enabled",
+        l1_write_intent: bool = False,
     ) -> dict[str, Any]:
         canonical_body = canonical_memory_body(body)
         from memory_semantics import guard_metadata
         metadata = guard_metadata(dict(metadata or {}), canonical_body)
+        previous = self.authority.get_memory_revision(memory_id, int(expected_revision)) if expected_revision else None
+        if previous and "memory_l1" in previous.get("metadata", {}) and not l1_write_intent:
+            if (previous["body_sha256"] != body_sha256(canonical_body)
+                    or metadata.get("memory_l1") != previous["metadata"]["memory_l1"]):
+                raise CommitStateError("structured L1 requires a coordinated body and semantic revision")
+        from memory_l1_schema import bind_l1_metadata
+        metadata = bind_l1_metadata(canonical_body, metadata)
         expected_hash = body_sha256(canonical_body)
         next_revision = int(expected_revision) + 1
         if isinstance(self.projection, BucketMemoryProjection):
@@ -335,7 +351,9 @@ class MemoryCommitService:
             self.authority.abort_memory_commit(operation_id, error_code="projection_not_applied")
             raise
         self.authority.record_body_written(
-            operation_id, observed_body_sha256=projected.body_sha256
+            operation_id, observed_body_sha256=projected.body_sha256,
+            observed_semantic_sha256=getattr(projected, "semantic_sha256", None),
+            observed_l1_content_sha256=getattr(projected, "l1_content_sha256", None),
         )
         return self.authority.finalize_memory_commit(operation_id)
 
