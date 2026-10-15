@@ -145,7 +145,7 @@ def minimal_service(tmp_path):
     item._moment_with_bucket_recall_signal = lambda m, s: m
     item._with_explicit_source_record_buckets = lambda q, b, a: b
     item._build_injected_context_messages = lambda **k: ("", "")
-    item._inject_context_messages = lambda messages, s, d: messages
+    item._inject_context_messages = lambda messages, s, d, *, composed_messages=None, coverage=None: messages
     item._apply_prompt_cache_hints = lambda *a, **k: None
     item._restore_cached_reasoning_content = lambda *a, **k: None
     item._operit_context_rewrite_debug_base = lambda: {}

@@ -51,6 +51,13 @@ def _usage_from_httpx_response(response: httpx.Response) -> dict | None:
     return dict(usage) if isinstance(usage, dict) else None
 
 from bucket_manager import BucketManager
+from memory_system_config import (
+    ConfigurationError, LIMITS as MEMORY_CONFIGURATION_LIMITS, REQUEST_CONFIGURATION,
+    RequestLimit, configuration as memory_configuration, merge_config as merge_memory_config,
+    preview as preview_memory_configuration, read_overlay as read_memory_overlay,
+    save_configuration as save_memory_configuration, update_overlay as update_memory_overlay,
+    validate_values as validate_memory_values,
+)
 from canonical_continuation import CanonicalContinuationAdapter, ContinuationBatch
 from dehydrator import Dehydrator
 from dream_engine import DreamEngine
@@ -527,6 +534,17 @@ class GatewayService:
     chat completions upstream.
     """
 
+    inject_max_cards = RequestLimit("inject_max_cards")
+    diffusion_inject_max_items = RequestLimit("diffusion_inject_max_items")
+    inject_total_budget = RequestLimit("inject_total_budget")
+    recalled_budget = RequestLimit("recalled_budget", "recalled_memory_budget")
+    related_memory_budget = RequestLimit("related_memory_budget")
+    memory_detail_recall_max_ids = RequestLimit("memory_detail_recall_max_ids")
+    memory_detail_recall_budget = RequestLimit("memory_detail_recall_budget")
+    semantic_candidate_top_k = RequestLimit("semantic_candidate_top_k")
+    moment_search_limit = RequestLimit("moment_search_limit")
+    dynamic_top_k = RequestLimit("dynamic_top_k")
+
     def __init__(
         self,
         config: dict,
@@ -697,16 +715,11 @@ class GatewayService:
             authority_cfg.get("moment_request_rebuild_enabled"),
             not self.memory_authority_enabled,
         )
-        self.dynamic_top_k = int(self.gateway_cfg.get("dynamic_top_k", 10))
-        self.semantic_candidate_top_k = max(
-            self.dynamic_top_k,
-            min(200, int(self.gateway_cfg.get("semantic_candidate_top_k", max(50, self.dynamic_top_k)))),
-        )
-        self.moment_search_limit = max(
-            1,
-            min(200, int(self.gateway_cfg.get("moment_search_limit", max(50, self.dynamic_top_k * 2)))),
-        )
-        self.inject_max_cards = max(0, min(2, int(self.gateway_cfg.get("inject_max_cards", 2))))
+        memory_limits = self._memory_limits_from_config(self.gateway_cfg)
+        self.dynamic_top_k = memory_limits["dynamic_top_k"]
+        self.semantic_candidate_top_k = memory_limits["semantic_candidate_top_k"]
+        self.moment_search_limit = memory_limits["moment_search_limit"]
+        self.inject_max_cards = memory_limits["inject_max_cards"]
         self.skip_recent_rounds = max(0, int(self.gateway_cfg.get("skip_recent_rounds", 5)))
         self.cooldown_hours = float(self.gateway_cfg.get("cooldown_hours", 6))
         self.cooldown_floor = float(self.gateway_cfg.get("cooldown_floor", 0.3))
@@ -725,7 +738,7 @@ class GatewayService:
             1.0,
         )
 
-        self.inject_total_budget = int(self.gateway_cfg.get("inject_total_budget", 1800))
+        self.inject_total_budget = memory_limits["inject_total_budget"]
         self.core_budget = int(self.gateway_cfg.get("core_memory_budget", 500))
         self.recent_budget = int(self.gateway_cfg.get("recent_context_budget", 300))
         self.recalled_budget = int(self.gateway_cfg.get("recalled_memory_budget", 900))
@@ -820,10 +833,7 @@ class GatewayService:
         self._prepare_snapshots: dict[str, dict[str, Any]] = {}
         self._prepare_snapshot_lock = threading.RLock()
         self.diffusion_options = diffusion_options_from_config(config)
-        self.diffusion_inject_max_items = max(
-            0,
-            min(2, int(self.gateway_cfg.get("diffusion_inject_max_items", 2))),
-        )
+        self.diffusion_inject_max_items = memory_limits["diffusion_inject_max_items"]
         self.diffusion_inject_min_confidence = self._clamp(
             float(self.gateway_cfg.get("diffusion_inject_min_confidence", 0.55)),
             0.0,
@@ -1003,14 +1013,8 @@ class GatewayService:
             self.gateway_cfg.get("memory_detail_recall_enabled"),
             False,
         )
-        self.memory_detail_recall_max_ids = max(
-            1,
-            min(3, int(self.gateway_cfg.get("memory_detail_recall_max_ids", 3))),
-        )
-        self.memory_detail_recall_budget = max(
-            200,
-            int(self.gateway_cfg.get("memory_detail_recall_budget", 1200)),
-        )
+        self.memory_detail_recall_max_ids = memory_limits["memory_detail_recall_max_ids"]
+        self.memory_detail_recall_budget = memory_limits["memory_detail_recall_budget"]
         self.edge_min_confidence = float(self.gateway_cfg.get("edge_min_confidence", 0.55))
         self.upstream_key_cooldown_seconds = max(
             0.0, float(self.gateway_cfg.get("upstream_key_cooldown_seconds", 300))
@@ -1320,6 +1324,11 @@ class GatewayService:
                 "dynamic_top_k": int(getattr(self, "dynamic_top_k", 0) or 0),
                 "semantic_candidate_top_k": int(getattr(self, "semantic_candidate_top_k", 0) or 0),
                 "moment_search_limit": int(getattr(self, "moment_search_limit", 0) or 0),
+                "inject_max_cards": int(getattr(self, "inject_max_cards", 0) or 0),
+                "diffusion_inject_max_items": int(
+                    getattr(self, "diffusion_inject_max_items", 0) or 0
+                ),
+                "inject_total_budget": int(getattr(self, "inject_total_budget", 0) or 0),
                 "graph_bucket_rerank_enabled": bool(
                     getattr(self, "graph_bucket_rerank_enabled", False)
                 ),
@@ -1401,6 +1410,54 @@ class GatewayService:
             "runtime_overlay_present": bool(overlay_status.get("present")),
             "runtime_overlay_sha256": str(overlay_status.get("sha256") or ""),
             "projection_schema_version": 1,
+        }
+
+    @staticmethod
+    def _validated_memory_limit(name: str, value: Any, minimum: int, maximum: int) -> int:
+        """Validate owner-controlled memory counts and budgets without clipping."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+        if value < minimum or value > maximum:
+            raise ValueError(f"{name} must be between {minimum} and {maximum}")
+        return value
+
+    @classmethod
+    def _memory_limits_from_config(cls, gateway_cfg: dict[str, Any]) -> dict[str, int]:
+        dynamic_top_k = cls._validated_memory_limit(
+            "dynamic_top_k", gateway_cfg.get("dynamic_top_k", 10), 1, 200
+        )
+        return {
+            "inject_max_cards": cls._validated_memory_limit(
+                "inject_max_cards", gateway_cfg.get("inject_max_cards", 2), 0, 200
+            ),
+            "diffusion_inject_max_items": cls._validated_memory_limit(
+                "diffusion_inject_max_items",
+                gateway_cfg.get("diffusion_inject_max_items", 2), 0, 200,
+            ),
+            "inject_total_budget": cls._validated_memory_limit(
+                "inject_total_budget", gateway_cfg.get("inject_total_budget", 1800), 0, 1_000_000
+            ),
+            "memory_detail_recall_max_ids": cls._validated_memory_limit(
+                "memory_detail_recall_max_ids",
+                gateway_cfg.get("memory_detail_recall_max_ids", 3), 0, 200,
+            ),
+            "memory_detail_recall_budget": cls._validated_memory_limit(
+                "memory_detail_recall_budget",
+                gateway_cfg.get("memory_detail_recall_budget", 1200), 0, 1_000_000,
+            ),
+            "dynamic_top_k": dynamic_top_k,
+            "semantic_candidate_top_k": cls._validated_memory_limit(
+                "semantic_candidate_top_k",
+                gateway_cfg.get("semantic_candidate_top_k", max(50, dynamic_top_k)),
+                1,
+                200,
+            ),
+            "moment_search_limit": cls._validated_memory_limit(
+                "moment_search_limit",
+                gateway_cfg.get("moment_search_limit", min(200, max(50, dynamic_top_k * 2))),
+                1,
+                200,
+            ),
         }
 
     @staticmethod
@@ -1781,7 +1838,10 @@ class GatewayService:
             "date_recall_max_buckets": self.date_recall_max_buckets,
             "recalled_memory_budget": self.recalled_budget,
             "related_memory_budget": self.related_memory_budget,
+            "inject_total_budget": self.inject_total_budget,
+            "inject_max_cards": self.inject_max_cards,
             "operit_context_rewrite_enabled": self.operit_context_rewrite_enabled,
+            "dynamic_top_k": self.dynamic_top_k,
             "semantic_candidate_top_k": self.semantic_candidate_top_k,
             "moment_search_limit": self.moment_search_limit,
             "diffusion_inject_max_items": self.diffusion_inject_max_items,
@@ -2051,6 +2111,21 @@ class GatewayService:
 
     def _apply_gateway_memory_config(self, payload: dict[str, Any]) -> list[str]:
         updated: list[str] = []
+        memory_limits = {
+            "inject_max_cards": (0, 200),
+            "diffusion_inject_max_items": (0, 200),
+            "inject_total_budget": (0, 1_000_000),
+            "memory_detail_recall_max_ids": (0, 200),
+            "memory_detail_recall_budget": (0, 1_000_000),
+            "dynamic_top_k": (1, 200),
+            "semantic_candidate_top_k": (1, 200),
+            "moment_search_limit": (1, 200),
+        }
+        validated_limits = {
+            name: self._validated_memory_limit(name, payload[name], *bounds)
+            for name, bounds in memory_limits.items()
+            if name in payload
+        }
         for name in ("recall_recent_turns", "recall_timeout_seconds", "automatic_recall_enabled"):
             if name in payload:
                 setattr(self, name, payload[name])
@@ -2227,19 +2302,28 @@ class GatewayService:
             )
             self.gateway_cfg["operit_context_rewrite_enabled"] = self.operit_context_rewrite_enabled
             updated.append("gateway.operit_context_rewrite_enabled")
-        if "semantic_candidate_top_k" in payload:
-            self.semantic_candidate_top_k = max(
-                self.dynamic_top_k,
-                min(200, int(payload["semantic_candidate_top_k"])),
-            )
+        if "inject_max_cards" in validated_limits:
+            self.inject_max_cards = validated_limits["inject_max_cards"]
+            self.gateway_cfg["inject_max_cards"] = self.inject_max_cards
+            updated.append("gateway.inject_max_cards")
+        if "inject_total_budget" in validated_limits:
+            self.inject_total_budget = validated_limits["inject_total_budget"]
+            self.gateway_cfg["inject_total_budget"] = self.inject_total_budget
+            updated.append("gateway.inject_total_budget")
+        if "dynamic_top_k" in validated_limits:
+            self.dynamic_top_k = validated_limits["dynamic_top_k"]
+            self.gateway_cfg["dynamic_top_k"] = self.dynamic_top_k
+            updated.append("gateway.dynamic_top_k")
+        if "semantic_candidate_top_k" in validated_limits:
+            self.semantic_candidate_top_k = validated_limits["semantic_candidate_top_k"]
             self.gateway_cfg["semantic_candidate_top_k"] = self.semantic_candidate_top_k
             updated.append("gateway.semantic_candidate_top_k")
-        if "moment_search_limit" in payload:
-            self.moment_search_limit = max(1, min(200, int(payload["moment_search_limit"])))
+        if "moment_search_limit" in validated_limits:
+            self.moment_search_limit = validated_limits["moment_search_limit"]
             self.gateway_cfg["moment_search_limit"] = self.moment_search_limit
             updated.append("gateway.moment_search_limit")
-        if "diffusion_inject_max_items" in payload:
-            self.diffusion_inject_max_items = max(0, min(2, int(payload["diffusion_inject_max_items"])))
+        if "diffusion_inject_max_items" in validated_limits:
+            self.diffusion_inject_max_items = validated_limits["diffusion_inject_max_items"]
             self.gateway_cfg["diffusion_inject_max_items"] = self.diffusion_inject_max_items
             updated.append("gateway.diffusion_inject_max_items")
         if "diffusion_inject_min_confidence" in payload:
@@ -2368,12 +2452,12 @@ class GatewayService:
             )
             self.gateway_cfg["memory_detail_recall_enabled"] = self.memory_detail_recall_enabled
             updated.append("gateway.memory_detail_recall_enabled")
-        if "memory_detail_recall_max_ids" in payload:
-            self.memory_detail_recall_max_ids = max(1, min(3, int(payload["memory_detail_recall_max_ids"])))
+        if "memory_detail_recall_max_ids" in validated_limits:
+            self.memory_detail_recall_max_ids = validated_limits["memory_detail_recall_max_ids"]
             self.gateway_cfg["memory_detail_recall_max_ids"] = self.memory_detail_recall_max_ids
             updated.append("gateway.memory_detail_recall_max_ids")
-        if "memory_detail_recall_budget" in payload:
-            self.memory_detail_recall_budget = max(200, int(payload["memory_detail_recall_budget"]))
+        if "memory_detail_recall_budget" in validated_limits:
+            self.memory_detail_recall_budget = validated_limits["memory_detail_recall_budget"]
             self.gateway_cfg["memory_detail_recall_budget"] = self.memory_detail_recall_budget
             updated.append("gateway.memory_detail_recall_budget")
         return updated
@@ -3027,7 +3111,115 @@ class GatewayService:
                 through_seq, channel_id
             )
 
+    def _memory_configuration_snapshot(self, *, apply=False) -> dict:
+        path = str(getattr(self, "_runtime_overlay_path", "") or "")
+        # Chat reads a small cached projection; a stat change invalidates it.
+        # Do not YAML-parse the full overlay (including save receipts) on every
+        # turn, and do not retain credentials in this owner projection cache.
+        signature = None
+        if path and Path(path).exists():
+            stat = Path(path).stat()
+            signature = (path, stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        cached = getattr(self, "_memory_configuration_overlay_cache", None)
+        if not cached or cached[0] != signature:
+            overlay = read_memory_overlay(path) if path else {}
+            safe_overlay = {}
+            for section in ("gateway", "reranker"):
+                keys = {row[1] for row in MEMORY_CONFIGURATION_LIMITS.values() if row[0] == section}
+                if isinstance(overlay.get(section), dict):
+                    safe_overlay[section] = {key: value for key, value in overlay[section].items() if key in keys}
+            if "memory_system" in overlay:
+                safe_overlay["memory_system"] = overlay["memory_system"]
+            cached = (signature, safe_overlay)
+            self._memory_configuration_overlay_cache = cached
+        effective = merge_memory_config(self.config, cached[1])
+        snapshot = memory_configuration(effective, last_request=getattr(self, "_last_memory_configuration_use", None))
+        if apply:
+            values = validate_memory_values(snapshot["values"])
+            attribute_names = {"recalled_memory_budget": "recalled_budget"}
+            changes = {name: value for name, value in values["limits"].items()
+                       if MEMORY_CONFIGURATION_LIMITS[name][0] == "gateway"
+                       and self.__dict__.get(attribute_names.get(name, name)) != value}
+            if changes:
+                applying = REQUEST_CONFIGURATION.set(None)
+                try:
+                    self._apply_gateway_memory_config(changes)
+                finally:
+                    REQUEST_CONFIGURATION.reset(applying)
+            limit = values["limits"]["rerank_candidate_limit"]
+            if self.reranker_engine.candidate_limit != limit:
+                self.reranker_engine.candidate_limit = limit
+                self.config.setdefault("reranker", {})["candidate_limit"] = limit
+                self._rerank_config_revision = getattr(self, "_rerank_config_revision", 0) + 1
+            self.config["memory_system"] = {key: value for key, value in values.items() if key != "limits"}
+        return snapshot
+
+    async def handle_memory_configuration(self, request: Request) -> Response:
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+        try:
+            if request.method == "GET":
+                return JSONResponse(self._memory_configuration_snapshot(apply=True), headers=headers)
+            raw = await request.body()
+            if len(raw) > 512 * 1024:
+                raise ConfigurationError("configuration_request_too_large")
+            try:
+                payload = json.loads(raw)
+            except (ValueError, UnicodeError):
+                raise ConfigurationError("invalid_json") from None
+            if request.method == "POST" and request.url.path.endswith("/preview"):
+                if not isinstance(payload, dict) or set(payload) != {"values", "inputs"}:
+                    raise ConfigurationError("invalid_preview_request")
+                return JSONResponse({"status": "ok", "result": preview_memory_configuration(
+                    payload["values"], payload["inputs"])}, headers=headers)
+            if request.method != "PUT":
+                return JSONResponse({"error": "method_not_allowed"}, status_code=405, headers=headers)
+            path = str(getattr(self, "_runtime_overlay_path", "") or "")
+            receipt, _effective = save_memory_configuration(path, self.config, payload)
+            # Apply the CURRENT saved state, not an older idempotent receipt.
+            current = self._memory_configuration_snapshot(apply=True)
+            return JSONResponse({"status": "ok", "applied": current["revision"] == receipt["revision"],
+                "saved_revision": receipt["revision"], "request_id": receipt["request_id"],
+                "replayed": receipt["replayed"], "result": {key: receipt[key] for key in (
+                    "schema_version", "revision", "values", "bindings", "application", "validation")}}, headers=headers)
+        except ConfigurationError as exc:
+            return JSONResponse(exc.payload(), status_code=exc.status, headers=headers)
+        except Exception as exc:
+            logger.warning("Memory configuration request failed: %s", type(exc).__name__)
+            return JSONResponse({"error": {"code": "memory_configuration_unavailable"}}, status_code=503, headers=headers)
+
     async def handle_chat(self, request: Request) -> Response:
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        try:
+            self._maybe_reload_runtime_overlay()
+            snapshot = self._memory_configuration_snapshot(apply=True)
+        except (ConfigurationError, OSError, ValueError):
+            # A bad external overlay must not replace a working request's
+            # existing numeric settings. Existing runtime diagnostics remain.
+            snapshot = memory_configuration(self.config)
+        frozen = {"service": id(self), "revision": snapshot["revision"], "values": snapshot["values"]}
+        token = REQUEST_CONFIGURATION.set(frozen)
+        try:
+            response = await self._handle_chat_unfrozen(request)
+            if isinstance(response, StreamingResponse):
+                iterator = response.body_iterator
+                async def frozen_stream():
+                    stream_token = REQUEST_CONFIGURATION.set(frozen)
+                    try:
+                        async for part in iterator:
+                            yield part
+                    finally:
+                        REQUEST_CONFIGURATION.reset(stream_token)
+                response.body_iterator = frozen_stream()
+            return response
+        finally:
+            REQUEST_CONFIGURATION.reset(token)
+
+    async def _handle_chat_unfrozen(self, request: Request) -> Response:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
             return auth_result
@@ -4108,6 +4300,7 @@ class GatewayService:
             "context_revision": context_revision,
             "effective_config_revision": effective_config.get("revision"),
             "effective_config_sha256": effective_config.get("sha256"),
+            "memory_configuration_revision": (REQUEST_CONFIGURATION.get() or {}).get("revision"),
             "prompt_preset_id": prompt_preset_id,
             "prompt_preset_revision": prompt_preset_revision,
             "prompt_plan_sha256": prompt_plan_sha256,
@@ -5973,30 +6166,13 @@ class GatewayService:
                     path = str(getattr(self, "_runtime_overlay_path", "") or "")
                     if not path:
                         return JSONResponse({"error": "runtime_config_unavailable", "applied": False}, status_code=503)
-                    import tempfile
-                    target = Path(path)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    lock = getattr(self, "_runtime_overlay_lock", None) or threading.RLock()
-                    with lock:
-                        existing = yaml.safe_load(target.read_text(encoding="utf-8")) if target.exists() else {}
-                        if not isinstance(existing or {}, dict):
-                            return JSONResponse({"error": "runtime_config_invalid", "applied": False}, status_code=409)
-                        existing = existing or {}
+                    def update_settings(existing):
                         existing.setdefault("gateway", {}).update(
                             recall_recent_turns=recent, recall_timeout_seconds=float(timeout),
-                            automatic_recall_enabled=auto,
-                        )
-                        fd, temp_path = tempfile.mkstemp(prefix=".recall-config-", dir=str(target.parent))
-                        try:
-                            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                                handle.write(yaml.safe_dump(existing, allow_unicode=True))
-                                handle.flush()
-                                os.fsync(handle.fileno())
-                            os.replace(temp_path, target)
-                        finally:
-                            if os.path.exists(temp_path):
-                                os.unlink(temp_path)
-                        self._apply_gateway_memory_config(existing["gateway"])
+                            automatic_recall_enabled=auto)
+                        return existing
+                    existing = update_memory_overlay(path, update_settings)
+                    self._apply_gateway_memory_config(existing["gateway"])
                 return JSONResponse({
                     "status": "ok",
                     "applied": request.method == "PUT",
@@ -7642,7 +7818,10 @@ class GatewayService:
         recent_bucket_ids, recent_moment_ids = self._recent_memory_reference_ids(session_id)
         intent = self._targeted_memory_detail_intent(query)
 
-        max_items = max(1, int(self.memory_detail_recall_max_ids or 1))
+        max_items = self.memory_detail_recall_max_ids
+        if max_items <= 0:
+            debug["skip_reason"] = "detail_limit_zero"
+            return "", debug
         if explicit_bucket_ids or explicit_moment_ids:
             bucket_ids = explicit_bucket_ids
             moment_ids = explicit_moment_ids
@@ -7938,6 +8117,13 @@ class GatewayService:
         requested = [bucket_id for bucket_id in bucket_ids if bucket_id]
         if not requested:
             return "", []
+        if len(requested) > self.memory_detail_recall_max_ids:
+            raise ValueError(
+                "memory_detail_recall_max_ids exceeded by direct detail request "
+                f"({len(requested)} > {self.memory_detail_recall_max_ids})"
+            )
+        if self.memory_detail_recall_budget <= 0:
+            return "", requested
         per_bucket_budget = max(80, self.memory_detail_recall_budget // max(1, len(requested)))
         blocks = [
             "Additional private memory detail for this turn. Use quietly when relevant; do not mention lookup.",
@@ -13446,7 +13632,7 @@ class GatewayService:
             seen_moment_ids: set[str] = set()
             search_input_count = len(all_moments) if all_moments is not None else len(eligible_ids)
             for search_index, moment_query in enumerate(moment_search_queries):
-                search_limit = max(self.moment_search_limit, self.inject_max_cards * 8)
+                search_limit = self.moment_search_limit
                 before_search_count = len(candidates)
                 if all_moments is None:
                     query_planner_debug["moment_search_source"] = "sqlite_store"
@@ -15155,11 +15341,9 @@ class GatewayService:
         )
 
     def _diffusion_inject_limit(self, query_plan: Any) -> int:
-        if self.inject_max_cards <= 0:
+        if self.inject_max_cards <= 0 or self.diffusion_inject_max_items <= 0:
             return 0
-        if getattr(query_plan, "wants_body_chain", False):
-            return max(0, min(5, self.inject_max_cards * 3))
-        return max(0, min(2, self.inject_max_cards, self.diffusion_inject_max_items))
+        return min(self.inject_max_cards, self.diffusion_inject_max_items)
 
     def _diffusion_explore_options(self, explore_limit: int):
         return replace(
@@ -15798,8 +15982,8 @@ class GatewayService:
             seen.add(bucket_id)
         if query_plan.wants_body_chain:
             hidden.sort(key=lambda moment: self._recall_rank(query, moment))
-            return hidden[: max(0, limit if limit is not None else 5)]
-        default_limit = max(0, min(2, self.inject_max_cards))
+            return hidden[: max(0, limit if limit is not None else self.inject_max_cards)]
+        default_limit = self.inject_max_cards
         return hidden[: max(0, limit if limit is not None else default_limit)]
 
     def _query_requires_topic_evidence(self, query: str) -> bool:
@@ -19187,7 +19371,7 @@ class GatewayService:
                     bucket_debug["fields"].append(field)
 
         ranked_ids = sorted(scores, key=lambda bucket_id: (-scores[bucket_id], bucket_id))
-        limit = max(self.dynamic_top_k, len(terms) * max_per_term)
+        limit = self.dynamic_top_k
         kept_ids = set(ranked_ids[:limit])
         return (
             {bucket_id: round(scores[bucket_id], 4) for bucket_id in ranked_ids if bucket_id in kept_ids},
@@ -19284,7 +19468,7 @@ class GatewayService:
         try:
             rows = search(
                 query,
-                limit=max(self.semantic_candidate_top_k, self.dynamic_top_k * 4, 20),
+                limit=self.semantic_candidate_top_k,
             )
         except Exception as exc:
             logger.warning("Gateway retrieval alias lookup failed: %s", exc)
@@ -22717,7 +22901,7 @@ class GatewayService:
                     values.append(value)
 
     def _pick_dynamic_cards(self, scored_candidates: list[dict], *, query: str = "") -> list[dict]:
-        if not scored_candidates:
+        if self.inject_max_cards <= 0 or not scored_candidates:
             return []
 
         axis_diverse = self._pick_axis_diverse_dynamic_cards(scored_candidates, query=query)
@@ -22763,14 +22947,21 @@ class GatewayService:
                     or self._dynamic_bucket_item_has_reliable_recall_signal(query, candidate)
                 ):
                     chosen.append(candidate)
-                    return chosen
+                    covered_terms.update(candidate_terms)
+                    if len(chosen) >= self.inject_max_cards:
+                        return chosen
 
-        second = remaining_candidates[0]
-        if (
-            second["score"] >= self.second_card_min_score
-            and second["score"] >= first["score"] * self.second_card_relative_score
-        ):
-            chosen.append(second)
+        for candidate in remaining_candidates:
+            if len(chosen) >= self.inject_max_cards:
+                break
+            if candidate in chosen:
+                continue
+            candidate_score = self._safe_float(candidate.get("score"), 0.0)
+            if (
+                candidate_score >= self.second_card_min_score
+                and candidate_score >= first["score"] * self.second_card_relative_score
+            ) or self._dynamic_bucket_item_has_reliable_recall_signal(query, candidate):
+                chosen.append(candidate)
         return chosen
 
     def _pick_axis_diverse_dynamic_cards(self, scored_candidates: list[dict], *, query: str = "") -> list[dict]:
@@ -23147,6 +23338,13 @@ class GatewayService:
         """
         sections: list[str] = []
 
+        configuration_use = REQUEST_CONFIGURATION.get()
+        if configuration_use and configuration_use.get("service") == id(self):
+            self._last_memory_configuration_use = {
+                "revision": configuration_use["revision"], "stage": "memory_projection",
+                "limits": dict(configuration_use["values"]["limits"]),
+            }
+
         def add(title: str, body: str) -> None:
             text = str(body or "").strip()
             if text:
@@ -23243,6 +23441,7 @@ class GatewayService:
         )
         return {
             "source_id": "ombre.memory_recall",
+            "configuration_revision": (configuration_use or {}).get("revision"),
             "recall_status": natural_status,
             "authority": "ombre.memory_authority",
             "body_mode": "dynamic",
@@ -26918,6 +27117,9 @@ def create_gateway_app(
     async def memory_authority_read(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_memory_authority_read(request)
 
+    async def memory_configuration_route(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_memory_configuration(request)
+
     async def memory_embedding_index(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_memory_embedding_index(request)
 
@@ -26956,6 +27158,10 @@ def create_gateway_app(
                   methods=["POST"], name="embedding-index-action"),
             Route("/api/memory-authority/memories/{memory_id}", memory_authority_detail,
                   methods=["GET"], name="memory-detail"),
+            Route("/api/memory-authority/configuration", memory_configuration_route,
+                  methods=["GET", "PUT"], name="memory-configuration"),
+            Route("/api/memory-authority/configuration/preview", memory_configuration_route,
+                  methods=["POST"], name="memory-configuration-preview"),
             Route("/api/memory-authority/{resource}", memory_authority_read,
                   methods=["GET", "PUT"], name="memory-authority-read"),
             Route("/v1/models", models, methods=["GET"]),

@@ -1,4 +1,7 @@
 import asyncio
+import inspect
+import math
+import re
 import time
 from types import SimpleNamespace
 from pathlib import Path
@@ -956,3 +959,133 @@ def test_memory_detail_recall_debug_reports_trigger_and_retry_timing():
     assert debug["retried"] is True
     assert debug["retry_status_code"] == 200
     assert debug["elapsed_ms"] >= debug["retry_elapsed_ms"] >= 0
+
+
+def test_memory_limit_default_stays_valid_for_largest_dynamic_channel():
+    assert GatewayService._memory_limits_from_config({"dynamic_top_k": 200})["moment_search_limit"] == 200
+    assert GatewayService._memory_limits_from_config({"dynamic_top_k": 200, "moment_search_limit": 5})["moment_search_limit"] == 5
+
+
+def test_memory_limit_configuration_initialization_and_hot_apply_read_back_six_items():
+    configured = {
+        "inject_max_cards": 6,
+        "diffusion_inject_max_items": 6,
+        "inject_total_budget": 12_345,
+        "memory_detail_recall_max_ids": 6,
+        "memory_detail_recall_budget": 9_876,
+        "dynamic_top_k": 12,
+        "semantic_candidate_top_k": 24,
+        "moment_search_limit": 36,
+    }
+    assert GatewayService._memory_limits_from_config(configured) == configured
+
+    service = GatewayService.__new__(GatewayService)
+    service.gateway_cfg = {}
+    updated = service._apply_gateway_memory_config(configured)
+    assert len(updated) == len(configured)
+    assert {name: service.gateway_cfg[name] for name in configured} == configured
+    assert service.inject_max_cards == 6
+    assert service.diffusion_inject_max_items == 6
+    assert service.inject_total_budget == 12_345
+    assert service.memory_detail_recall_max_ids == 6
+    assert service.dynamic_top_k == 12
+    assert service.semantic_candidate_top_k == 24
+    assert service.moment_search_limit == 36
+
+    payload_source = inspect.getsource(GatewayService._gateway_memory_config_payload)
+    for name in set(re.findall(r"self\.([A-Za-z_]\w*)", payload_source)):
+        if not hasattr(service, name):
+            setattr(service, name, 0)
+    service._effective_config_metadata = lambda: {}
+    service._gateway_upstreams_config_payload = lambda: []
+    payload = service._gateway_memory_config_payload()
+    assert {name: payload[name] for name in configured} == configured
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("inject_max_cards", True),
+        ("inject_max_cards", "6"),
+        ("inject_max_cards", 6.0),
+        ("inject_total_budget", math.nan),
+        ("memory_detail_recall_max_ids", -1),
+        ("diffusion_inject_max_items", 201),
+        ("dynamic_top_k", 0),
+        ("semantic_candidate_top_k", 201),
+        ("moment_search_limit", math.inf),
+    ],
+)
+def test_memory_limit_config_rejects_bad_type_nonfinite_and_out_of_range(field, value):
+    with pytest.raises(ValueError, match=field):
+        GatewayService._memory_limits_from_config({field: value})
+
+
+def test_memory_limit_hot_apply_validates_before_mutating():
+    service = GatewayService.__new__(GatewayService)
+    service.gateway_cfg = {"inject_max_cards": 2}
+    service.inject_max_cards = 2
+    service.dynamic_top_k = 10
+    with pytest.raises(ValueError, match="dynamic_top_k"):
+        service._apply_gateway_memory_config({
+            "inject_max_cards": 6,
+            "dynamic_top_k": 0,
+        })
+    assert service.inject_max_cards == 2
+    assert service.gateway_cfg == {"inject_max_cards": 2}
+
+
+def test_dynamic_final_selector_can_return_more_than_two_cards():
+    service = GatewayService.__new__(GatewayService)
+    service.inject_max_cards = 6
+    service.first_card_min_score = 0.7
+    service.second_card_min_score = 0.3
+    service.second_card_relative_score = 0.5
+    service._pick_axis_diverse_dynamic_cards = lambda *_args, **_kwargs: []
+    service._dynamic_bucket_item_has_reliable_recall_signal = lambda *_args, **_kwargs: True
+    candidates = [
+        {"bucket": {"id": f"b{i}"}, "score": 0.9 - i * 0.01, "matched_query_terms": [f"t{i}"]}
+        for i in range(8)
+    ]
+    chosen = service._pick_dynamic_cards(candidates, query="query")
+    assert [item["bucket"]["id"] for item in chosen] == [f"b{i}" for i in range(6)]
+    service.inject_max_cards = 0
+    assert service._pick_dynamic_cards(candidates, query="query") == []
+
+
+def test_diffusion_limit_is_independent_but_bounded_by_final_count():
+    service = GatewayService.__new__(GatewayService)
+    service.inject_max_cards = 6
+    service.diffusion_inject_max_items = 9
+    assert service._diffusion_inject_limit(SimpleNamespace(wants_body_chain=False)) == 6
+    service.diffusion_inject_max_items = 4
+    assert service._diffusion_inject_limit(SimpleNamespace(wants_body_chain=True)) == 4
+    service.inject_max_cards = 0
+    assert service._diffusion_inject_limit(SimpleNamespace(wants_body_chain=False)) == 0
+
+
+def test_direct_memory_detail_supports_more_than_three_and_rejects_over_limit():
+    service = GatewayService.__new__(GatewayService)
+    service.memory_detail_recall_max_ids = 4
+    service.memory_detail_recall_budget = 4_000
+    buckets = [
+        {"id": f"b{i}", "content": f"body {i}", "metadata": {"name": f"memory {i}"}}
+        for i in range(4)
+    ]
+    service._list_gateway_buckets = lambda **_kwargs: _async_result(buckets)
+    service._is_self_anchor_recall_excluded_bucket = lambda _bucket: False
+    service._rendered_bucket_content = lambda bucket: bucket["content"]
+    service._bucket_date_meta_parts = lambda _bucket: []
+
+    context, missing = asyncio.run(service._build_memory_detail_recall_context([f"b{i}" for i in range(4)]))
+    assert missing == []
+    assert all(f"[bucket_id:b{i}]" in context for i in range(4))
+    with pytest.raises(ValueError, match="memory_detail_recall_max_ids"):
+        asyncio.run(service._build_memory_detail_recall_context([f"b{i}" for i in range(5)]))
+    service.memory_detail_recall_max_ids = 0
+    with pytest.raises(ValueError, match="memory_detail_recall_max_ids"):
+        asyncio.run(service._build_memory_detail_recall_context(["b0"]))
+
+
+async def _async_result(value):
+    return value
