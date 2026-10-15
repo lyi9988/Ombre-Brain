@@ -433,6 +433,10 @@ class MemoryAuthorityStore:
             "INSERT INTO authority_meta(key,value) VALUES('schema_version','memory-authority-v1') "
             "ON CONFLICT(key) DO NOTHING"
         )
+        from memory_l1_index import initialize
+        initialize(conn)
+        from memory_l0_sources import initialize as initialize_source_copies
+        initialize_source_copies(conn)
         conn.commit()
         conn.close()
 
@@ -874,6 +878,8 @@ class MemoryAuthorityStore:
                  operation_id, now, payload["actor"]),
             )
             event_id = f"memory:{memory_id}:revision:{revision}"
+            from memory_l1_index import project
+            project(conn, memory_id, revision, payload["metadata"])
             outbox_payload = {
                 "memory_id": memory_id, "bucket_id": payload["bucket_id"],
                 "revision": revision, "body_sha256": payload["body_sha256"],

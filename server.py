@@ -12437,6 +12437,56 @@ async def api_memory_l1_revision(request):
         return JSONResponse({"error": {"code": "revision_outcome_unknown"}}, status_code=503, headers=headers)
 
 
+def _memory_l1_reads():
+    from memory_l0_sources import MemoryL0Sources, McpDiarySourceAdapter
+    from memory_l1_reads import MemoryL1Reads
+    adapters = []
+    if reflection_engine.diary_mcp_url:
+        adapters.append(McpDiarySourceAdapter(reflection_engine.diary_mcp_url, reflection_engine._read_diary_for_date))
+    service = _memory_l1_revision_service()
+    return MemoryL1Reads(service, MemoryL0Sources(memory_authority_store, adapters))
+
+
+@mcp.custom_route("/api/memory-authority/memories/{memory_id}/statements", methods=["GET"])
+@mcp.custom_route("/api/memory-authority/memories/{memory_id}/scenes", methods=["GET"])
+@mcp.custom_route("/api/memory-authority/memories/{memory_id}/scenes/{scene_id}", methods=["GET"])
+@mcp.custom_route("/api/memory-authority/memories/{memory_id}/sources", methods=["GET"])
+@mcp.custom_route("/api/memory-authority/memories/{memory_id}/sources/{binding_id}", methods=["GET"])
+async def api_memory_l1_parts(request):
+    from starlette.responses import JSONResponse
+    from memory_authority import MemoryNotFound
+    from memory_l1_contract import L1ContractError
+    from memory_l1_reads import read_query
+    from memory_l1_service import L1OwnerError
+    err = _require_owner_or_internal_index_maintenance(request)
+    if err: return err
+    headers = {"Cache-Control": "no-store"}
+    if memory_authority_store is None or memory_commit_service is None:
+        return JSONResponse({"error": {"code": "memory_authority_unavailable"}}, status_code=503, headers=headers)
+    memory_id = str(request.path_params.get("memory_id") or "")
+    binding_id = request.path_params.get("binding_id")
+    scene_id = request.path_params.get("scene_id")
+    resource = "source" if binding_id else "scene" if scene_id else request.url.path.rstrip("/").rsplit("/", 1)[-1]
+    try:
+        query = read_query(request.query_params, resource)
+        service = _memory_l1_reads()
+        if resource == "scene": result = await service.scene(memory_id, query["revision"], scene_id)
+        elif resource == "source": result = await service.locate(memory_id, binding_id=binding_id, **query)
+        elif resource == "sources": result = service.source_list(memory_id, query["revision"])
+        elif resource in ("scenes", "statements"): result = service.page(memory_id, module=resource, **query)
+        else: raise MemoryNotFound(resource)
+        return JSONResponse(result, headers=headers)
+    except MemoryNotFound:
+        return JSONResponse({"error": {"code": "memory_part_not_found"}}, status_code=404, headers=headers)
+    except L1ContractError as exc:
+        return JSONResponse({"error": {"code": exc.code, "field_path": exc.path}}, status_code=400, headers=headers)
+    except L1OwnerError as exc:
+        return JSONResponse({"error": {"code": exc.code, "field_path": exc.field_path}}, status_code=exc.status, headers=headers)
+    except Exception as exc:
+        logger.warning("Owner L1 part read incomplete: %s", type(exc).__name__)
+        return JSONResponse({"error": {"code": "memory_part_unavailable"}}, status_code=503, headers=headers)
+
+
 @mcp.custom_route("/api/memory-authority/memories", methods=["GET"])
 async def api_memory_authority_memories(request):
     """Owner-only active/revisioned Memory list; body is opt-in."""

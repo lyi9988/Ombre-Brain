@@ -35,6 +35,7 @@ class MemoryL1RevisionService:
                               "scene": scene_template(catalog, revision),
                               "entity": {"entity_id": "new:entity", "entity_type": {"state": "not_stated", "value": None, "evidence_refs": []}, "name": "", "aliases": []}},
                 "managed_fields": ["generation", "evidence_bindings", "entry.parent_ref", "entry.document_group_id", "entry.derived_from_revision",
+                                   "entry.scene_ref", "entry.shared_statement_refs",
                                    "entities.*.entity_id", "statements.*.statement_id", "statements.*.statement_revision_id",
                                    "scenes.*.scene_id", "scenes.*.scene_revision_id", "scenes.*.generation", "relations.*.relation_id", "relations.*.origin"],
                 "limits": {"request_bytes": 524288, "request_id_characters": 128}}
@@ -81,6 +82,7 @@ class MemoryL1RevisionService:
                 "rings": self.authority.list_memory_rings(memory_id, state="all", limit=200),
                 "projection_status": self.authority.list_projection_status(memory_id),
                 "l1": {"state": state, "document": document, "issue": issue,
+                       "coverage": (metadata.get("diary_l1_bundle") or {}).get("coverage"),
                        "semantic_sha256": metadata.get("memory_l1_semantic_sha256"),
                        "l1_content_sha256": metadata.get("memory_l1_content_sha256"),
                        "preparation": {"l2": {"state": "waiting_for_consumer" if state == "current" else "not_prepared", "consumer": "P4"}}}}
@@ -92,7 +94,7 @@ class MemoryL1RevisionService:
             if doc.get(key) != previous.get(key): raise L1OwnerError("managed_field_changed", field_path="document." + key)
         if not isinstance(doc.get("entry"), dict):
             raise L1OwnerError("object_required", field_path="document.entry")
-        for key in ("parent_ref", "document_group_id", "derived_from_revision"):
+        for key in ("parent_ref", "document_group_id", "derived_from_revision", "scene_ref", "shared_statement_refs"):
             if doc.get("entry", {}).get(key) != previous.get("entry", {}).get(key): raise L1OwnerError("managed_field_changed", field_path="document.entry." + key)
         # Keep the recorded vocabulary available for historical labels. This is
         # a per-revision snapshot, not a mutation of the active owner catalog.
