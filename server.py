@@ -14988,37 +14988,25 @@ if __name__ == "__main__":
             _app = mcp.streamable_http_app()
         else:
             _app = mcp.sse_app()
-        if hasattr(_app, "add_event_handler"):
-            chat_preparation_state = {'task': None}
-            async def _start_chat_memory_preparation():
-                chat_preparation_state['task'] = asyncio.create_task(_chat_memory_preparation_loop())
+        async def _start_decay_engine_on_app_startup():
+            await _ensure_decay_engine_started_for_transport(transport)
 
-            async def _stop_chat_memory_preparation():
-                task = chat_preparation_state['task']
-                if task is not None:
-                    task.cancel()
+        async def _close_retrieval_clients_on_app_shutdown():
+            for engine in (embedding_engine, reranker_engine):
+                close = getattr(engine, "close", None)
+                if callable(close):
                     try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+                        await close()
+                    except Exception:
+                        logger.debug("Retrieval client shutdown close failed", exc_info=True)
 
-            _app.add_event_handler('startup', _start_chat_memory_preparation)
-            _app.add_event_handler('shutdown', _stop_chat_memory_preparation)
-            async def _start_decay_engine_on_app_startup():
-                await _ensure_decay_engine_started_for_transport(transport)
-
-            _app.add_event_handler("startup", _start_decay_engine_on_app_startup)
-
-            async def _close_retrieval_clients_on_app_shutdown():
-                for engine in (embedding_engine, reranker_engine):
-                    close = getattr(engine, "close", None)
-                    if callable(close):
-                        try:
-                            await close()
-                        except Exception:
-                            logger.debug("Retrieval client shutdown close failed", exc_info=True)
-
-            _app.add_event_handler("shutdown", _close_retrieval_clients_on_app_shutdown)
+        from http_runtime_lifespan import attach_runtime_lifespan
+        attach_runtime_lifespan(
+            _app,
+            worker=_chat_memory_preparation_loop,
+            on_startup=_start_decay_engine_on_app_startup,
+            on_shutdown=_close_retrieval_clients_on_app_shutdown,
+        )
         _app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
