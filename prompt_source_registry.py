@@ -72,6 +72,8 @@ FIXED_PROMPT_SOURCES = {
               "reflection_engine:REFLECT_PROMPT_TEMPLATE", render="identity"),
         _spec("ombre.diary_memory_prompt", "memory.reflection",
               "memory_l1_prompts:DIARY_L1_PROMPT", render="domain_identity", revision="factory-memory-l1-v1"),
+        _spec("ombre.chat_memory_prepare_prompt", "memory.chat_prepare",
+              "memory_l1_prompts:CHAT_PREPARATION_PROMPT", render="domain_identity", revision="factory-chat-prepare-v1"),
         _spec("ombre.daily_chat_memory_prompt", "memory.daily_chat_review",
               "memory_l1_prompts:DAILY_L1_PROMPT",
               render="domain_identity", required=("{max_candidates}",), revision="factory-memory-l1-v1"),

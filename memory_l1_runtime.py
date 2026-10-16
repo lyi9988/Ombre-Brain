@@ -26,6 +26,8 @@ GENERATION_OPTIONS = {'diary_l1_input_window_chars': (64000, 256, 2000000),
     'daily_chat_memory_max_per_day': (10, 0, 10000),
     'daily_chat_memory_review_max_per_day': (10, 0, 10000)}
 GENERATION_OPTIONS['action_l1_jobs_per_run'] = (1, 0, 200)
+GENERATION_OPTIONS['chat_memory_jobs_per_run'] = (1, 0, 200)
+GENERATION_OPTIONS['chat_memory_prepare_interval_seconds'] = (5, 1, 3600)
 
 
 def task_options(config):
@@ -40,6 +42,10 @@ def task_options(config):
 
 
 def namespace_local_ids(document, prefix, known_ids=(), catalog=None):
+    from memory_l1_model_identity import normalize_model_local_keys
+    # Window authors also use ordinary local labels. Known prior members must
+    # remain stable; the existing namespace pass handles generated keys next.
+    document, first_map = normalize_model_local_keys(document, catalog=catalog, known_ids=known_ids)
     doc = copy.deepcopy(document)
     ids = {}
     for module, key in (('entities', 'entity_id'), ('scenes', 'scene_id'), ('statements', 'statement_id'), ('relations', 'relation_id')):
@@ -79,7 +85,7 @@ def namespace_local_ids(document, prefix, known_ids=(), catalog=None):
                 node['value'] = [ids.get(v, v) for v in value] if node.get('op') == 'in' else ids.get(value, value)
             for value in node.values(): typed_attributes(value)
     for module in ('attributes', 'statements', 'scenes'): typed_attributes(doc[module])
-    return doc, ids
+    return doc, {**ids, **{old: ids.get(local, local) for old, local in first_map.items()}}
 
 
 class MemoryL1Runtime:

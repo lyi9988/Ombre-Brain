@@ -57,6 +57,9 @@ def bind_sources(sources):
 
 
 def expand_model_document(document, base, source_texts=None):
+    from memory_l1_model_identity import normalize_model_local_keys
+    document, _ = normalize_model_local_keys(document, previous=base,
+        catalog=base.get('generation', {}).get('catalog_snapshot'))
     if not isinstance(document, dict) or set(document) != MODEL_FIELDS:
         raise L1OwnerError("model_document_fields_required", field_path="document")
     bindings = base["evidence_bindings"]

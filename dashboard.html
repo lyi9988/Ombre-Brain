@@ -4000,6 +4000,16 @@
       </div>
       <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">每次既有记忆后台任务最多整理多少条已完成行动结果；0暂停。整理使用已配置模型，来源提交本身不调用模型，也不会重执行行动。</div>
       <div class="config-row">
+        <label>聊天整理任务</label>
+        <input type="number" id="cfg-reflection-chat-memory-jobs-per-run" min="0" max="200" step="1" placeholder="默认 1" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">每轮后台最多准备多少条主人提交的聊天记忆稿；0 暂停聊天整理，不影响查看或编辑持久提交稿（0–200）。</div>
+      <div class="config-row">
+        <label>聊天整理检查间隔（秒）</label>
+        <input type="number" id="cfg-reflection-chat-memory-prepare-interval" min="1" max="3600" step="1" placeholder="默认 5" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">后台检查排队聊天提交任务的间隔；允许 1–3600 秒。</div>
+      <div class="config-row">
         <label>Diary 场景上限</label>
         <input type="number" id="cfg-reflection-diary-l1-scene-limit" step="1" placeholder="从服务器配置读取" />
       </div>
@@ -4172,6 +4182,7 @@ const reflectionConfigFormIds = [
   'cfg-reflection-diary-l1-scene-limit', 'cfg-reflection-diary-l1-max-tokens',
   'cfg-reflection-diary-l1-scene-min-value',
   'cfg-reflection-diary-l1-source-kind', 'cfg-reflection-action-l1-jobs-per-run',
+  'cfg-reflection-chat-memory-jobs-per-run', 'cfg-reflection-chat-memory-prepare-interval',
   'cfg-reflection-chat-memory-candidate-max-tokens', 'cfg-reflection-chat-memory-max-windows',
   'cfg-reflection-chat-memory-window-max-input-chars', 'cfg-reflection-chat-memory-max-per-day',
   'cfg-reflection-chat-memory-review-max-per-day',
@@ -8723,6 +8734,8 @@ async function loadConfig(explicitMemoryConflictReload) {
       'cfg-reflection-diary-l1-max-tokens': 'diary_l1_max_tokens',
       'cfg-reflection-diary-l1-scene-min-value': 'diary_l1_scene_min_value',
       'cfg-reflection-action-l1-jobs-per-run': 'action_l1_jobs_per_run',
+      'cfg-reflection-chat-memory-jobs-per-run': 'chat_memory_jobs_per_run',
+      'cfg-reflection-chat-memory-prepare-interval': 'chat_memory_prepare_interval_seconds',
       'cfg-reflection-chat-memory-candidate-max-tokens': 'daily_chat_memory_candidate_max_tokens',
       'cfg-reflection-chat-memory-max-windows': 'daily_chat_memory_max_windows_per_run',
       'cfg-reflection-chat-memory-window-max-input-chars': 'daily_chat_memory_window_max_input_chars',
@@ -8977,6 +8990,8 @@ async function saveConfig(persist, persistEnv) {
       diary_l1_max_tokens: generationIntegerValue('cfg-reflection-diary-l1-max-tokens', 'Diary 最大 tokens', 'diary_l1_max_tokens'),
       diary_l1_scene_min_value: generationDecimalValue('cfg-reflection-diary-l1-scene-min-value', '场景价值提示', 'diary_l1_scene_min_value'),
       action_l1_jobs_per_run: generationIntegerValue('cfg-reflection-action-l1-jobs-per-run', '行动整理任务', 'action_l1_jobs_per_run'),
+      chat_memory_jobs_per_run: generationIntegerValue('cfg-reflection-chat-memory-jobs-per-run', '聊天整理任务', 'chat_memory_jobs_per_run'),
+      chat_memory_prepare_interval_seconds: generationIntegerValue('cfg-reflection-chat-memory-prepare-interval', '聊天整理检查间隔', 'chat_memory_prepare_interval_seconds'),
       daily_chat_memory_candidate_max_tokens: generationIntegerValue('cfg-reflection-chat-memory-candidate-max-tokens', 'Daily 候选最大 tokens', 'daily_chat_memory_candidate_max_tokens'),
       daily_chat_memory_max_windows_per_run: generationIntegerValue('cfg-reflection-chat-memory-max-windows', 'Daily 每次最大窗口', 'daily_chat_memory_max_windows_per_run'),
       daily_chat_memory_window_max_input_chars: generationIntegerValue('cfg-reflection-chat-memory-window-max-input-chars', 'Daily 窗口输入字符', 'daily_chat_memory_window_max_input_chars'),
@@ -9037,6 +9052,8 @@ async function saveConfig(persist, persistEnv) {
       diary_l1_max_tokens: generationConfig.diary_l1_max_tokens,
       diary_l1_scene_min_value: generationConfig.diary_l1_scene_min_value,
       action_l1_jobs_per_run: generationConfig.action_l1_jobs_per_run,
+      chat_memory_jobs_per_run: generationConfig.chat_memory_jobs_per_run,
+      chat_memory_prepare_interval_seconds: generationConfig.chat_memory_prepare_interval_seconds,
       diary_l1_source_kind: document.getElementById('cfg-reflection-diary-l1-source-kind').value,
       daily_chat_memory_candidate_max_tokens: generationConfig.daily_chat_memory_candidate_max_tokens,
       daily_chat_memory_max_windows_per_run: generationConfig.daily_chat_memory_max_windows_per_run,
@@ -9441,7 +9458,7 @@ function loadDashboardModule(path) {
   document.body.appendChild(script);
 }
 
-loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261016-p2c');
+loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261016-chat-submit');
 </script>
 </body>
 </html>

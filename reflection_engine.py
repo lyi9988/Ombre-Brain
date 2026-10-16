@@ -2906,6 +2906,11 @@ class ReflectionEngine(MemoryL1Runtime):
         # checked); partial stops at the last successfully processed window; the
         # failed range is re-scanned on retry (idempotent, no double pending).
         partial = bool(extraction_meta.get("partial"))
+        # A malformed semantic document is a preparation failure, not a genuine
+        # zero-memory window. Keep its source range retryable after correction.
+        if (audit.get('hard_rejects') or {}).get('invalid_l1_document'):
+            partial = True
+            extraction_meta['last_processed_event_id'] = raw_event_cursor_id
         cursor_target = (
             max_seen_raw_event_id
             if not partial
@@ -4037,6 +4042,9 @@ class ReflectionEngine(MemoryL1Runtime):
             "parse_failure": False,
             "finish_reason": self._completion_finish_reason(response),
         }
+        if stats['finish_reason'] == 'length':
+            from memory_l1_service import L1OwnerError
+            raise L1OwnerError('first_pass_output_incomplete', field_path='generation')
         parsed = self._parse_json_object(raw or "")
         candidates = parsed.get("candidates") if isinstance(parsed, dict) else []
         if not isinstance(candidates, list):
@@ -4053,6 +4061,30 @@ class ReflectionEngine(MemoryL1Runtime):
                     continue
                 item["content"] = draft.get("narrative", {}).get("body", "")
                 item["title"] = draft.get("narrative", {}).get("title", "")
+                # The model selects binding labels; only the program maps them
+                # to archive/event/turn identities used by the existing policy.
+                refs = set(item.get('source_refs') or [])
+                def collect_refs(node):
+                    if isinstance(node, list):
+                        for child in node: collect_refs(child)
+                    elif isinstance(node, dict):
+                        refs.update(v for v in node.get('evidence_refs', []) if isinstance(v, str))
+                        refs.update(v for v in node.get('source_refs', []) if isinstance(v, str))
+                        for child in node.values(): collect_refs(child)
+                collect_refs(draft)
+                available = {'source:' + str(i + 1): source for i, source in enumerate(l1_sources)}
+                if refs - set(available):
+                    from memory_l1_service import L1OwnerError
+                    raise L1OwnerError('unknown_source_binding', field_path='candidate.source_refs')
+                if refs:
+                    selected_keys = {available[ref]['source_key'] for ref in refs}
+                    selected_turns = [turn for turn in window if selected_keys.intersection(
+                        s['source_key'] for s in daily_sources([turn], profile_id=self.memory_semantic_profile_id))]
+                    item['source_turn_ids'] = [str(turn['id']) for turn in selected_turns if str(turn.get('id', '')).isdigit()]
+                    from memory_source_provenance import raw_event_source
+                    item['source_event_ids'] = [str(event['id']) for turn in selected_turns
+                        for event in turn.get('_semantic_sources', []) if str(event.get('id', '')).isdigit()
+                        and raw_event_source(event, profile_id=self.memory_semantic_profile_id)['source_key'] in selected_keys]
                 task_seed = {"date": key, "window": window_index, "candidate": index,
                     "prompt": prompt_context["prompt_revision"], "sources": [s["source_key"] for s in l1_sources]}
                 from memory_l1_contract import semantic_sha256
@@ -4934,6 +4966,9 @@ class ReflectionEngine(MemoryL1Runtime):
                 except Exception as exc:
                     logger.warning("Daily L1 rejected: %s", type(exc).__name__)
                     record_hard("invalid_l1_document")
+                    if audit is not None:
+                        from memory_chat_preparation import issue
+                        audit.setdefault('l1_issues', []).append(issue(exc))
                     continue
             for flag in soft_flags:
                 record_soft(flag)

@@ -93,7 +93,7 @@ def test_aiz_catalog_adapter_commits_first_pass_l1_through_temporary_brain_route
     from starlette.routing import Route
 
     brain_root = Path(__file__).resolve().parents[1]
-    aiz_root = brain_root.parent / "aizizhu-memory-p2-r1"
+    aiz_root = brain_root.parent / "aizizhu-memory-chat-submit-r1"
     monkeypatch.syspath_prepend(str(aiz_root))
     monkeypatch.syspath_prepend(str(aiz_root / "tests"))
     from core.conversation_service import ConversationService, current_turn_context
@@ -192,7 +192,7 @@ def test_aiz_catalog_adapter_commits_first_pass_l1_through_temporary_brain_route
         event = context["user_event"]
         catalog.bind_turn("logical-request", conversation_id=event["conversation_id"], turn_id=event["id"])
         catalog.bind_tool_call("l1-write-call")
-        result = await catalog.execute("memory.write", {"document": document, "kind": "key_event"}, explicit_intent=True)
+        result = await catalog.execute("memory.write", {"narrative": document["narrative"]}, explicit_intent=True)
         observed.append(result)
         catalog.bind_tool_call("l1-status-call")
         status_result = await catalog.execute(
@@ -204,9 +204,22 @@ def test_aiz_catalog_adapter_commits_first_pass_l1_through_temporary_brain_route
         "temporary-conversation", source="app", source_event_id="temporary-ingress", content=original_source))
     assert turn["status"] == "completed", (turn.get("failure_event"), observed)
     assert observed[0].get("ok"), observed[0]
-    assert observed[0]["result"]["memory_status"] == "committed"
+    assert observed[0]["result"]["memory_status"] == "preparing"
+    async def locate(_binding): return {'state': 'available', 'eligible_source': True}
+    engine._memory_l1_sources = lambda: SimpleNamespace(locate=locate)
+    engine._daily_chat_memory_model_client = lambda **kw: (object(), 'synthetic-model', False)
+    async def create(_client, **kwargs):
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content=__import__('json').dumps({'document': document, 'kind': 'key_event', 'confidence': 0.95})), finish_reason='stop')])
+    engine._daily_chat_memory_create_completion = create
+    from memory_chat_preparation import prepare_chat_tasks
+    prepared = asyncio.run(prepare_chat_tasks(engine, bucket_manager))
+    observed[0]['result'] = prepared['results'][0]
+    assert observed[0]['result']['memory_status'] == 'committed'
     assert observed[0]["result"]["l1_state"] == "current"
     assert observed[0]["result"]["l1_complete"] is True
+    assert status_observed[0]["memory_status"] == "preparing"
+    status_observed[0] = asyncio.run(adapter.status({"operation_id": observed[0]["operation_id"]}))
     assert status_observed[0]["memory_status"] == "committed"
     assert status_observed[0]["l1_state"] == "current" and status_observed[0]["l1_complete"] is True
     rows = engine.memory_authority_store.list_candidates(status="all", limit=10)
@@ -217,9 +230,9 @@ def test_aiz_catalog_adapter_commits_first_pass_l1_through_temporary_brain_route
     assert proposal["proposed_body"] == document["narrative"]["body"]
     semantic = proposal["metadata"]["memory_l1"]
     assert semantic["generation"]["origin"] == "first_pass_model"
-    assert semantic["generation"]["prompt_revision"] is None
-    assert semantic["generation"]["model_route_revision"] is None
-    assert semantic["generation"]["task_id"] == proposal["metadata"]["tool_operation_id"]
+    assert semantic["generation"]["prompt_revision"].startswith("prompt_sha256:")
+    assert semantic["generation"]["model_route_revision"].startswith("route_sha256:")
+    assert semantic["generation"]["task_id"].startswith(candidate_id_value)
     assert semantic["evidence_bindings"][0]["binding_id"] == "source:1"
     assert semantic["evidence_bindings"][0]["source_namespace"] == "snapshot.aiz.canonical_event"
     assert semantic["statements"][0]["evidence_refs"] == ["source:1"]
@@ -288,6 +301,10 @@ def test_review_l1_candidate_owner_edit_uses_revision_service_before_commit(tmp_
     statement['content'] = '主人希望保留这段谈话。'
     statement['evidence_refs'] = ['source:current']
     document['statements'] = [statement]
+
+    async def locate(_binding): return {'state': 'available', 'eligible_source': True}
+    from types import SimpleNamespace
+    tool.engine._memory_l1_sources = lambda: SimpleNamespace(locate=locate)
 
     async def run():
         request = envelope()

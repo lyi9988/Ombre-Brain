@@ -20,7 +20,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 _AIZ_WORKTREE = Path(os.environ.get(
     "GUYAN_AIZ_WORKTREE",
-    str(Path(__file__).resolve().parents[2] / "aizizhu-memory-p2-r1"),
+    str(Path(__file__).resolve().parents[2] / "aizizhu-memory-chat-submit-r1"),
 ))
 if not _AIZ_WORKTREE.is_dir():
     pytest.skip("Aizizhu P2 worktree is not present for this cross-worktree test",

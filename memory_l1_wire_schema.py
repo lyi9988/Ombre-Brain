@@ -120,7 +120,11 @@ def _definitions() -> dict:
             "subject_ref": _ref("Unknown"), "classification": _ref("Classification"),
             "time": _ref("StatementTime"), "conditions": _ref("Condition"),
             "property": _ref("StatementProperty"), "evidence_refs": _ref("EvidenceRefs"),
-            "role_hint": _ref("Unknown"), "attributes": _ref("AttributeList"),
+            "role_hint": {"type": "object", "additionalProperties": False,
+                "required": ["state", "value", "evidence_refs"], "properties": {
+                    "state": {"type": "string", "enum": _UNKNOWN_STATES},
+                    "value": {"enum": [None, "core", "detail"]},
+                    "evidence_refs": _ref("EvidenceRefs")}}, "attributes": _ref("AttributeList"),
         }),
         "RelationEndpoint": _obj(("object_type", "object_id"), {
             "object_type": {"type": "string", "enum": ["memory", "scene", "statement"]},
@@ -256,8 +260,22 @@ MEMORY_WRITE_PARAMETERS = _tool_parameters()
 
 
 def tool_parameters() -> dict:
-    """Return an isolated schema object for the native ToolRegistry definition."""
-    return deepcopy(MEMORY_WRITE_PARAMETERS)
+    """Chat authors submit prose; the background author owns full L1 JSON."""
+    return chat_submission_parameters()
+
+
+def chat_submission_parameters() -> dict:
+    return {"type": "object", "additionalProperties": False, "required": ["narrative"],
+        "properties": {
+            "narrative": {"type": "object", "additionalProperties": False, "required": ["body"],
+                "properties": {
+                    "title": {"type": "string", "maxLength": 1000},
+                    "body": {"type": "string", "minLength": 1, "maxLength": MEMORY_WRITE_MAX_BODY_BYTES,
+                             "pattern": r"\S", "description": "完整自然回忆；保留主体、否定、条件和未知。"}}},
+            "semantic_hints": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+                "required": ["text"], "properties": {"text": {"type": "string", "minLength": 1,
+                    "maxLength": MEMORY_WRITE_MAX_BODY_BYTES, "pattern": r"\S",
+                    "description": "可选的明确时间、条件或解释线索，不替代原话证据。"}}}}}}
 
 
 __all__ = [

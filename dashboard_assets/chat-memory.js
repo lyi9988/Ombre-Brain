@@ -6,6 +6,13 @@
   var memorySourceLoadEpoch = 0;
   var memoryBusy = false;
   var memoryStateRestored = false;
+  var sourceTaskDetails = new Map();
+  var sourceTaskDrafts = new Map();
+  var sourceTaskOpenIds = new Set();
+  var sourceTaskDetailEpochs = new Map();
+  var sourceTaskDetailErrors = new Map();
+  var sourceTaskSaving = new Set();
+  var sourceTaskTasks = [];
   var MEMORY_STATE_KEY = 'guyan.ombre.daily-chat-memory-review.v1';
 
   function cloneValue(value) {
@@ -17,11 +24,15 @@
       if (!window.sessionStorage) return;
       var drafts = Array.from(memoryDrafts.entries());
       var requests = Array.from(memoryRequests.entries());
-      if (!drafts.length && !requests.length) {
+      var sourceTaskDraftsState = Array.from(sourceTaskDrafts.entries()).filter(function (entry) {
+        return entry[1] && (entry[1].dirty || entry[1].conflict || entry[1].unconfirmed);
+      });
+      if (!drafts.length && !requests.length && !sourceTaskDraftsState.length) {
         window.sessionStorage.removeItem(MEMORY_STATE_KEY);
         return;
       }
-      window.sessionStorage.setItem(MEMORY_STATE_KEY, JSON.stringify({ version: 1, drafts: drafts, requests: requests }));
+      window.sessionStorage.setItem(MEMORY_STATE_KEY, JSON.stringify({ version: 2, drafts: drafts, requests: requests,
+        sourceTaskDrafts: sourceTaskDraftsState }));
     } catch (_) { /* Session storage may be unavailable in a restricted browser context. */ }
   }
 
@@ -33,7 +44,7 @@
       var raw = window.sessionStorage.getItem(MEMORY_STATE_KEY);
       if (!raw) return;
       var saved = JSON.parse(raw);
-      if (!saved || saved.version !== 1) return;
+      if (!saved || (saved.version !== 1 && saved.version !== 2)) return;
       (Array.isArray(saved.drafts) ? saved.drafts : []).forEach(function (pair) {
         if (Array.isArray(pair) && typeof pair[0] === 'string' && pair[1] && typeof pair[1] === 'object') {
           memoryDrafts.set(pair[0], pair[1]);
@@ -42,6 +53,11 @@
       (Array.isArray(saved.requests) ? saved.requests : []).forEach(function (pair) {
         if (Array.isArray(pair) && typeof pair[0] === 'string' && pair[1] && pair[1].body) {
           memoryRequests.set(pair[0], pair[1]);
+        }
+      });
+      (Array.isArray(saved.sourceTaskDrafts) ? saved.sourceTaskDrafts : []).forEach(function (pair) {
+        if (Array.isArray(pair) && typeof pair[0] === 'string' && pair[1] && typeof pair[1] === 'object') {
+          sourceTaskDrafts.set(pair[0], pair[1]);
         }
       });
     } catch (_) { /* Ignore malformed session-only draft state; server data remains authoritative. */ }
@@ -486,10 +502,18 @@
   if (document.addEventListener) document.addEventListener('input', function (event) {
     var card = event.target.closest && event.target.closest('.chat-memory-card');
     if (card) captureMemoryDraft(card);
+    var sourceEditor = event.target.closest && event.target.closest('[data-chat-submission-editor]');
+    if (sourceEditor) captureSourceTaskDraft(sourceEditor);
   });
   if (window.addEventListener) window.addEventListener('beforeunload', function (event) {
     captureMemoryDrafts();
-    if (memoryDrafts.size || memoryBusy || memoryRequests.size) { event.preventDefault(); event.returnValue = ''; }
+    captureSourceTaskEditors(document);
+    var hasSourceTaskWork = Array.from(sourceTaskDrafts.values()).some(function(state) {
+      return state && (state.dirty || state.conflict || state.unconfirmed);
+    });
+    if (memoryDrafts.size || memoryBusy || memoryRequests.size || hasSourceTaskWork || sourceTaskSaving.size) {
+      event.preventDefault(); event.returnValue = '';
+    }
   });
   function dailyChatMemoryApiBase() {
     return typeof BASE !== 'undefined' ? BASE : '';
@@ -794,13 +818,14 @@
     var panel = document.getElementById('memory-source-tasks');
     if (!panel) {
       panel = document.createElement('details'); panel.id = 'memory-source-tasks';
-      var summary = document.createElement('summary'); summary.textContent = '行动结果的记忆准备状态'; panel.appendChild(summary);
-      var refresh = document.createElement('button'); refresh.textContent = '刷新准备状态';
+      var summary = document.createElement('summary'); summary.textContent = '来源提交的记忆准备状态'; panel.appendChild(summary);
+      var refresh = document.createElement('button'); refresh.type = 'button'; refresh.textContent = '刷新准备状态';
       refresh.addEventListener('click', function() { loadMemorySourceTasks(target); }); panel.appendChild(refresh);
       var notice = document.createElement('p'); notice.setAttribute('data-source-task-notice', ''); notice.setAttribute('role', 'status'); panel.appendChild(notice);
       var content = document.createElement('div'); content.setAttribute('data-source-task-list', ''); panel.appendChild(content);
       target.parentNode.insertBefore(panel, target);
     }
+    restoreMemoryState();
     var list = panel.querySelector('[data-source-task-list]');
     var notice = panel.querySelector('[data-source-task-notice]');
     var epoch = ++memorySourceLoadEpoch; notice.textContent = '正在刷新准备状态…';
@@ -810,36 +835,543 @@
       if (epoch !== memorySourceLoadEpoch) return;
       if (!data || !Array.isArray(data.tasks)) throw new Error('回执格式不符');
       notice.textContent = '准备状态已刷新。';
-      list.replaceChildren();
-      var help = document.createElement('p'); help.textContent = '来源提交与记忆采用分开。后台按预算整理，也可用原补扫入口处理；这里只显示前100条任务。'; list.appendChild(help);
-      data.tasks.forEach(function(task) {
-        var row = document.createElement('div'); row.className = 'chat-memory-card';
-        var status = document.createElement('p');
-        var labels = {queued:'等待整理', generating:'处理中', prepared:'候选已生成', failed:'整理失败'};
-        status.textContent = (labels[task.phase] || task.phase) + ' · ' + task.action_id; row.appendChild(status);
-        if (task.issue) { var issue = document.createElement('code'); issue.textContent = task.issue.code || '未完成'; row.appendChild(issue); }
-        if (task.candidate_ids && task.candidate_ids.length) {
-          var refs = document.createElement('p'); refs.textContent = '对应候选：' + task.candidate_ids.join('、') + '；采用状态以候选和正式记忆回执为准。'; row.appendChild(refs);
+      captureSourceTaskEditors(list);
+      sourceTaskTasks = data.tasks.slice();
+      renderSourceTaskList(list, target);
+      sourceTaskTasks.forEach(function(task) {
+        if (task && task.source_kind === 'chat_submission' && sourceTaskOpenIds.has(String(task.task_id || ''))) {
+          var cached = sourceTaskDetails.get(String(task.task_id || ''));
+          var state = sourceTaskDrafts.get(String(task.task_id || ''));
+          if (!cached || (state && state.unconfirmed) || (cached && sourceTaskRevisionChanged({
+              baseRevision: cached.task && cached.task.revision,
+              baseDraftRevision: cached.task && cached.task.draft_revision,
+            }, task)) || (state && state.dirty && sourceTaskRevisionChanged(state, task))) {
+            loadSourceTaskDetail(String(task.task_id || ''), target, true);
+          } else if (state && (state.dirty || state.unconfirmed) &&
+              sourceTaskRevisionChanged(state, task)) {
+            state.conflict = true;
+            state.latestServerRevision = task.revision;
+            state.lastMessage = '服务器草稿版本已变化；当前未保存内容已保留。请核对后再保存。';
+            persistMemoryState();
+            renderSourceTaskList(list, target);
+          }
         }
-        if (task.phase === 'failed' || task.phase === 'generating') {
-          var retry = document.createElement('button'); retry.textContent = task.phase === 'failed' ? '重试整理' : '中断后恢复整理';
-          retry.addEventListener('click', async function() {
-            if (!window.confirm('重新排队整理此来源；可能再次调用已配置模型，不会重新执行原行动。')) return;
-            retry.disabled = true;
-            try {
-              var res = await authFetch(dailyChatMemoryApiBase() + '/api/memory-authority/source-tasks/' + encodeURIComponent(task.task_id) + '/retry',
-                {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({expected_phase:task.phase})});
-              if (!res || !res.ok) throw new Error('未重新排队，请刷新核对任务状态');
-              loadMemorySourceTasks(target);
-            } catch (error) { status.textContent = error.message; retry.disabled = false; }
-          }); row.appendChild(retry);
-        }
-        list.appendChild(row);
       });
     }).catch(function() {
       if (epoch !== memorySourceLoadEpoch) return;
       notice.textContent = '准备状态刷新失败；以下保留上次回执，可能已过期。已有候选和草稿保持。';
     });
+  }
+
+  function sourceTaskPhaseLabel(task) {
+    var phase = String(task && task.phase || 'unknown');
+    if (phase === 'queued') return '等待准备';
+    if (phase === 'generating') return '准备中';
+    if (phase === 'failed') return '准备失败';
+    if (phase === 'prepared') return '候选已准备 · 待 Review；尚未正式入库';
+    return phase;
+  }
+
+  function sourceTaskApiUrl(taskId) {
+    return dailyChatMemoryApiBase() + '/api/memory-authority/source-tasks/' + encodeURIComponent(taskId);
+  }
+
+  function sourceTaskDraftValues(draft) {
+    draft = draft && typeof draft === 'object' ? draft : {};
+    var narrative = draft.narrative && typeof draft.narrative === 'object' ? draft.narrative : {};
+    var hints = Array.isArray(draft.semantic_hints) ? draft.semantic_hints : [];
+    return { title: typeof narrative.title === 'string' ? narrative.title : '',
+      body: typeof narrative.body === 'string' ? narrative.body : '',
+      hintsRaw: JSON.stringify(hints, null, 2) };
+  }
+
+  function sourceTaskDraftPayload(values) {
+    values = values || {};
+    var body = String(values.body == null ? '' : values.body);
+    if (!body.trim()) throw new Error('提交正文不能为空。');
+    var draft = { narrative: { body: body } };
+    var title = String(values.title == null ? '' : values.title);
+    if (title.trim()) draft.narrative.title = title;
+    var rawHints = String(values.hintsRaw == null ? '' : values.hintsRaw).trim();
+    if (rawHints) {
+      var hints;
+      try { hints = JSON.parse(rawHints); } catch (_) { throw new Error('语义提示必须是有效 JSON 数组。'); }
+      if (!Array.isArray(hints)) throw new Error('语义提示必须是 JSON 数组，例如 [{"text":"..."}]。');
+      hints.forEach(function(hint, index) {
+        if (!hint || typeof hint !== 'object' || Array.isArray(hint) || typeof hint.text !== 'string' || !hint.text.trim()) {
+          throw new Error('第 ' + (index + 1) + ' 条语义提示需要填写非空 text。');
+        }
+      });
+      if (hints.length) draft.semantic_hints = hints;
+    }
+    return draft;
+  }
+
+  function sourceTaskDraftsEqual(left, right) {
+    try { return sameValue(sourceTaskDraftPayload(left), sourceTaskDraftPayload(right)); }
+    catch (_) { return false; }
+  }
+
+  function sourceTaskRawDraftsEqual(left, right) {
+    left = left || {}; right = right || {};
+    return sameValue({ title: String(left.title == null ? '' : left.title),
+      body: String(left.body == null ? '' : left.body),
+      hintsRaw: String(left.hintsRaw == null ? '' : left.hintsRaw) },
+    { title: String(right.title == null ? '' : right.title),
+      body: String(right.body == null ? '' : right.body),
+      hintsRaw: String(right.hintsRaw == null ? '' : right.hintsRaw) });
+  }
+
+  function sourceTaskRevisionChanged(state, task) {
+    if (!state || !task) return false;
+    return String(state.baseRevision == null ? '' : state.baseRevision) !== String(task.revision == null ? '' : task.revision) ||
+      String(state.baseDraftRevision == null ? '' : state.baseDraftRevision) !== String(task.draft_revision == null ? '' : task.draft_revision);
+  }
+
+  function sourceTaskCreateDraftState(detail) {
+    var values = sourceTaskDraftValues(detail && detail.draft);
+    var task = detail && detail.task || {};
+    return { title: values.title, body: values.body, hintsRaw: values.hintsRaw,
+      base: cloneValue(values), baseRevision: task.revision, baseDraftRevision: task.draft_revision,
+      latestLoadedRevision: task.revision,
+      dirty: false, conflict: false, unconfirmed: false, lastMessage: '', lastError: '' };
+  }
+
+  function captureSourceTaskDraft(editor) {
+    if (!editor) return;
+    var taskId = editor.getAttribute('data-chat-submission-editor');
+    if (!taskId) return;
+    var state = sourceTaskDrafts.get(taskId);
+    if (!state) return;
+    var title = editor.querySelector('[data-chat-submission-title]');
+    var body = editor.querySelector('[data-chat-submission-body]');
+    var hints = editor.querySelector('[data-chat-submission-hints]');
+    state.title = title ? String(title.value || '') : state.title;
+    state.body = body ? String(body.value || '') : state.body;
+    state.hintsRaw = hints ? String(hints.value || '') : state.hintsRaw;
+    var validation = '';
+    try { sourceTaskDraftPayload(state); } catch (error) { validation = error.message; }
+    state.dirty = validation ? !sourceTaskRawDraftsEqual(state, state.base || {}) : !sourceTaskDraftsEqual(state, state.base || {});
+    state.lastError = validation;
+    var dirty = editor.querySelector('[data-chat-submission-dirty]');
+    if (dirty) dirty.textContent = state.dirty ? '有未保存修改；刷新状态、读取失败或版本冲突不会替换这些输入。' : '当前内容与服务器已保存草稿一致。';
+    var error = editor.querySelector('[data-chat-submission-error]');
+    if (error) error.textContent = validation || '';
+    var save = editor.querySelector('[data-chat-submission-save]');
+    if (save) save.disabled = Boolean(validation || state.saving || state.conflict || state.unconfirmed || !state.dirty);
+    persistMemoryState();
+  }
+
+  function captureSourceTaskEditors(container) {
+    if (!container || !container.querySelectorAll) return;
+    container.querySelectorAll('[data-chat-submission-editor]').forEach(captureSourceTaskDraft);
+  }
+
+  function sourceTaskReceiptLabel(value, kind) {
+    if (value == null || value === '') return kind === 'memory' ? '尚无正式入库回执' : '暂无准备回执';
+    var labels = kind === 'memory'
+      ? { absent: '尚未入库', pending: 'Review 待审（尚未正式入库）', pending_review: 'Review 待审（尚未正式入库）', review_pending: 'Review 待审（尚未正式入库）', confirmed: '已正式入库', committed: '已正式入库', rejected: '未采用', revoked: '已撤回' }
+      : { queued: '排队中', generating: '准备中', prepared: '候选已生成', failed: '准备失败', complete: '已完成' };
+    var key = String(value);
+    return labels[key] || key;
+  }
+
+  function renderSourceTaskList(list, target) {
+    captureSourceTaskEditors(list);
+    list.replaceChildren();
+    var help = document.createElement('p');
+    help.textContent = '聊天提交稿与正式记忆采用分开。提交稿可在这里查看和编辑；候选生成后，请到下方现有 Review 卡片完成审核与完整 L1 编辑。行动结果继续显示在同一列表。这里只显示前100条任务。';
+    list.appendChild(help);
+    if (!sourceTaskTasks.length) {
+      var empty = document.createElement('p'); empty.textContent = '暂无来源提交任务。'; list.appendChild(empty); return;
+    }
+    sourceTaskTasks.forEach(function(task) {
+      if (task && task.source_kind === 'chat_submission') list.appendChild(renderChatSubmissionTask(task, target));
+      else list.appendChild(renderActionSourceTask(task, target));
+    });
+  }
+
+  function renderActionSourceTask(task, target) {
+    var row = document.createElement('div'); row.className = 'chat-memory-card';
+    var status = document.createElement('p');
+    var labels = { queued:'等待整理', generating:'处理中', prepared:'候选已生成', failed:'整理失败' };
+    status.textContent = (labels[task.phase] || task.phase) + ' · ' + task.action_id; row.appendChild(status);
+    if (task.issue) { var issue = document.createElement('code'); issue.textContent = task.issue.code || '未完成'; row.appendChild(issue); }
+    if (task.candidate_ids && task.candidate_ids.length) {
+      var refs = document.createElement('p'); refs.textContent = '对应候选：' + task.candidate_ids.join('、') + '；采用状态以候选和正式记忆回执为准。'; row.appendChild(refs);
+    }
+    if (task.phase === 'failed' || task.phase === 'generating') {
+      var retry = document.createElement('button'); retry.type = 'button'; retry.textContent = task.phase === 'failed' ? '重试整理' : '中断后恢复整理';
+      retry.addEventListener('click', async function() {
+        if (!window.confirm('重新排队整理此来源；可能再次调用已配置模型，不会重新执行原行动。')) return;
+        retry.disabled = true;
+        try {
+          var res = await authFetch(sourceTaskApiUrl(task.task_id) + '/retry',
+            {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({expected_phase:task.phase})});
+          if (!res || !res.ok) throw new Error('未重新排队，请刷新核对任务状态');
+          loadMemorySourceTasks(target);
+        } catch (error) { status.textContent = error.message; retry.disabled = false; }
+      }); row.appendChild(retry);
+    }
+    return row;
+  }
+
+  function renderChatSubmissionTask(task, target) {
+    var taskId = String(task.task_id || '');
+    var row = document.createElement('div'); row.className = 'chat-memory-card';
+    row.style.overflowWrap = 'anywhere';
+    row.setAttribute('data-chat-submission-task-id', taskId);
+    var status = document.createElement('p');
+    var shortTaskId = taskId.length > 26 ? taskId.slice(0, 14) + '…' + taskId.slice(-6) : taskId;
+    status.textContent = '聊天提交 · ' + sourceTaskPhaseLabel(task) + (shortTaskId ? ' · ' + shortTaskId : '');
+    row.appendChild(status);
+    if (task.issue) {
+      var issue = document.createElement('p'); issue.className = 'chat-memory-stale';
+      issue.textContent = '失败原因：' + String(task.issue.code || '未完成') + (task.issue.field_path ? ' · 字段 ' + String(task.issue.field_path) : '');
+      row.appendChild(issue);
+    }
+    if (task.candidate_ids && task.candidate_ids.length) {
+      var refs = document.createElement('p');
+      refs.textContent = '对应 Review 候选：' + task.candidate_ids.join('、') + '；生成候选不代表正式入库。'; row.appendChild(refs);
+    }
+    var detail = sourceTaskDetails.get(taskId);
+    if (detail && detail.receipt) {
+      var receipt = document.createElement('p'); receipt.className = 'chat-memory-card-meta';
+      receipt.textContent = '正式入库：' + sourceTaskReceiptLabel(detail.receipt.memory_status, 'memory') +
+        ' · 准备：' + sourceTaskReceiptLabel(detail.receipt.preparation_status, 'preparation'); row.appendChild(receipt);
+    } else {
+      var receiptHint = document.createElement('p'); receiptHint.className = 'chat-memory-card-meta';
+      receiptHint.textContent = task.phase === 'prepared'
+        ? '正式入库：待 Review 确认后才会写入。'
+        : '正式入库：尚未显示回执；打开详情读取权威状态。';
+      row.appendChild(receiptHint);
+    }
+    var actions = document.createElement('div'); actions.className = 'chat-memory-card-actions';
+    var toggle = document.createElement('button'); toggle.type = 'button';
+    toggle.textContent = sourceTaskOpenIds.has(taskId) ? '收起提交稿' : (task.phase === 'prepared' ? '查看提交回执' : '查看/编辑提交稿');
+    toggle.addEventListener('click', function() {
+      captureSourceTaskEditors(row);
+      if (sourceTaskOpenIds.has(taskId)) sourceTaskOpenIds.delete(taskId);
+      else sourceTaskOpenIds.add(taskId);
+      renderSourceTaskList(row.parentNode, target);
+      if (sourceTaskOpenIds.has(taskId) && !sourceTaskDetails.has(taskId)) loadSourceTaskDetail(taskId, target, true);
+    });
+    actions.appendChild(toggle);
+    if (task.phase === 'failed') {
+      var retry = document.createElement('button'); retry.type = 'button'; retry.textContent = '重试准备';
+      retry.addEventListener('click', function() { retryChatSubmissionTask(task, retry, target); });
+      actions.appendChild(retry);
+    }
+    row.appendChild(actions);
+    if (sourceTaskOpenIds.has(taskId)) {
+      var detailPanel = document.createElement('div'); detailPanel.className = 'chat-memory-edit-panel';
+      detailPanel.setAttribute('data-chat-submission-detail', taskId);
+      if (detail) renderChatSubmissionDetail(detailPanel, task, detail, target);
+      else {
+        var loading = document.createElement('p');
+        var detailError = sourceTaskDetailErrors.get(taskId);
+        loading.className = detailError ? 'chat-memory-stale' : '';
+        loading.textContent = detailError || '正在读取持久提交稿…'; detailPanel.appendChild(loading);
+      }
+      row.appendChild(detailPanel);
+    }
+    return row;
+  }
+
+  function renderChatSubmissionDetail(panel, task, detail, target) {
+    var taskId = String(task.task_id || '');
+    var state = sourceTaskDrafts.get(taskId);
+    if (!state) {
+      state = sourceTaskCreateDraftState(detail);
+      sourceTaskDrafts.set(taskId, state);
+    }
+    var serverTask = detail.task || task;
+    if ((state.dirty || state.unconfirmed) && sourceTaskRevisionChanged(state, serverTask)) {
+      state.conflict = true;
+      state.latestServerRevision = serverTask.revision;
+      if (!state.lastMessage) state.lastMessage = '服务器草稿版本已变化；当前未保存内容已保留。请核对后再保存。';
+    }
+    var receipt = detail.receipt || {};
+    var receiptLine = document.createElement('p'); receiptLine.className = 'chat-memory-card-meta';
+    receiptLine.textContent = '准备状态：' + sourceTaskReceiptLabel(receipt.preparation_status || serverTask.phase, 'preparation') +
+      ' · 正式入库回执：' + sourceTaskReceiptLabel(receipt.memory_status, 'memory') +
+      ' · revision ' + String(serverTask.revision == null ? '未知' : serverTask.revision) +
+      ' · draft revision ' + String(serverTask.draft_revision == null ? '未知' : serverTask.draft_revision);
+    panel.appendChild(receiptLine);
+    appendSourceTaskHistory(panel, detail.history);
+
+    if (serverTask.phase === 'prepared' || task.phase === 'prepared') {
+      var reviewGuide = document.createElement('p'); reviewGuide.className = 'chat-memory-edit-needed';
+      reviewGuide.textContent = '候选已生成并进入待审核阶段，这里只保留提交稿回执。请在下方现有 Review 候选卡片中打开“编辑”，完成完整 L1 编辑并审核；正式记忆只有在 Review 确认后才入库。';
+      panel.appendChild(reviewGuide);
+      if (state.dirty || state.unconfirmed) {
+        var preserved = document.createElement('p'); preserved.className = 'chat-memory-stale';
+        preserved.textContent = '你有尚未保存的本地修改，已保留在当前浏览器会话中；准备任务进入待审核后不能再改提交稿。可复制以下修改内容，再到 Review 候选卡片编辑。';
+        panel.appendChild(preserved);
+        appendSourceTaskDraftPreview(panel, state);
+      }
+      appendSourceTaskReadOnlyDraft(panel, detail.draft);
+      return;
+    }
+
+    if (task.phase === 'failed') {
+      var failure = document.createElement('p'); failure.className = 'chat-memory-stale';
+      failure.textContent = '这次准备失败；提交稿仍保存在服务器，可先修订后保存，再重试准备。重试不会重新执行原聊天或行动。';
+      panel.appendChild(failure);
+    }
+    var editor = document.createElement('div'); editor.setAttribute('data-chat-submission-editor', taskId);
+    var notice = document.createElement('p'); notice.setAttribute('data-chat-submission-notice', '');
+    notice.className = state.conflict ? 'chat-memory-stale' : 'chat-memory-card-meta';
+    notice.textContent = state.lastMessage || (state.dirty ? '有未保存修改；读取或刷新不会覆盖当前输入。' : '编辑的是服务器持久提交稿；保存后会创建新的草稿版本。');
+    editor.appendChild(notice);
+    var titleLabel = document.createElement('label'); titleLabel.className = 'chat-memory-edit-field'; titleLabel.textContent = '标题（可选）';
+    var titleInput = document.createElement('input'); titleInput.type = 'text'; titleInput.setAttribute('data-chat-submission-title', ''); titleInput.value = state.title; titleLabel.appendChild(titleInput); editor.appendChild(titleLabel);
+    var bodyLabel = document.createElement('label'); bodyLabel.className = 'chat-memory-edit-field'; bodyLabel.textContent = '完整提交正文';
+    var bodyInput = document.createElement('textarea'); bodyInput.setAttribute('data-chat-submission-body', ''); bodyInput.value = state.body; bodyInput.rows = 8; bodyLabel.appendChild(bodyInput); editor.appendChild(bodyLabel);
+    var hintsLabel = document.createElement('label'); hintsLabel.className = 'chat-memory-edit-field'; hintsLabel.textContent = '语义提示 JSON（可选，数组元素需包含 text）';
+    var hintsInput = document.createElement('textarea'); hintsInput.setAttribute('data-chat-submission-hints', ''); hintsInput.value = state.hintsRaw; hintsInput.rows = 4; hintsLabel.appendChild(hintsInput); editor.appendChild(hintsLabel);
+    var dirty = document.createElement('p'); dirty.className = 'chat-memory-edit-needed'; dirty.setAttribute('data-chat-submission-dirty', '');
+    dirty.textContent = state.dirty ? '有未保存修改；刷新状态、读取失败或版本冲突不会替换这些输入。' : '当前内容与服务器已保存草稿一致。'; editor.appendChild(dirty);
+    var error = document.createElement('p'); error.className = 'chat-memory-stale'; error.setAttribute('data-chat-submission-error', ''); error.textContent = state.lastError || ''; editor.appendChild(error);
+    var actions = document.createElement('div'); actions.className = 'chat-memory-card-actions';
+    var save = document.createElement('button'); save.type = 'button'; save.textContent = state.saving ? '正在保存…' : '保存提交稿';
+    save.setAttribute('data-chat-submission-save', ''); save.disabled = Boolean(state.saving || state.conflict || state.unconfirmed || !state.dirty || state.lastError);
+    save.addEventListener('click', function() { saveChatSubmissionDraft(taskId, target, save); }); actions.appendChild(save);
+    var refresh = document.createElement('button'); refresh.type = 'button'; refresh.textContent = '读取服务器最新草稿';
+    refresh.addEventListener('click', function() { loadSourceTaskDetail(taskId, target, true); }); actions.appendChild(refresh);
+    editor.appendChild(actions); panel.appendChild(editor);
+    if (state.saving) editor.querySelectorAll('input, textarea, button').forEach(function(input) { input.disabled = true; });
+    if (state.conflict && state.latestServerRevision != null) {
+      var conflict = document.createElement('p'); conflict.className = 'chat-memory-stale';
+      conflict.textContent = '服务器 revision 已到 ' + String(state.latestServerRevision) + '。保留本地编辑；请先读取并核对服务器版本后，再继续保存。';
+      panel.appendChild(conflict);
+      appendSourceTaskReadOnlyDraft(panel, detail.draft);
+      if (String(state.latestLoadedRevision == null ? '' : state.latestLoadedRevision) === String(detail.task.revision == null ? '' : detail.task.revision)) {
+        var rebase = document.createElement('button'); rebase.type = 'button';
+        rebase.textContent = '保留当前编辑并以服务器版本为基线';
+        rebase.addEventListener('click', function() {
+          captureSourceTaskDraft(editor);
+          state.base = sourceTaskDraftValues(detail.draft);
+          state.baseRevision = detail.task.revision;
+          state.baseDraftRevision = detail.task.draft_revision;
+          state.latestServerRevision = detail.task.revision;
+          state.conflict = false; state.unconfirmed = false;
+          state.dirty = !sourceTaskDraftsEqual(state, state.base);
+          state.lastMessage = '已保留当前输入，并改用服务器最新版本作为 CAS 基线。请核对后再保存。';
+          state.lastError = '';
+          persistMemoryState();
+          renderSourceTaskList(panel.closest('[data-source-task-list]'), target);
+        });
+        panel.appendChild(rebase);
+      } else {
+        var awaiting = document.createElement('p'); awaiting.className = 'chat-memory-stale';
+        awaiting.textContent = '等待读取服务器最新草稿后，才能选择继续保留当前编辑。'; panel.appendChild(awaiting);
+      }
+    }
+    editor.querySelectorAll('input, textarea').forEach(function(input) {
+      input.addEventListener('input', function() { captureSourceTaskDraft(editor); });
+    });
+  }
+
+  function appendSourceTaskReadOnlyDraft(panel, draft) {
+    var values = sourceTaskDraftValues(draft);
+    var title = document.createElement('p'); title.textContent = '提交标题：' + (values.title || '（未填写）'); panel.appendChild(title);
+    var body = document.createElement('div'); body.className = 'chat-memory-card-body';
+    var heading = document.createElement('strong'); heading.textContent = '已保存的完整提交正文'; body.appendChild(heading);
+    var text = document.createElement('p'); text.style.whiteSpace = 'pre-wrap'; text.textContent = values.body || '（正文为空）'; body.appendChild(text); panel.appendChild(body);
+    if (values.hintsRaw !== '[]') {
+      var hints = document.createElement('pre'); hints.style.whiteSpace = 'pre-wrap'; hints.style.overflowWrap = 'anywhere';
+      hints.textContent = values.hintsRaw; panel.appendChild(hints);
+    }
+  }
+
+  function appendSourceTaskDraftPreview(panel, state) {
+    var title = document.createElement('p'); title.textContent = '保留的本地标题：' + (state.title || '（未填写）'); panel.appendChild(title);
+    var body = document.createElement('div'); body.className = 'chat-memory-card-body';
+    var heading = document.createElement('strong'); heading.textContent = '保留的未保存完整正文'; body.appendChild(heading);
+    var text = document.createElement('p'); text.style.whiteSpace = 'pre-wrap'; text.textContent = state.body || '（正文为空）'; body.appendChild(text); panel.appendChild(body);
+    if (String(state.hintsRaw || '').trim() && String(state.hintsRaw).trim() !== '[]') {
+      var hints = document.createElement('pre'); hints.style.whiteSpace = 'pre-wrap'; hints.style.overflowWrap = 'anywhere';
+      hints.textContent = '保留的语义提示 JSON：\n' + state.hintsRaw; panel.appendChild(hints);
+    }
+  }
+
+  function appendSourceTaskHistory(panel, history) {
+    if (!Array.isArray(history) || !history.length) return;
+    var details = document.createElement('details');
+    var summary = document.createElement('summary'); summary.textContent = '提交历史（' + history.length + ' 条）'; details.appendChild(summary);
+    history.slice(-10).reverse().forEach(function(entry) {
+      var line = document.createElement('p');
+      var parts = [];
+      if (entry.phase || entry.status) parts.push(String(entry.phase || entry.status));
+      if (entry.revision != null) parts.push('revision ' + String(entry.revision));
+      if (entry.draft_revision != null) parts.push('draft revision ' + String(entry.draft_revision));
+      if (entry.issue && entry.issue.code) parts.push('原因 ' + String(entry.issue.code));
+      if (entry.created_at || entry.updated_at) parts.push(String(entry.created_at || entry.updated_at));
+      line.textContent = parts.join(' · ') || '提交状态已记录'; details.appendChild(line);
+    });
+    panel.appendChild(details);
+  }
+
+  async function readSourceTaskResponse(res) {
+    if (!res) throw new Error('未连接，当前编辑已保留。');
+    var data = {};
+    try { data = await res.json(); } catch (_) { data = {}; }
+    return { ok: Boolean(res.ok), status: Number(res.status || 0), data: data };
+  }
+
+  async function fetchSourceTaskDetail(taskId) {
+    var result = await readSourceTaskResponse(await authFetch(sourceTaskApiUrl(taskId)));
+    if (!result.ok) {
+      var code = result.data && (result.data.error || result.data.code);
+      throw Object.assign(new Error(String(code || '提交稿读取失败 (HTTP ' + result.status + ')')), { status: result.status, code: code });
+    }
+    if (!result.data || !result.data.task || !result.data.draft) throw new Error('提交稿详情格式不符；当前编辑已保留。');
+    return result.data;
+  }
+
+  async function loadSourceTaskDetail(taskId, target, force) {
+    if (!taskId) return;
+    restoreMemoryState();
+    var epoch = (sourceTaskDetailEpochs.get(taskId) || 0) + 1;
+    sourceTaskDetailEpochs.set(taskId, epoch);
+    var list = document.querySelector('#memory-source-tasks [data-source-task-list]');
+    captureSourceTaskEditors(list);
+    var prior = sourceTaskDrafts.get(taskId);
+    if (prior && prior.dirty) prior.lastMessage = '正在读取服务器状态；当前未保存输入保持不变。';
+    try {
+      var detail = await fetchSourceTaskDetail(taskId);
+      if (sourceTaskDetailEpochs.get(taskId) !== epoch) return detail;
+      captureSourceTaskEditors(list);
+      sourceTaskDetailErrors.delete(taskId);
+      sourceTaskDetails.set(taskId, detail);
+      var current = sourceTaskDrafts.get(taskId);
+      if (!current || (!current.dirty && !current.unconfirmed)) {
+        var next = sourceTaskCreateDraftState(detail);
+        if (current && current.saving) next.saving = current.saving;
+        sourceTaskDrafts.set(taskId, next);
+      } else if (current.unconfirmed &&
+          String(current.baseDraftRevision == null ? '' : current.baseDraftRevision) !== String(detail.task.draft_revision == null ? '' : detail.task.draft_revision) &&
+          sourceTaskDraftsEqual(current, sourceTaskDraftValues(detail.draft))) {
+        var confirmed = sourceTaskCreateDraftState(detail);
+        confirmed.lastMessage = '保存响应未确认，但服务器读回已证明草稿内容和新 draft revision 均已持久保存。';
+        sourceTaskDrafts.set(taskId, confirmed);
+        persistMemoryState();
+      } else {
+        current.latestServerRevision = detail.task.revision;
+        current.latestLoadedRevision = detail.task.revision;
+        if (sourceTaskRevisionChanged(current, detail.task)) {
+          current.conflict = true;
+          current.lastMessage = '服务器草稿版本已变化；当前未保存内容已保留。请核对后再保存。';
+        } else if (current.unconfirmed) {
+          current.conflict = true;
+          current.lastMessage = '保存响应未确认；服务器读回尚未包含当前输入。输入已保留，请核对服务器版本后再继续。';
+        }
+      }
+      if (list) renderSourceTaskList(list, target);
+      return detail;
+    } catch (error) {
+      if (sourceTaskDetailEpochs.get(taskId) !== epoch) return null;
+      var state = sourceTaskDrafts.get(taskId);
+      if (state) { state.lastMessage = '服务器状态读取失败；当前输入已保留。' + error.message; state.lastError = state.dirty ? state.lastError : error.message; }
+      sourceTaskDetailErrors.set(taskId, '提交稿详情读取失败；请重试。' + error.message + (state && state.dirty ? ' 当前未保存输入已保留。' : ''));
+      if (list) renderSourceTaskList(list, target);
+      else setDailyChatMemoryMessage('提交稿读取失败，编辑已保留: ' + error.message, 'error');
+      return null;
+    }
+  }
+
+  async function saveChatSubmissionDraft(taskId, target, button) {
+    var state = sourceTaskDrafts.get(taskId);
+    var detail = sourceTaskDetails.get(taskId);
+    var list = document.querySelector('#memory-source-tasks [data-source-task-list]');
+    var editor = list && list.querySelector('[data-chat-submission-editor="' + taskId.replace(/"/g, '\\"') + '"]');
+    captureSourceTaskDraft(editor);
+    if (!state || !detail || !state.dirty || state.lastError || state.saving) return;
+    if (detail.task && detail.task.phase === 'prepared') {
+      state.lastMessage = '候选已准备；请在下方 Review 候选卡片中编辑完整 L1。';
+      renderSourceTaskList(list, target); return;
+    }
+    var draft;
+    try { draft = sourceTaskDraftPayload(state); }
+    catch (error) { state.lastError = error.message; renderSourceTaskList(list, target); return; }
+    var expectedRevision = state.baseRevision;
+    var expectedDraftRevision = state.baseDraftRevision;
+    var requestId = newDailyChatMemoryRequestId();
+    state.saving = true; state.lastMessage = '正在按当前 revision 保存…'; state.lastError = '';
+    sourceTaskSaving.add(taskId); persistMemoryState();
+    if (button) button.disabled = true;
+    try {
+      var result = await readSourceTaskResponse(await authFetch(sourceTaskApiUrl(taskId), {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expected_revision: expectedRevision, request_id: requestId, draft: draft })
+      }));
+      if (!result.ok) {
+        var code = result.data && (result.data.error || result.data.code);
+        var message = code === 'edit_prepared_candidate_in_review'
+          ? '候选已准备，请到下方 Review 候选卡片完成完整 L1 编辑。'
+          : code === 'revision_conflict' || result.status === 409
+            ? '服务器版本冲突；当前输入已保留。正在读取服务器版本供核对。'
+            : String(code || '保存失败 (HTTP ' + result.status + ')') + '；当前输入已保留。';
+        state.lastMessage = message; state.lastError = message;
+        if (result.status === 409 && code !== 'edit_prepared_candidate_in_review') {
+          state.conflict = true;
+          state.latestLoadedRevision = null;
+          state.latestServerRevision = result.data && result.data.task && result.data.task.revision != null
+            ? result.data.task.revision : expectedRevision;
+        } else if (result.status >= 500) {
+          state.conflict = true; state.unconfirmed = true; state.latestLoadedRevision = null;
+          state.latestServerRevision = expectedRevision;
+        }
+        state.saving = false; sourceTaskSaving.delete(taskId); persistMemoryState();
+        if (result.status === 409 && code !== 'edit_prepared_candidate_in_review') await loadSourceTaskDetail(taskId, target, true);
+        else if (result.status >= 500) await loadSourceTaskDetail(taskId, target, true);
+        else if (result.status === 409) loadDailyChatMemoryPending();
+        else if (list) renderSourceTaskList(list, target);
+        return;
+      }
+
+      var readback = await fetchSourceTaskDetail(taskId);
+      if (!sourceTaskDraftsEqual(sourceTaskDraftValues(readback.draft), state)) {
+        throw new Error('服务器读回与提交内容不一致；本地编辑仍保留，请读取最新草稿核对。');
+      }
+      if (sameValue(expectedDraftRevision, readback.task.draft_revision)) {
+        throw new Error('服务器读回内容一致，但 draft revision 未变化；本地编辑仍保留，请核对提交回执。');
+      }
+      sourceTaskDetails.set(taskId, readback);
+      var next = sourceTaskCreateDraftState(readback);
+      next.lastMessage = '已保存并从服务器读回；draft revision ' + String(readback.task.draft_revision) + '。';
+      sourceTaskDrafts.set(taskId, next);
+      sourceTaskSaving.delete(taskId); persistMemoryState();
+      var taskIndex = sourceTaskTasks.findIndex(function(task) { return String(task.task_id || '') === taskId; });
+      if (taskIndex >= 0) sourceTaskTasks[taskIndex] = readback.task;
+      if (list) renderSourceTaskList(list, target);
+      setDailyChatMemoryMessage(next.lastMessage, 'ok');
+      loadMemorySourceTasks(target);
+    } catch (error) {
+      state.saving = false; state.unconfirmed = true; state.lastMessage = error.message + ' 当前输入已保留。'; state.lastError = error.message;
+      state.conflict = true; state.latestLoadedRevision = null;
+      state.latestServerRevision = state.latestServerRevision == null ? expectedRevision : state.latestServerRevision;
+      sourceTaskSaving.delete(taskId); persistMemoryState();
+      if (list) renderSourceTaskList(list, target);
+      setDailyChatMemoryMessage('提交稿保存结果尚未核实，编辑已保留: ' + error.message, 'error');
+      await loadSourceTaskDetail(taskId, target, true);
+    }
+  }
+
+  async function retryChatSubmissionTask(task, button, target) {
+    if (!window.confirm('重试准备此聊天提交；可能调用已配置模型，但不会重新执行聊天或写入正式记忆。')) return;
+    button.disabled = true;
+    try {
+      var result = await readSourceTaskResponse(await authFetch(sourceTaskApiUrl(task.task_id) + '/retry', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_phase: 'failed' })
+      }));
+      if (!result.ok) throw new Error(String(result.data && (result.data.error || result.data.code) || '未重新排队，请刷新核对任务状态'));
+      loadMemorySourceTasks(target);
+    } catch (error) {
+      button.disabled = false;
+      setDailyChatMemoryMessage('未能重试准备；失败回执和提交稿保持: ' + error.message, 'error');
+    }
   }
 
   function renderDailyChatMemoryPending(items) {

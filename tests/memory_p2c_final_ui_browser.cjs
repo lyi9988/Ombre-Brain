@@ -27,6 +27,8 @@ function configFixture() {
     diary_l1_max_tokens: { minimum: 1, maximum: 100000 },
     diary_l1_scene_min_value: { minimum: 0, maximum: 1 },
     action_l1_jobs_per_run: { minimum: 0, maximum: 10000 },
+    chat_memory_jobs_per_run: { minimum: 0, maximum: 200 },
+    chat_memory_prepare_interval_seconds: { minimum: 1, maximum: 3600 },
     daily_chat_memory_candidate_max_tokens: { minimum: 1, maximum: 100000 },
     daily_chat_memory_max_windows_per_run: { minimum: 1, maximum: 10000 },
     daily_chat_memory_window_max_input_chars: { minimum: 256, maximum: 2000000 },
@@ -43,7 +45,7 @@ function configFixture() {
     gateway: { upstreams: [], cooldown_hours: 6, skip_recent_rounds: 5, recent_context_cooldown_hours: 6, recent_context_reentry_idle_hours: 24, recent_context_budget: 300, recalled_memory_budget: 900, related_memory_budget: 220, inject_max_cards: 2, diffusion_inject_max_items: 2, inject_total_budget: 1800, dynamic_top_k: 10, semantic_candidate_top_k: 50, moment_search_limit: 50, memory_detail_recall_enabled: false, memory_detail_recall_max_ids: 3, memory_detail_recall_budget: 1200, current_inner_state_interval_rounds: 15, direct_render_mode: 'auto', retrieval_mode: 'graph', operit_context_rewrite_enabled: false, word_map_hint_enabled: false, query_planner_enabled: false, domain_sentinel_enabled: true, domain_sentinel_model: '', domain_sentinel_base_url: '', domain_sentinel_api_ready: false },
     recall: { query_resurface_enabled: false },
     memory_diffusion: { enabled: false, top_k: 5, min_score: 0.5, chain_walk_enabled: false, chain_hops: 1, chain_confidence: 0.5, chain_frontier: 10 },
-    reflection: { enabled: true, auto_enabled: true, daily_enabled: true, daily_min_memory_items: 5, daily_conversation_turn_limit: 12, daily_chat_memory_mode: 'review', daily_chat_memory_turn_limit: 0, memory_affect_anchor_enabled: true, relationship_weather_affect_anchor_enabled: true, diary_l1_input_window_chars: 4096, diary_l1_max_windows: 10, diary_l1_scene_limit: 12, diary_l1_max_tokens: 2048, diary_l1_scene_min_value: 0.2, diary_l1_source_kind: 'mcp', action_l1_jobs_per_run: 5, daily_chat_memory_candidate_max_tokens: 2048, daily_chat_memory_max_windows_per_run: 10, daily_chat_memory_window_max_input_chars: 50000, daily_chat_memory_max_per_day: 5, daily_chat_memory_review_max_per_day: 10, model: '', thinking_mode: '', base_url: '', api_key_masked: '', api_ready: false, generation_parameter_bounds: bounds },
+    reflection: { enabled: true, auto_enabled: true, daily_enabled: true, daily_min_memory_items: 5, daily_conversation_turn_limit: 12, daily_chat_memory_mode: 'review', daily_chat_memory_turn_limit: 0, memory_affect_anchor_enabled: true, relationship_weather_affect_anchor_enabled: true, diary_l1_input_window_chars: 4096, diary_l1_max_windows: 10, diary_l1_scene_limit: 12, diary_l1_max_tokens: 2048, diary_l1_scene_min_value: 0.2, diary_l1_source_kind: 'mcp', action_l1_jobs_per_run: 5, chat_memory_jobs_per_run: 1, chat_memory_prepare_interval_seconds: 5, daily_chat_memory_candidate_max_tokens: 2048, daily_chat_memory_max_windows_per_run: 10, daily_chat_memory_window_max_input_chars: 50000, daily_chat_memory_max_per_day: 5, daily_chat_memory_review_max_per_day: 10, model: '', thinking_mode: '', base_url: '', api_key_masked: '', api_ready: false, generation_parameter_bounds: bounds },
     portrait: { enabled: false, auto_enabled: false, auto_initial_enabled: false, daily_enabled: false, material_limit: 18, first_run_material_limit: 160, api_ready: false, state_path: '' },
     self_anchor: { entry_bucket_id: '' },
     merge_threshold: 90,
@@ -232,9 +234,22 @@ function configFixture() {
       });
       assert.equal(await configPage.locator('#cfg-reflection-diary-l1-input-window-chars').getAttribute('min'), '256');
       assert.equal(await configPage.locator('#cfg-reflection-action-l1-jobs-per-run').getAttribute('max'), '10000');
+      assert.equal(await configPage.locator('#cfg-reflection-chat-memory-jobs-per-run').inputValue(), '1');
+      assert.equal(await configPage.locator('#cfg-reflection-chat-memory-jobs-per-run').getAttribute('min'), '0');
+      assert.equal(await configPage.locator('#cfg-reflection-chat-memory-jobs-per-run').getAttribute('max'), '200');
+      assert.equal(await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').inputValue(), '5');
+      assert.equal(await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').getAttribute('min'), '1');
+      assert.equal(await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').getAttribute('max'), '3600');
       await configPage.locator('#cfg-reflection-diary-l1-input-window-chars').fill('24000');
       await configPage.locator('#cfg-reflection-diary-l1-source-kind').selectOption('private');
       await configPage.locator('#cfg-reflection-action-l1-jobs-per-run').fill('17');
+      await configPage.locator('#cfg-reflection-chat-memory-jobs-per-run').fill('0');
+      await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').fill('3601');
+      await configPage.locator('#config-view button[onclick="saveConfig(true)"]').click();
+      await configPage.waitForFunction(() => document.querySelector('#config-status')?.textContent.includes('聊天整理检查间隔须为 1–3600'));
+      assert.equal(api.posts.length, 0, 'out-of-range chat preparation interval is rejected before the API write');
+      assert.equal(await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').inputValue(), '3601', 'invalid input remains visible for correction');
+      await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').fill('3600');
       await configPage.locator('#config-view button[onclick="saveConfig(true)"]').click();
       await configPage.waitForFunction(() => document.querySelector('#config-status')?.textContent.includes('配置落盘失败'), null, { timeout: 5000 }).catch(async () => {
         const debug = await configPage.evaluate(() => ({ active: document.querySelector('.tab.active')?.dataset.tab, status: document.querySelector('#config-status')?.textContent, source: document.querySelector('#cfg-reflection-diary-l1-source-kind')?.value, actionJobs: document.querySelector('#cfg-reflection-action-l1-jobs-per-run')?.value }));
@@ -244,6 +259,8 @@ function configFixture() {
       assert.equal(api.posts[0].reflection.diary_l1_input_window_chars, 24000);
       assert.equal(api.posts[0].reflection.diary_l1_source_kind, 'private');
       assert.equal(api.posts[0].reflection.action_l1_jobs_per_run, 17);
+      assert.equal(api.posts[0].reflection.chat_memory_jobs_per_run, 0, 'zero explicitly pauses background chat preparation');
+      assert.equal(api.posts[0].reflection.chat_memory_prepare_interval_seconds, 3600);
       assert.match(await configPage.locator('#config-status').textContent(), /输入已保留/);
 
       await configPage.locator('.tab[data-tab="model-config"]').click();
@@ -251,6 +268,8 @@ function configFixture() {
       await configPage.waitForFunction(() => document.querySelector('#cfg-reflection-diary-l1-source-kind')?.value === 'private');
       assert.equal(await configPage.locator('#cfg-reflection-diary-l1-input-window-chars').inputValue(), '24000');
       assert.equal(await configPage.locator('#cfg-reflection-action-l1-jobs-per-run').inputValue(), '17');
+      assert.equal(await configPage.locator('#cfg-reflection-chat-memory-jobs-per-run').inputValue(), '0');
+      assert.equal(await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').inputValue(), '3600');
       assert.ok(api.gets >= 3, 'configuration tab re-read synthetic server config');
 
       if (stage) await configPage.screenshot({ path: path.join(stage, 'memory-p2c-config-1280.png'), fullPage: true });

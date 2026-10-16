@@ -12381,7 +12381,8 @@ async def api_chat_memory_tool(request):
         return JSONResponse({"error": "memory_authority_unavailable"}, status_code=503, headers=headers)
     try:
         if request.method == "GET":
-            result = receipt(memory_authority_store, candidate_id(request.path_params["operation_id"]))
+            from memory_chat_preparation import ChatMemoryPreparation
+            result = ChatMemoryPreparation(memory_authority_store).receipt(candidate_id(request.path_params["operation_id"]))
         else:
             raw = await request.body()
             if len(raw) > 524288:
@@ -12394,11 +12395,32 @@ async def api_chat_memory_tool(request):
         return JSONResponse(result, headers=headers)
     except IdempotencyConflict:
         return JSONResponse({"error": "idempotency_conflict"}, status_code=409, headers=headers)
-    except ChatMemoryValidationError:
+    except ChatMemoryValidationError as exc:
+        return JSONResponse({"error": exc.code, "field_path": exc.field_path}, status_code=400, headers=headers)
+    except ValueError as exc:
+        from memory_l1_service import L1OwnerError
+        from memory_l1_contract import L1ContractError
+        if isinstance(exc, L1OwnerError):
+            return JSONResponse({"error": exc.code, "field_path": exc.field_path}, status_code=exc.status, headers=headers)
+        if isinstance(exc, L1ContractError):
+            return JSONResponse({'error': exc.code, 'field_path': exc.path}, status_code=400, headers=headers)
         return JSONResponse({"error": "invalid_chat_memory_request"}, status_code=400, headers=headers)
     except Exception as exc:
         logger.warning("Chat Memory operation incomplete: %s", type(exc).__name__)
         return JSONResponse({"error": "execution_outcome_unknown"}, status_code=503, headers=headers)
+
+
+async def _chat_memory_preparation_loop():
+    """Consume durable submissions, including those queued before a restart."""
+    from memory_chat_preparation import prepare_chat_tasks
+    while True:
+        try:
+            if reflection_engine and bucket_mgr:
+                await prepare_chat_tasks(reflection_engine, bucket_mgr)
+        except Exception as exc:
+            logger.warning('Chat Memory preparation loop: %s', type(exc).__name__)
+        delay = task_options(config)['chat_memory_prepare_interval_seconds']
+        await asyncio.sleep(delay)
 
 
 def _memory_l1_revision_service():
@@ -12412,6 +12434,7 @@ def _memory_l1_revision_service():
 
 @mcp.custom_route("/api/memory-authority/action-source", methods=["POST"])
 @mcp.custom_route("/api/memory-authority/source-tasks", methods=["GET"])
+@mcp.custom_route("/api/memory-authority/source-tasks/{task_id}", methods=["GET", "PUT"])
 @mcp.custom_route("/api/memory-authority/source-tasks/{task_id}/retry", methods=["POST"])
 async def api_memory_l1_source_tasks(request):
     """Source IDs and task receipts only; this endpoint never invokes a model."""
@@ -12429,13 +12452,29 @@ async def api_memory_l1_source_tasks(request):
         return JSONResponse({"error": "memory_authority_unavailable"}, status_code=503, headers=headers)
     try:
         tasks = MemoryL1SourceTasks(memory_authority_store)
+        from memory_chat_preparation import ChatMemoryPreparation
+        chat_tasks = ChatMemoryPreparation(memory_authority_store)
         task_id = request.path_params.get("task_id")
+        if task_id and str(task_id).startswith('chat_memory_') and not request.url.path.endswith('/retry'):
+            # Draft bodies/edit are owner-only. The writer token can submit
+            # its canonical envelope, not read/edit arbitrary owner drafts.
+            if not _dashboard_authenticated(request):
+                return _require_dashboard_auth(request)
+            if request.method == 'GET':
+                return JSONResponse(chat_tasks.detail(str(task_id)), headers=headers)
+            raw = await request.body()
+            if len(raw) > 524288:
+                return JSONResponse({'error': 'request_too_large'}, status_code=413, headers=headers)
+            result = chat_tasks.edit(str(task_id), json.loads(raw))
+            return JSONResponse(result, headers=headers)
         if request.method == "GET":
             if set(request.query_params) - {"limit"} or len(request.query_params.getlist("limit")) > 1:
                 raise L1OwnerError("invalid_task_query", field_path="query")
             value = request.query_params.get("limit", "100")
             if not value.isascii() or not value.isdigit(): raise L1OwnerError("invalid_task_page_limit", field_path="limit")
-            return JSONResponse({"status": "ok", "tasks": tasks.list(limit=int(value)),
+            combined = tasks.list(limit=int(value)) + chat_tasks.list(limit=int(value))
+            combined.sort(key=lambda row: (row.get('created_at', ''), row['task_id']), reverse=True)
+            return JSONResponse({"status": "ok", "tasks": combined[:int(value)],
                 "adoption_is_separate": True}, headers=headers)
         raw = await request.body()
         if len(raw) > 8192: return JSONResponse({"error": "request_too_large"}, status_code=413, headers=headers)
@@ -12445,6 +12484,19 @@ async def api_memory_l1_source_tasks(request):
             # retries the source action or changes its completion status.
             if not isinstance(payload, dict) or set(payload) != {"expected_phase"} or payload["expected_phase"] not in {"failed", "generating"}:
                 raise L1OwnerError("invalid_source_task_retry", field_path="expected_phase")
+            if str(task_id).startswith('chat_memory_'):
+                if not _dashboard_authenticated(request):
+                    return _require_dashboard_auth(request)
+                current = chat_tasks.get(str(task_id))
+                if not current or current['phase'] != payload['expected_phase']:
+                    raise L1OwnerError('task_phase_changed', status=409, field_path='expected_phase')
+                if current['phase'] == 'generating' and current.get('lease_until', 0) > __import__('time').time():
+                    raise L1OwnerError('memory_preparation_in_progress', status=409, field_path='task_id')
+                def retry(row):
+                    row.update(phase='queued', lease_until=0, claim_token=None, issue=None)
+                    return row
+                updated = chat_tasks.update(str(task_id), expected_revision=current['revision'], transform=retry)
+                return JSONResponse({'status': 'queued', 'task': chat_tasks.public(updated)}, headers=headers)
             if getattr(reflection_engine, "_daily_chat_memory_run_lock", False):
                 raise L1OwnerError("memory_preparation_in_progress", status=409, field_path="task_id")
             row = tasks.transition(str(task_id), payload["expected_phase"], "queued")
@@ -14937,6 +14989,21 @@ if __name__ == "__main__":
         else:
             _app = mcp.sse_app()
         if hasattr(_app, "add_event_handler"):
+            chat_preparation_state = {'task': None}
+            async def _start_chat_memory_preparation():
+                chat_preparation_state['task'] = asyncio.create_task(_chat_memory_preparation_loop())
+
+            async def _stop_chat_memory_preparation():
+                task = chat_preparation_state['task']
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+            _app.add_event_handler('startup', _start_chat_memory_preparation)
+            _app.add_event_handler('shutdown', _stop_chat_memory_preparation)
             async def _start_decay_engine_on_app_startup():
                 await _ensure_decay_engine_started_for_transport(transport)
 

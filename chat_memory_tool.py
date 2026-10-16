@@ -24,7 +24,9 @@ KINDS = {"preference", "boundary", "commitment", "shared_experience", "key_event
 
 
 class ChatMemoryValidationError(ValueError):
-    pass
+    def __init__(self, code, field_path=''):
+        super().__init__(code)
+        self.code, self.field_path = code, field_path
 
 
 def candidate_id(operation_id):
@@ -74,7 +76,7 @@ class ChatMemoryTool:
         self.engine, self.bucket_mgr = engine, bucket_mgr
         self.store = engine.memory_authority_store
 
-    def _proposal(self, envelope):
+    def _proposal(self, envelope, *, generation=None, catalog_context=None):
         if not isinstance(envelope, dict) or set(envelope) != {"operation_id", "arguments", "context"}:
             raise ValueError("invalid_envelope")
         memory_id = candidate_id(envelope["operation_id"])
@@ -195,9 +197,9 @@ class ChatMemoryTool:
             revisions = self.engine._memory_l1_revisions(self.bucket_mgr)
             prepared_document = prepare_model_document(
                 revisions, memory_id=memory_id, document=document_input, sources=evidence_sources,
-                generation={"prompt_revision": None, "model_route_revision": None,
+                generation=generation or {"prompt_revision": None, "model_route_revision": None,
                             "task_id": envelope["operation_id"], "actor": "chat_model"},
-                request_id=envelope["operation_id"], previous=None)
+                request_id=envelope["operation_id"], previous=None, catalog_context=catalog_context)
             content, l1_semantic = split_document(prepared_document)
             title = str(prepared_document["narrative"]["title"])
         else:
@@ -231,10 +233,14 @@ class ChatMemoryTool:
         return MemoryProposal.from_mapping(payload)
 
     async def submit(self, envelope):
+        if isinstance(envelope, dict) and isinstance(envelope.get('arguments'), dict) and 'narrative' in envelope['arguments']:
+            from memory_chat_preparation import ChatMemoryPreparation
+            return ChatMemoryPreparation(self.store).enqueue(envelope)
         try:
             proposal = self._proposal(envelope)
         except (ValueError, TypeError, KeyError) as exc:
-            raise ChatMemoryValidationError("invalid_chat_memory_request") from exc
+            raise ChatMemoryValidationError(getattr(exc, 'code', 'invalid_chat_memory_request'),
+                getattr(exc, 'field_path', getattr(exc, 'path', ''))) from exc
         row = self.store.get_candidate(proposal.proposal_id)
         if row:
             if row["proposal"].get("metadata", {}).get("submission_fingerprint") != proposal.metadata["submission_fingerprint"]:
@@ -257,6 +263,9 @@ class ChatMemoryTool:
         if row["status"] != "accepted":
             raise ValueError("candidate_not_accepted")
         proposal = row["proposal"]
+        if isinstance(proposal.get('metadata', {}).get('memory_l1'), dict):
+            return await self.engine._memory_l1_adopt_candidate(row, self.bucket_mgr,
+                request_id='chat-tool-adopt:' + memory_id)
         candidate = copy.deepcopy(proposal["metadata"]["legacy_candidate"])
         candidate.update(content=proposal["proposed_body"], narrative=proposal["metadata"]["narrative"])
         candidate["semantic_annotations"] = proposal["metadata"].get("semantic_annotations")
