@@ -79,7 +79,8 @@ class ChatMemoryPreparation:
     def public(row):
         return {k: copy.deepcopy(row.get(k)) for k in (
             'task_id', 'operation_id', 'phase', 'draft_revision', 'revision', 'created_at', 'updated_at',
-            'candidate_ids', 'issue', 'attempts', 'generation', 'usage', 'duration_ms')} | {'source_kind': 'chat_submission'}
+            'candidate_ids', 'issue', 'attempts', 'generation', 'usage', 'duration_ms',
+            'output_shape')} | {'source_kind': 'chat_submission'}
 
     def enqueue(self, envelope):
         from chat_memory_tool import candidate_id
@@ -122,7 +123,7 @@ class ChatMemoryPreparation:
                     where += " OR (json_extract(value,'$.phase')='generating' AND json_extract(value,'$.lease_until')<?)"
                     params.append(time.time())
                 where += ')'
-            projection = 'value' if private else "json_remove(value,'$.envelope','$.history','$.edit_requests') AS value"
+            projection = 'value' if private else "json_remove(value,'$.envelope','$.history','$.edit_requests','$.preparation_output') AS value"
             ordering = 'ASC' if phase is not None else 'DESC'
             rows = db.execute('SELECT ' + projection + ' FROM authority_meta WHERE key LIKE ?' + where
                 + " ORDER BY json_extract(value,'$.created_at') " + ordering + ',key LIMIT ?', (*params, limit)).fetchall()
@@ -174,7 +175,8 @@ class ChatMemoryPreparation:
         if not row:
             raise L1OwnerError('task_not_found', status=404, field_path='task_id')
         return {'task': self.public(row), 'draft': copy.deepcopy(row['envelope']['arguments']),
-                'history': copy.deepcopy(row['history']), 'receipt': self.receipt(memory_id)}
+                'history': copy.deepcopy(row['history']), 'receipt': self.receipt(memory_id),
+                'preparation_output': copy.deepcopy(row.get('preparation_output'))}
 
     def edit(self, memory_id, payload):
         if (not isinstance(payload, dict) or set(payload) != {'expected_revision', 'request_id', 'draft'}
@@ -245,6 +247,7 @@ async def prepare_chat_tasks(engine, bucket_mgr):
     results = []
     try:
         for pending in tasks.list(limit=options['chat_memory_jobs_per_run'], phase='queued', private=True):
+            completion_meta = {}
             try:
                 claimed = tasks.claim(pending, lease_seconds=engine.daily_chat_memory_timeout_seconds + 60)
             except L1OwnerError:
@@ -286,9 +289,32 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 reported_usage = getattr(response, 'usage', None)
                 usage = {name: getattr(reported_usage, name, None) for name in
                          ('prompt_tokens', 'completion_tokens', 'total_tokens')}
+                raw_output = engine._completion_content(response) or ''
+                generation = {'prompt_revision': prompt_context['prompt_revision'],
+                    'model_route_revision': 'route_sha256:' + semantic_sha256({'model': model, 'daily_client': use_daily}),
+                    'task_id': memory_id + ':' + str(claimed['draft_revision']), 'actor': 'chat_memory_preparation'}
+                completion_meta = {'generation': generation, 'usage': usage,
+                    'duration_ms': int((time.monotonic() - started) * 1000),
+                    'preparation_output': {'draft_revision': claimed['draft_revision'],
+                        'attempt': claimed['attempts'],
+                        'model': model, 'finish_reason': engine._completion_finish_reason(response),
+                        'text': raw_output}, 'output_shape': None}
                 if engine._completion_finish_reason(response) == 'length':
                     raise L1OwnerError('first_pass_output_incomplete', field_path='generation')
-                parsed = engine._parse_json_object(engine._completion_content(response) or '')
+                parsed = engine._parse_json_object(raw_output)
+                from memory_l1_ingestion import MODEL_FIELDS
+                output_shape = {'draft_revision': claimed['draft_revision'],
+                    'attempt': claimed['attempts'],
+                    'top_level_keys': sorted(parsed) if isinstance(parsed, dict) else [],
+                    'normalization': 'document_wrapper' if isinstance(parsed, dict)
+                        and isinstance(parsed.get('document'), dict) else 'unrecognized'}
+                completion_meta['output_shape'] = output_shape
+                # A complete model document at the root has the same semantic
+                # contract. Wrapping it is a program-formatting responsibility;
+                # no fields are discarded and inner L1 validation still runs.
+                if isinstance(parsed, dict) and set(parsed) == MODEL_FIELDS:
+                    parsed = {'document': parsed}
+                    output_shape['normalization'] = 'complete_document_root'
                 if not isinstance(parsed, dict) or set(parsed) - {'document', 'kind', 'confidence', 'sensitive'} or not isinstance(parsed.get('document'), dict):
                     raise L1OwnerError('model_document_fields_required', field_path='document')
                 document = parsed['document']
@@ -304,9 +330,6 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 # invalidate this task before it can create a proposal.
                 if tasks.get(memory_id)['revision'] != claimed['revision']:
                     raise L1OwnerError('submission_revision_conflict', status=409, field_path='revision')
-                generation = {'prompt_revision': prompt_context['prompt_revision'],
-                    'model_route_revision': 'route_sha256:' + semantic_sha256({'model': model, 'daily_client': use_daily}),
-                    'task_id': memory_id + ':' + str(claimed['draft_revision']), 'actor': 'chat_memory_preparation'}
                 prepared_envelope = copy.deepcopy(envelope)
                 prepared_envelope['arguments'] = {**parsed, 'document': document}
                 proposal = ChatMemoryTool(engine, bucket_mgr)._proposal(prepared_envelope, generation=generation,
@@ -326,11 +349,12 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                     await engine._memory_l1_adopt_candidate(row, bucket_mgr, request_id='chat-task:' + memory_id)
                 tasks.finish(claimed, phase='prepared', candidate_ids=[memory_id],
                     generation=generation, catalog_revision=catalog_revision, usage=usage,
-                    duration_ms=int((time.monotonic() - started) * 1000))
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    output_shape=output_shape, preparation_output=None)
                 results.append(tasks.receipt(memory_id))
             except Exception as exc:
                 try:
-                    tasks.finish(claimed, phase='failed', issue=issue(exc))
+                    tasks.finish(claimed, phase='failed', issue=issue(exc), **completion_meta)
                 except L1OwnerError:
                     pass  # A newer owner draft owns its own queued task.
                 results.append({'task_id': claimed['task_id'], 'status': 'failed', 'issue': issue(exc)})
