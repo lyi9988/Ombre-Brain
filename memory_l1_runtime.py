@@ -94,7 +94,7 @@ class MemoryL1Runtime:
         from memory_authority import MemoryProposal
         from memory_l1_source_readers import AizActionSourceReader
         from memory_l1_source_tasks import MemoryL1SourceTasks
-        from memory_l1_wire_schema import model_document_schema
+        from memory_l1_catalog_schema import model_document_schema
         tasks = MemoryL1SourceTasks(self.memory_authority_store)
         options = task_options(self.config)
         maximum = options['action_l1_jobs_per_run']
@@ -124,7 +124,7 @@ class MemoryL1Runtime:
                     'recorded_at': source.get('recorded_at')}
                 snapshots, bindings = bind_sources([raw_source])
                 payload = {'input_kind': 'completed_action_receipt', 'conversation_turns': [],
-                    'l1_contract': {'document_schema': model_document_schema([b['binding_id'] for b in bindings]), 'catalog': catalog,
+                    'l1_contract': {'document_schema': model_document_schema([b['binding_id'] for b in bindings], catalog=catalog), 'catalog': catalog,
                         'catalog_revision': catalog_revision, 'document_template': model_template(catalog=catalog),
                         'source_bindings': bindings, 'source_texts': [{'binding_id': 'source:1', 'text': source['text'],
                             'author': source.get('author'), 'coverage': source.get('coverage')}]} }
@@ -202,12 +202,12 @@ class MemoryL1Runtime:
                       'binding': meta.get('binding'), 'selected_blocks': meta.get('selected_blocks')}
 
     def _memory_l1_daily_context(self, window):
-        from memory_l1_wire_schema import model_document_schema
+        from memory_l1_catalog_schema import model_document_schema
         service = self._memory_l1_revisions()
         catalog, catalog_revision = service.catalog_provider()
         sources = daily_sources(window, profile_id=self.memory_semantic_profile_id)
         snapshots, bindings = bind_sources(sources)
-        return {'document_schema': model_document_schema([b['binding_id'] for b in bindings]), 'document_template': model_template(catalog=catalog),
+        return {'document_schema': model_document_schema([b['binding_id'] for b in bindings], catalog=catalog), 'document_template': model_template(catalog=catalog),
                 'catalog': catalog, 'catalog_revision': catalog_revision,
                 'source_bindings': bindings,
                 'source_texts': [{'binding_id': b['binding_id'], 'text': s['text'], 'author': s['author'],
@@ -319,7 +319,7 @@ class MemoryL1Runtime:
 
     async def _memory_l1_diary_task(self, key, bucket_mgr):
         from memory_diary_l1 import DiaryL1Service
-        from memory_l1_wire_schema import model_document_schema
+        from memory_l1_catalog_schema import model_document_schema
         options = task_options(self.config)
         prompt, prompt_context = self._memory_l1_prompt('ombre.diary_memory_prompt')
         if not prompt.strip(): return {'status': 'disabled', 'reason': 'prompt_disabled'}
@@ -361,7 +361,7 @@ class MemoryL1Runtime:
                 target_revision=source['source_revision'], text_view_id=source['text_view_id'], start=start, end=end)
             payload = {'date': key, 'source': {k: v for k, v in source.items() if k != 'text'},
                 'source_text': text[start:end], 'input_range': {'start': start, 'end': end}, 'source_anchor': anchor,
-                'binding_id': binding['binding_id'], 'model_document_schema': model_document_schema([binding['binding_id']], entry_forms=('episode',)),
+                'binding_id': binding['binding_id'], 'model_document_schema': model_document_schema([binding['binding_id']], catalog=catalog, entry_forms=('episode',)),
                 'catalog': catalog, 'catalog_revision': catalog_revision, 'options': options,
                 'existing_members': {module: (previous or {}).get(module, []) for module in ('entities', 'scenes', 'statements', 'relations')},
                 'window_index': index, 'source_length': len(text)}

@@ -226,7 +226,7 @@ async def prepare_chat_tasks(engine, bucket_mgr):
     """Runs outside the chat request; never executes the original tool again."""
     from chat_memory_tool import ChatMemoryTool
     from memory_l1_ingestion import bind_sources
-    from memory_l1_wire_schema import model_document_schema
+    from memory_l1_catalog_schema import model_document_schema
     from memory_source_provenance import canonical_source
     from memory_l1_runtime import task_options
     if getattr(engine, '_chat_preparation_running', False):
@@ -279,7 +279,7 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 service = engine._memory_l1_revisions(bucket_mgr)
                 catalog, catalog_revision = service.catalog_provider()
                 payload = {'input_kind': 'chat_authored_draft', 'draft': envelope['arguments'],
-                    'document_schema': model_document_schema([b['binding_id'] for b in bindings]),
+                    'document_schema': model_document_schema([b['binding_id'] for b in bindings], catalog=catalog),
                     'catalog': catalog, 'catalog_revision': catalog_revision,
                     'sources': [{'binding_id': b['binding_id'], 'text': s['text'], 'author': s['author'],
                                  'recorded_at': s['recorded_at']} for s, b in zip(snapshots, bindings)]}
