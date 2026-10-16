@@ -206,7 +206,9 @@ def test_aiz_catalog_adapter_commits_first_pass_l1_through_temporary_brain_route
     assert observed[0].get("ok"), observed[0]
     assert observed[0]["result"]["memory_status"] == "preparing"
     async def locate(_binding): return {'state': 'available', 'eligible_source': True}
-    engine._memory_l1_sources = lambda: SimpleNamespace(locate=locate)
+    from memory_l0_sources import MemoryL0Sources
+    engine._memory_l1_sources = lambda: SimpleNamespace(locate=locate,
+        retain_copy=MemoryL0Sources(engine.memory_authority_store).retain_copy)
     engine._daily_chat_memory_model_client = lambda **kw: (object(), 'synthetic-model', False)
     async def create(_client, **kwargs):
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(

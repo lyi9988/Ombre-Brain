@@ -22,7 +22,9 @@ def setup(tmp_path, *, mode='review', bad=False, during=None):
     engine.memory_authority_store = env['authority']
     engine.memory_ingestion_policy = env['policy']
     engine._memory_l1_revisions = lambda manager=None: env['revisions']
-    engine._memory_l1_sources = lambda: NS(locate=locate)
+    from memory_l0_sources import MemoryL0Sources
+    retain_copy = MemoryL0Sources(env['authority']).retain_copy
+    engine._memory_l1_sources = lambda: NS(locate=locate, retain_copy=retain_copy)
     calls = []
     async def create(client, **kwargs):
         payload = json.loads(kwargs['messages'][1]['content'])
@@ -137,7 +139,9 @@ def test_revoked_source_prevents_model_and_adoption(tmp_path):
     key = tasks.enqueue(envelope)['task_id']
     async def revoked(binding):
         return {'state': 'revoked', 'eligible_source': False}
-    engine._memory_l1_sources = lambda: NS(locate=revoked)
+    from memory_l0_sources import MemoryL0Sources
+    engine._memory_l1_sources = lambda: NS(locate=revoked,
+        retain_copy=MemoryL0Sources(env['authority']).retain_copy)
     asyncio.run(prepare_chat_tasks(engine, env['buckets']))
     assert tasks.receipt(key)['issue']['code'] == 'source_not_currently_readable'
     assert not calls

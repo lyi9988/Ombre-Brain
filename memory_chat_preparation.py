@@ -264,6 +264,12 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                     profile_id=engine.memory_semantic_profile_id) for s in envelope['context']['sources']]
                 snapshots, bindings = bind_sources(sources)
                 readers = engine._memory_l1_sources()
+                # Preserve the authenticated program snapshots first: the
+                # canonical reader resolves their exact upstream revisions
+                # from these copies. A retained copy never grants eligibility;
+                # locate still checks the live source before model use.
+                for snapshot in snapshots:
+                    readers.retain_copy(snapshot)
                 for binding in bindings:
                     if not (await readers.locate(binding))['eligible_source']:
                         raise L1OwnerError('source_not_currently_readable', status=409, field_path='sources')
