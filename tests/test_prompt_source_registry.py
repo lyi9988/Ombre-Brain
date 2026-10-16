@@ -26,6 +26,7 @@ EXPECTED_FIXED_SOURCE_IDS = {
     "ombre.memory_classify_prompt",
     "ombre.reflection_prompt",
     "ombre.diary_memory_prompt",
+    "ombre.chat_memory_prepare_prompt",
     "ombre.daily_chat_memory_prompt",
     "ombre.daily_chat_summary_prompt",
     "ombre.daily_activity_summary_prompt",
