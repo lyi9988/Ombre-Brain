@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import math
@@ -3745,7 +3746,7 @@ class ReflectionEngine(MemoryL1Runtime):
         if not rid:
             return
         ledger = [item for item in self._request_ledger_load() if str(item.get("request_id") or "") != rid]
-        entry = {
+        receipt = {
             "request_id": rid,
             "action": str(entry.get("action") or ""),
             "candidate_ids": sorted(str(item or "") for item in (entry.get("candidate_ids") or [])),
@@ -3754,7 +3755,12 @@ class ReflectionEngine(MemoryL1Runtime):
             "missing": int(entry.get("missing") or 0),
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
-        ledger.append(entry)
+        # Recovery needs the original response and its input fingerprint. Counts
+        # alone cannot satisfy the Review UI or validate a versioned retry.
+        for key in ("status", "request_hash", "deferred", "results"):
+            if key in entry:
+                receipt[key] = copy.deepcopy(entry[key])
+        ledger.append(receipt)
         ledger = ledger[-500:]
         os.makedirs(os.path.dirname(self.daily_chat_memory_requests_path), exist_ok=True)
         tmp_path = self.daily_chat_memory_requests_path + ".tmp"

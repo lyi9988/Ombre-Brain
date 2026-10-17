@@ -2865,6 +2865,23 @@
     cursor: pointer;
     user-select: none;
   }
+  .chat-memory-l1-details {
+    padding: 8px 0;
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+  .chat-memory-l1-details details {
+    margin-top: 7px;
+  }
+  .chat-memory-l1-details pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 320px;
+    overflow: auto;
+  }
+  .chat-memory-l1-statement {
+    margin: 10px 0;
+  }
   .chat-memory-excerpt {
     margin-top: 4px;
   }
@@ -9458,7 +9475,7 @@ function loadDashboardModule(path) {
   document.body.appendChild(script);
 }
 
-loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261016-chat-submit');
+loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261017-p2-closeout');
 </script>
 </body>
 </html>

@@ -588,6 +588,30 @@
     try { return JSON.stringify(value); } catch (_) { return String(value); }
   }
 
+  function semanticValue(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return displayValue(value);
+    var labels = { not_stated: '未说明', unresolved: '待确认', not_applicable: '不适用', unbounded: '明确不限定结束' };
+    return value.state === 'known' ? displayValue(value.value) : (labels[value.state] || displayValue(value));
+  }
+
+  function statementSourceRefs(statement) {
+    var refs = new Set();
+    function collect(node) {
+      if (!node || typeof node !== 'object') return;
+      if (Array.isArray(node)) { node.forEach(collect); return; }
+      Object.keys(node).forEach(function (key) {
+        if (key === 'evidence_refs' && Array.isArray(node[key])) node[key].forEach(function (ref) { refs.add(ref); });
+        else collect(node[key]);
+      });
+    }
+    collect(statement);
+    return refs;
+  }
+
+  function bindingRole(binding) {
+    try { return JSON.parse(binding.source_id).role || ''; } catch (_) { return ''; }
+  }
+
   function renderL1ReviewDetails(item, document) {
     var candidate = item && item.candidate && typeof item.candidate === 'object' ? item.candidate : {};
     var metadata = candidate.metadata && typeof candidate.metadata === 'object' ? candidate.metadata : {};
@@ -598,28 +622,74 @@
     var bindings = Array.isArray(document.evidence_bindings) ? document.evidence_bindings : [];
     var sourceRefs = candidate.source_refs || item && item.source_refs || [];
     if (!Array.isArray(sourceRefs)) sourceRefs = [sourceRefs];
-    var bindingRows = bindings.map(function (binding) {
+    var statements = Array.isArray(document.statements) ? document.statements : [];
+    var referenced = statements.map(statementSourceRefs);
+    var usedBindings = bindings.filter(function (binding) { return referenced.some(function (refs) { return refs.has(binding.binding_id); }); });
+    var bindingRows = bindings.map(function (binding, index) {
       if (!binding || typeof binding !== 'object') return '<li>' + esc(displayValue(binding)) + '</li>';
-      var label = [binding.source_namespace || binding.namespace || binding.source_type || binding.type,
-        binding.source_id || binding.id, binding.source_revision || binding.revision,
-        binding.author_ref || binding.speaker_ref, binding.text_view_id,
-        binding.content_sha256 || binding.source_content_sha256].filter(Boolean).join(' · ');
-      return '<li>' + esc(label || displayValue(binding)) + '</li>';
+      var uses = referenced.filter(function (refs) { return refs.has(binding.binding_id); }).length;
+      var role = bindingRole(binding);
+      var speaker = role === 'user' ? ' · 主人' : (role === 'assistant' ? ' · 顾衍' : '');
+      return '<li><details data-l1-source-binding><summary>材料 ' + (index + 1) + ' · ' +
+        (uses ? uses + ' 条陈述引用' : '上下文材料，未被陈述引用') + speaker + '</summary>' +
+        '<pre>' + esc(JSON.stringify(binding, null, 2)) + '</pre></details></li>';
     }).join('');
     var refRows = sourceRefs.map(function (value) { return '<li>' + esc(displayValue(value)) + '</li>'; }).join('');
     var generation = document.generation || candidate.generation || {};
     var generationRows = Object.keys(generation).sort().map(function (key) {
-      return '<li><strong>' + esc(key) + '：</strong>' + esc(displayValue(generation[key])) + '</li>';
+      return '<li><details><summary>' + esc(key) + '</summary><pre>' +
+        esc(typeof generation[key] === 'object' ? JSON.stringify(generation[key], null, 2) : displayValue(generation[key])) + '</pre></details></li>';
+    }).join('');
+    var kindLabels = { experience: '经历', state: '状态', fact: '事实', preference: '偏好', boundary: '边界',
+      intention: '意向', interpretation: '理解', procedure: '做法' };
+    var definitions = (generation.catalog_snapshot || {}).definitions || [];
+    function classificationLabel(axis, value) {
+      var resolved = semanticValue(value);
+      var definition = definitions.find(function (item) { return item.axis === axis && item.id === resolved; });
+      return definition && definition.label || (axis === 'kinds' ? kindLabels[resolved] : '') || resolved;
+    }
+    var scopeLabels = { episode: '当次经历', time_range: '明确时间范围', recurring: '按条件反复适用', unknown: '适用时间未明确' };
+    var statementRows = statements.map(function (statement, index) {
+      var classification = statement.classification || {};
+      var kind = semanticValue(classification.kind);
+      var time = statement.time || {}, event = time.event || {}, applicability = time.applicability || {};
+      var conditions = statement.conditions || {};
+      var refs = referenced[index];
+      var entity = (document.entities || []).find(function (item) { return item.entity_id === (statement.subject_ref || {}).value; });
+      var subjectRole = entity && (entity.entity_type || {}).value;
+      var subject = subjectRole === 'user' ? '主人' : (subjectRole === 'assistant' ? '顾衍' : (entity && entity.name || '主体未明确'));
+      var basisRefs = (classification.basis || {}).evidence_refs || [];
+      var directRefs = new Set(basisRefs.length ? basisRefs : (statement.evidence_refs || []));
+      var evidence = bindings.filter(function (binding) { return directRefs.has(binding.binding_id); });
+      var needsEvidenceReview = subjectRole === 'user' && (classification.basis || {}).value === 'direct_expression' &&
+        evidence.length && evidence.every(function (binding) { return bindingRole(binding) === 'assistant'; });
+      return '<li class="chat-memory-l1-statement"><strong>' + esc(statement.content || '（缺少陈述正文）') + '</strong>' +
+        '<p>主体：' + esc(subject) + ' · ' + esc(kindLabels[kind] || kind) + ' · ' + esc(scopeLabels[applicability.temporal_scope] || '适用时间未明确') +
+        ' · ' + refs.size + ' 项来源引用</p>' +
+        (needsEvidenceReview ? '<p class="chat-memory-edit-needed" data-l1-evidence-warning>当前标为主人直接表达，但引用材料均为顾衍发言；请核对主体与证据性质，不能据此确认主人长期偏好。</p>' : '') +
+        '<details><summary>分类、时间与条件</summary>' +
+        '<p>类型：' + esc(classificationLabel('kinds', classification.kind)) + '；表达：' + esc(classificationLabel('modalities', classification.modality)) +
+        '；依据：' + esc(classificationLabel('bases', classification.basis)) + '；稳定性：' + esc(classificationLabel('stabilities', classification.stability)) + '</p>' +
+        '<p>事件开始：' + esc(semanticValue(event.start)) + '；事件结束：' + esc(semanticValue(event.end)) + '</p>' +
+        '<p>适用开始：' + esc(semanticValue(applicability.start)) + '；适用结束：' + esc(semanticValue(applicability.end)) + '</p>' +
+        '<p>条件：' + esc(conditions.text || semanticValue(conditions)) + '</p>' +
+        '<pre>' + esc(JSON.stringify(statement, null, 2)) + '</pre></details></li>';
     }).join('');
     var coverage = bundle && bundle.coverage || candidate.coverage || item && item.coverage;
-    return '<details class="chat-memory-excerpt-details chat-memory-l1-details">' +
-      '<summary>来源状态与生成版本</summary>' +
-      '<p><strong>来源状态：</strong>' + esc(displayValue(sourceState)) + '</p>' +
+    return '<details class="chat-memory-excerpt-details chat-memory-l1-details" data-l1-statements>' +
+      '<summary>结构化记忆 · ' + statements.length + ' 条陈述 · ' + (document.scenes || []).length + ' 个场景</summary>' +
+      '<p>这里记录各条陈述的性质；来源核对通过不等于这些结论已被主人确认。</p>' +
+      (statementRows ? '<ol>' + statementRows + '</ol>' : '<p>没有提取到独立陈述。</p>') + '</details>' +
+      '<details class="chat-memory-excerpt-details chat-memory-l1-details" data-l1-sources>' +
+      '<summary>来源定位 · ' + bindings.length + ' 项材料 · ' + usedBindings.length + ' 项被陈述引用</summary>' +
+      '<p>绑定材料包含当时提供的上下文；陈述引用才是该陈述标注的依据，引用本身不证明结论正确。</p>' +
+      '<p><strong>写入时来源核对状态：</strong>' + esc(sourceState === 'verified' ? '已核对' : displayValue(sourceState)) + '；当前资格在采用时重新检查。</p>' +
       (coverage ? '<p><strong>覆盖：</strong>' + esc(displayValue(coverage)) + '</p>' : '') +
-      '<p><strong>L1来源绑定：</strong>' + bindings.length + ' 项</p>' +
       (bindingRows ? '<ul>' + bindingRows + '</ul>' : '<p>当前文档没有来源绑定；不代表来源已验证。</p>') +
       (refRows ? '<p><strong>候选来源引用：</strong></p><ul>' + refRows + '</ul>' : '') +
-      '<p><strong>generation：</strong></p>' +
+      '</details>' +
+      '<details class="chat-memory-excerpt-details chat-memory-l1-details" data-l1-technical>' +
+      '<summary>技术详情与生成版本</summary><p>版本、校验值与目录快照用于溯源，不代表它们全部参与召回评分。</p>' +
       (generationRows ? '<ul>' + generationRows + '</ul>' : '<p>未提供生成版本信息。</p>') +
       '</details>';
   }
@@ -1419,7 +1489,11 @@
     var blocked = confirmBlocked(item);
     var editRequired = needsOwnerEdit(item);
     var hasSource = hasSourcePreview(item);
-    var excerpt = String(candidate.original_excerpt || '').trim() || (legacy ? '历史候选无原文摘录' : '（无来源片段）');
+    var bindings = l1Document && Array.isArray(l1Document.evidence_bindings) ? l1Document.evidence_bindings : [];
+    var hasExcerpt = Boolean(String(candidate.original_excerpt || '').trim());
+    var excerpt = String(candidate.original_excerpt || '').trim() || (bindings.length
+      ? '已绑定 ' + bindings.length + ' 项来源材料，未提供单独摘录。点击“查看完整原文”读取来源。'
+      : (legacy ? '历史候选无原文摘录' : '（无来源片段）'));
     var proposed = String((l1Draft ? l1Draft.document : l1Document || {}).narrative
       ? (l1Draft ? l1Draft.document : l1Document).narrative.body
       : (candidate.proposed_memory || candidate.content || '')).trim() || '（缺少建议记忆）';
@@ -1434,7 +1508,8 @@
     if (candidate.source_turn_ids && candidate.source_turn_ids.length) {
       sourceParts.push('轮次 ' + candidate.source_turn_ids.slice(0, 12).join(', '));
     }
-    var sourceText = sourceParts.length ? sourceParts.join(' · ') : '（无来源）';
+    var sourceText = bindings.length ? '来源材料 ' + bindings.length + ' 项；具体引用见下方来源定位。'
+      : (sourceParts.length ? sourceParts.join(' · ') : '未提供来源定位');
     var sourceHash = String(candidate.source_hash || '').slice(0, 8);
     var staleNote = item.stale
       ? '<div class="chat-memory-stale">来源无法核对（' + esc(String(item.stale_reason || 'candidate_source_invalid')) + '），不可写入，请拒绝。</div>'
@@ -1464,9 +1539,9 @@
             '<div class="chat-memory-card-body">' + esc(proposed) + '</div>' +
           '</div>' +
           '<div class="chat-memory-column">' +
-            '<div class="chat-memory-column-title">来源摘录</div>' +
-            '<details class="chat-memory-excerpt-details"' + (legacy ? ' open' : '') + '>' +
-              '<summary>' + (legacy ? '历史候选无原文摘录' : '展开来源摘录') + '</summary>' +
+            '<div class="chat-memory-column-title">来源依据</div>' +
+            '<details class="chat-memory-excerpt-details"' + (legacy && !bindings.length ? ' open' : '') + '>' +
+              '<summary>' + (hasExcerpt ? '展开来源摘录' : (bindings.length ? '已绑定来源，未提供单独摘录' : '未提供原文摘录')) + '</summary>' +
               '<div class="chat-memory-excerpt' + (legacy ? ' chat-memory-legacy' : '') + '">' + esc(excerpt) + '</div>' +
             '</details>' +
             '<div class="chat-memory-card-source">' + esc(sourceText) + '</div>' +
@@ -1572,24 +1647,27 @@
 
   function renderDailyChatMemorySourcePanel(data) {
     var blocks = [];
+    var note = data.source_authority === 'aizizhu_canonical_snapshot'
+      ? '<p class="chat-memory-source-empty">以下为提交时保留的对话来源快照；记录时间不代表事件发生时间，也不代表内容目前仍成立。</p>' : '';
     (data.turns || []).forEach(function (turn) {
       if (turn.text) {
-        blocks.push(renderSourceBlock('轮次 ' + turn.id + ' · 我', turn.text, turn.truncated, turn.continue_after, 'turn', turn.id));
+        blocks.push(renderSourceBlock('对话轮次 ' + turn.id + ' · 主人与顾衍', turn.text, turn.truncated, turn.continue_after, 'turn', turn.id));
       } else {
-        if (turn.user_text) blocks.push(renderSourceBlock('轮次 ' + turn.id + ' · 我', turn.user_text, false, -1, null, null));
-        if (turn.assistant_text) blocks.push(renderSourceBlock('轮次 ' + turn.id + ' · 润润', turn.assistant_text, false, -1, null, null));
+        if (turn.user_text) blocks.push(renderSourceBlock('轮次 ' + turn.id + ' · 主人', turn.user_text, false, -1, null, null));
+        if (turn.assistant_text) blocks.push(renderSourceBlock('轮次 ' + turn.id + ' · 顾衍', turn.assistant_text, false, -1, null, null));
       }
     });
     (data.events || []).forEach(function (event) {
       if (event.text) {
-        var roleLabel = event.role === 'user' ? '我' : '润润';
-        blocks.push(renderSourceBlock('事件 ' + event.id + ' · ' + roleLabel, event.text, event.truncated, event.continue_after, 'event', event.id));
+        var roleLabel = event.role === 'user' ? '主人' : (event.role === 'assistant' ? '顾衍' : '其他来源');
+        var recorded = event.created_at ? ' · 记录时间 ' + event.created_at : '';
+        blocks.push(renderSourceBlock('来源 ' + (blocks.length + 1) + ' · ' + roleLabel + recorded, event.text, event.truncated, event.continue_after, 'event', event.id));
       }
     });
     if (!blocks.length) {
       return '<div class="chat-memory-source-empty">未找到可展开的完整原文（来源事件可能已被清理或撤回）。</div>';
     }
-    return blocks.join('');
+    return note + blocks.join('');
   }
 
   function renderSourceBlock(label, text, truncated, continueAfter, sourceKind, sourceId) {

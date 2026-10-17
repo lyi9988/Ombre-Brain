@@ -267,7 +267,7 @@ const styles = (html.match(/<style[^>]*>[\s\S]*?<\/style>/g) || []).join('\n');
       assert.equal(await p.evaluate(() => items[0].status), 'pending');
       assert.deepEqual(await p.evaluate(() => calls[0].body.edit.document.retrieval.keywords), ['主人新增完整JSON字段']);
       assert.equal(await p.evaluate(() => calls[0].body.edit.document.narrative.body), '日记整篇第一遍正文。');
-      assert.match(await card(p, 'one').locator('.chat-memory-l1-details').textContent(), /readable|owner_edit|source-rev-a/);
+      assert.match(await card(p, 'one').locator('[data-l1-sources]').textContent(), /readable|source-rev-a/);
       assert.equal(JSON.parse(await json.inputValue()).retrieval.keywords[0], '主人新增完整JSON字段');
       assert.match(await result(p), /仍待审核/);
     }, true);
@@ -346,6 +346,59 @@ const styles = (html.match(/<style[^>]*>[\s\S]*?<\/style>/g) || []).join('\n');
       assert.equal(await p.evaluate(() => calls[0].body.edit.document.narrative.body), '准备采用的完整正文。');
       assert.equal(await p.evaluate(() => calls[1].body.expected_revisions.one), 2);
     }, true);
+    for (const width of [390,1280]) {
+      const p = await fixture(width, true);
+      await p.evaluate(() => {
+        const c = items[0].candidate, d = c.l1_document;
+        c.original_excerpt = '';
+        c.source_refs = [];
+        c.source_verification = 'verified';
+        d.evidence_bindings = Array.from({length:16}, (_,i) => ({binding_id:'source:'+(i+1),
+          source_namespace:'snapshot.aiz.canonical_event', source_id:JSON.stringify({event_id:'event-'+i,role:i===11?'assistant':'user'}),
+          source_revision:'rev-'+i, anchors:[]}));
+        d.entities = [{entity_id:'owner',entity_type:{state:'known',value:'user',evidence_refs:[]},name:'主人',aliases:[]}];
+        d.statements = Array.from({length:3},(_,i) => ({...structuredClone(d.statements[0]),statement_id:'st-'+i,
+          content:i===1?'没有原话支持的条件偏好':'合成陈述 '+i,
+          subject_ref:{state:'known',value:'owner',evidence_refs:[]},
+          evidence_refs:[i===1?'source:12':'source:1'],
+          classification:{...structuredClone(d.statements[0].classification),
+            basis:{state:'known',value:'direct_expression',evidence_refs:[i===1?'source:12':'source:1']}}}));
+        d.generation.catalog_snapshot={definitions:[{axis:'bases',id:'direct_expression',label:'当事人表达'}],
+          topics:[],attributes:[],long_text:'long-catalog-'.repeat(700)};
+        d.generation.task_id='<img src=x onerror="window.xss=true">';
+        items[0].display.has_source_preview = true;
+        const oldFetch = authFetch;
+        window.authFetch = async (url, options) => url.includes('/source-preview')
+          ? {ok:true,json:async()=>({source_authority:'aizizhu_canonical_snapshot',events:[
+              {id:'user-event',role:'user',text:'合成主人原文',truncated:false},
+              {id:'assistant-event',role:'assistant',text:'合成顾衍原文',truncated:false}],turns:[]})}
+          : oldFetch(url,options);
+        return loadDailyChatMemoryPending();
+      });
+      const c = card(p,'one');
+      assert.doesNotMatch(await c.locator('.chat-memory-card-source').textContent(),/无来源/);
+      assert.match(await c.locator('[data-l1-statements] > summary').textContent(),/3 条陈述/);
+      assert.match(await c.locator('[data-l1-sources] > summary').textContent(),/16 项材料 · 2 项被陈述引用/);
+      assert.equal(await c.locator('[data-l1-technical]').getAttribute('open'),null);
+      assert.equal(await c.locator('[data-l1-technical] pre').first().isVisible(),false);
+      if(process.env.EDITOR_SCREENSHOT_DIR) await p.screenshot({path:path.join(process.env.EDITOR_SCREENSHOT_DIR,`memory-closeout-default-${width}.png`),fullPage:true});
+      await c.locator('[data-l1-statements] > summary').click();
+      assert.equal(await c.locator('[data-l1-evidence-warning]').count(),1);
+      assert.match(await c.locator('[data-l1-evidence-warning]').textContent(),/均为顾衍发言/);
+      await c.locator('[data-l1-sources] > summary').click();
+      assert.equal(await c.locator('[data-l1-source-binding]').count(),16);
+      assert.match(await c.locator('[data-l1-source-binding]').nth(15).textContent(),/未被陈述引用/);
+      await c.locator('[data-l1-technical] > summary').click();
+      await c.locator('[data-l1-technical] summary').filter({hasText:'catalog_snapshot'}).click();
+      assert.match(await c.locator('[data-l1-technical]').textContent(),/long-catalog-/);
+      assert.equal(await c.locator('img').count(),0);
+      assert.equal(await p.evaluate(()=>Boolean(window.xss)),false);
+      await c.getByRole('button',{name:'查看完整原文',exact:true}).click();
+      assert.match(await c.locator('.chat-memory-source-panel').textContent(),/提交时.*主人.*顾衍/s);
+      assert.equal(await p.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false);
+      if(process.env.EDITOR_SCREENSHOT_DIR) await p.screenshot({path:path.join(process.env.EDITOR_SCREENSHOT_DIR,`memory-closeout-${width}.png`),fullPage:true});
+      passed++; console.log('PASS structured Review and evidence display',width); await p.close();
+    }
     for (const width of [390,1280]) {
       const p = await fixture(width, true);
       await open(p, 'one');
