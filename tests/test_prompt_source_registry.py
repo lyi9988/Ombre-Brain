@@ -14,6 +14,7 @@ from prompt_source_registry import (
     INTERNAL_FIXED_PROMPT_SOURCES,
     RUNTIME_MECHANIC_SOURCES,
     DYNAMIC_CONTEXT_SOURCES,
+    factory_body,
     resolve_fixed_prompt,
     source_detail,
 )
@@ -28,6 +29,7 @@ EXPECTED_FIXED_SOURCE_IDS = {
     "ombre.diary_memory_prompt",
     "ombre.chat_memory_prepare_prompt",
     "ombre.daily_chat_memory_prompt",
+    "ombre.memory_l2_generation_prompt",
     "ombre.daily_chat_summary_prompt",
     "ombre.daily_activity_summary_prompt",
     "ombre.domain_sentinel_prompt",
@@ -60,6 +62,19 @@ def test_registry_contains_every_included_fixed_source():
     assert set(FIXED_PROMPT_SOURCES) == EXPECTED_FIXED_SOURCE_IDS
     assert not EXPECTED_FIXED_SOURCE_IDS & DYNAMIC_CONTEXT_SOURCES
     assert not EXPECTED_FIXED_SOURCE_IDS & RUNTIME_MECHANIC_SOURCES
+
+
+def test_l2_generation_prompt_is_registered_and_has_gateway_fallback_factory():
+    source_id = "ombre.memory_l2_generation_prompt"
+    spec = FIXED_PROMPT_SOURCES[source_id]
+    body = factory_body(source_id)
+
+    assert spec.scope == "memory.reflection"
+    assert spec.source_revision == "factory-memory-l2-generation-v2-review"
+    assert spec.factory_body() == body
+    assert '"review"' in body
+    assert '"required":false' in body
+    assert "review 是自动稿审阅判断元数据，不是记忆正文" in body
 
 
 def test_internal_recall_preparation_sources_are_scoped_and_provenanced():

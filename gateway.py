@@ -6003,6 +6003,8 @@ class GatewayService:
                 "time_context": debug.get("time_context") or {},
                 "recall_input": (debug.get("prepare_timing_debug") or {}).get("recall_input", {}),
                 "recall_status": (debug.get("prepare_timing_debug") or {}).get("recall_status", {}),
+                "memory_presentation": (debug.get("memory_recall_projection") or {}).get(
+                    "presentation_trace", []),
                 "query_views": (debug.get("prepare_timing_debug") or {}).get("query_views", []),
                 "selected_memory_ids": (debug.get("prepare_timing_debug") or {}).get("selected_memory_ids", []),
                 "injected_count": (debug.get("prepare_timing_debug") or {}).get("injected_count"),
@@ -6169,6 +6171,67 @@ class GatewayService:
         except Exception as exc:
             logger.warning("Memory L1 transport failed: %s", type(exc).__name__)
             return JSONResponse({"error": {"code": "memory_l1_unavailable"}}, status_code=503, headers=headers)
+
+    async def handle_memory_presentation(self, request: Request) -> JSONResponse:
+        """Authenticated owner proxy for Brain's independent L2 presentation API."""
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        from urllib.parse import quote
+        headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+        base = os.environ.get("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://ombre-brain:8000").rstrip("/")
+        token = os.environ.get("OMBRE_MEMORY_WRITE_TOKEN") or self.gateway_token
+        if not base or not token:
+            return JSONResponse({"error": {"code": "memory_presentation_unconfigured"}},
+                                status_code=503, headers=headers)
+        memory_id = str(request.path_params.get("memory_id") or "")
+        if not memory_id:
+            return JSONResponse({"error": {"code": "memory_not_found"}}, status_code=404,
+                                headers=headers)
+        path = "/api/memory-authority/memories/" + quote(memory_id, safe="") + "/presentation"
+        if request.method == "GET":
+            revisions = request.query_params.getlist("presentation_revision")
+            revision_text = revisions[0] if len(revisions) == 1 else ""
+            if revisions and (len(revisions) != 1
+                              or not revision_text
+                              or any(char < "0" or char > "9" for char in revision_text)
+                              or not revision_text.lstrip("0")):
+                return JSONResponse({"error": {"code": "invalid_presentation_revision"}},
+                                    status_code=400, headers=headers)
+        elif request.method == "POST":
+            action = str(request.path_params.get("action") or "")
+            if action not in {"prepare", "revisions"}:
+                return JSONResponse({"error": {"code": "method_not_allowed"}}, status_code=405,
+                                    headers=headers)
+            path += "/" + action
+        else:
+            return JSONResponse({"error": {"code": "method_not_allowed"}}, status_code=405,
+                                headers=headers)
+        if request.url.query:
+            path += "?" + request.url.query
+        raw = await request.body() if request.method == "POST" else None
+        if raw is not None and len(raw) > 524288:
+            return JSONResponse({"error": {"code": "request_too_large"}}, status_code=413,
+                                headers=headers)
+        request_headers = {"Authorization": "Bearer " + token}
+        if raw is not None:
+            request_headers["Content-Type"] = request.headers.get("Content-Type", "application/json")
+        try:
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+                upstream = await client.request(
+                    request.method, base + path, content=raw, headers=request_headers,
+                )
+            if upstream.status_code not in {200, 201, 202, 400, 404, 409, 413, 422, 503}:
+                return JSONResponse({"error": {"code": "memory_presentation_unavailable"}},
+                                    status_code=503, headers=headers)
+            result = upstream.json()
+            if not isinstance(result, dict):
+                raise ValueError("invalid_presentation_response")
+            return JSONResponse(result, status_code=upstream.status_code, headers=headers)
+        except Exception as exc:
+            logger.warning("Memory presentation transport failed: %s", type(exc).__name__)
+            return JSONResponse({"error": {"code": "memory_presentation_unavailable"}},
+                                status_code=503, headers=headers)
 
     async def handle_memory_source_tasks(self, request: Request) -> JSONResponse:
         """Transport source IDs/task receipts; Brain remains the only writer."""
@@ -23656,6 +23719,7 @@ class GatewayService:
             "selected_bucket_ids": selected_bucket_ids,
             "selected_memory_revisions": revisions,
             "selected_ring_ids": ring_ids,
+            "presentation_trace": list((natural_input or {}).get("presentation_trace") or []),
             "fact_body": fact_body,
             "body": body,
             "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
@@ -27331,6 +27395,9 @@ def create_gateway_app(
     async def memory_l1_parts_route(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_memory_l1_parts(request)
 
+    async def memory_presentation_route(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_memory_presentation(request)
+
     async def memory_source_tasks_route(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_memory_source_tasks(request)
 
@@ -27371,6 +27438,10 @@ def create_gateway_app(
             Route("/api/memory-authority/action-source", memory_source_tasks_route, methods=["POST"], name="memory-action-source"),
             Route("/api/memory-authority/source-tasks", memory_source_tasks_route, methods=["GET"], name="memory-source-tasks"),
             Route("/api/memory-authority/source-tasks/{task_id}/retry", memory_source_tasks_route, methods=["POST"], name="memory-source-task-retry"),
+            Route("/api/memory-authority/memories/{memory_id}/presentation",
+                  memory_presentation_route, methods=["GET"], name="memory-presentation-read"),
+            Route("/api/memory-authority/memories/{memory_id}/presentation/{action:str}",
+                  memory_presentation_route, methods=["POST"], name="memory-presentation-action"),
             Route("/api/memory-authority/memories/{memory_id}/statements", memory_l1_parts_route, methods=["GET"], name="memory-l1-statements"),
             Route("/api/memory-authority/memories/{memory_id}/scenes", memory_l1_parts_route, methods=["GET"], name="memory-l1-scenes"),
             Route("/api/memory-authority/memories/{memory_id}/scenes/{object_id}", memory_l1_parts_route, methods=["GET"], name="memory-l1-scene"),

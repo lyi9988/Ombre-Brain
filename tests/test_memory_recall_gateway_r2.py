@@ -200,16 +200,32 @@ def _freshness_config():
     return values
 
 
-def _install_source_http(monkeypatch, *, state="available"):
-    requests = []
+def _install_source_http(monkeypatch, *, state="available", presentations=None):
+    class RequestCalls(list):
+        pass
+
+    requests = RequestCalls()
+    presentation_requests = []
+    presentations = presentations or {}
     original_client = httpx.AsyncClient
 
     def handler(request):
         payload = json.loads(request.content)
-        requests.append({
+        call = {
             "url": str(request.url), "authorization": request.headers.get("Authorization"),
             "payload": payload,
-        })
+        }
+        if request.url.path.endswith("/presentations/resolve"):
+            presentation_requests.append(call)
+            rows = []
+            for item in payload["items"]:
+                resolution = presentations.get(item["memory_id"], {
+                    "state": "stale", "text": "", "presentation_revision": None,
+                    "reason": "presentation_missing",
+                })
+                rows.append({"memory_id": item["memory_id"], **resolution})
+            return httpx.Response(200, json={"status": "ok", "items": rows})
+        requests.append(call)
         rows = []
         for item in payload["items"]:
             sources = {
@@ -235,6 +251,7 @@ def _install_source_http(monkeypatch, *, state="available"):
     monkeypatch.setattr(memory_use.httpx, "AsyncClient", mock_client)
     monkeypatch.setenv("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://brain.synthetic.invalid")
     monkeypatch.setenv("OMBRE_MEMORY_WRITE_TOKEN", "synthetic-source-check-token")
+    requests.presentation_requests = presentation_requests
     return requests
 
 
@@ -463,7 +480,12 @@ def test_withdrawn_source_cannot_reintroduce_the_old_raw_bucket_body(tmp_path, m
     _authority, view, _records, buckets = _authority_fixture(
         tmp_path, [("bucket-revoked", "撤回后不应注入的原始故事正文。")],
     )
-    _install_source_http(monkeypatch, state="withdrawn")
+    source_requests = _install_source_http(
+        monkeypatch, state="withdrawn",
+        presentations={"memory:bucket-revoked": {
+            "state": "ready", "text": "Must not be read", "presentation_revision": 9,
+        }},
+    )
     service, _calls = _gateway_service(
         tmp_path, monkeypatch, view, buckets, [], _base_config(),
     )
@@ -477,6 +499,7 @@ def test_withdrawn_source_cannot_reintroduce_the_old_raw_bucket_body(tmp_path, m
          "targeted": ("", [], 0), "diffused": ("", [], 0)},
     ))
     assert sections["direct"] == ""
+    assert source_requests.presentation_requests == []
     assert request["injected_usage_bucket_ids"] == []
     final = service._build_memory_recall_projection(
         recalled_memory=sections["direct"], targeted_memory_detail="", related_memory="",
@@ -488,11 +511,16 @@ def test_withdrawn_source_cannot_reintroduce_the_old_raw_bucket_body(tmp_path, m
     assert "撤回后不应注入的原始故事正文" not in final["body"]
 
 
-def test_usage_card_off_source_does_not_fall_back_to_raw_narrative(tmp_path, monkeypatch):
+def test_usage_card_off_source_does_not_fall_back_to_l1_or_ready_l2(tmp_path, monkeypatch):
     _authority, view, _records, buckets = _authority_fixture(
         tmp_path, [("bucket-prompt-off", "主人关闭卡片后不得回退的原始故事。")],
     )
-    _install_source_http(monkeypatch)
+    source_requests = _install_source_http(monkeypatch, presentations={
+        "memory:bucket-prompt-off": {
+            "state": "ready", "text": "Ready L2 must remain suppressed",
+            "presentation_revision": 4,
+        },
+    })
     service, _calls = _gateway_service(
         tmp_path, monkeypatch, view, buckets, [], _base_config(),
     )
@@ -527,7 +555,12 @@ def test_usage_card_off_source_does_not_fall_back_to_raw_narrative(tmp_path, mon
          "targeted": ("", [], 0), "diffused": ("", [], 0)},
     ))
     assert sections["direct"] == ""
+    assert len(source_requests.presentation_requests) == 1
     assert request["injected_usage_bucket_ids"] == []
+    trace = request["presentation_trace"][0]
+    assert trace["source"] == "none"
+    assert trace["presentation_revision"] is None
+    assert trace["fallback_reason"] == "usage_card_prompt_unavailable"
     final = service._build_memory_recall_projection(
         recalled_memory=sections["direct"], targeted_memory_detail="", related_memory="",
         recalled_moments=[], targeted_memory_detail_debug={},
@@ -535,6 +568,170 @@ def test_usage_card_off_source_does_not_fall_back_to_raw_narrative(tmp_path, mon
     )
     assert "主人关闭卡片后不得回退的原始故事" not in final["fact_body"]
     assert "主人关闭卡片后不得回退的原始故事" not in final["body"]
+    assert "Ready L2 must remain suppressed" not in final["body"]
+
+
+def test_ready_l2_is_batch_resolved_and_used_with_per_statement_use_constraints(tmp_path, monkeypatch):
+    _authority, view, _records, buckets = _authority_fixture(
+        tmp_path, [("bucket-l2-ready", "L1 raw original sentinel; full source narrative.")],
+    )
+    source_requests = _install_source_http(monkeypatch, presentations={
+        "memory:bucket-l2-ready": {
+            "state": "ready", "text": "L2 coherent presentation sentinel.",
+            "presentation_revision": 7, "reason": None,
+        },
+    })
+    service, _calls = _gateway_service(
+        tmp_path, monkeypatch, view, buckets, [], _base_config(),
+    )
+    request = _recall_input()
+    raw = "[bucket_id:bucket-l2-ready] L1 raw original sentinel; full source narrative."
+
+    sections = asyncio.run(memory_use.project_sections(
+        service, request, request["q_context"], buckets,
+        {"direct": (raw, ["bucket-l2-ready"], 4000),
+         "targeted": ("", [], 0), "diffused": ("", [], 0)},
+    ))
+
+    assert len(source_requests.presentation_requests) == 1
+    call = source_requests.presentation_requests[0]
+    assert call["url"].endswith("/api/memory-authority/presentations/resolve")
+    assert call["authorization"] == "Bearer synthetic-source-check-token"
+    item = call["payload"]["items"][0]
+    expected_statement_uses = {
+        use["statement_id"]: use["usage"]
+        for use in request["usage_by_bucket"]["bucket-l2-ready"]["items"]
+    }
+    assert item["statement_uses"] == expected_statement_uses
+    assert set(item["allowed_uses"]) == set(expected_statement_uses.values())
+    assert item["narrative_allowed"] is True
+    assert "current_basis" in sections["direct"]
+    assert "historical_evidence" in sections["direct"]
+    assert "L2 coherent presentation sentinel." in sections["direct"]
+    assert "L1 raw original sentinel" not in sections["direct"]
+    trace = request["presentation_trace"][0]
+    assert trace["source"] == "l2"
+    assert trace["presentation_revision"] == 7
+    assert trace["fallback_reason"] is None
+
+    projection = service._build_memory_recall_projection(
+        recalled_memory=sections["direct"], targeted_memory_detail="", related_memory="",
+        recalled_moments=[], targeted_memory_detail_debug={},
+        memory_sentinel_debug={"route": "natural"}, natural_input=request,
+    )
+    assert projection["presentation_trace"] == request["presentation_trace"]
+
+
+def test_stale_l2_falls_back_to_l1_and_records_exact_reason(tmp_path, monkeypatch):
+    _authority, view, _records, buckets = _authority_fixture(
+        tmp_path, [("bucket-l2-stale", "L1 fallback narrative sentinel.")],
+    )
+    source_requests = _install_source_http(monkeypatch, presentations={
+        "memory:bucket-l2-stale": {
+            "state": "stale", "text": "Stale L2 must not be used",
+            "presentation_revision": None, "reason": "dependency_version_stale",
+        },
+    })
+    service, _calls = _gateway_service(
+        tmp_path, monkeypatch, view, buckets, [], _base_config(),
+    )
+    request = _recall_input()
+    raw = "[bucket_id:bucket-l2-stale] L1 fallback narrative sentinel."
+
+    sections = asyncio.run(memory_use.project_sections(
+        service, request, request["q_context"], buckets,
+        {"direct": (raw, ["bucket-l2-stale"], 4000),
+         "targeted": ("", [], 0), "diffused": ("", [], 0)},
+    ))
+
+    assert len(source_requests.presentation_requests) == 1
+    assert "L1 fallback narrative sentinel." in sections["direct"]
+    assert "Stale L2 must not be used" not in sections["direct"]
+    trace = request["presentation_trace"][0]
+    assert trace["resolver_state"] == "stale"
+    assert trace["source"] == "l1"
+    assert trace["presentation_revision"] is None
+    assert trace["fallback_reason"] == "dependency_version_stale"
+
+
+def test_l2_is_kept_as_a_whole_unit_when_it_exceeds_the_remaining_budget(tmp_path, monkeypatch):
+    _authority, view, _records, buckets = _authority_fixture(
+        tmp_path, [("bucket-l2-large", "Short L1 fallback with its condition preserved.")],
+    )
+    _install_source_http(monkeypatch, presentations={
+        "memory:bucket-l2-large": {
+            "state": "ready",
+            "text": "L2 complete condition unit and its exception. " * 120,
+            "presentation_revision": 8, "reason": None,
+        },
+    })
+    service, _calls = _gateway_service(
+        tmp_path, monkeypatch, view, buckets, [], _base_config(),
+    )
+    request = _recall_input()
+    raw = "[bucket_id:bucket-l2-large] Short L1 fallback with its condition preserved."
+
+    sections = asyncio.run(memory_use.project_sections(
+        service, request, request["q_context"], buckets,
+        {"direct": (raw, ["bucket-l2-large"], 400),
+         "targeted": ("", [], 0), "diffused": ("", [], 0)},
+    ))
+
+    assert "Short L1 fallback with its condition preserved." in sections["direct"]
+    assert "L2 complete condition unit" not in sections["direct"]
+    trace = request["presentation_trace"][0]
+    assert trace["source"] == "l1"
+    assert trace["presentation_revision"] is None
+    assert trace["fallback_reason"] == "presentation_exceeds_remaining_budget"
+
+
+def test_large_l2_selects_complete_units_that_fit_the_existing_budget(tmp_path, monkeypatch):
+    _authority, view, _records, buckets = _authority_fixture(
+        tmp_path, [("bucket-l2-units", "L1 fallback must not replace a fitting L2 unit.")],
+    )
+    current_unit = (
+        "Complete current unit: the arrangement applies only under its stated condition, "
+        "with the listed exception preserved."
+    )
+    oversized_unit = "Complete historical unit with all conditions. " * 120
+    _install_source_http(monkeypatch, presentations={
+        "memory:bucket-l2-units": {
+            "state": "ready",
+            "text": "Full preferred L2 narrative. " * 120,
+            "presentation_revision": 9,
+            "reason": None,
+            "units": [
+                {"unit_id": "unit:current", "statement_refs": [
+                    "statement:bucket-l2-units:current",
+                ], "text": current_unit},
+                {"unit_id": "unit:historical", "statement_refs": [
+                    "statement:bucket-l2-units:old",
+                ], "text": oversized_unit},
+            ],
+        },
+    })
+    service, _calls = _gateway_service(
+        tmp_path, monkeypatch, view, buckets, [], _base_config(),
+    )
+    request = _recall_input()
+    raw = "[bucket_id:bucket-l2-units] L1 fallback must not replace a fitting L2 unit."
+
+    sections = asyncio.run(memory_use.project_sections(
+        service, request, request["q_context"], buckets,
+        {"direct": (raw, ["bucket-l2-units"], 400),
+         "targeted": ("", [], 0), "diffused": ("", [], 0)},
+    ))
+
+    assert current_unit in sections["direct"]
+    assert oversized_unit not in sections["direct"]
+    assert "Full preferred L2 narrative." not in sections["direct"]
+    assert "L1 fallback must not replace a fitting L2 unit." not in sections["direct"]
+    trace = request["presentation_trace"][0]
+    assert trace["source"] == "l2"
+    assert trace["presentation_revision"] == 9
+    assert trace["selected_unit_ids"] == ["unit:current"]
+    assert trace["partial_presentation"] is True
+    assert trace["fallback_reason"] is None
 
 
 def test_real_configuration_preview_route_accepts_scenario_and_legacy_payload_without_providers(tmp_path):

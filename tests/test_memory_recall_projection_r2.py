@@ -287,6 +287,13 @@ def test_l1_legacy_source_record_and_repeated_sections_reach_one_ordered_compose
     assert sections["direct"].count("Historical narrative (record date is not event date):") == 1
     assert "Legacy archive narrative" in sections["direct"]
     assert request["injected_usage_bucket_ids"] == ["bucket-l1", "bucket-legacy"]
+    trace_by_bucket = {
+        item["bucket_id"]: item for item in request["presentation_trace"]
+    }
+    assert trace_by_bucket["bucket-l1"]["source"] == "l1_targeted_original"
+    assert trace_by_bucket["bucket-l1"]["reason"] == "explicit_targeted_original"
+    assert trace_by_bucket["bucket-legacy"]["source"] == "legacy"
+    assert trace_by_bucket["bucket-legacy"]["fallback_reason"] == "no_l1_authority"
 
     projection = _projection(service, request, sections)
     assert projection["selected_bucket_ids"] == ["bucket-l1", "bucket-legacy"]

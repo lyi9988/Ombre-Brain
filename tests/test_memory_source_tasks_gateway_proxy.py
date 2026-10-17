@@ -37,7 +37,16 @@ def source_task_peer():
                 "authorization": self.headers.get("Authorization"),
                 "content_type": self.headers.get("Content-Type"),
             })
-            mode = parse_qs(urlsplit(self.path).query).get("mode", ["ok"])[0]
+            path = urlsplit(self.path).path
+            if path.endswith("/presentation/prepare"):
+                default_mode = "prepare"
+            elif path.endswith("/presentation/revisions"):
+                default_mode = "revisions"
+            elif path.endswith("/presentation"):
+                default_mode = "read"
+            else:
+                default_mode = "ok"
+            mode = parse_qs(urlsplit(self.path).query).get("mode", [default_mode])[0]
             status, body, extra_headers = state["responses"].get(
                 mode, (200, {"items": [], "status": "ok"}, {})
             )
@@ -239,3 +248,69 @@ def test_source_task_body_limit_receipt_shape_and_upstream_statuses(monkeypatch)
                 assert bad_shape.status_code == 503
                 assert bad_shape.json() == {"error": "memory_tasks_unavailable"}
                 assert len(peer["calls"]) == before + 1
+
+
+def test_memory_presentation_routes_authenticate_and_proxy_query_and_raw_bodies(monkeypatch):
+    with source_task_peer() as (brain_url, peer):
+        monkeypatch.setenv("OMBRE_MEMORY_INDEX_ADMIN_URL", brain_url)
+        monkeypatch.setenv("OMBRE_MEMORY_WRITE_TOKEN", "brain-write-token")
+        peer["responses"].update({
+            "read": (200, {"state": "ready", "presentation_revision": 3}, {}),
+            "prepare": (202, {"state": "queued"}, {}),
+            "revisions": (200, {"presentation_revision": 4}, {}),
+        })
+        with gateway_loopback(source_task_gateway()) as gateway_url:
+            with httpx.Client(base_url=gateway_url, trust_env=False, timeout=3) as client:
+                denied = client.get(
+                    "/api/memory-authority/memories/memory%20%CE%B1/presentation"
+                    "?presentation_revision=3&mode=read",
+                )
+                assert denied.status_code == 401
+                assert peer["calls"] == []
+
+                bad_revision = client.get(
+                    "/api/memory-authority/memories/memory%20%CE%B1/presentation"
+                    "?presentation_revision=0",
+                    headers={"Authorization": "Bearer owner-token"},
+                )
+                assert bad_revision.status_code == 400
+                assert peer["calls"] == []
+
+                headers = {"Authorization": "Bearer owner-token", "Content-Type": "application/json"}
+                read = client.get(
+                    "/api/memory-authority/memories/memory%20%CE%B1/presentation"
+                    "?presentation_revision=3&mode=read",
+                    headers=headers,
+                )
+                assert read.status_code == 200
+                assert read.json() == {"state": "ready", "presentation_revision": 3}
+                assert peer["calls"][-1]["method"] == "GET"
+                assert peer["calls"][-1]["path"] == (
+                    "/api/memory-authority/memories/memory%20%CE%B1/presentation"
+                    "?presentation_revision=3&mode=read"
+                )
+                assert peer["calls"][-1]["authorization"] == "Bearer brain-write-token"
+
+                prepare_body = b'{"expected_l1_revision":2,"request_id":"prepare-1"}'
+                prepared = client.post(
+                    "/api/memory-authority/memories/memory%20%CE%B1/presentation/prepare",
+                    content=prepare_body, headers=headers,
+                )
+                assert prepared.status_code == 202
+                assert prepared.json() == {"state": "queued"}
+                assert peer["calls"][-1]["path"] == (
+                    "/api/memory-authority/memories/memory%20%CE%B1/presentation/prepare"
+                )
+                assert peer["calls"][-1]["body"] == prepare_body
+
+                revisions_body = b'{"text":"owner edit","expected_presentation_revision":3}'
+                saved = client.post(
+                    "/api/memory-authority/memories/memory%20%CE%B1/presentation/revisions",
+                    content=revisions_body, headers=headers,
+                )
+                assert saved.status_code == 200
+                assert saved.json() == {"presentation_revision": 4}
+                assert peer["calls"][-1]["path"].endswith("/presentation/revisions")
+                assert peer["calls"][-1]["body"] == revisions_body
+                assert peer["calls"][-1]["authorization"] == "Bearer brain-write-token"
+                assert len(peer["calls"]) == 3

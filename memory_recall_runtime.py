@@ -247,6 +247,180 @@ def render(service, usage, header, original, budget):
     return service._trim_text(text, budget) if text else ""
 
 
+def render_presentation(service, usage, header, presentation, budget):
+    """Render Brain's already-qualified persisted L2 through the existing card."""
+    if usage["state"] == "excluded":
+        return "", "usage_excluded", [], False
+    from utils import count_tokens_approx
+
+    statements = usage_lines(usage)
+    presentation_text = str(presentation.get("text") or "")
+
+    def wrap(narrative):
+        return service._resolve_gateway_fixed_prompt("ombre.memory_usage_card_prompt", runtime_values={
+            "header": header, "statements": statements,
+            # Brain has already applied source, dependency, and per-statement
+            # use checks to the complete L2 or to each returned unit.
+            "narrative": narrative,
+        })
+
+    text = wrap(presentation_text)
+    if not text:
+        return "", "usage_card_prompt_unavailable", [], False
+
+    units = []
+    seen_unit_ids = set()
+    for unit in presentation.get("units") or []:
+        if not isinstance(unit, dict):
+            continue
+        unit_id = str(unit.get("unit_id") or "").strip()
+        unit_text = unit.get("text")
+        if (not unit_id or unit_id in seen_unit_ids
+                or not isinstance(unit_text, str) or not unit_text.strip()):
+            continue
+        seen_unit_ids.add(unit_id)
+        units.append({"unit_id": unit_id, "text": unit_text})
+    unit_ids = [unit["unit_id"] for unit in units]
+
+    # Keep the complete preferred L2 whenever it fits the remaining owner
+    # budget. Otherwise choose complete resolver-approved units, never slices.
+    if count_tokens_approx(text) <= max(0, budget):
+        return text, None, unit_ids, False
+    if not units:
+        return "", "presentation_exceeds_remaining_budget", [], False
+
+    wrapper_cost = max(0, count_tokens_approx(text) - count_tokens_approx(presentation_text))
+    available_narrative_budget = max(0, budget - wrapper_cost)
+    selected = []
+    for unit in units:
+        candidate = selected + [unit]
+        narrative = "\n\n".join(item["text"] for item in candidate)
+        if count_tokens_approx(narrative) <= available_narrative_budget:
+            selected = candidate
+    if not selected:
+        return "", "no_complete_unit_fits_remaining_budget", [], False
+
+    # The final result receives one shared usage card wrapper around all units.
+    # Recheck its exact estimate and drop whole trailing units if wrapper
+    # boundaries made the conservative estimate differ by a token.
+    while selected:
+        narrative = "\n\n".join(item["text"] for item in selected)
+        selected_text = wrap(narrative)
+        if selected_text and count_tokens_approx(selected_text) <= max(0, budget):
+            selected_ids = [item["unit_id"] for item in selected]
+            return selected_text, None, selected_ids, len(selected_ids) < len(unit_ids)
+        selected.pop()
+    return "", "no_complete_unit_fits_remaining_budget", [], False
+
+
+async def resolve_presentations(service, candidates):
+    """Resolve only source-qualified, non-targeted L1 memories in one Brain call."""
+    if not candidates:
+        return {}, {}
+    items = []
+    for candidate in candidates:
+        usage = candidate["usage"]
+        statement_ids = list(dict.fromkeys(
+            str(item.get("statement_id") or "")
+            for item in usage.get("items", [])
+            if item.get("statement_id") and item.get("usage") != "excluded"
+        ))
+        allowed_uses = list(dict.fromkeys(
+            str(item.get("usage") or "")
+            for item in usage.get("items", [])
+            if item.get("usage") and item.get("usage") != "excluded"
+        ))
+        statement_uses = {
+            str(item["statement_id"]): str(item["usage"])
+            for item in usage.get("items", [])
+            if item.get("statement_id") and item.get("usage") != "excluded"
+        }
+        items.append({
+            "memory_id": candidate["memory_id"],
+            "revision": candidate["revision"],
+            "statement_ids": statement_ids,
+            "allowed_uses": allowed_uses,
+            "statement_uses": statement_uses,
+            "narrative_allowed": bool(usage.get("narrative_allowed")),
+        })
+
+    base = os.environ.get("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://ombre-brain:8000").rstrip("/")
+    token = os.environ.get("OMBRE_MEMORY_WRITE_TOKEN") or getattr(service, "gateway_token", "")
+    failure = "brain_unconfigured" if not base or not token else None
+    rows_by_memory = {}
+    try:
+        if failure:
+            raise RuntimeError(failure)
+        async with httpx.AsyncClient(timeout=20.0, trust_env=False) as client:
+            response = await client.post(
+                base + "/api/memory-authority/presentations/resolve",
+                headers={"Authorization": "Bearer " + token},
+                json={"items": items},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        if not isinstance(payload, dict) or payload.get("status") != "ok" \
+                or not isinstance(payload.get("items"), list):
+            raise ValueError("invalid_presentation_response")
+        for row in payload["items"]:
+            if isinstance(row, dict) and row.get("memory_id"):
+                rows_by_memory[str(row["memory_id"])] = row
+    except asyncio.CancelledError:
+        raise
+    except RuntimeError:
+        pass
+    except httpx.HTTPStatusError as exc:
+        failure = f"resolver_http_{exc.response.status_code}"
+    except httpx.HTTPError:
+        failure = "resolver_transport_error"
+    except (ValueError, TypeError, KeyError):
+        failure = "resolver_invalid_response"
+
+    presentations, trace = {}, {}
+    for candidate in candidates:
+        bid = candidate["bucket_id"]
+        memory_id = candidate["memory_id"]
+        common = {
+            "bucket_id": bid,
+            "memory_id": memory_id,
+            "l1_revision": candidate["revision"],
+            "presentation_revision": None,
+            "resolved_presentation_revision": None,
+            "selected_unit_ids": [],
+            "partial_presentation": False,
+            "resolver_state": None,
+            "source": "l1",
+            "fallback_reason": failure or "resolver_missing_item",
+        }
+        row = rows_by_memory.get(memory_id) if not failure else None
+        if row is not None:
+            state = str(row.get("state") or "unknown")
+            reason = str(row.get("reason") or "").strip()
+            common["resolver_state"] = state
+            common["fallback_reason"] = None
+            if state != "ready":
+                common["fallback_reason"] = reason or f"presentation_{state}"
+            else:
+                text = row.get("text")
+                revision = row.get("presentation_revision")
+                if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
+                    common["fallback_reason"] = "invalid_presentation_revision"
+                elif not isinstance(text, str) or not text.strip():
+                    common["resolved_presentation_revision"] = revision
+                    common["fallback_reason"] = "empty_ready_presentation"
+                else:
+                    common["resolved_presentation_revision"] = revision
+                    common["fallback_reason"] = None
+                    presentations[bid] = {
+                        "text": text,
+                        "units": row.get("units") if isinstance(row.get("units"), list) else [],
+                        "presentation_revision": revision,
+                        "resolver_state": state,
+                    }
+        trace[bid] = common
+    return presentations, trace
+
+
 def hierarchy_pool(service, request, pool):
     mode = option(service, "hierarchy_mode", "auto")
     if mode == "mixed":
@@ -377,34 +551,159 @@ async def project_sections(service, request, query, buckets, sections):
     for bid in requested - allowed:
         uses[bid] = {"state": "excluded", "items": [], "narrative_allowed": False}
     bucket_map = {str(bucket["id"]): bucket for bucket in valid}
-    rendered, seen = {}, set()
-    # Explicit original detail wins over a brief of the same record.
+    render_ids_by_section, planned_section, seen = {}, {}, set()
     for key in ("targeted", "direct", "diffused"):
         body, _refs, budget = sections.get(key, ("", [], 0))
         ids = [bid for bid in ids_by_section.get(key, []) if bid in allowed and bid not in seen]
         seen.update(ids)
+        render_ids_by_section[key] = ids
+        if body and budget > 0:
+            for bid in ids:
+                planned_section[bid] = key
+
+    records = request.get("_semantic_records", {})
+    trace_by_bucket = {}
+    l2_candidates = []
+    for bid, key in planned_section.items():
+        usage = uses[bid]
+        record = records.get(bid) or {}
+        if key == "targeted":
+            trace_by_bucket[bid] = {
+                "bucket_id": bid, "memory_id": record.get("memory_id"),
+                "l1_revision": record.get("revision"), "presentation_revision": None,
+                "source": "l1_targeted_original" if usage["state"] == "l1" else "legacy",
+                "resolver_state": None, "fallback_reason": None,
+                "reason": "explicit_targeted_original",
+            }
+        elif usage["state"] == "legacy":
+            trace_by_bucket[bid] = {
+                "bucket_id": bid, "memory_id": None, "l1_revision": None,
+                "presentation_revision": None, "source": "legacy",
+                "resolver_state": None, "fallback_reason": "no_l1_authority",
+            }
+        elif (record.get("state") == "l1" and record.get("memory_id")
+              and isinstance(record.get("revision"), int)):
+            l2_candidates.append({
+                "bucket_id": bid, "memory_id": str(record["memory_id"]),
+                "revision": int(record["revision"]), "usage": usage,
+            })
+        else:
+            trace_by_bucket[bid] = {
+                "bucket_id": bid, "memory_id": record.get("memory_id"),
+                "l1_revision": record.get("revision"), "presentation_revision": None,
+                "source": "l1", "resolver_state": None,
+                "fallback_reason": "l1_revision_unavailable",
+            }
+
+    presentations, resolved_trace = await resolve_presentations(service, l2_candidates)
+    trace_by_bucket.update(resolved_trace)
+    candidate_by_bucket = {str(item["bucket"]["id"]): item for item in candidates}
+    for bid in requested - allowed:
+        item = candidate_by_bucket.get(bid)
+        reason = (item or {}).get("admission_reason") or "l1_source_or_body_not_eligible"
+        record = records.get(bid) or {}
+        trace_by_bucket[bid] = {
+            "bucket_id": bid, "memory_id": record.get("memory_id"),
+            "l1_revision": record.get("revision"), "presentation_revision": None,
+            "source": "none", "resolver_state": None, "fallback_reason": reason,
+        }
+
+    rendered = {}
+    # Explicit original detail wins over a brief of the same record.
+    for key in ("targeted", "direct", "diffused"):
+        body, _refs, budget = sections.get(key, ("", [], 0))
+        ids = render_ids_by_section.get(key, [])
         if not body or not ids or budget <= 0:
             rendered[key] = ""
             continue
-        if len(ids) == len(ids_by_section[key]) and all(uses[bid]["narrative_allowed"] for bid in ids):
+        has_l2 = any(bid in presentations for bid in ids)
+        if (not has_l2 and len(ids) == len(ids_by_section[key])
+                and all(uses[bid]["narrative_allowed"] for bid in ids)):
             notes = "\n".join(f'[bucket_id:{bid}] {usage_lines(uses[bid])}' for bid in ids)
             text = service._resolve_gateway_fixed_prompt("ombre.memory_usage_card_prompt", runtime_values={
                 "header": "", "statements": notes, "narrative": body})
             rendered[key] = service._trim_text(text, budget) if text else ""
+            included_ids = set(service._extract_bucket_ids_from_context(rendered[key]))
+            for bid in ids:
+                row = trace_by_bucket.setdefault(bid, {"bucket_id": bid, "source": "none"})
+                if bid not in included_ids:
+                    row["source"] = "none"
+                    row["fallback_reason"] = (
+                        "usage_card_prompt_unavailable" if not rendered[key]
+                        else "section_budget_exhausted")
+                elif row.get("source") not in {"l1_targeted_original", "legacy"}:
+                    row["source"] = "l1"
         else:
             parts, remaining = [], budget
             for bid in ids:
                 bucket = bucket_map[bid]
                 header = service._direct_bucket_header(bucket, {"bucket_id": bid})
-                text = render(service, uses[bid], header, str(bucket.get("content") or ""), remaining)
+                row = trace_by_bucket.setdefault(bid, {"bucket_id": bid, "source": "none"})
+                presentation = presentations.get(bid)
+                if presentation:
+                    text, render_reason, selected_unit_ids, partial_presentation = render_presentation(
+                        service, uses[bid], header, presentation, remaining,
+                    )
+                    if text:
+                        row["source"] = "l2"
+                        row["presentation_revision"] = presentation["presentation_revision"]
+                        row["selected_unit_ids"] = selected_unit_ids
+                        row["partial_presentation"] = partial_presentation
+                        row["fallback_reason"] = None
+                    else:
+                        row["fallback_reason"] = render_reason
+                        if render_reason in {
+                            "presentation_exceeds_remaining_budget",
+                            "no_complete_unit_fits_remaining_budget",
+                        }:
+                            text = render(
+                                service, uses[bid], header,
+                                str(bucket.get("content") or ""), remaining,
+                            )
+                            if text:
+                                row["source"] = "l1"
+                            else:
+                                row["source"] = "none"
+                                row["render_reason"] = "usage_card_prompt_unavailable"
+                        else:
+                            row["source"] = "none"
+                            row["render_reason"] = render_reason
+                else:
+                    text = render(service, uses[bid], header,
+                                  str(bucket.get("content") or ""), remaining)
+                    if text:
+                        if row.get("source") not in {"l1_targeted_original", "legacy"}:
+                            row["source"] = "legacy" if uses[bid]["state"] == "legacy" else "l1"
+                    else:
+                        row["source"] = "none"
+                        row.setdefault("render_reason", "usage_card_prompt_unavailable")
                 if text:
                     parts.append(text)
                     # The existing Gateway owns token accounting and budgets.
                     from utils import count_tokens_approx
                     remaining -= count_tokens_approx(text)
+                elif remaining > 0:
+                    row.setdefault("fallback_reason", "not_rendered")
                 if remaining <= 0:
                     break
+            if remaining <= 0:
+                included_ids = set(bid for part in parts
+                                   for bid in service._extract_bucket_ids_from_context(part))
+                for bid in ids:
+                    if bid not in included_ids:
+                        row = trace_by_bucket.setdefault(bid, {"bucket_id": bid, "source": "none"})
+                        row["source"] = "none"
+                        row["fallback_reason"] = "section_budget_exhausted"
             rendered[key] = "\n".join(parts)
+    presentation_trace = [
+        trace_by_bucket[bid]
+        for bid in list(planned_section) + sorted(requested - allowed)
+        if bid in trace_by_bucket
+    ]
+    for row in presentation_trace:
+        row.setdefault("selected_unit_ids", [])
+        row.setdefault("partial_presentation", False)
+    request["presentation_trace"] = presentation_trace
     # A dependency supplements an actually shown memory; it cannot reserve
     # tokens first and clip the selected memory's decisive claim away.
     from utils import count_tokens_approx
