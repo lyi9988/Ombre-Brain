@@ -12,6 +12,7 @@ import math
 
 from memory_l1_contract import canonical_json, make_text_anchor, semantic_sha256
 from memory_l1_ingestion import bind_sources, expand_model_document, model_template, prepare_model_document
+from memory_l1_semantic_wire import assemble_document, semantic_contract
 from memory_l1_schema import document_template, join_document, split_document
 from memory_l1_service import L1OwnerError, MemoryL1RevisionService
 from memory_source_provenance import daily_sources
@@ -99,7 +100,6 @@ class MemoryL1Runtime:
         from memory_authority import MemoryProposal
         from memory_l1_source_readers import AizActionSourceReader
         from memory_l1_source_tasks import MemoryL1SourceTasks
-        from memory_l1_catalog_schema import model_document_schema
         tasks = MemoryL1SourceTasks(self.memory_authority_store)
         options = task_options(self.config)
         maximum = options['action_l1_jobs_per_run']
@@ -130,8 +130,8 @@ class MemoryL1Runtime:
                     'recorded_at': source.get('recorded_at')}
                 snapshots, bindings = bind_sources([raw_source])
                 payload = {'input_kind': 'completed_action_receipt', 'conversation_turns': [],
-                    'l1_contract': {'document_schema': model_document_schema([b['binding_id'] for b in bindings], catalog=catalog), 'catalog': catalog,
-                        'catalog_revision': catalog_revision, 'document_template': model_template(catalog=catalog),
+                    'l1_contract': {'semantic_contract': semantic_contract([b['binding_id'] for b in bindings], catalog=catalog),
+                        'catalog_revision': catalog_revision,
                         'source_bindings': bindings, 'source_texts': [{'binding_id': 'source:1', 'text': source['text'],
                             'author': source.get('author'), 'coverage': source.get('coverage')}]} }
                 response = await self._daily_chat_memory_create_completion(client, model=model,
@@ -157,7 +157,7 @@ class MemoryL1Runtime:
                     generation = {'prompt_revision': context['prompt_revision'], 'model_route_revision': 'route_sha256:'
                         + semantic_sha256({k: v for k, v in route.items() if k != 'client'}),
                         'task_id': task['task_id'], 'actor': 'action_first_pass'}
-                    doc = prepare_model_document(service, memory_id=memory_id, document=item['document'], sources=[raw_source],
+                    doc = prepare_model_document(service, memory_id=memory_id, document=assemble_document(item['document']), sources=[raw_source],
                         generation=generation, request_id=task['task_id'] + ':' + str(index), catalog_context=(catalog, catalog_revision))
                     body, semantic = split_document(doc)
                     proposal = MemoryProposal.from_mapping({'proposal_id': memory_id, 'source_type': 'action_receipt',
@@ -209,16 +209,15 @@ class MemoryL1Runtime:
                       'binding': meta.get('binding'), 'selected_blocks': meta.get('selected_blocks')}
 
     def _memory_l1_daily_context(self, window):
-        from memory_l1_catalog_schema import model_document_schema
         service = self._memory_l1_revisions()
         catalog, catalog_revision = service.catalog_provider()
         sources = daily_sources(window, profile_id=self.memory_semantic_profile_id)
         snapshots, bindings = bind_sources(sources)
-        return {'document_schema': model_document_schema([b['binding_id'] for b in bindings], catalog=catalog), 'document_template': model_template(catalog=catalog),
-                'catalog': catalog, 'catalog_revision': catalog_revision,
+        return {'semantic_contract': semantic_contract([b['binding_id'] for b in bindings], catalog=catalog),
+                'catalog_revision': catalog_revision,
                 'source_bindings': bindings,
                 'source_texts': [{'binding_id': b['binding_id'], 'text': s['text'], 'author': s['author'],
-                    'recorded_at': s['recorded_at']} for s, b in zip(snapshots, bindings)]}, sources
+                    'recorded_at': s['recorded_at']} for s, b in zip(snapshots, bindings)]}, sources, (copy.deepcopy(catalog), catalog_revision)
 
     def _memory_l1_daily_document(self, candidate, memory_id):
         sources = candidate.get('_l1_sources')
@@ -326,7 +325,6 @@ class MemoryL1Runtime:
 
     async def _memory_l1_diary_task(self, key, bucket_mgr):
         from memory_diary_l1 import DiaryL1Service
-        from memory_l1_catalog_schema import model_document_schema
         options = task_options(self.config)
         prompt, prompt_context = self._memory_l1_prompt('ombre.diary_memory_prompt')
         if not prompt.strip(): return {'status': 'disabled', 'reason': 'prompt_disabled'}
@@ -369,8 +367,8 @@ class MemoryL1Runtime:
                 target_revision=source['source_revision'], text_view_id=source['text_view_id'], start=start, end=end)
             payload = {'date': key, 'source': {k: v for k, v in source.items() if k != 'text'},
                 'source_text': text[start:end], 'input_range': {'start': start, 'end': end}, 'source_anchor': anchor,
-                'binding_id': binding['binding_id'], 'model_document_schema': model_document_schema([binding['binding_id']], catalog=catalog, entry_forms=('episode',)),
-                'catalog': catalog, 'catalog_revision': catalog_revision, 'options': options,
+                'binding_id': binding['binding_id'], 'semantic_contract': semantic_contract([binding['binding_id']], catalog=catalog),
+                'catalog_revision': catalog_revision, 'options': options,
                 'existing_members': {module: (previous or {}).get(module, []) for module in ('entities', 'scenes', 'statements', 'relations')},
                 'window_index': index, 'source_length': len(text)}
             try:
@@ -382,7 +380,8 @@ class MemoryL1Runtime:
                 parsed = self._parse_json_object(self._completion_content(response) or '')
                 if not isinstance(parsed, dict) or set(parsed) != {'document', 'scene_bodies', 'confidence'}:
                     raise ValueError('diary_task_result_required')
-                draft, local_map = namespace_local_ids(parsed['document'], 'w' + str(index), known_ids, catalog)
+                model_document = assemble_document(parsed['document'])
+                draft, local_map = namespace_local_ids(model_document, 'w' + str(index), known_ids, catalog)
                 candidate_base = copy.deepcopy(previous) if previous else document_template(catalog=catalog, catalog_revision=catalog_revision)
                 window_binding = copy.deepcopy(binding)
                 window_binding['anchors'] = [anchor]
@@ -397,7 +396,7 @@ class MemoryL1Runtime:
                     scene['source_ranges'] = [{'source_ref': binding['binding_id'], 'start': a['start'], 'end': a['end']}
                         for a in validated_scene['anchors']]
                 if not isinstance(parsed['scene_bodies'], dict): raise ValueError('scene_bodies_required')
-                expected_scene_keys = {s['scene_id'] for s in parsed['document']['scenes']}
+                expected_scene_keys = {s['scene_id'] for s in model_document['scenes']}
                 if set(parsed['scene_bodies']) != expected_scene_keys: raise ValueError('scene_body_membership_mismatch')
                 staged_scene_bodies = {}
                 for key_local, body in parsed['scene_bodies'].items():

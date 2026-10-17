@@ -244,10 +244,10 @@ def test_empty_attribute_catalog_keeps_lists_empty_and_disables_structured_field
     _rejects(schema, invalid_property)
 
 
-def test_chat_preparation_sends_schema_built_from_the_same_live_catalog_snapshot(tmp_path):
+def test_chat_preparation_sends_semantic_contract_from_the_same_live_catalog_snapshot(tmp_path):
     # Reuse the established synthetic model stub and its captured request payload.
     from memory_chat_preparation import ChatMemoryPreparation, prepare_chat_tasks
-    from memory_l1_catalog_schema import model_document_schema as dynamic_schema
+    from memory_l1_semantic_wire import semantic_contract
     from test_chat_memory_preparation import setup as setup_chat_preparation
 
     env, engine, envelope, calls = setup_chat_preparation(tmp_path)
@@ -275,8 +275,8 @@ def test_chat_preparation_sends_schema_built_from_the_same_live_catalog_snapshot
     engine.dehydration_model = "synthetic-dehydration-default"
     # The shared setup helper still supports legacy tests. This case exercises
     # the task-route method and its selected fake connection directly.
-    del engine._daily_chat_memory_model_client
     del engine._daily_chat_memory_create_completion
+    del engine._memory_task_route
 
     edited_catalog = copy.deepcopy(env["catalog"])
     edited_catalog["topics"].append("hot-edited-topic")
@@ -297,8 +297,8 @@ def test_chat_preparation_sends_schema_built_from_the_same_live_catalog_snapshot
     assert routed_client.calls[0]["reasoning_effort"] == "high"
     payload = calls[0]
     assert payload["catalog_revision"] == catalog_revision
-    assert payload["catalog"] == edited_catalog
     binding_ids = [source["binding_id"] for source in payload["sources"]]
-    assert payload["document_schema"] == dynamic_schema(binding_ids, catalog=payload["catalog"])
-    assert "hot-edited-topic" in payload["document_schema"]["$defs"]["Classification"]["properties"]["topics"]["items"]["enum"]
-    assert "hot-edited-kind" in payload["document_schema"]["$defs"]["Classification"]["properties"]["kind"]["properties"]["value"]["enum"]
+    assert payload["semantic_contract"] == semantic_contract(binding_ids, catalog=edited_catalog)
+    assert not {"document_schema", "catalog", "document_template"}.intersection(payload)
+    assert "hot-edited-topic" in payload["semantic_contract"]["catalog"]["topics"]
+    assert "hot-edited-kind" in payload["semantic_contract"]["catalog"]["kinds"]

@@ -82,6 +82,33 @@ def test_queue_is_identifiers_only_idempotent_and_conflicting_request_is_not_rep
     assert len(tasks.list()) == 1 and engine.memory_authority_store.list_memories() == []
 
 
+def test_action_semantic_draft_assembles_full_l1_with_original_receipt_and_route(tmp_path, monkeypatch):
+    engine, buckets, tasks, payload, calls, source = setup(tmp_path, monkeypatch)
+    engine.dehydration_client.content = json.dumps({'candidates': [{
+        'kind': 'key_event', 'confidence': 0.9, 'document': {
+            'format': 'semantic-v1', 'narrative': {'title': '行动经验', 'body': '我完成浏览并留下完整经验。'},
+            'entities': [], 'statements': [{'content': '这次浏览了天文学资料。', 'subject_ref': None,
+                'classification': {'kind': 'experience', 'stability': 'episode', 'modality': 'assertion', 'basis': 'record'},
+                'time': None, 'conditions': None, 'evidence_refs': ['source:1']}]}}]})
+    tasks.enqueue_action(payload)
+    result = run(engine._memory_l1_action_tasks(buckets))
+    assert result['results'][0]['status'] == 'prepared'
+    proposal = engine.memory_authority_store.list_candidates(status='all')[0]['proposal']
+    assert proposal['proposed_body'] == '我完成浏览并留下完整经验。'
+    semantic = proposal['metadata']['memory_l1']
+    assert semantic['statements'][0]['classification']['basis'] == {
+        'state': 'known', 'value': 'record', 'evidence_refs': ['source:1']}
+    assert semantic['evidence_bindings'][0]['source_namespace'] == 'snapshot.aiz.action_receipt'
+    request = json.loads(calls[0]['messages'][1]['content'])
+    contract = request['l1_contract']
+    assert contract['source_texts'][0]['text'] == source['text']
+    assert 'semantic_contract' in contract
+    assert not {'document_schema', 'catalog', 'document_template'}.intersection(contract)
+    assert calls[0]['model'] == 'synthetic-action-l1-v1'
+    assert calls[0]['max_tokens'] == 4321
+    assert calls[0]['reasoning_effort'] == 'medium'
+
+
 def test_review_worker_keeps_full_l1_and_does_not_claim_adoption(tmp_path, monkeypatch):
     engine, buckets, tasks, payload, calls, _ = setup(tmp_path, monkeypatch)
     tasks.enqueue_action(payload)

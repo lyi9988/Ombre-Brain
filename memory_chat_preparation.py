@@ -80,7 +80,7 @@ class ChatMemoryPreparation:
         return {k: copy.deepcopy(row.get(k)) for k in (
             'task_id', 'operation_id', 'phase', 'draft_revision', 'revision', 'created_at', 'updated_at',
             'candidate_ids', 'issue', 'attempts', 'generation', 'usage', 'duration_ms',
-            'output_shape')} | {'source_kind': 'chat_submission'}
+            'output_shape', 'input_metrics')} | {'source_kind': 'chat_submission'}
 
     def enqueue(self, envelope):
         from chat_memory_tool import candidate_id
@@ -226,7 +226,7 @@ async def prepare_chat_tasks(engine, bucket_mgr):
     """Runs outside the chat request; never executes the original tool again."""
     from chat_memory_tool import ChatMemoryTool
     from memory_l1_ingestion import bind_sources
-    from memory_l1_catalog_schema import model_document_schema
+    from memory_l1_semantic_wire import assemble_document, semantic_contract
     from memory_source_provenance import canonical_source
     from memory_l1_runtime import task_options
     if getattr(engine, '_chat_preparation_running', False):
@@ -280,22 +280,33 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 service = engine._memory_l1_revisions(bucket_mgr)
                 catalog, catalog_revision = service.catalog_provider()
                 payload = {'input_kind': 'chat_authored_draft', 'draft': envelope['arguments'],
-                    'document_schema': model_document_schema([b['binding_id'] for b in bindings], catalog=catalog),
-                    'catalog': catalog, 'catalog_revision': catalog_revision,
+                    'semantic_contract': semantic_contract([b['binding_id'] for b in bindings], catalog=catalog),
+                    'narrative_from_draft': True, 'catalog_revision': catalog_revision,
                     'sources': [{'binding_id': b['binding_id'], 'text': s['text'], 'author': s['author'],
                                  'recorded_at': s['recorded_at']} for s, b in zip(snapshots, bindings)]}
+                serialized_payload = json.dumps(payload, ensure_ascii=False)
+                input_metrics = {'contract': 'semantic-v1', 'catalog_revision': catalog_revision,
+                    'system_characters': len(prompt), 'payload_characters': len(serialized_payload),
+                    'payload_utf8_bytes': len(serialized_payload.encode('utf-8')),
+                    'components': {key: len(json.dumps(value, ensure_ascii=False)) for key, value in payload.items()}}
+                completion_meta['input_metrics'] = input_metrics
                 response = await engine._daily_chat_memory_create_completion(client, model=model,
-                    messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}],
+                    messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': serialized_payload}],
                     max_tokens=engine.daily_chat_memory_candidate_max_tokens, temperature=engine.temperature,
                     use_daily_client=use_daily, task_stage='chat_l1', task_route=route)
                 reported_usage = getattr(response, 'usage', None)
                 usage = {name: getattr(reported_usage, name, None) for name in
                          ('prompt_tokens', 'completion_tokens', 'total_tokens')}
+                token_details = getattr(reported_usage, 'completion_tokens_details', None)
+                reasoning_tokens = (token_details.get('reasoning_tokens') if isinstance(token_details, dict)
+                                    else getattr(token_details, 'reasoning_tokens', None))
+                if type(reasoning_tokens) is int:
+                    usage['reasoning_tokens'] = reasoning_tokens
                 raw_output = engine._completion_content(response) or ''
                 generation = {'prompt_revision': prompt_context['prompt_revision'],
                     'model_route_revision': 'route_sha256:' + semantic_sha256({k: v for k, v in route.items() if k != 'client'}),
                     'task_id': memory_id + ':' + str(claimed['draft_revision']), 'actor': 'chat_memory_preparation'}
-                completion_meta = {'generation': generation, 'usage': usage,
+                completion_meta = {'generation': generation, 'usage': usage, 'input_metrics': input_metrics,
                     'duration_ms': int((time.monotonic() - started) * 1000),
                     'preparation_output': {'draft_revision': claimed['draft_revision'],
                         'attempt': claimed['attempts'],
@@ -315,12 +326,13 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 # A complete model document at the root has the same semantic
                 # contract. Wrapping it is a program-formatting responsibility;
                 # no fields are discarded and inner L1 validation still runs.
-                if isinstance(parsed, dict) and set(parsed) == MODEL_FIELDS:
+                if isinstance(parsed, dict) and (set(parsed) == MODEL_FIELDS or parsed.get('format') == 'semantic-v1'):
                     parsed = {'document': parsed}
-                    output_shape['normalization'] = 'complete_document_root'
+                    output_shape['normalization'] = ('semantic_document_root' if parsed['document'].get('format') == 'semantic-v1'
+                        else 'complete_document_root')
                 if not isinstance(parsed, dict) or set(parsed) - {'document', 'kind', 'confidence', 'sensitive'} or not isinstance(parsed.get('document'), dict):
                     raise L1OwnerError('model_document_fields_required', field_path='document')
-                document = parsed['document']
+                document = assemble_document(parsed['document'], narrative=envelope['arguments']['narrative'])
                 # The model proposes semantics. The first-pass author keeps its
                 # complete prose; silently replacing it would lose that product.
                 draft = envelope['arguments']['narrative']
@@ -351,7 +363,7 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 if row['status'] == 'accepted':
                     await engine._memory_l1_adopt_candidate(row, bucket_mgr, request_id='chat-task:' + memory_id)
                 tasks.finish(claimed, phase='prepared', candidate_ids=[memory_id],
-                    generation=generation, catalog_revision=catalog_revision, usage=usage,
+                    generation=generation, catalog_revision=catalog_revision, usage=usage, input_metrics=input_metrics,
                     duration_ms=int((time.monotonic() - started) * 1000),
                     output_shape=output_shape, preparation_output=None)
                 results.append(tasks.receipt(memory_id))

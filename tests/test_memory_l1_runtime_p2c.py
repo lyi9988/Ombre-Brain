@@ -12,7 +12,7 @@ from test_memory_authority_r1 import reflection_config
 from test_memory_diary_l1_p2b import setup_diary, DAY
 
 
-def runtime(tmp_path, text, *, fail_window=None, limit=32):
+def runtime(tmp_path, text, *, fail_window=None, limit=32, compact=False):
     env = setup_diary(tmp_path, text)
     config = reflection_config(tmp_path / 'engine', mode='review')
     config['reflection'].update(diary_l1_input_window_chars=256, diary_l1_max_windows=limit)
@@ -34,9 +34,17 @@ def runtime(tmp_path, text, *, fail_window=None, limit=32):
         draft['statements'] = [statement]
         draft['scenes'] = [{'scene_id': 'new:scene', 'title': '一次连贯经历',
             'source_refs': ['diary-source'], 'statement_refs': ['new:statement'], 'attributes': []}]
-        from jsonschema import Draft202012Validator
-        Draft202012Validator(payload['model_document_schema']).validate(draft)
-        result = {'document': draft, 'scene_bodies': {'new:scene': '场景独立完整正文：' + payload['source_text']}, 'confidence': 0.9}
+        assert 'semantic_contract' in payload
+        assert not {'model_document_schema', 'catalog', 'document_template'}.intersection(payload)
+        if compact:
+            draft = {'format': 'semantic-v1', 'narrative': draft['narrative'], 'entities': [],
+                'statements': [{'content': statement['content'], 'subject_ref': None,
+                    'classification': {'kind': None, 'stability': None, 'modality': None, 'basis': None},
+                    'time': None, 'conditions': None, 'evidence_refs': ['diary-source']}],
+                'scenes': [{'title': '一次连贯经历',
+                    'source_refs': ['diary-source'], 'statement_refs': ['s1']}]}
+        result = {'document': draft, 'scene_bodies': {'c1' if compact else 'new:scene':
+            '场景独立完整正文：' + payload['source_text']}, 'confidence': 0.9}
         return NS(choices=[NS(message=NS(content=json.dumps(result, ensure_ascii=False)), finish_reason='stop')])
     engine.model = 'synthetic-model'
     engine.client = NS(chat=NS(completions=NS(create=create)))
@@ -66,9 +74,10 @@ def test_memory_l2_generation_options_have_bounded_defaults():
                 task_options({"reflection": {key: value}})
 
 
-def test_diary_actual_task_covers_all_segments_and_prepares_full_root_and_scene_bodies(tmp_path):
+@pytest.mark.parametrize('compact', [False, True])
+def test_diary_actual_task_covers_all_segments_and_prepares_full_root_and_scene_bodies(tmp_path, compact):
     text = ('合成日记正文🙂，这是完整资料。' * 90)
-    env, engine, calls = runtime(tmp_path, text)
+    env, engine, calls = runtime(tmp_path, text, compact=compact)
     result = run(engine._memory_l1_diary_task(DAY, env['buckets']))
     assert result['status'] == 'pending'
     assert ''.join(call['source_text'] for call in calls) == text

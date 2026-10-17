@@ -15,7 +15,7 @@ from test_memory_authority_r1 import reflection_config
 from test_memory_diary_l1_p2b import setup_diary
 
 
-def setup(tmp_path, *, mode='review', bad=False, during=None):
+def setup(tmp_path, *, mode='review', bad=False, during=None, compact=False):
     env = setup_diary(tmp_path / 'memory', '合成来源')
     config = reflection_config(tmp_path / 'engine', mode=mode)
     engine = ReflectionEngine(config)
@@ -39,6 +39,11 @@ def setup(tmp_path, *, mode='review', bad=False, during=None):
         if bad:
             statement['subject_ref'] = {'state': 'known', 'value': 'undeclared', 'evidence_refs': ['source:2']}
         document['statements'] = [statement]
+        if compact:
+            document = {'format': 'semantic-v1', 'entities': [], 'statements': [{
+                'content': statement['content'], 'subject_ref': None,
+                'classification': {'kind': None, 'stability': None, 'modality': None, 'basis': None},
+                'time': None, 'conditions': None, 'evidence_refs': ['source:2']}]}
         return NS(choices=[NS(message=NS(content=json.dumps({'document': document,
             'kind': 'shared_experience', 'confidence': 0.95})), finish_reason='stop')])
     async def locate(binding):
@@ -69,8 +74,9 @@ def test_submit_is_durable_without_model_or_adopted_memory_and_replays_readonly(
     assert task['envelope'] == envelope
 
 
-def test_background_prepares_full_l1_preserves_body_and_uses_real_message_evidence(tmp_path):
-    env, engine, envelope, calls = setup(tmp_path)
+@pytest.mark.parametrize('compact', [False, True])
+def test_background_prepares_full_l1_preserves_body_and_uses_real_message_evidence(tmp_path, compact):
+    env, engine, envelope, calls = setup(tmp_path, compact=compact)
     tasks = ChatMemoryPreparation(env['authority'])
     tasks.enqueue(envelope)
     result = asyncio.run(prepare_chat_tasks(engine, env['buckets']))
@@ -83,6 +89,9 @@ def test_background_prepares_full_l1_preserves_body_and_uses_real_message_eviden
     assert len(l1['evidence_bindings']) == 3
     assert l1['generation']['actor'] == 'chat_memory_preparation'
     assert len(calls) == 1
+    assert calls[0]['narrative_from_draft'] is True
+    assert 'semantic_contract' in calls[0]
+    assert not {'document_schema', 'document_template', 'catalog'}.intersection(calls[0])
     asyncio.run(prepare_chat_tasks(engine, env['buckets']))
     assert len(calls) == 1
 

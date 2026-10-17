@@ -114,6 +114,12 @@ def expand_model_document(document, base, source_texts=None):
         prior = old_members['relations'].get(item.get('relation_id'))
         item['origin'] = prior['origin'] if prior else 'model'
         item['confirmation_state'] = 'proposed'
+        for side in ('from', 'to'):
+            endpoint = item.get(side)
+            if isinstance(endpoint, dict) and set(endpoint) == {'object_type', 'object_id'}:
+                # Model-local references do not invent a persistent identity.
+                # The owner normalizer binds this pair to the committed revision.
+                endpoint.update(memory_id=None, revision='this_revision')
 
     def remap_evidence(node):
         if isinstance(node, list):

@@ -4038,7 +4038,7 @@ class ReflectionEngine(MemoryL1Runtime):
         l1_sources = None
         prompt_context = None
         if self.memory_authority_enabled and self.memory_authority_store:
-            l1_payload, l1_sources = self._memory_l1_daily_context(window)
+            l1_payload, l1_sources, l1_catalog_context = self._memory_l1_daily_context(window)
             payload["l1_contract"] = l1_payload
             prompt, prompt_context = self._memory_l1_prompt("ombre.daily_chat_memory_prompt",
                 runtime_values={"max_candidates": max(1, int(max_candidates or self.daily_chat_memory_max_per_day or 1))})
@@ -4101,6 +4101,9 @@ class ReflectionEngine(MemoryL1Runtime):
                     # cannot masquerade as a generated structured first pass.
                     item["l1_state"] = "legacy_body_only"
                     continue
+                from memory_l1_semantic_wire import assemble_document
+                draft = assemble_document(draft)
+                item['document'] = draft
                 item["content"] = draft.get("narrative", {}).get("body", "")
                 item["title"] = draft.get("narrative", {}).get("title", "")
                 # The model selects binding labels; only the program maps them
@@ -4131,7 +4134,7 @@ class ReflectionEngine(MemoryL1Runtime):
                     "prompt": prompt_context["prompt_revision"], "sources": [s["source_key"] for s in l1_sources]}
                 from memory_l1_contract import semantic_sha256
                 item["_l1_sources"] = l1_sources
-                item["_l1_catalog_context"] = (l1_payload["catalog"], l1_payload["catalog_revision"])
+                item["_l1_catalog_context"] = l1_catalog_context
                 item["_l1_generation"] = {"prompt_revision": prompt_context["prompt_revision"],
                     "model_route_revision": "route_sha256:" + semantic_sha256({k: v for k, v in route.items() if k != "client"}),
                     "task_id": "daily-task-" + semantic_sha256(task_seed)[:40], "actor": "daily_chat_first_pass"}
