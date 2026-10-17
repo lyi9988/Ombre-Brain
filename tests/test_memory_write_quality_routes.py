@@ -88,7 +88,7 @@ def make_engine(tmp_path, monkeypatch, *, routes=None, include_daily=True,
     return ReflectionEngine(config)
 
 
-def test_route_normalization_returns_all_six_stages_and_validates_values():
+def test_route_normalization_returns_all_stages_and_validates_values():
     routes = normalize_task_routes({"auto_l1": {"model": "  route-model  "}})
 
     assert set(routes) == set(STAGES)
@@ -105,6 +105,7 @@ def test_route_normalization_returns_all_six_stages_and_validates_values():
         {"auto_l1": {"max_tokens": 0}},
         {"auto_l1": {"max_tokens": 1_000_001}},
         {"auto_l1": {"api_key": "must-not-be-a-route-field"}},
+        {"presentation_l2": {"api_key": "must-not-be-a-route-field"}},
     ]
     for value in invalid:
         with pytest.raises(ValueError):
@@ -136,11 +137,18 @@ def test_stage_completion_calls_use_the_selected_model_thinking_effort_and_token
             "reasoning_effort": "medium",
             "max_tokens": 2403,
         },
+        "presentation_l2": {
+            "connection": "daily",
+            "model": "memory-presentation-v1",
+            "thinking_mode": "disabled",
+            "reasoning_effort": "high",
+            "max_tokens": 12345,
+        },
     }
     engine = make_engine(tmp_path, monkeypatch, routes=routes)
     messages = [{"role": "user", "content": "synthetic request"}]
 
-    for stage in ("auto_l1", "chat_l1", "chat_summary"):
+    for stage in ("auto_l1", "chat_l1", "chat_summary", "presentation_l2"):
         asyncio.run(engine._daily_chat_memory_create_completion(
             None,
             model="legacy-caller-model",
@@ -169,6 +177,27 @@ def test_stage_completion_calls_use_the_selected_model_thinking_effort_and_token
     assert summary_call["max_tokens"] == 2403
     assert "extra_body" not in summary_call
     assert summary_call["reasoning_effort"] == "medium"
+
+    presentation_call = engine.daily_chat_memory_client.calls[1]
+    assert presentation_call["model"] == "memory-presentation-v1"
+    assert presentation_call["max_tokens"] == 12345
+    assert presentation_call["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert presentation_call["reasoning_effort"] == "high"
+
+
+def test_presentation_l2_legacy_route_uses_existing_model_and_full_draft_default(
+    tmp_path, monkeypatch
+):
+    engine = make_engine(tmp_path, monkeypatch)
+
+    route = engine._memory_task_route("presentation_l2")
+
+    assert route["stage"] == "presentation_l2"
+    assert route["connection"] == "daily"
+    assert route["model"] == "daily-candidate-default"
+    assert route["thinking_mode"] == "enabled"
+    assert route["max_tokens"] == 16000
+    assert route["max_tokens_source"] == "task_default"
 
 
 def test_explicit_unconfigured_connection_stays_unavailable_without_cross_source_fallback(
@@ -479,6 +508,7 @@ def test_memory_task_route_persist_failure_restores_old_runtime_then_retry_saves
     assert not config_api.runtime_config_path.exists()
     assert all(client.calls == [] for client in clients)
 
+
     monkeypatch.setattr(memory_system_config, "update_overlay", original_update_overlay)
     saved = asyncio.run(config_api.server.api_config_update(FakeRequest(request_body)))
 
@@ -491,6 +521,38 @@ def test_memory_task_route_persist_failure_restores_old_runtime_then_retry_saves
     assert "new-owner-route-model" in config_api.runtime_config_path.read_text(encoding="utf-8")
     assert all(client.calls == [] for client in clients)
 
+
+def test_l2_schema_config_persists_reads_back_and_rejects_stale_or_invalid(config_api):
+    initial = response_json(asyncio.run(config_api.server.api_config_get(FakeRequest())))['reflection']
+    schema = copy.deepcopy(initial['memory_l2_output_schema'])
+    schema['properties']['full_injection_text']['minLength'] = 2
+    saved = asyncio.run(config_api.server.api_config_update(FakeRequest({'reflection':{'memory_l2_output_schema':schema},
+        'expected_memory_l2_schema_revision':initial['memory_l2_schema_revision'], 'persist':True})))
+    assert saved.status_code == 200, saved.body
+    readback = response_json(asyncio.run(config_api.server.api_config_get(FakeRequest())))['reflection']
+    assert readback['memory_l2_output_schema'] == schema
+    assert readback['memory_l2_schema_revision'] != initial['memory_l2_schema_revision']
+    assert 'memory_l2_output_schema' in config_api.runtime_config_path.read_text(encoding='utf-8')
+    before = copy.deepcopy(config_api.config)
+    stale = asyncio.run(config_api.server.api_config_update(FakeRequest({'reflection':{'memory_l2_output_schema':{}},
+        'expected_memory_l2_schema_revision':initial['memory_l2_schema_revision']})))
+    assert stale.status_code == 409 and config_api.config == before
+    invalid = asyncio.run(config_api.server.api_config_update(FakeRequest({'reflection':{'memory_l2_output_schema':{'type':'not-a-json-schema-type'}},
+        'expected_memory_l2_schema_revision':readback['memory_l2_schema_revision']})))
+    assert invalid.status_code == 400 and config_api.config == before
+
+
+def test_l2_scheduler_uses_same_server_cas_as_task_routes(config_api):
+    initial = response_json(asyncio.run(config_api.server.api_config_get(FakeRequest())))['reflection']
+    first = asyncio.run(config_api.server.api_config_update(FakeRequest({'reflection':{'memory_l2_jobs_per_run':3},
+        'expected_memory_task_revision':initial['memory_task_revision'], 'persist':True})))
+    assert first.status_code == 200, first.body
+    readback = response_json(asyncio.run(config_api.server.api_config_get(FakeRequest())))['reflection']
+    assert readback['memory_l2_jobs_per_run'] == 3
+    assert readback['memory_task_revision'] != initial['memory_task_revision']
+    second = asyncio.run(config_api.server.api_config_update(FakeRequest({'reflection':{'memory_l2_jobs_per_run':7},
+        'expected_memory_task_revision':initial['memory_task_revision'], 'persist':True})))
+    assert second.status_code == 409 and config_api.config['reflection']['memory_l2_jobs_per_run'] == 3
 
 def test_memory_task_route_expected_revision_conflict_has_no_partial_update(
     config_api, monkeypatch, tmp_path

@@ -43,7 +43,11 @@ def setup(tmp_path, *, mode='review', bad=False, during=None):
             'kind': 'shared_experience', 'confidence': 0.95})), finish_reason='stop')])
     async def locate(binding):
         return {'state': 'available', 'eligible_source': True}
-    engine._daily_chat_memory_model_client = lambda **kw: (object(), 'synthetic-model', False)
+    # Preparation now consumes the explicit stage router, not the old daily
+    # client helper. Keep this integration fixture on the real route boundary.
+    engine._memory_task_route = lambda stage: {'stage':stage, 'client':object(), 'model':'synthetic-model',
+        'connection':'reflection', 'configured':True, 'thinking_mode':'', 'reasoning_effort':'',
+        'max_tokens':16000, 'unavailable_reason':''}
     engine._daily_chat_memory_create_completion = create
     sources = [{'event_id': 'evt-1', 'version_id': 'v1', 'role': 'user', 'text': '我今天有点累。', 'created_at': '2026-10-16T10:00:00Z'},
                {'event_id': 'evt-2', 'version_id': 'v2', 'role': 'user', 'text': '抱抱我。', 'created_at': '2026-10-16T10:00:01Z'},

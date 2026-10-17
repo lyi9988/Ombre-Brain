@@ -3,7 +3,8 @@ from copy import deepcopy
 import hashlib
 import json
 
-STAGES = ("auto_l1", "chat_l1", "action_l1", "diary_l1", "chat_summary", "activity_summary")
+STAGES = ("auto_l1", "chat_l1", "action_l1", "diary_l1", "presentation_l2",
+          "chat_summary", "activity_summary")
 DEFAULT_ROUTE = {"connection": "legacy", "model": "", "thinking_mode": "inherit",
                  "reasoning_effort": "", "max_tokens": None}
 
@@ -72,7 +73,12 @@ def resolve_task_route(engine, stage, default_max_tokens=None):
     if thinking == "default":
         thinking = ""
     if default_max_tokens is None:
-        if stage == "diary_l1":
+        if stage == "presentation_l2":
+            # L2 is the complete readable injection draft, not a short summary.
+            # Keep its 16k default independent from first-pass candidate limits;
+            # owners can still tune the stage through memory_task_routes.
+            default_max_tokens = 16000
+        elif stage == "diary_l1":
             from memory_l1_runtime import task_options
             default_max_tokens = task_options(config)["diary_l1_max_tokens"]
         else:
@@ -98,11 +104,17 @@ def public_task_models(engine):
         row = resolve_task_route(engine, stage)
         row.pop("client")
         effective[stage] = row
-    return {"routes": deepcopy(routes), "effective": effective, "revision": task_routes_revision(routes)}
+    from memory_l1_runtime import task_options
+    return {"routes": deepcopy(routes), "effective": effective,
+            "revision": task_routes_revision(routes, task_options(getattr(engine, 'config', {})))}
 
 
-def task_routes_revision(routes):
-    return "mt-" + hashlib.sha256(json.dumps(normalize_task_routes(routes), sort_keys=True,
+def task_routes_revision(routes, scheduling=None):
+    from memory_l1_runtime import task_options
+    options = task_options({}) if scheduling is None else scheduling
+    payload = {'routes':normalize_task_routes(routes), 'l2_scheduling':{key:options[key] for key in
+        ('memory_l2_jobs_per_run','memory_l2_concurrency','memory_l2_prepare_interval_seconds')}}
+    return "mt-" + hashlib.sha256(json.dumps(payload, sort_keys=True,
         ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
 

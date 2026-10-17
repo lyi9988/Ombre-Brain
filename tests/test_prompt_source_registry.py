@@ -28,6 +28,7 @@ EXPECTED_FIXED_SOURCE_IDS = {
     "ombre.diary_memory_prompt",
     "ombre.chat_memory_prepare_prompt",
     "ombre.daily_chat_memory_prompt",
+    "ombre.memory_l2_generation_prompt",
     "ombre.daily_chat_summary_prompt",
     "ombre.daily_activity_summary_prompt",
     "ombre.domain_sentinel_prompt",
@@ -60,6 +61,85 @@ def test_registry_contains_every_included_fixed_source():
     assert set(FIXED_PROMPT_SOURCES) == EXPECTED_FIXED_SOURCE_IDS
     assert not EXPECTED_FIXED_SOURCE_IDS & DYNAMIC_CONTEXT_SOURCES
     assert not EXPECTED_FIXED_SOURCE_IDS & RUNTIME_MECHANIC_SOURCES
+
+
+def test_l2_generation_prompt_is_composer_editable_and_keeps_its_contract(tmp_path):
+    source_id = "ombre.memory_l2_generation_prompt"
+    spec = FIXED_PROMPT_SOURCES[source_id]
+    detail = source_detail(source_id, {})
+    prompt = detail["factory_body"]
+
+    assert spec.scope == "memory.reflection"
+    assert detail["source_revision"] == "factory-memory-l2-generation-v2-review"
+    for requirement in (
+        '"full_injection_text"',
+        '"coherent_sections"',
+        '"optional_use_variants"',
+        '"review"',
+        '"required"',
+        '"reasons"',
+        '"statement_refs"',
+        '"intended_use"',
+        "每一条分节或用途变体都必须至少有一个可靠的 statement_refs",
+        "current_basis、conditional_basis、relationship_reference、historical_evidence、unresolved_evidence",
+        "完整 L1",
+        "来源限制",
+        "时间年轮",
+        "自然的第一人称",
+        "否定、条件、范围和不确定性",
+        "不得把历史状态改写成当前状态",
+        "不得把一次性的请求提升成长期偏好",
+        "自审主体、时序、否定、条件和范围",
+        "required=true",
+        "不得自行假定或消解",
+        "required=false 只表示模型完成了自检，不代表任何记忆内容已被证实真实",
+        "review 是自动稿审阅判断元数据，不是记忆正文",
+        "不得把它或 reasons 写入 full_injection_text、分节或用途变体",
+        '"reasons":[]',
+        "2200 token 摘要",
+        "source_refs",
+        "内部版本身份",
+    ):
+        assert requirement in prompt
+
+    store = PromptPlanMirrorStore(tmp_path / "l2-prompt.sqlite3")
+
+    def bind(mode, revision, owner_body=""):
+        block = {
+            "block_id": "block:l2-generation",
+            "source_id": source_id,
+            "scope": spec.scope,
+            "stage": "ombre_post_injection",
+            "mode": mode,
+            "role": "system",
+            "lane": "instruction",
+            "anchor": "instructions.end",
+            "order": 0,
+            "enabled": True,
+            "owner_body": owner_body,
+        }
+        digest = hashlib.sha256(str(revision).encode()).hexdigest()
+        store.put_plan(
+            "preset:l2",
+            revision,
+            plan_sha256=digest,
+            gateway_slice={"blocks": [block]},
+        )
+        store.put_binding(
+            spec.scope,
+            preset_id="preset:l2",
+            preset_revision=revision,
+            plan_sha256=digest,
+            aiz_binding_revision=revision,
+        )
+
+    bind("owner_override", 1, "主人定制的 L2 第二遍写作要求")
+    resolved, _meta = resolve_fixed_prompt(store, source_id)
+    assert resolved == "主人定制的 L2 第二遍写作要求"
+
+    bind("off", 2)
+    resolved, _meta = resolve_fixed_prompt(store, source_id)
+    assert resolved == ""
 
 
 def test_internal_recall_preparation_sources_are_scoped_and_provenanced():

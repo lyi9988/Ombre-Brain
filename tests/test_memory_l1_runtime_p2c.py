@@ -46,6 +46,26 @@ def runtime(tmp_path, text, *, fail_window=None, limit=32):
 def run(task): return asyncio.run(task)
 
 
+def test_memory_l2_generation_options_have_bounded_defaults():
+    from memory_l1_runtime import GENERATION_OPTIONS, task_options
+    from memory_l1_service import L1OwnerError
+
+    assert GENERATION_OPTIONS["memory_l2_jobs_per_run"] == (1, 0, 200)
+    assert GENERATION_OPTIONS["memory_l2_prepare_interval_seconds"] == (5, 1, 3600)
+    assert task_options({"reflection": {}})["memory_l2_jobs_per_run"] == 1
+    assert task_options({"reflection": {}})["memory_l2_prepare_interval_seconds"] == 5
+
+    for key, allowed in (
+        ("memory_l2_jobs_per_run", (0, 200)),
+        ("memory_l2_prepare_interval_seconds", (1, 3600)),
+    ):
+        for value in allowed:
+            assert task_options({"reflection": {key: value}})[key] == value
+        for value in (allowed[0] - 1, allowed[1] + 1, True, 1.5):
+            with pytest.raises(L1OwnerError, match="invalid_generation_configuration"):
+                task_options({"reflection": {key: value}})
+
+
 def test_diary_actual_task_covers_all_segments_and_prepares_full_root_and_scene_bodies(tmp_path):
     text = ('合成日记正文🙂，这是完整资料。' * 90)
     env, engine, calls = runtime(tmp_path, text)

@@ -24,7 +24,10 @@ GENERATION_OPTIONS = {'diary_l1_input_window_chars': (64000, 256, 2000000),
     'daily_chat_memory_max_windows_per_run': (10, 1, 10000),
     'daily_chat_memory_window_max_input_chars': (12000, 256, 2000000),
     'daily_chat_memory_max_per_day': (10, 0, 10000),
-    'daily_chat_memory_review_max_per_day': (10, 0, 10000)}
+    'daily_chat_memory_review_max_per_day': (10, 0, 10000),
+    'memory_l2_jobs_per_run': (1, 0, 200),
+    'memory_l2_concurrency': (1, 1, 200),
+    'memory_l2_prepare_interval_seconds': (5, 1, 3600)}
 GENERATION_OPTIONS['action_l1_jobs_per_run'] = (1, 0, 200)
 GENERATION_OPTIONS['chat_memory_jobs_per_run'] = (1, 0, 200)
 GENERATION_OPTIONS['chat_memory_prepare_interval_seconds'] = (5, 1, 3600)

@@ -87,7 +87,8 @@ class MemoryL1RevisionService:
                        "coverage": (metadata.get("diary_l1_bundle") or {}).get("coverage"),
                        "semantic_sha256": metadata.get("memory_l1_semantic_sha256"),
                        "l1_content_sha256": metadata.get("memory_l1_content_sha256"),
-                       "preparation": {"l2": {"state": "waiting_for_consumer" if state == "current" else "not_prepared", "consumer": "P4"}}}}
+                       "preparation": {"l2": {"state": "tracked" if state == "current" else "not_prepared",
+                                              "status_url": "/api/memory-authority/memories/" + memory_id + "/presentation"}}}}
 
     def _owner_document(self, submitted, previous, *, memory_id, request_id, catalog, catalog_revision, revision):
         doc = copy.deepcopy(submitted)

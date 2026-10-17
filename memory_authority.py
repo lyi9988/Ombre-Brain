@@ -437,6 +437,8 @@ class MemoryAuthorityStore:
         initialize(conn)
         from memory_l0_sources import initialize as initialize_source_copies
         initialize_source_copies(conn)
+        from memory_l2_store import initialize as initialize_presentations
+        initialize_presentations(conn)
         conn.commit()
         conn.close()
 
@@ -888,7 +890,9 @@ class MemoryAuthorityStore:
             if "memory_l1" in payload["metadata"]:
                 outbox_payload.update({key: payload["metadata"][key] for key in
                     ("memory_l1_semantic_sha256", "memory_l1_content_sha256")})
-                outbox_payload["l2_preparation"] = {"state": "waiting_for_consumer", "consumer": "P4",
+                from memory_l2_store import enqueue_in_transaction
+                l2_task = enqueue_in_transaction(conn, memory_id, revision)
+                outbox_payload["l2_preparation"] = {"state": "pending", "task_id": l2_task,
                     "dependency": payload["metadata"]["memory_l1_content_sha256"]}
             conn.execute(
                 "INSERT INTO outbox(event_id,operation_id,event_type,aggregate_id,aggregate_revision,payload_json,"

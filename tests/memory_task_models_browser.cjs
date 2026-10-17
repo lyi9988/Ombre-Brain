@@ -6,7 +6,17 @@ const { chromium } = require('playwright');
 
 const root = path.resolve(__dirname, '..');
 const script = fs.readFileSync(path.join(root, 'dashboard_assets/memory-task-models.js'), 'utf8');
-const stageIds = ['auto_l1', 'chat_l1', 'action_l1', 'diary_l1', 'chat_summary', 'activity_summary'];
+const stageIds = ['auto_l1', 'chat_l1', 'action_l1', 'diary_l1', 'presentation_l2', 'chat_summary', 'activity_summary'];
+const OUTPUT_SCHEMA = {
+  type: 'object',
+  required: ['full_injection_text', 'coherent_sections', 'optional_use_variants', 'review'],
+  properties: {
+    full_injection_text: { type: 'string' },
+    coherent_sections: { type: 'array' },
+    optional_use_variants: { type: 'array' },
+    review: { type: 'object' },
+  },
+};
 
 function makeRoutes() {
   return Object.fromEntries(stageIds.map((stage) => [stage, {
@@ -38,13 +48,18 @@ function makeEffective(routes) {
   }));
 }
 
-function makeConfig(routes = makeRoutes(), revision = 'revision-1') {
+function makeConfig(routes = makeRoutes(), revision = 'revision-1', schema = OUTPUT_SCHEMA, schemaRevision = 'schema-revision-1') {
   return {
     reflection: {
       api_key: 'SYNTHETIC_SECRET_SHOULD_NOT_RENDER',
       memory_task_routes: structuredClone(routes),
       memory_task_effective: makeEffective(routes),
       memory_task_revision: revision,
+      memory_l2_output_schema: structuredClone(schema),
+      memory_l2_schema_revision: schemaRevision,
+      memory_l2_jobs_per_run: 1,
+      memory_l2_concurrency: 1,
+      memory_l2_prepare_interval_seconds: 5,
     },
   };
 }
@@ -83,7 +98,10 @@ async function makePage(browser, width = 390) {
     window.failPost = false;
     window.failNextGet = false;
     window.keepRoutesOnPost = false;
+    window.keepSchemaOnPost = false;
     window.conflictNextPost = false;
+    window.schemaConflictNextPost = false;
+    window.schemaRevisionCounter = 1;
     window.xssTriggered = false;
     window.revisionCounter = 1;
     window.buildEffective = buildEffective;
@@ -102,15 +120,51 @@ async function makePage(browser, width = 390) {
       const body = JSON.parse(options.body);
       window.lastPostedBody = body;
       if (window.failPost) return reply({ ok: false, error: 'synthetic failure' }, 503);
-      if (window.conflictNextPost || body.expected_memory_task_revision !== window.serverConfig.reflection.memory_task_revision) {
+      const reflectionPatch = body.reflection || {};
+      const taskOptionKeys = ['memory_l2_jobs_per_run', 'memory_l2_concurrency', 'memory_l2_prepare_interval_seconds'];
+      const hasTaskPatch = Object.prototype.hasOwnProperty.call(reflectionPatch, 'memory_task_routes')
+        || taskOptionKeys.some((key) => Object.prototype.hasOwnProperty.call(reflectionPatch, key));
+      const taskConflict = Object.prototype.hasOwnProperty.call(body, 'expected_memory_task_revision')
+        && body.expected_memory_task_revision !== window.serverConfig.reflection.memory_task_revision;
+      const schemaConflict = Object.prototype.hasOwnProperty.call(body, 'expected_memory_l2_schema_revision')
+        && body.expected_memory_l2_schema_revision !== window.serverConfig.reflection.memory_l2_schema_revision;
+      if (window.schemaConflictNextPost) {
+        window.schemaConflictNextPost = false;
+        window.serverConfig.reflection.memory_l2_output_schema = structuredClone(window.conflictingOutputSchema || {
+          ...window.serverConfig.reflection.memory_l2_output_schema,
+          description: '服务器并发更新',
+        });
+        window.schemaRevisionCounter += 1;
+        window.serverConfig.reflection.memory_l2_schema_revision = 'schema-revision-' + window.schemaRevisionCounter;
+        return reply({ ok: false, error: 'memory_l2_schema_revision_conflict' }, 409);
+      }
+      if (window.conflictNextPost || taskConflict || schemaConflict) {
         window.conflictNextPost = false;
         return reply({ ok: false, error: 'memory_task_revision_conflict' }, 409);
       }
-      if (!window.keepRoutesOnPost) {
-        window.serverConfig.reflection.memory_task_routes = structuredClone(body.reflection.memory_task_routes);
-        window.serverConfig.reflection.memory_task_effective = buildEffective(body.reflection.memory_task_routes);
+      if (hasTaskPatch && !window.keepRoutesOnPost) {
+        if (Object.prototype.hasOwnProperty.call(reflectionPatch, 'memory_task_routes')) {
+          window.serverConfig.reflection.memory_task_routes = structuredClone(reflectionPatch.memory_task_routes);
+          window.serverConfig.reflection.memory_task_effective = buildEffective(reflectionPatch.memory_task_routes);
+        }
+        if (Object.prototype.hasOwnProperty.call(reflectionPatch, 'memory_l2_jobs_per_run')) {
+          window.serverConfig.reflection.memory_l2_jobs_per_run = reflectionPatch.memory_l2_jobs_per_run;
+        }
+        if (Object.prototype.hasOwnProperty.call(reflectionPatch, 'memory_l2_concurrency')) {
+          window.serverConfig.reflection.memory_l2_concurrency = reflectionPatch.memory_l2_concurrency;
+        }
+        if (Object.prototype.hasOwnProperty.call(reflectionPatch, 'memory_l2_prepare_interval_seconds')) {
+          window.serverConfig.reflection.memory_l2_prepare_interval_seconds = reflectionPatch.memory_l2_prepare_interval_seconds;
+        }
         window.revisionCounter += 1;
         window.serverConfig.reflection.memory_task_revision = 'revision-' + window.revisionCounter;
+      }
+      if (Object.prototype.hasOwnProperty.call(reflectionPatch, 'memory_l2_output_schema')) {
+        if (!window.keepSchemaOnPost) {
+          window.serverConfig.reflection.memory_l2_output_schema = structuredClone(reflectionPatch.memory_l2_output_schema);
+          window.schemaRevisionCounter += 1;
+          window.serverConfig.reflection.memory_l2_schema_revision = 'schema-revision-' + window.schemaRevisionCounter;
+        }
       }
       return reply({ ok: true });
     };
@@ -118,7 +172,7 @@ async function makePage(browser, width = 390) {
   await page.goto('http://memory-task.test/');
   await page.addScriptTag({ content: script });
   await page.evaluate(() => window.renderMemoryTaskModels());
-  await page.waitForFunction(() => document.querySelector('#memory-task-models .mtm-status')?.textContent.includes('路由配置已读取'));
+  await page.waitForFunction(() => document.querySelector('#memory-task-models .mtm-status')?.textContent.includes('已从服务器读取'));
   return page;
 }
 
@@ -143,7 +197,7 @@ async function expectDashboardTheme(page) {
   assert.equal(colors.cardBackground, 'rgb(247, 242, 232)');
   assert.equal(colors.cardText, 'rgb(58, 53, 48)');
   assert.equal(colors.summaryWhiteSpace, 'nowrap');
-  assert.ok(colors.documentHeight < 2200, `default 390px layout should be compact: ${colors.documentHeight}px`);
+  assert.ok(colors.documentHeight < 3000, `default seven-stage 390px layout should remain bounded: ${colors.documentHeight}px`);
 }
 
 (async () => {
@@ -152,14 +206,18 @@ async function expectDashboardTheme(page) {
     const page = await makePage(browser, 390);
     await expectNoOverflow(page, 1);
     await expectDashboardTheme(page);
-    assert.equal(await page.locator('.mtm-stage').count(), 6);
-    assert.equal(await page.locator('input[data-route-field="model"]').count(), 6);
+    assert.equal(await page.locator('.mtm-stage').count(), 7);
+    assert.equal(await page.locator('input[data-route-field="model"]').count(), 7);
+    assert.equal(await page.locator('#mtm-presentation_l2-model').count(), 1, 'presentation_l2 stays visible as its own adjustable stage');
+    assert.equal(await page.locator('#mtm-memory_l2_jobs_per_run').inputValue(), '1');
+    assert.equal(await page.locator('#mtm-memory_l2_concurrency').inputValue(), '1');
+    assert.equal(await page.locator('#mtm-memory_l2_prepare_interval_seconds').inputValue(), '5');
     assert.equal(await page.locator('.mtm-more-settings[open]').count(), 0);
     assert.equal(await page.locator('.mtm-effective-details[open]').count(), 0);
     assert.equal(await page.locator('#memory-task-models').getByText('SYNTHETIC_SECRET_SHOULD_NOT_RENDER').count(), 0);
     assert.equal(await page.locator('#memory-task-models').getByText('独立 L2').count(), 0);
 
-    const screenshotDir = path.resolve(root, '..', '..', 'staging', 'memory-write-quality-ui-20261017');
+    const screenshotDir = path.resolve(root, '..', '..', 'staging', 'memory-l2-p4-ui-20261018');
     fs.mkdirSync(screenshotDir, { recursive: true });
     const mobileScreenshot = path.join(screenshotDir, 'memory-task-models-390.png');
     const desktopScreenshot = path.join(screenshotDir, 'memory-task-models-1280.png');
@@ -176,8 +234,9 @@ async function expectDashboardTheme(page) {
       const draft = JSON.parse(sessionStorage.getItem('ombre.memory-task-models.draft.v1'));
       return { keys: Object.keys(draft).sort(), baseRevision: draft.base_revision, json: JSON.stringify(draft) };
     });
-    assert.deepEqual(savedDraft.keys, ['base_revision', 'base_routes', 'routes', 'version']);
+    assert.deepEqual(savedDraft.keys, ['base_output_schema', 'base_output_schema_revision', 'base_revision', 'base_routes', 'base_task_options', 'output_schema_text', 'routes', 'task_options', 'version']);
     assert.equal(savedDraft.baseRevision, 'revision-1');
+    assert.equal(JSON.parse(savedDraft.json).output_schema_text, null, 'route-only drafts do not claim an unedited schema');
     assert.doesNotMatch(savedDraft.json, /api_key|SYNTHETIC_SECRET|memory_task_effective/);
     await page.reload();
     await page.addScriptTag({ content: script });
@@ -295,7 +354,196 @@ async function expectDashboardTheme(page) {
     assert.equal(rebasedPost.serverRoutes.chat_summary.model, '服务器并发更新');
     await conflictPage.close();
 
-    console.log('PASS memory-task-models: 390px and 1280px layout, six stages, GET initialization, target-section-only CAS save, exact readback, refresh/error/conflict draft preservation and rebase, daily unavailable reason, XSS rendered as text');
+    console.log('PASS memory-task-models: 390px and 1280px layout, seven visible stages, GET initialization, target-section-only CAS save, exact readback, refresh/error/conflict draft preservation and rebase, L2 job/interval/concurrency settings, daily unavailable reason, XSS rendered as text');
+
+    const optionsPage = await makePage(browser, 390);
+    const jobsInput = optionsPage.locator('#mtm-memory_l2_jobs_per_run');
+    const concurrencyInput = optionsPage.locator('#mtm-memory_l2_concurrency');
+    const intervalInput = optionsPage.locator('#mtm-memory_l2_prepare_interval_seconds');
+    await jobsInput.fill('201');
+    await optionsPage.locator('[data-action="save-memory-task-models"]').click();
+    await optionsPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('0 到 200 之间的整数'));
+    assert.equal(await optionsPage.evaluate(() => window.callLog.filter((call) => call.method === 'POST').length), 0);
+    assert.equal(await jobsInput.inputValue(), '201', 'out-of-range values stay visible for correction');
+
+    await jobsInput.fill('1');
+    await concurrencyInput.fill('0');
+    await optionsPage.locator('[data-action="save-memory-task-models"]').click();
+    await optionsPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('1 到 200 之间的整数'));
+    assert.equal(await optionsPage.evaluate(() => window.callLog.filter((call) => call.method === 'POST').length), 0);
+    assert.equal(await concurrencyInput.inputValue(), '0', 'out-of-range concurrency stays visible for correction');
+
+    await jobsInput.fill('0');
+    await concurrencyInput.fill('200');
+    await intervalInput.fill('3600');
+    await optionsPage.locator('[data-action="save-memory-task-models"]').click();
+    await optionsPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('已保存并应用'));
+    const optionsPost = await optionsPage.evaluate(() => ({
+      body: window.lastPostedBody,
+      reflection: window.serverConfig.reflection,
+      calls: window.callLog,
+    }));
+    assert.deepEqual(optionsPost.body.reflection, {
+      memory_l2_jobs_per_run: 0,
+      memory_l2_concurrency: 200,
+      memory_l2_prepare_interval_seconds: 3600,
+    });
+    assert.equal(optionsPost.reflection.memory_l2_jobs_per_run, 0);
+    assert.equal(optionsPost.reflection.memory_l2_concurrency, 200);
+    assert.equal(optionsPost.reflection.memory_l2_prepare_interval_seconds, 3600);
+    assert.ok(optionsPost.calls.filter((call) => call.method === 'GET').length >= 2,
+      'editing L2 frequency checks the current reflection values before the CAS-backed save');
+    await optionsPage.close();
+
+    const optionsConflictPage = await makePage(browser, 390);
+    const conflictJobsInput = optionsConflictPage.locator('#mtm-memory_l2_jobs_per_run');
+    await conflictJobsInput.fill('7');
+    await optionsConflictPage.evaluate(() => { window.serverConfig.reflection.memory_l2_jobs_per_run = 2; });
+    await optionsConflictPage.locator('[data-action="save-memory-task-models"]').click();
+    await optionsConflictPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('服务器任务配置或第二遍输出 Schema 已有更新'));
+    assert.equal(await optionsConflictPage.evaluate(() => window.callLog.filter((call) => call.method === 'POST').length), 0,
+      'a preflight conflict does not overwrite a newer scheduler value');
+    assert.equal(await conflictJobsInput.inputValue(), '7');
+    await optionsConflictPage.locator('[data-action="rebase-memory-task-models"]').click();
+    await optionsConflictPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('已核对服务器新版'));
+    assert.equal(await conflictJobsInput.inputValue(), '7', 'explicit rebase preserves the owner edit');
+    await optionsConflictPage.locator('[data-action="save-memory-task-models"]').click();
+    await optionsConflictPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('已保存并应用'));
+    assert.equal(await optionsConflictPage.evaluate(() => window.serverConfig.reflection.memory_l2_jobs_per_run), 7);
+    await optionsConflictPage.close();
+
+    const invalidSchemaPage = await makePage(browser, 390);
+    const invalidSchemaInput = invalidSchemaPage.locator('#mtm-memory_l2_output_schema');
+    assert.equal(await invalidSchemaInput.inputValue(), JSON.stringify(OUTPUT_SCHEMA, null, 2),
+      'the schema editor is initialized from the GET payload, not a JavaScript copy');
+    assert.equal(await invalidSchemaPage.locator('.mtm-schema[open]').count(), 0,
+      'the long schema editor starts collapsed');
+    await invalidSchemaPage.locator('.mtm-schema').evaluate((node) => { node.open = true; });
+    await invalidSchemaInput.fill('{"type":');
+    await invalidSchemaPage.locator('[data-action="save-memory-task-models"]').click();
+    await invalidSchemaPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('JSON 语法无效'));
+    assert.equal(await invalidSchemaPage.evaluate(() => window.callLog.filter((call) => call.method === 'POST').length), 0,
+      'invalid JSON blocks every save request');
+    const invalidDraft = await invalidSchemaPage.evaluate(() => JSON.parse(sessionStorage.getItem('ombre.memory-task-models.draft.v1')));
+    assert.equal(invalidDraft.output_schema_text, '{"type":');
+    await invalidSchemaPage.reload();
+    await invalidSchemaPage.addScriptTag({ content: script });
+    await invalidSchemaPage.evaluate(() => window.renderMemoryTaskModels());
+    await invalidSchemaPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('已恢复此标签页的未保存草稿'));
+    assert.equal(await invalidSchemaInput.inputValue(), '{"type":', 'invalid schema draft survives a page reload');
+    await invalidSchemaPage.close();
+
+    const schemaOnlyPage = await makePage(browser, 390);
+    const schemaOnlyInput = schemaOnlyPage.locator('#mtm-memory_l2_output_schema');
+    await schemaOnlyPage.locator('.mtm-schema').evaluate((node) => { node.open = true; });
+    const ownerSchema = { ...OUTPUT_SCHEMA, description: 'owner schema-only edit' };
+    await schemaOnlyInput.fill(JSON.stringify(ownerSchema, null, 2));
+    await schemaOnlyPage.locator('[data-action="save-memory-task-models"]').click();
+    await schemaOnlyPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('schema-revision-2'));
+    const schemaOnlyPost = await schemaOnlyPage.evaluate(() => ({
+      body: window.lastPostedBody,
+      schema: window.serverConfig.reflection.memory_l2_output_schema,
+      schemaRevision: window.serverConfig.reflection.memory_l2_schema_revision,
+      taskRevision: window.serverConfig.reflection.memory_task_revision,
+    }));
+    assert.deepEqual(Object.keys(schemaOnlyPost.body).sort(), [
+      'expected_memory_l2_schema_revision', 'persist', 'reflection',
+    ]);
+    assert.deepEqual(Object.keys(schemaOnlyPost.body.reflection), ['memory_l2_output_schema'],
+      'schema-only saves do not submit routes or task options');
+    assert.equal(schemaOnlyPost.body.expected_memory_l2_schema_revision, 'schema-revision-1');
+    assert.equal(Object.prototype.hasOwnProperty.call(schemaOnlyPost.body, 'expected_memory_task_revision'), false,
+      'schema-only saves use only the schema CAS');
+    assert.deepEqual(schemaOnlyPost.schema, ownerSchema);
+    assert.equal(schemaOnlyPost.schemaRevision, 'schema-revision-2');
+    assert.equal(schemaOnlyPost.taskRevision, 'revision-1');
+    assert.match(await schemaOnlyPage.locator('.mtm-status').textContent(), /已保存并应用/);
+    await schemaOnlyPage.close();
+
+    const combinedPage = await makePage(browser, 390);
+    await combinedPage.locator('.mtm-schema').evaluate((node) => { node.open = true; });
+    await combinedPage.locator('#mtm-memory_l2_output_schema').fill(JSON.stringify(ownerSchema, null, 2));
+    await combinedPage.locator('#mtm-memory_l2_jobs_per_run').fill('4');
+    await combinedPage.locator('[data-action="save-memory-task-models"]').click();
+    await combinedPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('schema-revision-2'));
+    const combinedPost = await combinedPage.evaluate(() => ({
+      body: window.lastPostedBody,
+      schema: window.serverConfig.reflection.memory_l2_output_schema,
+      taskRevision: window.serverConfig.reflection.memory_task_revision,
+      schemaRevision: window.serverConfig.reflection.memory_l2_schema_revision,
+    }));
+    assert.deepEqual(Object.keys(combinedPost.body).sort(), [
+      'expected_memory_l2_schema_revision', 'expected_memory_task_revision', 'persist', 'reflection',
+    ]);
+    assert.deepEqual(Object.keys(combinedPost.body.reflection).sort(), [
+      'memory_l2_jobs_per_run', 'memory_l2_output_schema',
+    ], 'combined saves submit only dirty schema and scheduler fields');
+    assert.equal(combinedPost.body.expected_memory_task_revision, 'revision-1');
+    assert.equal(combinedPost.body.expected_memory_l2_schema_revision, 'schema-revision-1');
+    assert.deepEqual(combinedPost.schema, ownerSchema);
+    assert.equal(combinedPost.taskRevision, 'revision-2');
+    assert.equal(combinedPost.schemaRevision, 'schema-revision-2');
+    await combinedPage.close();
+
+    const schemaConflictPage = await makePage(browser, 390);
+    await schemaConflictPage.locator('.mtm-schema').evaluate((node) => { node.open = true; });
+    const localSchema = { ...OUTPUT_SCHEMA, description: 'local schema draft' };
+    const serverSchema = { ...OUTPUT_SCHEMA, description: 'server schema revision' };
+    const conflictSchemaInput = schemaConflictPage.locator('#mtm-memory_l2_output_schema');
+    await conflictSchemaInput.fill(JSON.stringify(localSchema, null, 2));
+    await schemaConflictPage.evaluate((newerSchema) => {
+      window.conflictingOutputSchema = newerSchema;
+      window.schemaConflictNextPost = true;
+    }, serverSchema);
+    await schemaConflictPage.locator('[data-action="save-memory-task-models"]').click();
+    await schemaConflictPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('配置有新版本'));
+    const conflictedBody = await schemaConflictPage.evaluate(() => window.lastPostedBody);
+    assert.equal(conflictedBody.expected_memory_l2_schema_revision, 'schema-revision-1');
+    assert.equal(Object.prototype.hasOwnProperty.call(conflictedBody, 'expected_memory_task_revision'), false);
+    assert.equal(await conflictSchemaInput.inputValue(), JSON.stringify(localSchema, null, 2),
+      'a schema CAS conflict does not replace the local draft');
+    assert.equal(await schemaConflictPage.locator('[data-action="rebase-memory-task-models"]').isVisible(), true);
+    await schemaConflictPage.locator('[data-action="rebase-memory-task-models"]').click();
+    await schemaConflictPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('已核对服务器新版'));
+    assert.equal(await conflictSchemaInput.inputValue(), JSON.stringify(localSchema, null, 2),
+      'explicit rebase preserves the owner schema edit');
+    await schemaConflictPage.locator('[data-action="save-memory-task-models"]').click();
+    await schemaConflictPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('schema-revision-3'));
+    const rebasedSchemaPost = await schemaConflictPage.evaluate(() => ({
+      body: window.lastPostedBody,
+      schema: window.serverConfig.reflection.memory_l2_output_schema,
+      schemaRevision: window.serverConfig.reflection.memory_l2_schema_revision,
+    }));
+    assert.equal(rebasedSchemaPost.body.expected_memory_l2_schema_revision, 'schema-revision-2');
+    assert.equal(Object.prototype.hasOwnProperty.call(rebasedSchemaPost.body, 'expected_memory_task_revision'), false);
+    assert.deepEqual(rebasedSchemaPost.schema, localSchema);
+    assert.equal(rebasedSchemaPost.schemaRevision, 'schema-revision-3');
+    await schemaConflictPage.close();
+
+    const schemaMismatchPage = await makePage(browser, 390);
+    await schemaMismatchPage.locator('.mtm-schema').evaluate((node) => { node.open = true; });
+    const mismatchSchema = { ...OUTPUT_SCHEMA, description: 'server readback mismatch' };
+    const mismatchSchemaInput = schemaMismatchPage.locator('#mtm-memory_l2_output_schema');
+    await mismatchSchemaInput.fill(JSON.stringify(mismatchSchema, null, 2));
+    await schemaMismatchPage.evaluate(() => { window.keepSchemaOnPost = true; });
+    await schemaMismatchPage.locator('[data-action="save-memory-task-models"]').click();
+    await schemaMismatchPage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('Schema 读回与草稿不一致'));
+    assert.equal(await mismatchSchemaInput.inputValue(), JSON.stringify(mismatchSchema, null, 2));
+    assert.equal(await schemaMismatchPage.evaluate(() => JSON.parse(sessionStorage.getItem('ombre.memory-task-models.draft.v1')).output_schema_text),
+      JSON.stringify(mismatchSchema, null, 2), 'a successful HTTP response without exact schema readback does not clear the draft');
+    await schemaMismatchPage.close();
+
+    const schemaFailurePage = await makePage(browser, 390);
+    await schemaFailurePage.locator('.mtm-schema').evaluate((node) => { node.open = true; });
+    const failedSchemaDraft = { ...OUTPUT_SCHEMA, description: 'keep after network failure' };
+    await schemaFailurePage.locator('#mtm-memory_l2_output_schema').fill(JSON.stringify(failedSchemaDraft, null, 2));
+    await schemaFailurePage.evaluate(() => { window.failPost = true; });
+    await schemaFailurePage.locator('[data-action="save-memory-task-models"]').click();
+    await schemaFailurePage.waitForFunction(() => document.querySelector('.mtm-status')?.textContent.includes('保存失败'));
+    assert.equal(await schemaFailurePage.locator('#mtm-memory_l2_output_schema').inputValue(), JSON.stringify(failedSchemaDraft, null, 2));
+    assert.equal(await schemaFailurePage.evaluate(() => JSON.parse(sessionStorage.getItem('ombre.memory-task-models.draft.v1')).output_schema_text),
+      JSON.stringify(failedSchemaDraft, null, 2), 'schema text stays in the session draft after a failed save');
+    await schemaFailurePage.close();
   } finally {
     await browser.close();
   }
