@@ -19,6 +19,7 @@ import threading
 from contextvars import ContextVar
 
 import yaml
+from memory_metadata import CANONICAL_DOMAINS
 
 SCHEMA_VERSION = "memory-config-v1"
 # These are public resource bounds, not owner presets or silent clamps.
@@ -46,6 +47,7 @@ RECALL_DEFAULTS = {
     "second_card_relative_score": None,
     "window_formula_weight": 1.0, "rrf_constant": 60.0,
     "scoring_profiles": [],
+    "signal_bindings": [], "affinity_mappings": [], "affinity_aggregation": "max",
     "cognition_chain_depth": 2, "cognition_chain_nodes": 8, "cognition_chain_budget": 300,
     "local_match_weights": LOCAL_MATCH_WEIGHTS,
 }
@@ -83,13 +85,17 @@ RUNTIME_INPUTS = [
     ("cognition_status", "string", "陈述的认识状态；不等于世界事实的真假"),
     ("open_question_count", "number", "该认知明确留下的未解问题数"),
 ]
+CONDITIONAL_RUNTIME_INPUTS = [
+    ("interest_affinity", "number", "兴趣亲和度（条件输入；须有真实快照）"),
+    ("drive_affinity", "number", "驱力亲和度（条件输入；须有真实快照）"),
+    ("goal_alignment", "number", "目标关联（条件输入；须有真实快照）"),
+]
 PENDING_RUNTIME_INPUTS = [
-    ("interest_affinity", "number", "兴趣亲和度（未接入，运行时未知）"),
-    ("drive_affinity", "number", "驱力亲和度（未接入，运行时未知）"),
-    ("goal_alignment", "number", "目标关联（未接入，运行时未知）"),
     ("feedback_score", "number", "真实反馈（未接入，运行时未知）"),
     ("repeat_penalty", "number", "跨轮重复惩罚（未接入，运行时未知）"),
 ]
+SIGNAL_PRODUCERS = frozenset({"aiz.needs", "aiz.goals", "aiz.interests", "ombre.persona"})
+AFFINITY_TARGETS = frozenset({"interest_affinity", "drive_affinity", "goal_alignment"})
 _ID = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _FUNCTIONS = {"min", "max", "clamp", "coalesce", "exp", "abs"}
 COGNITION_CATALOG_AXES = ("cognition_roles", "cognition_statuses")
@@ -176,6 +182,23 @@ def _number(value, field):
     if not valid:
         _fail("finite_number_required", field)
     return value
+
+
+def _canonical_affinity_topic(value, catalog, field):
+    if value in catalog["topics"]:
+        return value
+    needle = value.strip().casefold()
+    matches = {
+        item["id"]
+        for item in catalog["definitions"]
+        if item["axis"] == "topics"
+        and any(alias.strip().casefold() == needle for alias in item["aliases"] if alias.strip())
+    }
+    if len(matches) == 1:
+        return next(iter(matches))
+    if len(matches) > 1:
+        _fail("ambiguous_affinity_topic_alias", field, value=value)
+    _fail("unknown_affinity_topic", field, value=value)
 
 
 def validate_limit(name, value):
@@ -393,7 +416,8 @@ def validate_values(values):
     if recall["formula_id"] is not None:
         _id(recall["formula_id"], "recall.formula_id")
     for name, value in recall.items():
-        if name in {"mode", "formula_id", "hierarchy_mode", "scoring_profiles", "local_match_weights"} or value is None:
+        if name in {"mode", "formula_id", "hierarchy_mode", "scoring_profiles", "local_match_weights",
+                    "signal_bindings", "affinity_mappings", "affinity_aggregation"} or value is None:
             continue
         _number(value, "recall." + name)
         if name in COGNITION_LIMITS and (type(value) is not int or not 0 <= value <= COGNITION_LIMITS[name]):
@@ -499,6 +523,62 @@ def validate_values(values):
         visited.add(key)
     for key in definition_ids:
         visit_definition(key)
+    if recall["affinity_aggregation"] not in ("max", "mean"):
+        _fail("invalid_affinity_aggregation", "recall.affinity_aggregation")
+    signal_bindings = recall["signal_bindings"]
+    if not isinstance(signal_bindings, list) or len(signal_bindings) > 256:
+        _fail("invalid_signal_bindings", "recall.signal_bindings")
+    signal_ids = set()
+    for index, item in enumerate(signal_bindings):
+        field = f"recall.signal_bindings[{index}]"
+        _object(item, {"id", "label", "producer", "key", "max_age_seconds"}, field,
+                {"id", "producer", "key", "max_age_seconds"})
+        ident = _id(item["id"], field + ".id")
+        if len(ident) > 56:
+            _fail("signal_id_too_long", field + ".id", maximum=56)
+        if ident in signal_ids:
+            _fail("duplicate_identifier", field + ".id")
+        signal_ids.add(ident)
+        producer = _text(item["producer"], field + ".producer", maximum=64)
+        if producer not in SIGNAL_PRODUCERS:
+            _fail("unknown_signal_producer", field + ".producer")
+        _text(item["key"], field + ".key", maximum=120)
+        if "label" in item:
+            _text(item["label"], field + ".label", empty=True)
+        max_age = item["max_age_seconds"]
+        if max_age is not None and _number(max_age, field + ".max_age_seconds") <= 0:
+            _fail("invalid_signal_max_age", field + ".max_age_seconds")
+    affinity_mappings = recall["affinity_mappings"]
+    if not isinstance(affinity_mappings, list) or len(affinity_mappings) > 512:
+        _fail("invalid_affinity_mappings", "recall.affinity_mappings")
+    mapping_ids = set()
+    for index, item in enumerate(affinity_mappings):
+        field = f"recall.affinity_mappings[{index}]"
+        _object(item, {"id", "selector", "signal_id", "target", "weight"}, field,
+                {"id", "selector", "signal_id", "target", "weight"})
+        ident = _id(item["id"], field + ".id")
+        if ident in mapping_ids:
+            _fail("duplicate_identifier", field + ".id")
+        mapping_ids.add(ident)
+        selector = _object(item["selector"], {"topic", "domain"}, field + ".selector")
+        if not selector:
+            _fail("empty_affinity_selector", field + ".selector")
+        if "topic" in selector:
+            topic = _text(selector["topic"], field + ".selector.topic", maximum=120)
+            selector["topic"] = _canonical_affinity_topic(topic, catalog, field + ".selector.topic")
+        if "domain" in selector:
+            domain = _text(selector["domain"], field + ".selector.domain", maximum=120)
+            if domain not in CANONICAL_DOMAINS:
+                _fail("unknown_affinity_domain", field + ".selector.domain")
+        signal_id = _id(item["signal_id"], field + ".signal_id")
+        if signal_id not in signal_ids:
+            _fail("unknown_affinity_signal", field + ".signal_id")
+        target = _text(item["target"], field + ".target", maximum=64)
+        if target not in AFFINITY_TARGETS:
+            _fail("invalid_affinity_target", field + ".target")
+        weight = _number(item["weight"], field + ".weight")
+        if not 0 <= weight <= 1:
+            _fail("affinity_weight_out_of_range", field + ".weight")
     features = values["features"]
     if not isinstance(features, list) or len(features) > 256:
         _fail("invalid_features", "features")
@@ -746,7 +826,8 @@ def configuration(config, *, last_request=None):
     values = values_from_config(config)
     rev = revision(values)
     try:
-        validate_values(values)
+        values = validate_values(values)
+        rev = revision(values)
         validation = {"valid": True, "errors": []}
     except ConfigurationError as exc:
         validation = {"valid": False, "errors": [exc.payload()["error"]]}
@@ -760,13 +841,37 @@ def configuration(config, *, last_request=None):
     }
     recall = values["recall"] if isinstance(values["recall"], dict) else RECALL_DEFAULTS
     configured_recall = (config.get("memory_system") or {}).get("recall") or {}
+    conditional_note = "Schema支持此输入；当前请求仍需真实producer快照，缺失或过期时保持unknown。"
+    runtime_inputs = [
+        {"id": name, "value_type": kind, "label": label, "availability": "bound"}
+        for name, kind, label in RUNTIME_INPUTS
+    ]
+    conditional_inputs = []
+    pending_inputs = []
+    for name, kind, label in CONDITIONAL_RUNTIME_INPUTS:
+        runtime_inputs.append({
+            "id": name, "value_type": kind, "label": label,
+            "availability": "conditional", "availability_note": conditional_note,
+        })
+        conditional_inputs.append(name)
+    for name, kind, label in PENDING_RUNTIME_INPUTS:
+        runtime_inputs.append({"id": name, "value_type": kind, "label": label, "availability": "pending"})
+        pending_inputs.append(name)
+    for binding in recall.get("signal_bindings", []):
+        input_id = "signal_" + binding["id"]
+        runtime_inputs.append({
+            "id": input_id, "value_type": "number",
+            "label": binding.get("label") or input_id,
+            "availability": "conditional", "availability_note": conditional_note,
+            "producer": binding["producer"], "key": binding["key"],
+            "max_age_seconds": binding["max_age_seconds"],
+        })
+        conditional_inputs.append(input_id)
     return {
         "schema_version": SCHEMA_VERSION, "revision": rev, "values": values,
         "bindings": {"limits": {name: {"section": row[0], "key": row[1], "minimum": row[2],
                       "maximum": row[3], "default": row[4], "label": row[5]} for name, row in LIMITS.items()},
-            "runtime_inputs": [{"id": name, "value_type": kind, "label": label, "availability": state}
-                               for rows, state in ((RUNTIME_INPUTS, "bound"), (PENDING_RUNTIME_INPUTS, "pending"))
-                               for name, kind, label in rows],
+            "runtime_inputs": runtime_inputs,
             "recall": {name: {"value": recall.get(name) if recall.get(name) is not None else value,
                               "source": "owner" if name in configured_recall and recall.get(name) is not None else "inherited"}
                        for name, value in {**RECALL_DEFAULTS, **inherited}.items()}},
@@ -774,9 +879,11 @@ def configuration(config, *, last_request=None):
             "limits": {"state": "active", "revision": rev},
             "catalog": {"state": "active", "consumer": "l1_generation_and_natural_recall", "revision": rev},
             "features": {"state": "active", "consumer": "natural_recall", "revision": rev,
-                         "pending_inputs": [row[0] for row in PENDING_RUNTIME_INPUTS]},
+                         "pending_inputs": pending_inputs,
+                         "conditional_inputs": conditional_inputs},
             "formulas": {"state": "active", "consumer": "natural_recall", "revision": rev},
             "time_profiles": {"state": "active", "consumer": "natural_recall_statement_usage", "revision": rev},
+            "affinity_config": {"revision": rev},
             "last_request": last_request,
         }, "validation": validation,
     }

@@ -1222,7 +1222,11 @@ class PersonaStateEngine:
         ]
 
     def _snapshot(self, global_state: dict, session_state: dict, reply_guidance: str) -> dict:
+        from memory_affinity import sample_persona
         return {
+            "recall_signal_source": sample_persona(
+                session_state, profile_id=self.profile_id,
+                session_id=session_state.get("session_id", ""), updated_at=session_state.get("updated_at")),
             "profile_id": self.profile_id,
             "personality": {
                 key: round(self._clamp_float(global_state.get(key, self.default_personality[key])), 3)

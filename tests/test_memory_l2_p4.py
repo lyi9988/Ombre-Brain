@@ -324,3 +324,19 @@ def test_owner_schema_is_passed_to_model_and_changes_invalidate_l2(tmp_path):
     result = run(service.run_once(1))
     assert result['results'][0]['reason'] == 'l2_output_schema_mismatch'
     assert service.detail('m1')['l2']['presentation']['presentation_revision'] == 1
+
+
+def test_runtime_affinity_settings_do_not_regenerate_persistent_l2(tmp_path):
+    service, _, calls = setup(tmp_path)
+    run(service.run_once(1))
+    before = service.generation_context()[2]
+    service.engine.config = {'memory_system': {'recall': {
+        'signal_bindings': [{'id': 'care', 'producer': 'ombre.persona', 'key': 'protective_drive',
+                             'max_age_seconds': 60}],
+        'affinity_mappings': [{'id': 'care_life', 'selector': {'domain': 'life'},
+                               'signal_id': 'care', 'target': 'drive_affinity', 'weight': .5}],
+        'affinity_aggregation': 'max'}}}
+    assert service.generation_context()[2] == before
+    assert service.detail('m1')['l2']['state'] == 'ready'
+    run(service.run_once(1))
+    assert len(calls) == 1
