@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 
 from memory_authority import MemoryNotFound
 from memory_l1_contract import L1ContractError
@@ -47,6 +48,87 @@ class MemoryL1Reads:
         self.authority = revision_service.authority
         self.index = MemoryL1Index(self.authority)
         self.sources = sources
+
+    async def recall_source_status(self, items):
+        """Verify requested bindings without returning text or retaining copies."""
+        if not isinstance(items, list):
+            raise L1OwnerError("array_required", field_path="items")
+        requests, dependencies, epochs = [], {}, {}
+        for item in items:
+            required = {"memory_id", "revision", "binding_ids"}
+            if (not isinstance(item, dict) or not required <= set(item) or set(item) - required - {"allow_historical"}
+                    or not isinstance(item["memory_id"], str) or type(item["revision"]) is not int or item["revision"] <= 0
+                    or not isinstance(item["binding_ids"], list)
+                    or type(item.get("allow_historical", False)) is not bool
+                    or any(not isinstance(value, str) for value in item["binding_ids"])):
+                raise L1OwnerError("invalid_recall_source_request", field_path="items")
+            memory = self.authority.get_memory(item["memory_id"])
+            if (not memory or memory["state"] != "active" or memory["recall_policy"] != "enabled"
+                    or (not item.get("allow_historical") and memory["active_revision"] != item["revision"])):
+                requests.append((item, {}, "memory_not_current_or_eligible"))
+                continue
+            epochs[(item["memory_id"], item["revision"])] = memory["active_revision"]
+            try:
+                result, identity = self.base(item["memory_id"], item["revision"])
+            except MemoryNotFound:
+                requests.append((item, {}, "revision_unavailable"))
+                continue
+            if not identity:
+                requests.append((item, {}, "legacy"))
+                continue
+            root_id, root_revision, _ = self._shared_root(item["memory_id"], item["revision"], identity)
+            root = self.authority.get_memory(root_id)
+            if (not root or root["state"] != "active" or root["recall_policy"] != "enabled"
+                    or (not item.get("allow_historical") and root["active_revision"] != root_revision)):
+                requests.append((item, {}, "dependency_changed"))
+                continue
+            dependencies[(item["memory_id"], item["revision"])] = (root_id, root["active_revision"])
+            bindings = {key: self.index.member(root_id, root_revision, "evidence_bindings", key)
+                        for key in set(item["binding_ids"])}
+            requests.append((item, bindings, "ok"))
+        semaphore = asyncio.Semaphore(8)
+        tasks = {}
+        async def check(binding):
+            async with semaphore:
+                return await self.sources.locate(binding, verify_only=True)
+        for _item, bindings, _state in requests:
+            for binding in bindings.values():
+                if binding:
+                    key = json.dumps(binding, sort_keys=True, ensure_ascii=False)
+                    if key not in tasks:
+                        tasks[key] = asyncio.create_task(check(binding))
+        try:
+            if tasks:
+                await asyncio.gather(*tasks.values())
+            results = []
+            for item, bindings, state in requests:
+                latest = self.authority.get_memory(item["memory_id"])
+                if (not latest or latest["state"] != "active" or latest["recall_policy"] != "enabled"
+                        or latest["active_revision"] != epochs.get((item["memory_id"], item["revision"]), item["revision"])):
+                    state = "memory_not_current_or_eligible"
+                dependency = dependencies.get((item["memory_id"], item["revision"]))
+                if dependency:
+                    root = self.authority.get_memory(dependency[0])
+                    if (not root or root["state"] != "active" or root["recall_policy"] != "enabled"
+                            or root["active_revision"] != dependency[1]):
+                        state = "dependency_changed"
+                statuses = {}
+                for key, binding in bindings.items():
+                    if not binding:
+                        statuses[key] = {"state": "unavailable", "eligible_source": False,
+                                         "reason": "binding_not_in_revision"}
+                    else:
+                        statuses[key] = tasks[json.dumps(binding, sort_keys=True, ensure_ascii=False)].result()
+                results.append({"memory_id": item["memory_id"], "revision": item["revision"],
+                                "state": state, "sources": statuses,
+                                "historical": bool(latest and latest["active_revision"] != item["revision"])})
+            return {"items": results}
+        finally:
+            for task in tasks.values():
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks.values(), return_exceptions=True)
 
     def base(self, memory_id, revision):
         memory = self.authority.get_memory(memory_id)

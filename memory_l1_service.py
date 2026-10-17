@@ -104,7 +104,7 @@ class MemoryL1RevisionService:
         previous_generation = previous.get("generation")
         historical = previous_generation.get("catalog_snapshot") if isinstance(previous_generation, dict) else {}
         historical = historical if isinstance(historical, dict) else {}
-        for axis in ("subjects", "entity_types", "kinds", "topics", "stabilities", "modalities", "bases", "relation_types"):
+        for axis in ("subjects", "entity_types", "kinds", "topics", "stabilities", "modalities", "bases", "relation_types", "cognition_roles", "cognition_statuses"):
             effective[axis] = list(dict.fromkeys(effective[axis] + list(historical.get(axis, []))))
         existing_defs = {item["id"]: item for item in effective["attributes"]}
         # A catalogue edit must not silently reinterpret an existing field's
@@ -139,6 +139,8 @@ class MemoryL1RevisionService:
             for item in doc[module]: item[key] = mapping.get(item[key], item[key])
         for item in doc["statements"]:
             item["subject_ref"]["value"] = mapping.get(item["subject_ref"]["value"], item["subject_ref"]["value"])
+            if item.get("cognition"):
+                item["cognition"]["about_refs"] = [mapping.get(ref, ref) for ref in item["cognition"].get("about_refs", [])]
             app = item["time"]["applicability"]; app["scene_ref"] = mapping.get(app["scene_ref"], app["scene_ref"])
         for item in doc["scenes"]:
             item["statement_refs"] = [mapping.get(ref, ref) for ref in item["statement_refs"]]

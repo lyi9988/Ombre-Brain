@@ -104,6 +104,142 @@
       Boolean(candidate.diary_l1_bundle || metadata.diary_l1_bundle || item && item.diary_l1_bundle);
   }
 
+  function cognitionInputText(value) {
+    if (value == null) return '';
+    return typeof value === 'string' ? value : displayValue(value);
+  }
+
+  function cognitionValueLists(document) {
+    var defaults = {
+      cognition_roles: ['observation', 'question', 'hypothesis', 'insight', 'view', 'practice'],
+      cognition_statuses: ['tentative', 'supported', 'contested', 'revised', 'resolved'],
+    };
+    var snapshot = document && document.generation && document.generation.catalog_snapshot || {};
+    function values(axis) {
+      var source = Array.isArray(snapshot[axis]) ? snapshot[axis] : defaults[axis];
+      var definitions = Array.isArray(snapshot.definitions) ? snapshot.definitions : [];
+      var definitionAxis = axis === 'cognition_roles' ? 'cognition_role' : 'cognition_status';
+      var fromDefinitions = definitions.filter(function (item) { return item && (item.axis === axis || item.axis === definitionAxis) && typeof item.id === 'string'; })
+        .map(function (item) { return item.id; });
+      return Array.from(new Set(source.concat(fromDefinitions).filter(function (item) { return typeof item === 'string' && item; })));
+    }
+    return { cognition_roles: values('cognition_roles'), cognition_statuses: values('cognition_statuses') };
+  }
+
+  function captureL1CognitionForm(card, l1Document, statementIndex) {
+    var statements = Array.isArray(l1Document && l1Document.statements) ? l1Document.statements : [];
+    var index = Number(statementIndex);
+    var statement = Number.isInteger(index) ? statements[index] : null;
+    if (!statement || typeof statement !== 'object' || Array.isArray(statement)) return;
+    var current = statement.cognition;
+    if (current != null && (typeof current !== 'object' || Array.isArray(current))) return;
+    var cognition = current == null ? {} : current;
+    var changed = false;
+    function updateComponent(componentKey) {
+      var stateInput = card.querySelector('[data-cognition-field="' + componentKey + '.state"]');
+      var valueInput = card.querySelector('[data-cognition-field="' + componentKey + '.value"]');
+      if (!stateInput && !valueInput) return;
+      var original = cognition[componentKey];
+      if (original != null && (typeof original !== 'object' || Array.isArray(original))) return;
+      var component = original || {};
+      var stateText = stateInput ? String(stateInput.value || '') : cognitionInputText(component.state);
+      var valueText = valueInput ? String(valueInput.value || '') : cognitionInputText(component.value);
+      var previousState = cognitionInputText(component.state);
+      var previousValue = cognitionInputText(component.value);
+      if (stateText === previousState && valueText === previousValue) return;
+      changed = true;
+      component = Object.assign({}, component);
+      if (stateText === '' && valueText !== '') stateText = 'known';
+      if (stateText === '') stateText = 'not_stated';
+      component.state = stateText;
+      component.value = valueText === '' ? null : valueText;
+      if (!Object.prototype.hasOwnProperty.call(component, 'evidence_refs')) component.evidence_refs = [];
+      cognition[componentKey] = component;
+    }
+    updateComponent('role'); updateComponent('epistemic_status');
+    ['about_refs', 'open_questions'].forEach(function (key) {
+      var input = card.querySelector('[data-cognition-field="' + key + '"]');
+      if (!input) return;
+      var previous = cognition[key];
+      var previousText = Array.isArray(previous) ? previous.join('\n') : (previous == null ? '' : JSON.stringify(previous));
+      if (input.value === previousText) return;
+      changed = true;
+      cognition[key] = String(input.value || '').split(/\r?\n/).map(function (value) { return value.trim(); }).filter(Boolean);
+    });
+    if (changed) {
+      ['role', 'epistemic_status'].forEach(function (key) {
+        var component = cognition[key];
+        if (component == null) cognition[key] = { state: 'not_stated', value: null, evidence_refs: [] };
+        else if (typeof component !== 'object' || Array.isArray(component)) return;
+        else {
+          if (!Object.prototype.hasOwnProperty.call(component, 'state')) component.state = 'not_stated';
+          if (!Object.prototype.hasOwnProperty.call(component, 'value')) component.value = null;
+          if (!Object.prototype.hasOwnProperty.call(component, 'evidence_refs')) component.evidence_refs = [];
+        }
+      });
+      if (!Object.prototype.hasOwnProperty.call(cognition, 'about_refs')) cognition.about_refs = [];
+      if (!Object.prototype.hasOwnProperty.call(cognition, 'open_questions')) cognition.open_questions = [];
+      statement.cognition = cognition;
+    }
+  }
+
+  function syncL1CognitionForm(card, l1Document, statementIndex) {
+    var statements = Array.isArray(l1Document && l1Document.statements) ? l1Document.statements : [];
+    var select = card && card.querySelector('[data-cognition-statement]');
+    if (!select) return;
+    var domDocument = card.ownerDocument || (typeof window !== 'undefined' ? window.document : null);
+    if (!domDocument || typeof domDocument.createElement !== 'function') return;
+    var index = Number(statementIndex);
+    if (!Number.isInteger(index) || index < 0) index = 0;
+    if (statements.length && index >= statements.length) index = statements.length - 1;
+    if (!statements.length) index = 0;
+    select.replaceChildren();
+    statements.forEach(function (statement, itemIndex) {
+      var option = domDocument.createElement('option');
+      var identifier = statement && (statement.statement_id || statement.id) || ('陈述 ' + (itemIndex + 1));
+      var content = String(statement && statement.content || '').replace(/\s+/g, ' ').slice(0, 54);
+      option.value = String(itemIndex);
+      option.textContent = (itemIndex + 1) + '. ' + identifier + (content ? ' · ' + content : '');
+      select.appendChild(option);
+    });
+    if (!statements.length) {
+      var empty = domDocument.createElement('option'); empty.value = ''; empty.textContent = '当前没有可编辑的现有陈述'; empty.disabled = true; select.appendChild(empty);
+      select.value = '';
+      select.setAttribute('data-cognition-active-index', '0');
+      card.querySelectorAll('[data-cognition-field]').forEach(function (input) { input.value = ''; input.disabled = true; });
+      select.disabled = true;
+      return;
+    }
+    select.value = String(index);
+    select.setAttribute('data-cognition-active-index', String(index));
+    select.disabled = false;
+    var statement = statements[index] || {};
+    var cognition = statement.cognition && typeof statement.cognition === 'object' && !Array.isArray(statement.cognition) ? statement.cognition : {};
+    var role = cognition.role && typeof cognition.role === 'object' && !Array.isArray(cognition.role) ? cognition.role : {};
+    var status = cognition.epistemic_status && typeof cognition.epistemic_status === 'object' && !Array.isArray(cognition.epistemic_status) ? cognition.epistemic_status : {};
+    var values = {
+      'role.state': cognitionInputText(role.state), 'role.value': cognitionInputText(role.value),
+      'epistemic_status.state': cognitionInputText(status.state), 'epistemic_status.value': cognitionInputText(status.value),
+      about_refs: Array.isArray(cognition.about_refs) ? cognition.about_refs.join('\n') : cognitionInputText(cognition.about_refs),
+      open_questions: Array.isArray(cognition.open_questions) ? cognition.open_questions.join('\n') : cognitionInputText(cognition.open_questions),
+    };
+    var activeRoot = card && typeof card.getRootNode === 'function' ? card.getRootNode() : domDocument;
+    if (!activeRoot || !activeRoot.activeElement) activeRoot = domDocument;
+    var activeElement = activeRoot && activeRoot.activeElement;
+    var activeElements = new Set();
+    while (activeElement && !activeElements.has(activeElement)) {
+      if (activeElement === domDocument.activeElement && activeElement === select) break;
+      activeElements.add(activeElement);
+      var nestedShadow = activeElement.shadowRoot;
+      if (!nestedShadow || !nestedShadow.activeElement) break;
+      activeElement = nestedShadow.activeElement;
+    }
+    card.querySelectorAll('[data-cognition-field]').forEach(function (input) {
+      if (activeElement !== input) input.value = values[input.getAttribute('data-cognition-field')] || '';
+      input.disabled = false;
+    });
+  }
+
   function sameValue(left, right) {
     return JSON.stringify(left) === JSON.stringify(right);
   }
@@ -138,6 +274,9 @@
       var baseSceneBodies = prior && prior.type === 'l1' ? prior.baseSceneBodies : itemSceneBodies(item);
       var sceneBodies = prior && prior.type === 'l1' ? cloneValue(prior.sceneBodies || {}) : cloneValue(baseSceneBodies || {});
       var mode = card.getAttribute('data-l1-editor-mode') || (prior && prior.mode) || 'body';
+      var cognitionSelect = card.querySelector('[data-cognition-statement]');
+      var cognitionStatementIndex = prior && prior.type === 'l1' && Number.isInteger(prior.cognitionStatementIndex)
+        ? prior.cognitionStatementIndex : Number(cognitionSelect && cognitionSelect.getAttribute('data-cognition-active-index')) || 0;
       var invalidJson = false;
       var rawJson = '';
       if (mode === 'json') {
@@ -156,6 +295,7 @@
         var bodyInput = card.querySelector('[data-l1-body]');
         if (titleInput) document.narrative.title = String(titleInput.value || '');
         if (bodyInput) document.narrative.body = String(bodyInput.value || '');
+        captureL1CognitionForm(card, document, cognitionStatementIndex);
         rawJson = JSON.stringify(document, null, 2);
       }
       card.querySelectorAll('[data-scene-body], [data-orphan-scene-body]').forEach(function (input) {
@@ -167,11 +307,19 @@
       if (changed) {
         memoryDrafts.set(id, { type: 'l1', baseDocument: cloneValue(baseDocument), document: document,
           rawJson: rawJson, sceneBodies: sceneBodies, baseSceneBodies: cloneValue(baseSceneBodies || {}),
-          invalidJson: invalidJson, mode: mode, revision: prior ? prior.revision : Number(card.getAttribute('data-revision')),
+          invalidJson: invalidJson, mode: mode, cognitionStatementIndex: cognitionStatementIndex,
+          revision: prior ? prior.revision : Number(card.getAttribute('data-revision')),
           expanded: card.getAttribute('data-editing') === 'true' });
       } else memoryDrafts.delete(id);
       var error = card.querySelector('[data-l1-json-error]');
       if (error) error.textContent = invalidJson ? 'JSON 尚未解析成功；草稿已保留，修复 JSON 后才能保存或采用。' : '';
+      var semantics = card.querySelector('.chat-memory-semantics');
+      if (semantics && !invalidJson) {
+        var wasOpen = Boolean(semantics.querySelector('details[open]'));
+        semantics.innerHTML = renderL1ReviewDetails(item, document);
+        var details = semantics.querySelector('details');
+        if (details && wasOpen) details.open = true;
+      }
       persistMemoryState();
       return;
     }
@@ -337,6 +485,7 @@
       rawJson: currentDraft.mode === 'json' ? JSON.stringify(nextDocument, null, 2) : JSON.stringify(nextDocument, null, 2),
       sceneBodies: nextSceneBodies, baseSceneBodies: savedSceneBodies,
       invalidJson: false, mode: currentDraft.mode || 'body',
+      cognitionStatementIndex: currentDraft.cognitionStatementIndex || 0,
       revision: Number(savedItem.authority_revision), expanded: currentDraft.expanded,
     };
   }
@@ -362,13 +511,13 @@
         if (bodyView) bodyView.hidden = mode !== 'body';
         if (jsonView) jsonView.hidden = mode !== 'json';
         if (draft && draft.type === 'l1') {
-          syncL1Form(card, draft.document, draft.sceneBodies);
+          syncL1Form(card, draft.document, draft.sceneBodies, draft.cognitionStatementIndex);
           var json = card.querySelector('[data-l1-json]');
           if (json) json.value = draft.rawJson || JSON.stringify(draft.document, null, 2);
           var error = card.querySelector('[data-l1-json-error]');
           if (error) error.textContent = draft.invalidJson ? 'JSON 尚未解析成功；草稿已保留，修复 JSON 后才能保存或采用。' : '';
         } else {
-          syncL1Form(card, l1Document, itemSceneBodies(item));
+          syncL1Form(card, l1Document, itemSceneBodies(item), 0);
           var savedJson = card.querySelector('[data-l1-json]');
           if (savedJson) savedJson.value = JSON.stringify(l1Document, null, 2);
         }
@@ -505,6 +654,24 @@
     var sourceEditor = event.target.closest && event.target.closest('[data-chat-submission-editor]');
     if (sourceEditor) captureSourceTaskDraft(sourceEditor);
   });
+  if (document.addEventListener) document.addEventListener('change', function (event) {
+    var select = event.target.closest && event.target.closest('[data-cognition-statement]');
+    if (!select) return;
+    var card = select.closest('.chat-memory-card');
+    if (!card) return;
+    captureMemoryDraft(card);
+    var id = card.getAttribute('data-candidate-id');
+    var draft = memoryDrafts.get(id);
+    var item = memoryItems.get(id);
+    var index = Number(select.value);
+    if (!Number.isInteger(index) || index < 0) return;
+    select.setAttribute('data-cognition-active-index', String(index));
+    if (draft && draft.type === 'l1') {
+      draft.cognitionStatementIndex = index;
+      if (!draft.invalidJson) syncL1CognitionForm(card, draft.document, index);
+      persistMemoryState();
+    } else if (item) syncL1CognitionForm(card, itemL1Document(item), index);
+  });
   if (window.addEventListener) window.addEventListener('beforeunload', function (event) {
     captureMemoryDrafts();
     captureSourceTaskEditors(document);
@@ -594,6 +761,20 @@
     return value.state === 'known' ? displayValue(value.value) : (labels[value.state] || displayValue(value));
   }
 
+  function cognitionFieldSummary(value) {
+    if (value == null) return '未提供';
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return displayValue(value);
+    var state = value.state == null ? 'state 未提供' : 'state ' + displayValue(value.state);
+    var fieldValue = value.value == null ? 'value 未提供' : 'value ' + displayValue(value.value);
+    return state + ' · ' + fieldValue;
+  }
+
+  function cognitionEntityRef(reference, entities) {
+    var id = typeof reference === 'string' ? reference : displayValue(reference);
+    var entity = (Array.isArray(entities) ? entities : []).find(function (item) { return item && item.entity_id === id; });
+    return entity ? displayValue(entity.display_name || entity.name || id) + ' · ' + id : id;
+  }
+
   function statementSourceRefs(statement) {
     var refs = new Set();
     function collect(node) {
@@ -655,17 +836,25 @@
       var time = statement.time || {}, event = time.event || {}, applicability = time.applicability || {};
       var conditions = statement.conditions || {};
       var refs = referenced[index];
+      var cognition = statement.cognition && typeof statement.cognition === 'object' && !Array.isArray(statement.cognition) ? statement.cognition : {};
       var entity = (document.entities || []).find(function (item) { return item.entity_id === (statement.subject_ref || {}).value; });
       var subjectRole = entity && (entity.entity_type || {}).value;
       var subject = subjectRole === 'user' ? '主人' : (subjectRole === 'assistant' ? '顾衍' : (entity && entity.name || '主体未明确'));
+      var aboutRefs = Array.isArray(cognition.about_refs) ? cognition.about_refs : null;
+      var aboutText = aboutRefs ? (aboutRefs.length ? aboutRefs.map(function (reference) { return cognitionEntityRef(reference, document.entities); }).join('、') : '无') : '未提供';
+      var questions = Array.isArray(cognition.open_questions) ? cognition.open_questions : null;
+      var questionsText = questions ? (questions.length ? questions.map(displayValue).join('；') : '无') : '未提供';
       var basisRefs = (classification.basis || {}).evidence_refs || [];
       var directRefs = new Set(basisRefs.length ? basisRefs : (statement.evidence_refs || []));
       var evidence = bindings.filter(function (binding) { return directRefs.has(binding.binding_id); });
       var needsEvidenceReview = subjectRole === 'user' && (classification.basis || {}).value === 'direct_expression' &&
         evidence.length && evidence.every(function (binding) { return bindingRole(binding) === 'assistant'; });
       return '<li class="chat-memory-l1-statement"><strong>' + esc(statement.content || '（缺少陈述正文）') + '</strong>' +
-        '<p>主体：' + esc(subject) + ' · ' + esc(kindLabels[kind] || kind) + ' · ' + esc(scopeLabels[applicability.temporal_scope] || '适用时间未明确') +
+        '<p>认知主体 subject_ref：' + esc(subject) + ' · ' + esc(cognitionFieldSummary(statement.subject_ref)) + ' · ' + esc(kindLabels[kind] || kind) + ' · ' + esc(scopeLabels[applicability.temporal_scope] || '适用时间未明确') +
         ' · ' + refs.size + ' 项来源引用</p>' +
+        '<div class="chat-memory-cognition" data-l1-cognition><p>认知角色：' + esc(cognitionFieldSummary(cognition.role)) +
+        ' · 认知状态：' + esc(cognitionFieldSummary(cognition.epistemic_status)) + '</p><p>讨论对象 about_refs：' + esc(aboutText) +
+        '</p><p>未解问题 open_questions：' + esc(questionsText) + '</p></div>' +
         (needsEvidenceReview ? '<p class="chat-memory-edit-needed" data-l1-evidence-warning>当前标为主人直接表达，但引用材料均为顾衍发言；请核对主体与证据性质，不能据此确认主人长期偏好。</p>' : '') +
         '<details><summary>分类、时间与条件</summary>' +
         '<p>类型：' + esc(classificationLabel('kinds', classification.kind)) + '；表达：' + esc(classificationLabel('modalities', classification.modality)) +
@@ -694,6 +883,45 @@
       '</details>';
   }
 
+  function renderL1CognitionEditor(item, document, draft) {
+    var statements = Array.isArray(document && document.statements) ? document.statements : [];
+    var selectedIndex = draft && Number.isInteger(draft.cognitionStatementIndex) ? draft.cognitionStatementIndex : 0;
+    if (selectedIndex < 0 || selectedIndex >= statements.length) selectedIndex = 0;
+    var statementOptions = statements.map(function (statement, index) {
+      var identifier = statement && (statement.statement_id || statement.id) || ('陈述 ' + (index + 1));
+      var content = String(statement && statement.content || '').replace(/\s+/g, ' ').slice(0, 54);
+      return '<option value="' + index + '"' + (index === selectedIndex ? ' selected' : '') + '>' + esc((index + 1) + '. ' + identifier + (content ? ' · ' + content : '')) + '</option>';
+    }).join('');
+    var selected = statements[selectedIndex] || {};
+    var cognition = selected.cognition && typeof selected.cognition === 'object' && !Array.isArray(selected.cognition) ? selected.cognition : {};
+    var role = cognition.role && typeof cognition.role === 'object' && !Array.isArray(cognition.role) ? cognition.role : {};
+    var epistemicStatus = cognition.epistemic_status && typeof cognition.epistemic_status === 'object' && !Array.isArray(cognition.epistemic_status) ? cognition.epistemic_status : {};
+    var lists = cognitionValueLists(document);
+    var idSuffix = String(item && item.id || 'candidate').replace(/[^a-zA-Z0-9_-]/g, '_');
+    var roleListId = 'chat-memory-cognition-roles-' + idSuffix;
+    var statusListId = 'chat-memory-cognition-statuses-' + idSuffix;
+    function datalist(id, values, current) {
+      var choices = Array.from(new Set(values.concat(current ? [current] : [])));
+      return '<datalist id="' + escAttr(id) + '">' + choices.map(function (value) { return '<option value="' + escAttr(value) + '"></option>'; }).join('') + '</datalist>';
+    }
+    var disabled = statements.length ? '' : ' disabled';
+    return '<section class="chat-memory-cognition-editor" data-l1-cognition-editor>' +
+      '<strong>轻量认知编辑 · 选择已有陈述</strong>' +
+      '<p class="chat-memory-edit-needed">认知主体 subject_ref 与讨论对象 about_refs 分开保存；不会自动把主人改成顾衍。空白继续保持未知，证据引用不会由此编辑器改写。</p>' +
+      '<label class="chat-memory-edit-field">现有陈述<select data-cognition-statement data-cognition-active-index="' + selectedIndex + '"' + disabled + '>' +
+        (statementOptions || '<option value="" disabled selected>当前没有可编辑的现有陈述</option>') + '</select></label>' +
+      '<div class="chat-memory-cognition-grid">' +
+        '<label class="chat-memory-edit-field">认知角色 state<input type="text" data-cognition-field="role.state" value="' + escAttr(cognitionInputText(role.state)) + '"' + disabled + ' /></label>' +
+        '<label class="chat-memory-edit-field">认知角色 value<input type="text" list="' + escAttr(roleListId) + '" data-cognition-field="role.value" value="' + escAttr(cognitionInputText(role.value)) + '"' + disabled + ' /></label>' +
+        '<label class="chat-memory-edit-field">认知状态 state<input type="text" data-cognition-field="epistemic_status.state" value="' + escAttr(cognitionInputText(epistemicStatus.state)) + '"' + disabled + ' /></label>' +
+        '<label class="chat-memory-edit-field">认知状态 value<input type="text" list="' + escAttr(statusListId) + '" data-cognition-field="epistemic_status.value" value="' + escAttr(cognitionInputText(epistemicStatus.value)) + '"' + disabled + ' /></label>' +
+        '<label class="chat-memory-edit-field">讨论对象 about_refs · 每行一个 entity_id<textarea rows="3" data-cognition-field="about_refs"' + disabled + '>' + esc(Array.isArray(cognition.about_refs) ? cognition.about_refs.join('\n') : cognitionInputText(cognition.about_refs)) + '</textarea></label>' +
+        '<label class="chat-memory-edit-field">未解问题 open_questions · 每行一项<textarea rows="3" data-cognition-field="open_questions"' + disabled + '>' + esc(Array.isArray(cognition.open_questions) ? cognition.open_questions.join('\n') : cognitionInputText(cognition.open_questions)) + '</textarea></label>' +
+      '</div>' + datalist(roleListId, lists.cognition_roles, role.value) + datalist(statusListId, lists.cognition_statuses, epistemicStatus.value) +
+      (statements.length ? '' : '<p class="chat-memory-edit-needed">当前没有现有陈述；此入口只编辑已有项，可先用完整L1 JSON增加陈述。</p>') +
+      '</section>';
+  }
+
   function renderL1EditPanel(item, document, draft) {
     var current = draft && draft.type === 'l1' ? draft.document : document;
     var mode = draft && draft.type === 'l1' ? draft.mode : 'body';
@@ -705,6 +933,7 @@
       '<label class="chat-memory-edit-field">第一遍完整正文' +
       '<textarea data-l1-body rows="9">' + esc((current.narrative || {}).body || '') + '</textarea>' +
       '</label>';
+    bodyFields += renderL1CognitionEditor(item, current, draft);
     var scenes = itemIsDiary(item) ? renderDiarySceneBodies(current, sceneBodies) : '';
     return '<div class="chat-memory-l1-editor" data-l1-editor-mode="' + escAttr(mode) + '">' +
       '<div class="chat-memory-card-actions">' +
@@ -761,12 +990,13 @@
     container.innerHTML = renderDiarySceneBodies(document, sceneBodies, selectedTargets);
   }
 
-  function syncL1Form(card, document, sceneBodies) {
+  function syncL1Form(card, document, sceneBodies, cognitionStatementIndex) {
     var title = card.querySelector('[data-l1-title]');
     var body = card.querySelector('[data-l1-body]');
     if (title) title.value = String((document.narrative || {}).title || '');
     if (body) body.value = String((document.narrative || {}).body || '');
     refreshDiarySceneBodies(card, document, sceneBodies);
+    syncL1CognitionForm(card, document, cognitionStatementIndex == null ? 0 : cognitionStatementIndex);
   }
 
   function ensureL1Draft(card, item) {
@@ -779,6 +1009,7 @@
       draft = { type: 'l1', baseDocument: cloneValue(current), document: cloneValue(current),
         rawJson: JSON.stringify(current, null, 2), sceneBodies: scenes, baseSceneBodies: cloneValue(scenes),
         invalidJson: false, mode: card.getAttribute('data-l1-editor-mode') || 'body',
+        cognitionStatementIndex: Number(card.querySelector('[data-cognition-statement]')?.getAttribute('data-cognition-active-index')) || 0,
         revision: Number(card.getAttribute('data-revision')), expanded: true };
       memoryDrafts.set(id, draft);
     }
@@ -834,7 +1065,7 @@
     }
     var document = draft && draft.type === 'l1' ? draft.document : itemL1Document(item);
     var sceneBodies = draft && draft.type === 'l1' ? draft.sceneBodies : itemSceneBodies(item);
-    if (nextMode === 'body') syncL1Form(card, document, sceneBodies);
+    if (nextMode === 'body') syncL1Form(card, document, sceneBodies, draft && draft.type === 'l1' ? draft.cognitionStatementIndex : 0);
     var json = card.querySelector('[data-l1-json]');
     if (json && nextMode === 'json' && !(draft && draft.type === 'l1' && draft.invalidJson)) {
       json.value = JSON.stringify(document, null, 2);
@@ -1554,7 +1785,7 @@
         '<div class="chat-memory-source-panel" hidden>' +
           '<div class="chat-memory-source-loading">读取完整原文...</div>' +
         '</div>' +
-        '<div class="chat-memory-semantics">' + (l1Document ? renderL1ReviewDetails(item, l1Document) : renderMemorySemantics(item, draft)) + '</div>' + staleNote + blockedNote + editNote +
+        '<div class="chat-memory-semantics">' + (l1Document ? renderL1ReviewDetails(item, l1Draft ? l1Draft.document : l1Document) : renderMemorySemantics(item, draft)) + '</div>' + staleNote + blockedNote + editNote +
         (draft ? '<p class="chat-memory-edit-needed">有未保存修改' + (item.draft_orphan || revision !== item.authority_revision ? '；服务器版本或状态已变化，请核对后再操作' : '') + '。</p>' : '') +
         '<div class="chat-memory-edit-panel"' + (draft && draft.expanded ? '' : ' hidden') + '>' +
           (l1Document ? renderL1EditPanel(item, l1Document, l1Draft) :

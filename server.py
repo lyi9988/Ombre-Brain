@@ -12608,6 +12608,33 @@ def _memory_l1_reads():
     return MemoryL1Reads(service, reflection_engine._memory_l1_sources())
 
 
+@mcp.custom_route("/api/memory-authority/recall-sources", methods=["POST"])
+async def api_memory_recall_sources(request):
+    from starlette.responses import JSONResponse
+    from memory_l1_service import L1OwnerError
+    err = _require_owner_or_internal_memory_read(request)
+    if err: return err
+    headers = {"Cache-Control": "no-store"}
+    if memory_authority_store is None or memory_commit_service is None:
+        return JSONResponse({"error": {"code": "memory_authority_unavailable"}}, status_code=503, headers=headers)
+    try:
+        raw = await request.body()
+        if len(raw) > 512 * 1024:
+            raise L1OwnerError("recall_source_request_too_large")
+        payload = _json_lib.loads(raw)
+        if not isinstance(payload, dict) or set(payload) != {"items"}:
+            raise L1OwnerError("invalid_recall_source_request")
+        result = await _memory_l1_reads().recall_source_status(payload["items"])
+        return JSONResponse(result, headers=headers)
+    except L1OwnerError as exc:
+        return JSONResponse({"error": {"code": exc.code, "field_path": exc.field_path}}, status_code=exc.status, headers=headers)
+    except (ValueError, TypeError):
+        return JSONResponse({"error": {"code": "invalid_recall_source_request"}}, status_code=400, headers=headers)
+    except Exception as exc:
+        logger.warning("Recall source check incomplete: %s", type(exc).__name__)
+        return JSONResponse({"error": {"code": "recall_sources_unavailable"}}, status_code=503, headers=headers)
+
+
 @mcp.custom_route("/api/memory-authority/memories/{memory_id}/statements", methods=["GET"])
 @mcp.custom_route("/api/memory-authority/memories/{memory_id}/scenes", methods=["GET"])
 @mcp.custom_route("/api/memory-authority/memories/{memory_id}/scenes/{scene_id}", methods=["GET"])

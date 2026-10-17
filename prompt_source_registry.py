@@ -49,11 +49,20 @@ _MEMORY_EMBEDDING_QUERY_PREPARATION_PROMPT = (
     "Given a memory search query, retrieve relevant long-term memory passages."
 )
 _MEMORY_EMBEDDING_DOCUMENT_PREPARATION_PROMPT = ""
+_MEMORY_USAGE_CARD_PROMPT = """{{header}}
+{{statements}}
+Historical narrative (record date is not event date):
+{{narrative}}"""
+_MEMORY_COGNITION_CHAIN_PROMPT = """Related cognition and evidence:
+These are recorded understandings, questions and supporting material. Earlier versions remain historical; tentative or contested views remain unresolved.
+{{content}}"""
 _MEMORY_RECALL_STATUS_WRAPPER_PROMPT = """Recall status: {{status}}.
 
 Use only included committed Memory evidence for factual claims. `selected` means evidence items are included below. `no_match` means this completed search found no relevant Memory; it does not prove no Memory exists. `incomplete` means retrieval did not fully complete, so do not treat it as `no_match` or claim the remembered event/person does not exist. `disabled` means Memory recall was disabled. Status text by itself is not a selected Memory item.
 
 Semantic relevance and recent assistant wording are search cues, not proof of identity or aliases. An experience can be relevant without proving two names refer to the same person. Keep uncertain relationships uncertain; do not invent an identity from a relevant passage.
+
+Claim-use labels limit evidence: current_basis has explicit current scope; conditional_basis keeps its conditions; historical_evidence and relationship_reference do not establish present state or universal preferences; unresolved_evidence remains unconfirmed.
 
 {{content}}"""
 
@@ -71,12 +80,12 @@ FIXED_PROMPT_SOURCES = {
         _spec("ombre.reflection_prompt", "memory.reflection",
               "reflection_engine:REFLECT_PROMPT_TEMPLATE", render="identity"),
         _spec("ombre.diary_memory_prompt", "memory.reflection",
-              "memory_l1_prompts:DIARY_L1_PROMPT", render="domain_identity", revision="factory-memory-l1-evidence-v2"),
+              "memory_l1_prompts:DIARY_L1_PROMPT", render="domain_identity", revision="factory-memory-cognition-v1"),
         _spec("ombre.chat_memory_prepare_prompt", "memory.chat_prepare",
-              "memory_l1_prompts:CHAT_PREPARATION_PROMPT", render="domain_identity", revision="factory-chat-prepare-evidence-v2"),
+              "memory_l1_prompts:CHAT_PREPARATION_PROMPT", render="domain_identity", revision="factory-chat-cognition-v1"),
         _spec("ombre.daily_chat_memory_prompt", "memory.daily_chat_review",
               "memory_l1_prompts:DAILY_L1_PROMPT",
-              render="domain_identity", required=("{max_candidates}",), revision="factory-memory-l1-evidence-v2"),
+              render="domain_identity", required=("{max_candidates}",), revision="factory-memory-cognition-v1"),
         _spec("ombre.daily_chat_summary_prompt", "memory.daily_chat_review",
               "reflection_engine:DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE", render="identity",
               revision="factory-chat-narrative-v1"),
@@ -148,10 +157,22 @@ INTERNAL_FIXED_PROMPT_SOURCES = {
             "prompt_source_registry:_MEMORY_EMBEDDING_DOCUMENT_PREPARATION_PROMPT",
         ),
         _spec(
+            "ombre.memory_usage_card_prompt", "memory.usage_card",
+            "prompt_source_registry:_MEMORY_USAGE_CARD_PROMPT",
+            required=("{{header}}", "{{statements}}"),
+            revision="factory-memory-use-v1",
+        ),
+        _spec(
+            "ombre.memory_cognition_chain_prompt", "memory.cognition_chain",
+            "prompt_source_registry:_MEMORY_COGNITION_CHAIN_PROMPT",
+            required=("{{content}}",), revision="factory-cognition-chain-v1",
+        ),
+        _spec(
             "ombre.memory_recall_status_wrapper_prompt",
             "memory.recall_status_wrapper",
             "prompt_source_registry:_MEMORY_RECALL_STATUS_WRAPPER_PROMPT",
             required=("{{status}}", "{{content}}"),
+            revision="factory-memory-use-v1",
         ),
     )
 }

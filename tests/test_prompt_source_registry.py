@@ -67,6 +67,8 @@ def test_internal_recall_preparation_sources_are_scoped_and_provenanced():
         "ombre.memory_embedding_query_prep_prompt": "memory.embedding_query",
         "ombre.memory_embedding_document_prep_prompt": "memory.embedding_document",
         "ombre.memory_recall_status_wrapper_prompt": "memory.recall_status_wrapper",
+        "ombre.memory_usage_card_prompt": "memory.usage_card",
+        "ombre.memory_cognition_chain_prompt": "memory.cognition_chain",
     }
     assert set(INTERNAL_FIXED_PROMPT_SOURCES) == set(expected_scopes)
     assert not set(INTERNAL_FIXED_PROMPT_SOURCES) & set(FIXED_PROMPT_SOURCES)

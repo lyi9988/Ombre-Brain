@@ -47,6 +47,13 @@ def project(conn, memory_id, revision, semantic):
         for group, values in item['time'].items():
             for field, value in values.items(): put('statement', ident, 'time.' + group + '.' + field, value)
         put('statement', ident, 'conditions', item['conditions'])
+        cognition = item.get('cognition')
+        if cognition:
+            for key in ('role', 'epistemic_status'):
+                put('statement', ident, 'cognition.' + key, cognition[key])
+            for key in ('about_refs', 'open_questions'):
+                for ordinal, value in enumerate(cognition[key]):
+                    put('statement', ident, 'cognition.' + key, value, ordinal)
         if item['property'] is not None:
             prop = item['property']
             put('statement', ident, 'property.' + prop['key'], prop['value'])

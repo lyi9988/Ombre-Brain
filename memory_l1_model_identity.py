@@ -32,6 +32,8 @@ def normalize_model_local_keys(document, *, previous=None, catalog=None, known_i
     for item in draft.get('statements', []):
         subject = item.get('subject_ref')
         if isinstance(subject, dict): subject['value'] = mapping.get(subject.get('value'), subject.get('value'))
+        if item.get('cognition'):
+            item['cognition']['about_refs'] = [mapping.get(ref, ref) for ref in item['cognition'].get('about_refs', [])]
         scope = (item.get('time') or {}).get('applicability') or {}
         scope['scene_ref'] = mapping.get(scope.get('scene_ref'), scope.get('scene_ref'))
     for item in draft.get('scenes', []):

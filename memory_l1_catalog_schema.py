@@ -31,6 +31,8 @@ def model_document_schema(source_ids=None, *, catalog, entry_forms=None):
     else:
         topics['maxItems'] = 0
     definitions['Entity']['properties']['entity_type'] = classified_value('entity_types')
+    for name, axis in (('role', 'cognition_roles'), ('epistemic_status', 'cognition_statuses')):
+        definitions['Cognition']['properties'][name] = classified_value(axis)
     if vocabulary['relation_types']:
         definitions['Relation']['properties']['kind']['enum'] = list(vocabulary['relation_types'])
     else:

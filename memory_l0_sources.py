@@ -116,7 +116,7 @@ class MemoryL0Sources:
                    "author_ref": None, "speaker_ref": None, "anchors": [anchor]}
         return {"source": snapshot, "binding": binding}
 
-    async def locate(self, binding, *, start=None, end=None):
+    async def locate(self, binding, *, start=None, end=None, verify_only=False):
         adapter = self.adapters.get(binding["source_namespace"])
         try:
             current = await asyncio.wait_for(adapter.read(binding), timeout=self.read_timeout_seconds) if adapter else {"state": "unavailable", "reason": "source_adapter_unconfigured"}
@@ -134,6 +134,9 @@ class MemoryL0Sources:
             except (L1ContractError, KeyError, TypeError):
                 eligible = False
                 current = {"state": "mismatch", "reason": "source_anchor_mismatch"}
+        if verify_only:
+            return {"state": "available" if eligible else "changed" if current.get("state") == "available" else current.get("state", "unavailable"),
+                    "eligible_source": eligible, "reason": current.get("reason")}
         if eligible:
             self.retain_copy(current)
         snapshot = current if eligible else self.copy(binding)

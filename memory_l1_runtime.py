@@ -63,6 +63,8 @@ def namespace_local_ids(document, prefix, known_ids=(), catalog=None):
     for item in doc['statements']:
         value = item['subject_ref']['value']
         item['subject_ref']['value'] = ids.get(value, value)
+        if item.get('cognition'):
+            item['cognition']['about_refs'] = [ids.get(ref, ref) for ref in item['cognition'].get('about_refs', [])]
         value = item['time']['applicability']['scene_ref']
         item['time']['applicability']['scene_ref'] = ids.get(value, value)
     for scene in doc['scenes']: scene['statement_refs'] = [ids.get(ref, ref) for ref in scene['statement_refs']]

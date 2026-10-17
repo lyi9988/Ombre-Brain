@@ -287,6 +287,66 @@ const styles = (html.match(/<style[^>]*>[\s\S]*?<\/style>/g) || []).join('\n');
       assert.equal(await p.evaluate(() => calls[0].body.edit.document.narrative.body), '主人编辑后的整篇L1正文。');
       assert.deepEqual(await p.evaluate(() => calls[0].body.edit.document.retrieval.tags), ['JSON端修改']);
     }, true);
+    await test('cognition Review shows actual statement fields and light edits preserve unknown values and subject_ref', async p => {
+      await p.evaluate(async () => {
+        const document = items[0].candidate.l1_document;
+        document.entities = [
+          { entity_id: 'owner', display_name: '主人' },
+          { entity_id: 'assistant', display_name: '顾衍' },
+        ];
+        document.statements = [
+          { ...structuredClone(document.statements[0]), statement_id: 'stmt-question',
+            content: '这是一条仍待核验的问题。',
+            subject_ref: { state: 'known', value: 'owner', evidence_refs: ['source-owner'] },
+            cognition: { role: { state: 'known', value: 'question', evidence_refs: ['role-ref'] },
+              epistemic_status: { state: 'custom_state', value: 'future_status', evidence_refs: ['status-ref'] },
+              about_refs: ['assistant'], open_questions: ['原问题'], extension: { keep: true } } },
+          { ...structuredClone(document.statements[0]), statement_id: 'stmt-assistant',
+            content: '顾衍正在追问一个线索。',
+            subject_ref: { state: 'known', value: 'assistant', evidence_refs: ['source-assistant'] },
+            cognition: { role: { state: 'future_state', value: 'future_role', evidence_refs: ['future-role-ref'] },
+              epistemic_status: { state: 'unknown_state', value: 'future_status', evidence_refs: ['future-status-ref'] },
+              about_refs: ['owner'], open_questions: ['旧问题'], extension: { preserve: true } } },
+        ];
+        items[0].candidate.l1_document = document;
+        await loadDailyChatMemoryPending();
+      });
+      const candidate = card(p, 'one');
+      await candidate.locator('[data-l1-statements] > summary').click();
+      assert.match(await candidate.locator('[data-l1-statements]').textContent(), /认知主体 subject_ref：主人/);
+      assert.match(await candidate.locator('[data-l1-statements]').textContent(), /future_role/);
+      assert.match(await candidate.locator('[data-l1-statements]').textContent(), /讨论对象 about_refs：主人 · owner/);
+      assert.match(await candidate.locator('[data-l1-statements]').textContent(), /未解问题 open_questions：旧问题/);
+      assert.equal(await candidate.locator('[data-l1-technical]').getAttribute('open'), null, 'machine catalog details stay folded');
+
+      await open(p, 'one');
+      const selector = candidate.locator('[data-cognition-statement]');
+      await selector.selectOption('1');
+      assert.equal(await candidate.locator('[data-cognition-field="role.value"]').inputValue(), 'future_role');
+      assert.equal(await candidate.locator('[data-cognition-field="role.state"]').inputValue(), 'future_state');
+      assert.equal(await candidate.locator('[data-cognition-field="epistemic_status.value"]').inputValue(), 'future_status');
+      await candidate.locator('[data-cognition-field="about_refs"]').fill('owner\nassistant\nfuture-entity');
+      await candidate.locator('[data-cognition-field="open_questions"]').fill('继续核对时间顺序\n确认关联对象');
+      await p.evaluate(() => loadDailyChatMemoryPending());
+      assert.equal(await candidate.locator('[data-cognition-statement]').inputValue(), '1');
+      assert.equal(await candidate.locator('[data-cognition-field="about_refs"]').inputValue(), 'owner\nassistant\nfuture-entity');
+      assert.equal(await candidate.locator('[data-cognition-field="open_questions"]').inputValue(), '继续核对时间顺序\n确认关联对象');
+      await candidate.getByRole('button', {name:'完整L1 JSON'}).click();
+      const json = JSON.parse(await candidate.locator('[data-l1-json]').inputValue());
+      assert.equal(json.statements[1].cognition.role.value, 'future_role');
+      assert.equal(json.statements[1].cognition.epistemic_status.value, 'future_status');
+      await save(p, 'one');
+      const saved = await p.evaluate(() => calls[0].body.edit.document);
+      assert.equal(saved.statements[1].content, '顾衍正在追问一个线索。');
+      assert.deepEqual(saved.statements[1].subject_ref, { state: 'known', value: 'assistant', evidence_refs: ['source-assistant'] });
+      assert.deepEqual(saved.statements[1].cognition.role, { state: 'future_state', value: 'future_role', evidence_refs: ['future-role-ref'] });
+      assert.deepEqual(saved.statements[1].cognition.epistemic_status, { state: 'unknown_state', value: 'future_status', evidence_refs: ['future-status-ref'] });
+      assert.deepEqual(saved.statements[1].cognition.about_refs, ['owner', 'assistant', 'future-entity']);
+      assert.deepEqual(saved.statements[1].cognition.open_questions, ['继续核对时间顺序', '确认关联对象']);
+      assert.deepEqual(saved.statements[1].cognition.extension, { preserve: true });
+      assert.equal(await p.evaluate(() => items[0].status), 'pending');
+      assert.equal(await p.evaluate(() => calls.filter(call => call.url.endsWith('/confirm')).length), 0);
+    }, true);
     await test('diary scene body is an explicit part of the save-only candidate edit', async p => {
       await open(p, 'one');
       await card(p, 'one').locator('[data-scene-body="scene-a"]').fill('主人编辑后的场景正文。');
@@ -363,6 +423,11 @@ const styles = (html.match(/<style[^>]*>[\s\S]*?<\/style>/g) || []).join('\n');
           evidence_refs:[i===1?'source:12':'source:1'],
           classification:{...structuredClone(d.statements[0].classification),
             basis:{state:'known',value:'direct_expression',evidence_refs:[i===1?'source:12':'source:1']}}}));
+        d.statements.forEach((statement, index) => { statement.cognition = {
+          role: {state: index === 1 ? 'future_state' : 'known', value: index === 1 ? 'future_role' : 'observation', evidence_refs: []},
+          epistemic_status: {state: 'known', value: 'tentative', evidence_refs: []},
+          about_refs: ['owner'], open_questions: ['viewport question ' + index],
+        }; });
         d.generation.catalog_snapshot={definitions:[{axis:'bases',id:'direct_expression',label:'当事人表达'}],
           topics:[],attributes:[],long_text:'long-catalog-'.repeat(700)};
         d.generation.task_id='<img src=x onerror="window.xss=true">';
@@ -378,6 +443,10 @@ const styles = (html.match(/<style[^>]*>[\s\S]*?<\/style>/g) || []).join('\n');
       const c = card(p,'one');
       assert.doesNotMatch(await c.locator('.chat-memory-card-source').textContent(),/无来源/);
       assert.match(await c.locator('[data-l1-statements] > summary').textContent(),/3 条陈述/);
+      assert.equal(await c.locator('.chat-memory-cognition').count(),3);
+      assert.match(await c.locator('.chat-memory-cognition').first().textContent(),/认知角色：state known · value observation/);
+      assert.match(await c.locator('.chat-memory-cognition').nth(1).textContent(),/future_role/);
+      assert.match(await c.locator('.chat-memory-cognition').first().textContent(),/viewport question 0/);
       assert.match(await c.locator('[data-l1-sources] > summary').textContent(),/16 项材料 · 2 项被陈述引用/);
       assert.equal(await c.locator('[data-l1-technical]').getAttribute('open'),null);
       assert.equal(await c.locator('[data-l1-technical] pre').first().isVisible(),false);

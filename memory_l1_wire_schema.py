@@ -114,12 +114,19 @@ def _definitions() -> dict:
                 {"type": "null"},
             ],
         },
+        "Cognition": _obj(("role", "epistemic_status", "about_refs", "open_questions"), {
+            "role": _ref("Unknown"), "epistemic_status": _ref("Unknown"),
+            "about_refs": {"type": "array", "items": _ref("Text160"), "uniqueItems": True},
+            "open_questions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        }),
         "Statement": _obj(("statement_id", "content", "subject_ref", "classification", "time", "conditions", "property", "evidence_refs", "role_hint", "attributes"), {
             "statement_id": _ref("Text160"),
             "content": {"type": "string", "minLength": 1, "maxLength": 12000},
             "subject_ref": _ref("Unknown"), "classification": _ref("Classification"),
             "time": _ref("StatementTime"), "conditions": _ref("Condition"),
             "property": _ref("StatementProperty"), "evidence_refs": _ref("EvidenceRefs"),
+            "cognition": {"oneOf": [_ref("Cognition"), {"type": "null"}],
+                          "description": "Optional cognitive annotation: role and epistemic status use catalog; about_refs reference declared entities. Content remains in statement.content, source evidence in evidence_refs."},
             "role_hint": {"type": "object", "additionalProperties": False,
                 "required": ["state", "value", "evidence_refs"], "properties": {
                     "state": {"type": "string", "enum": _UNKNOWN_STATES},

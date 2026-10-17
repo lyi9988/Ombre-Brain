@@ -379,6 +379,164 @@ class MemoryAuthorityRecallView:
             }
         return result
 
+    def memory_l1_recall_map(self, bucket_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Batch current semantic data; stale/missing indexes do not hide L1.
+
+Read the committed revision metadata as the fallback, never rebuild the
+database during chat. Source readability is verified separately, per binding.
+"""
+        ids = list(dict.fromkeys(str(value) for value in bucket_ids if value))
+        if not ids or not self.available():
+            return {}
+        conn = self._connect()
+        result = {}
+        try:
+            conn.execute("BEGIN")
+            for offset in range(0, len(ids), 400):
+                chunk = ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    "SELECT m.memory_id,COALESCE(NULLIF(m.bucket_id,''),m.memory_id),m.active_revision,"
+                    "r.body_sha256,json_extract(r.metadata_json,'$.memory_l1'),"
+                    "json_extract(r.metadata_json,'$.memory_l1_semantic_sha256') "
+                    "FROM memories m JOIN memory_revisions r ON r.memory_id=m.memory_id AND r.revision=m.active_revision "
+                    "WHERE m.state='active' AND m.recall_policy='enabled' "
+                    f"AND (m.bucket_id IN ({placeholders}) OR m.memory_id IN ({placeholders}))",
+                    [*chunk, *chunk],
+                ).fetchall()
+                for memory_id, bid, revision, body_sha, raw, semantic_sha in rows:
+                    row = {"memory_id": memory_id, "revision": revision, "body_sha256": body_sha,
+                           "document": None, "state": "legacy"}
+                    if raw:
+                        from memory_l1_contract import semantic_sha256
+                        semantic = json.loads(raw)
+                        if semantic_sha256(semantic) != semantic_sha:
+                            row["state"] = "semantic_mismatch"
+                        else:
+                            row.update(document=semantic, state="l1")
+                            entry = semantic.get("entry") or {}
+                            parent = entry.get("parent_ref")
+                            if parent:
+                                root = conn.execute(
+                                    "SELECT m.active_revision,r.metadata_json FROM memories m JOIN memory_revisions r "
+                                    "ON r.memory_id=m.memory_id AND r.revision=? WHERE m.memory_id=? "
+                                    "AND m.state='active' AND m.recall_policy='enabled'",
+                                    (parent["revision"], parent["memory_id"])).fetchone()
+                                if not root or root[0] != parent["revision"]:
+                                    row["state"] = "dependency_changed"
+                                else:
+                                    root_metadata = json.loads(root[1])
+                                    root_doc = root_metadata.get("memory_l1") or {}
+                                    if semantic_sha256(root_doc) != root_metadata.get("memory_l1_semantic_sha256"):
+                                        row["state"] = "dependency_changed"
+                                    refs = set(entry.get("shared_statement_refs") or [])
+                                    semantic = {**semantic,
+                                        "statements": [s for s in root_doc.get("statements", []) if s.get("statement_id") in refs],
+                                        "evidence_bindings": root_doc.get("evidence_bindings", []),
+                                        "entities": root_doc.get("entities", []),
+                                        "relations": root_doc.get("relations", [])}
+                                    row["document"] = semantic
+                    if bid in result:
+                        # Multiple authorities cannot silently select a winner.
+                        result[bid] = {"state": "ambiguous", "document": None}
+                    else:
+                        result[bid] = row
+        except (sqlite3.Error, ValueError, TypeError):
+            return {}
+        finally:
+            conn.close()
+        return result
+
+    def cognition_chain(self, seeds, *, depth, limit):
+        """Bounded explicit revision/relationship traversal, no model or writes.
+
+Historical versions remain history. Every returned binding still needs the
+same current-source check on Brain before any claim is shown to chat.
+"""
+        from collections import deque
+        from memory_l1_contract import semantic_sha256
+        if not self.available() or depth <= 0 or limit <= 0:
+            return {"nodes": [], "truncated": False, "issues": []}
+        conn = self._connect()
+        cache, nodes, seen, issues, depth_limited = {}, [], set(), [], False
+        reached = {}
+        def load(mid, rev):
+            key = (mid, rev)
+            if key in cache:
+                return cache[key]
+            cache[key] = None
+            row = conn.execute(
+                "SELECT m.active_revision,COALESCE(NULLIF(m.bucket_id,''),m.memory_id),r.metadata_json "
+                "FROM memories m JOIN memory_revisions r ON r.memory_id=m.memory_id AND r.revision=? "
+                "WHERE m.memory_id=? AND m.state='active' AND m.recall_policy='enabled'", (rev, mid)).fetchone()
+            if not row:
+                return None
+            metadata = json.loads(row[2])
+            document = metadata.get("memory_l1")
+            if not document or semantic_sha256(document) != metadata.get("memory_l1_semantic_sha256"):
+                return None
+            parent = (document.get("entry") or {}).get("parent_ref")
+            if parent:
+                root = load(parent["memory_id"], parent["revision"])
+                if root is None:
+                    return None
+                root_doc = root["document"]
+                refs = set(document["entry"].get("shared_statement_refs") or [])
+                document = {**document,
+                    "statements": [s for s in root_doc.get("statements", []) if s["statement_id"] in refs],
+                    "entities": root_doc.get("entities", []), "evidence_bindings": root_doc.get("evidence_bindings", []),
+                    "relations": root_doc.get("relations", [])}
+            result = {"memory_id": mid, "revision": rev, "bucket_id": row[1],
+                      "historical": row[0] != rev or bool(parent and root["historical"]), "document": document}
+            cache[key] = result
+            return result
+        queue = deque((mid, rev, 0, None) for mid, rev in seeds)
+        try:
+            conn.execute("BEGIN")
+            while queue and len(nodes) < limit:
+                mid, rev, level, via = queue.popleft()
+                key = (mid, rev)
+                if key in seen:
+                    if via and key in reached and via not in reached[key]["via_paths"]:
+                        reached[key]["via_paths"].append(via)
+                    continue
+                seen.add(key)
+                record = load(mid, rev)
+                if record is None:
+                    issues.append({"memory_id": mid, "revision": rev, "reason": "related_revision_unavailable"})
+                    continue
+                document = record["document"]
+                cognitive = any(s.get("cognition") for s in document.get("statements", []))
+                if level == 0 and not cognitive:
+                    continue
+                node = {**record, "depth": level, "via": via, "via_paths": [via] if via else []}
+                nodes.append(node)
+                reached[key] = node
+                if level >= depth:
+                    depth_limited = depth_limited or (cognitive and rev > 1) or bool(document.get("relations"))
+                    continue
+                if cognitive and rev > 1:
+                    queue.append((mid, rev - 1, level + 1, {"kind": "revision_history", "from": key}))
+                host = (document.get("entry") or {}).get("parent_ref") or {"memory_id": mid, "revision": rev}
+                for relation in document.get("relations", []):
+                    if relation.get("confirmation_state") == "rejected":
+                        continue
+                    for endpoint in (relation["from"], relation["to"]):
+                        target_id = endpoint.get("memory_id") or host["memory_id"]
+                        target_rev = host["revision"] if endpoint.get("revision") == "this_revision" else endpoint.get("revision")
+                        if type(target_rev) is int and (target_id, target_rev) != key:
+                            queue.append((target_id, target_rev, level + 1,
+                                {"kind": relation["kind"], "relation_id": relation["relation_id"],
+                                 "confirmation_state": relation["confirmation_state"], "from": key,
+                                 "object_type": endpoint["object_type"], "object_id": endpoint["object_id"]}))
+            return {"nodes": nodes, "truncated": depth_limited or any((mid, rev) not in seen for mid, rev, _level, _via in queue),
+                    "depth_limited": depth_limited,
+                    "issues": issues}
+        except (sqlite3.Error, ValueError, TypeError, KeyError):
+            return {"nodes": [], "truncated": False, "issues": [{"reason": "cognition_chain_unavailable"}]}
+        finally:
+            conn.close()
+
     def resolve_memory_refs(self, memory_or_bucket_ids: list[str]) -> dict[str, dict[str, Any]]:
         ids = list(dict.fromkeys(
             str(memory_id or "").strip()

@@ -26,7 +26,8 @@ def finite_score(value):
     return score if math.isfinite(score) else None
 
 
-def select_natural_window(items, limit, priorities):
+def select_natural_window(items, limit, priorities, *, configured_scores=None,
+                          configured_weight=1.0, rrf_constant=60.0):
     """Return pool indices and request-local evidence, without modifying items.
 
 The four special-evidence flags retain the old priority. Within a tier, reciprocal
@@ -35,6 +36,8 @@ Types, narrator and text length are deliberately not eligibility conditions.
 """
     if len(items) != len(priorities):
         raise ValueError("window_priority_count_mismatch")
+    if configured_scores is not None and len(configured_scores) != len(items):
+        raise ValueError("window_feature_count_mismatch")
     limit = max(0, min(int(limit), len(items)))
     channels = {name: [] for name in ("keyword", "semantic", "moment", "structural")}
     for index, item in enumerate(items):
@@ -58,7 +61,18 @@ Types, narrator and text length are deliberately not eligibility conditions.
         candidates.sort(key=lambda pair: (-pair[1], identity(pair[0])))
         for rank, (index, _score) in enumerate(candidates, 1):
             notes[index]["channel_ranks"][name] = rank
-            notes[index]["fusion_score"] += 1.0 / (60 + rank)
+            notes[index]["fusion_score"] += 1.0 / (rrf_constant + rank)
+    configured = [(i, finite_score(score)) for i, score in enumerate(configured_scores or [])]
+    configured = [(i, score) for i, score in configured if score is not None]
+    if configured and configured_weight:
+        configured.sort(key=lambda pair: (-pair[1], identity(pair[0])))
+        previous, rank = None, 0
+        for position, (index, score) in enumerate(configured, 1):
+            if previous is None or score != previous:
+                rank = position
+            previous = score
+            notes[index]["channel_ranks"]["configured"] = rank
+            notes[index]["fusion_score"] += configured_weight / (rrf_constant + rank)
 
     def rank_key(index):
         ranks = notes[index]["channel_ranks"]
@@ -79,6 +93,8 @@ Types, narrator and text length are deliberately not eligibility conditions.
         "selected_count": len(selected),
         "channel_candidates": {name: len(rows) for name, rows in channels.items()},
         "channel_selected": {name: selected_counts[name] for name in channels},
+        "configured_candidates": len(configured), "configured_weight": configured_weight,
+        "rrf_constant": rrf_constant,
     }
     return selected, notes, summary
 

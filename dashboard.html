@@ -2882,6 +2882,38 @@
   .chat-memory-l1-statement {
     margin: 10px 0;
   }
+  .chat-memory-cognition {
+    display: grid;
+    gap: 3px;
+    margin: 7px 0;
+    padding: 7px 9px;
+    border-left: 2px solid var(--accent, #7a86b7);
+    border-radius: 5px;
+    background: rgba(255,255,255,0.18);
+    overflow-wrap: anywhere;
+  }
+  .chat-memory-cognition p { margin: 0; font-size: 12px; line-height: 1.5; }
+  .chat-memory-cognition-editor {
+    display: grid;
+    gap: 8px;
+    margin: 8px 0;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: rgba(255,255,255,0.14);
+    min-width: 0;
+  }
+  .chat-memory-cognition-editor > strong { font-size: 12px; }
+  .chat-memory-cognition-editor > p { margin: 0; }
+  .chat-memory-cognition-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; min-width: 0; }
+  .chat-memory-cognition-grid select,
+  .chat-memory-cognition-grid input,
+  .chat-memory-cognition-grid textarea {
+    width: 100%; min-width: 0; box-sizing: border-box; padding: 8px;
+    border: 1px solid var(--border); border-radius: 7px; color: var(--text);
+    background: rgba(255,255,255,0.26); font: inherit;
+  }
+  .chat-memory-cognition-grid textarea { resize: vertical; }
   .chat-memory-excerpt {
     margin-top: 4px;
   }
@@ -3018,6 +3050,7 @@
     .chat-memory-edit-grid {
       grid-template-columns: 1fr;
     }
+    .chat-memory-cognition-grid { grid-template-columns: 1fr; }
     .header { padding: 20px; flex-wrap: wrap; }
     .header h1 { font-size: 22px; }
     .darkroom-door {
@@ -9515,7 +9548,7 @@ function loadDashboardModule(path, onload) {
   document.body.appendChild(script);
 }
 
-loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261017-p2-closeout');
+loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261017-cognition-owner-ui-r1');
 loadDashboardModule('/dashboard-assets/memory-task-models.js?v=20261017-write-quality', function() {
   if (window.renderMemoryTaskModels) window.renderMemoryTaskModels();
 });
