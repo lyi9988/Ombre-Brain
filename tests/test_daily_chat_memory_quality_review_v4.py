@@ -8,8 +8,10 @@ cursor/watermark、run audit、defer、Review/Auto 门禁分离、V3 回归。
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from reflection_engine import ReflectionEngine
 
@@ -85,16 +87,26 @@ class FakeResponse:
 def patch_model(engine: ReflectionEngine, content: str):
     calls = []
 
-    async def fake_create_completion(client, *, model, messages, max_tokens, temperature, use_daily_client):
-        payload_text = ""
-        for message in messages:
-            if message.get("role") == "user":
-                payload_text = message.get("content") or ""
-        calls.append(json.loads(payload_text))
-        return FakeResponse(content)
+    class FakeCompletionClient:
+        def __init__(self):
+            self.request_calls = []
+            self.chat = SimpleNamespace(completions=self)
 
-    engine._daily_chat_memory_model_client = lambda *, candidate: (object(), "fake-model", True)
-    engine._daily_chat_memory_create_completion = fake_create_completion
+        async def create(self, **kwargs):
+            self.request_calls.append(copy.deepcopy(kwargs))
+            payload_text = ""
+            for message in kwargs["messages"]:
+                if message.get("role") == "user":
+                    payload_text = message.get("content") or ""
+            calls.append(json.loads(payload_text))
+            return FakeResponse(content)
+
+    client = FakeCompletionClient()
+    engine.config["reflection"]["memory_task_routes"] = {
+        "auto_l1": {"connection": "daily", "model": "fake-model"},
+    }
+    engine.daily_chat_memory_candidate_model = "fake-model"
+    engine.daily_chat_memory_client = client
     return calls
 
 

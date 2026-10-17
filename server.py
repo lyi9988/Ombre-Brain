@@ -2372,6 +2372,8 @@ def _bucket_read_payload(bucket: dict) -> dict:
     ]
     return {
         "id": bucket["id"],
+        "revision": ((memory_authority_store.get_memory(bucket["id"]) or {}).get("active_revision")
+                     if memory_authority_store is not None else None),
         "metadata": {key: meta.get(key) for key in fields if key in meta},
         "metadata_view": metadata_view,
         **metadata_view,
@@ -4141,6 +4143,7 @@ async def _revise_tool_memory(
     updates: dict,
     idempotency_key: str,
     actor: str,
+    expected_revision: int | None = None,
 ) -> dict:
     if memory_commit_service is None or memory_authority_store is None:
         raise RuntimeError("memory authority is not enabled")
@@ -4160,6 +4163,16 @@ async def _revise_tool_memory(
     commit_idempotency_key = f"{operation_key}:revision"
     prior_commit = memory_authority_store.get_commit_by_idempotency(commit_idempotency_key)
     if prior_commit and prior_commit.get("status") == "committed":
+        from memory_authority import IdempotencyConflict
+        original = prior_commit.get("payload") or {}
+        if "content" in updates:
+            desired_hash = hashlib.sha256(body.replace("\r\n", "\n").replace("\r", "\n").strip().encode("utf-8")).hexdigest()
+            if desired_hash != original.get("body_sha256"):
+                raise IdempotencyConflict("operation payload differs")
+        requested_meta = {key: value for key, value in updates.items() if key not in ("content", "last_active", "extra_metadata")}
+        requested_meta.update(updates.get("extra_metadata") or {})
+        if any(value != (original.get("metadata") or {}).get(key) for key, value in requested_meta.items()):
+            raise IdempotencyConflict("operation payload differs")
         return dict(prior_commit.get("result") or {})
     prior_payload = (prior_commit or {}).get("payload") or {}
     if prior_commit:
@@ -4178,7 +4191,7 @@ async def _revise_tool_memory(
             f"tool_operation:{operation_key}",
             f"memory_revision:{memory['active_revision']}",
         ]
-        expected_revision = int(memory["active_revision"])
+        expected_revision = int(memory["active_revision"]) if expected_revision is None else expected_revision
         memory_state = str(memory.get("state") or "active")
         recall_policy = str(memory.get("recall_policy") or "enabled")
     return await memory_commit_service.commit_memory(
@@ -10223,6 +10236,8 @@ async def api_buckets(request):
             metadata_view = normalize_memory_metadata(b)
             result.append({
                 "id": b["id"],
+                "revision": ((memory_authority_store.get_memory(b["id"]) or {}).get("active_revision")
+                             if memory_authority_store is not None else None),
                 "name": meta.get("name", b["id"]),
                 "type": meta.get("type", "dynamic"),
                 "domain": meta.get("domain", []),
@@ -11178,6 +11193,10 @@ async def api_buckets_bulk_update(request):
     if not any([domain_key, tags_add, tags_remove, facets_add, facets_remove, status]):
         return JSONResponse({"error": "no bulk operation requested"}, status_code=400)
     bulk_operation_key = str(body.get("idempotency_key") or request.headers.get("X-Idempotency-Key") or "")
+    expected_revisions = body.get("expected_revisions")
+    if expected_revisions is not None and (not isinstance(expected_revisions, dict) or any(
+            type(expected_revisions.get(bid)) is not int or expected_revisions[bid] < 1 for bid in bucket_ids)):
+        return JSONResponse({"error": "invalid_expected_revisions"}, status_code=400)
 
     summary = {"matched": 0, "changed": 0, "unchanged": 0, "not_found": 0, "invalid": 0, "failed": 0}
     changed_ids: list[str] = []
@@ -11196,6 +11215,13 @@ async def api_buckets_bulk_update(request):
             continue
         summary["matched"] += 1
         meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+        baseline = expected_revisions.get(bucket_id) if expected_revisions is not None else None
+        if baseline is not None and memory_authority_store is not None:
+            current_memory = memory_authority_store.get_memory(bucket_id) or {}
+            if current_memory.get("active_revision") != baseline:
+                summary["failed"] += 1
+                results.append({"id": bucket_id, "status": "conflict", "reason": "revision_conflict"})
+                continue
 
         changed = False
         update_kwargs: dict = {}
@@ -11224,6 +11250,7 @@ async def api_buckets_bulk_update(request):
                         updates=update_kwargs,
                         idempotency_key=f"{bulk_operation_key}:{bucket_id}:metadata" if bulk_operation_key else "",
                         actor="bulk_bucket_api",
+                        expected_revision=baseline,
                     )
                     ok = True
                 except Exception:
@@ -11234,6 +11261,9 @@ async def api_buckets_bulk_update(request):
                 summary["failed"] += 1
                 results.append({"id": bucket_id, "status": "failed", "reason": "update_failed"})
                 continue
+
+            if baseline is not None:
+                baseline += 1
 
         if status == "archived":
             current = await bucket_mgr.get(bucket_id)
@@ -11250,6 +11280,8 @@ async def api_buckets_bulk_update(request):
                                 f"{bulk_operation_key}:{bucket_id}:archive" if bulk_operation_key else "",
                             ),
                             actor="bulk_bucket_api",
+                            expected_revision=baseline,
+                            expected_state=str((memory_authority_store.get_memory(bucket_id) or {}).get("state") or "active"),
                         )
                         ok = True
                     except Exception:
@@ -11260,6 +11292,7 @@ async def api_buckets_bulk_update(request):
                     summary["failed"] += 1
                     results.append({"id": bucket_id, "status": "failed", "reason": "archive_failed"})
                     continue
+
                 changed = True
         elif status == "active":
             current = await bucket_mgr.get(bucket_id)
@@ -11276,6 +11309,8 @@ async def api_buckets_bulk_update(request):
                                 f"{bulk_operation_key}:{bucket_id}:active" if bulk_operation_key else "",
                             ),
                             actor="bulk_bucket_api",
+                            expected_revision=baseline,
+                            expected_state="archived",
                         )
                         ok = True
                     except Exception:
@@ -11304,6 +11339,7 @@ async def api_buckets_bulk_update(request):
                                 if bulk_operation_key else ""
                             ),
                             actor="bulk_bucket_api",
+                            expected_revision=baseline,
                         )
                         await memory_commit_service.change_memory_state(
                             memory_id=bucket_id,
@@ -11661,6 +11697,9 @@ async def api_bucket_update(request):
 
     before_bucket = bucket
     operation_key = str(body.get("idempotency_key") or request.headers.get("X-Idempotency-Key") or "")
+    expected_revision = body.get("expected_revision")
+    if memory_commit_service is not None and (type(expected_revision) is not int or expected_revision < 1):
+        return JSONResponse({"error": "expected_revision_required"}, status_code=400)
     if memory_commit_service is not None:
         try:
             await _revise_tool_memory(
@@ -11669,10 +11708,17 @@ async def api_bucket_update(request):
                 updates=update_kwargs,
                 idempotency_key=operation_key,
                 actor="dashboard",
+                expected_revision=expected_revision,
             )
             ok = True
-        except Exception:
-            ok = False
+        except Exception as exc:
+            from memory_authority import RevisionConflict, IdempotencyConflict
+            if isinstance(exc, RevisionConflict):
+                current = memory_authority_store.get_memory(bucket_id) or {}
+                return JSONResponse({"error": "revision_conflict", "current_revision": current.get("active_revision")}, status_code=409)
+            if isinstance(exc, IdempotencyConflict):
+                return JSONResponse({"error": "operation_payload_conflict"}, status_code=409)
+            return JSONResponse({"error": "update_failed"}, status_code=500)
     else:
         ok = await bucket_mgr.update(bucket_id, **update_kwargs)
     if not ok:
@@ -13178,6 +13224,9 @@ async def api_config_get(request):
             ),
             **task_options(config),
             "diary_l1_source_kind": reflection_cfg.get("diary_l1_source_kind", "mcp"),
+            "memory_task_routes": reflection_engine.memory_task_models_public()["routes"],
+            "memory_task_effective": reflection_engine.memory_task_models_public()["effective"],
+            "memory_task_revision": reflection_engine.memory_task_models_public()["revision"],
             "generation_parameter_bounds": {key: {"minimum": spec[1], "maximum": spec[2]}
                 for key, spec in GENERATION_OPTIONS.items()},
             "model": getattr(reflection_engine, "model", reflection_cfg.get("model", "")),
@@ -13244,7 +13293,21 @@ async def api_config_update(request):
     # Validate before mutating any runtime section or persisting a partial save.
     if not isinstance(body, dict):
         return JSONResponse({"error": "invalid config object"}, status_code=400)
+    if isinstance(body.get("reflection"), dict) and "memory_task_routes" in body["reflection"]:
+        from memory_task_routes import normalize_task_routes, task_routes_revision
+        try:
+            body["reflection"]["memory_task_routes"] = normalize_task_routes(body["reflection"]["memory_task_routes"])
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc), "field_path": "reflection.memory_task_routes"}, status_code=400)
+        expected_task_revision = body.get("expected_memory_task_revision")
+        if expected_task_revision is not None and expected_task_revision != task_routes_revision(
+                (config.get("reflection") or {}).get("memory_task_routes")):
+            return JSONResponse({"error": "memory_task_revision_conflict"}, status_code=409)
     memory_config_base = deepcopy(config)
+    memory_task_runtime_before = (reflection_engine, memory_authority_store, memory_commit_service)
+    memory_tasks_only = (set(body).issubset({"reflection", "persist", "expected_memory_task_revision"})
+                         and isinstance(body.get("reflection"), dict)
+                         and set(body["reflection"]) == {"memory_task_routes"})
     memory_expected = body.get("expected_memory_revision")
     if "gateway" in body:
         if not isinstance(body["gateway"], dict):
@@ -13742,6 +13805,9 @@ async def api_config_update(request):
         except L1OwnerError as exc:
             return JSONResponse({"error": exc.code, "field_path": exc.field_path}, status_code=400)
         reflection_cfg = config.setdefault("reflection", {})
+        if "memory_task_routes" in r:
+            reflection_cfg["memory_task_routes"] = deepcopy(r["memory_task_routes"])
+            updated.append("reflection.memory_task_routes")
         if "diary_l1_source_kind" in r:
             reflection_cfg["diary_l1_source_kind"] = r["diary_l1_source_kind"]
             updated.append("reflection.diary_l1_source_kind")
@@ -14203,6 +14269,8 @@ async def api_config_update(request):
 
             if "reflection" in body:
                 sc_reflection = save_config.setdefault("reflection", {})
+                if "memory_task_routes" in body["reflection"]:
+                    sc_reflection["memory_task_routes"] = deepcopy(body["reflection"]["memory_task_routes"])
                 for key in (
                     "enabled",
                     "auto_enabled",
@@ -14361,12 +14429,18 @@ async def api_config_update(request):
         except ConfigurationError as exc:
             config.clear()
             config.update(memory_config_base)
+            if memory_tasks_only:
+                reflection_engine, memory_authority_store, memory_commit_service = memory_task_runtime_before
             return JSONResponse(exc.payload(), status_code=exc.status)
         except Exception:
             # The old fallback re-tried the runtime overlay here, which is now the
             # primary (and only) write target -- retrying it would just repeat the
             # same failure. Report instead of silently double-writing.
             persistence["runtime_yaml"] = "failed"
+            if memory_tasks_only:
+                config.clear()
+                config.update(memory_config_base)
+                reflection_engine, memory_authority_store, memory_commit_service = memory_task_runtime_before
             if persistence["credentials"] == "pending":
                 persistence["credentials"] = "not_attempted"
             return JSONResponse(config_save_result(

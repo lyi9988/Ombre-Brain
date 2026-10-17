@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from reflection_engine import ReflectionEngine
 
@@ -83,11 +85,21 @@ class FakeResponse:
 
 
 def patch_model(engine: ReflectionEngine, content: str):
-    async def fake_create_completion(client, *, model, messages, max_tokens, temperature, use_daily_client):
-        return FakeResponse(content)
+    class FakeCompletionClient:
+        def __init__(self):
+            self.calls = []
+            self.chat = SimpleNamespace(completions=self)
 
-    engine._daily_chat_memory_model_client = lambda *, candidate: (object(), "fake-model", True)
-    engine._daily_chat_memory_create_completion = fake_create_completion
+        async def create(self, **kwargs):
+            self.calls.append(copy.deepcopy(kwargs))
+            return FakeResponse(content)
+
+    client = FakeCompletionClient()
+    engine.config["reflection"]["memory_task_routes"] = {
+        "auto_l1": {"connection": "daily", "model": "fake-model"},
+    }
+    engine.daily_chat_memory_candidate_model = "fake-model"
+    engine.daily_chat_memory_client = client
 
 
 def model_candidates_json(candidates: list[dict]) -> str:

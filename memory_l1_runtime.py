@@ -104,8 +104,9 @@ class MemoryL1Runtime:
         prompt, context = self._memory_l1_prompt('ombre.daily_chat_memory_prompt',
             runtime_values={'max_candidates': self._daily_chat_memory_candidate_limit(mode)})
         if not prompt.strip(): return {'status': 'disabled', 'reason': 'prompt_disabled', 'results': []}
-        client, model, use_daily = self._daily_chat_memory_model_client(candidate=True)
-        if client is None: return {'status': 'not_prepared', 'reason': 'model_unconfigured', 'results': []}
+        route = self._memory_task_route('action_l1')
+        client, model, use_daily = route['client'], route['model'], route['connection'] == 'daily'
+        if not route['configured']: return {'status': 'not_prepared', 'reason': route['unavailable_reason'], 'results': []}
         reader = AizActionSourceReader(self.config)
         service = self._memory_l1_revisions(bucket_mgr)
         catalog, catalog_revision = service.catalog_provider()
@@ -130,7 +131,8 @@ class MemoryL1Runtime:
                             'author': source.get('author'), 'coverage': source.get('coverage')}]} }
                 response = await self._daily_chat_memory_create_completion(client, model=model,
                     messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}],
-                    max_tokens=self.daily_chat_memory_candidate_max_tokens, temperature=self.temperature, use_daily_client=use_daily)
+                    max_tokens=self.daily_chat_memory_candidate_max_tokens, temperature=self.temperature,
+                    use_daily_client=use_daily, task_stage='action_l1', task_route=route)
                 if self._completion_finish_reason(response) == 'length':
                     raise L1OwnerError('first_pass_output_incomplete', field_path='generation')
                 parsed = self._parse_json_object(self._completion_content(response) or '')
@@ -148,7 +150,7 @@ class MemoryL1Runtime:
                         raise L1OwnerError('boolean_required', field_path='candidates.sensitive')
                     memory_id = 'action_l1_' + hashlib.sha256((task['task_id'] + ':' + str(index)).encode()).hexdigest()[:40]
                     generation = {'prompt_revision': context['prompt_revision'], 'model_route_revision': 'route_sha256:'
-                        + semantic_sha256({'model': model, 'daily_client': use_daily}),
+                        + semantic_sha256({k: v for k, v in route.items() if k != 'client'}),
                         'task_id': task['task_id'], 'actor': 'action_first_pass'}
                     doc = prepare_model_document(service, memory_id=memory_id, document=item['document'], sources=[raw_source],
                         generation=generation, request_id=task['task_id'] + ':' + str(index), catalog_context=(catalog, catalog_revision))
@@ -323,7 +325,8 @@ class MemoryL1Runtime:
         options = task_options(self.config)
         prompt, prompt_context = self._memory_l1_prompt('ombre.diary_memory_prompt')
         if not prompt.strip(): return {'status': 'disabled', 'reason': 'prompt_disabled'}
-        if not self.client: return {'status': 'not_prepared', 'reason': 'first_pass_model_unconfigured'}
+        route = self._memory_task_route('diary_l1', options['diary_l1_max_tokens'])
+        if not route['configured']: return {'status': 'not_prepared', 'reason': 'first_pass_model_unconfigured'}
         sources = self._memory_l1_sources()
         captured = await sources.capture_diary(key, binding_id='diary-source')
         source, binding = captured['source'], captured['binding']
@@ -339,9 +342,9 @@ class MemoryL1Runtime:
         combined = model_template(catalog=catalog)
         prose, scene_bodies, input_ranges, confidence = [], {}, [], []
         batch_identity = {'source': source['source_revision'], 'prompt': prompt_context, 'options': options,
-                          'catalog_revision': catalog_revision, 'model': self.model}
+                          'catalog_revision': catalog_revision, 'model_task': {k: v for k, v in route.items() if k != 'client'}}
         task_id = 'diary-task-' + semantic_sha256(batch_identity)[:40]
-        model_route = 'route_sha256:' + semantic_sha256({'model': self.model, 'thinking_mode': self.thinking_mode})
+        model_route = 'route_sha256:' + semantic_sha256({k: v for k, v in route.items() if k != 'client'})
         memory_id = 'diary_full_' + hashlib.sha256(source['source_id'].encode()).hexdigest()[:32]
         candidate_id = 'diary-l1:' + memory_id + ':' + task_id
         original_candidate = self.memory_authority_store.get_candidate(candidate_id)
@@ -366,9 +369,10 @@ class MemoryL1Runtime:
                 'existing_members': {module: (previous or {}).get(module, []) for module in ('entities', 'scenes', 'statements', 'relations')},
                 'window_index': index, 'source_length': len(text)}
             try:
-                response = await self.client.chat.completions.create(model=self.model,
+                response = await self._daily_chat_memory_create_completion(route['client'], model=route['model'],
                     messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}],
-                    **self._completion_options(max_tokens=options['diary_l1_max_tokens'], temperature=self.temperature))
+                    max_tokens=options['diary_l1_max_tokens'], temperature=self.temperature,
+                    use_daily_client=route['connection'] == 'daily', task_stage='diary_l1', task_route=route)
                 if self._completion_finish_reason(response) == 'length': raise ValueError('first_pass_output_incomplete')
                 parsed = self._parse_json_object(self._completion_content(response) or '')
                 if not isinstance(parsed, dict) or set(parsed) != {'document', 'scene_bodies', 'confidence'}:

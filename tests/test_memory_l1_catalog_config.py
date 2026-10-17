@@ -63,8 +63,12 @@ def test_definition_reference_and_hierarchy_errors(tmp_path, bad_definition, cod
     catalog = payload["values"]["catalog"]
     if code == "definition_parent_cycle":
         catalog["definitions"] = deepcopy(catalog["definitions"])
-        catalog["definitions"][0]["parent_id"] = "phase"
-        catalog["definitions"][1]["parent_id"] = "episode"
+        episode = next(item for item in catalog["definitions"]
+                       if item["axis"] == "stabilities" and item["id"] == "episode")
+        phase = next(item for item in catalog["definitions"]
+                     if item["axis"] == "stabilities" and item["id"] == "phase")
+        episode["parent_id"] = "phase"
+        phase["parent_id"] = "episode"
     else:
         catalog["definitions"].append(bad_definition)
     with pytest.raises(ConfigurationError) as exc:
@@ -143,3 +147,67 @@ def test_invalid_attributes_are_typed_errors(tmp_path, attribute, code):
     with pytest.raises(ConfigurationError) as exc:
         save_configuration(str(tmp_path / "overlay.yaml"), {}, payload)
     assert exc.value.code == code and exc.value.status == 400
+
+
+def test_default_definitions_cover_values_per_axis_and_allow_reused_ids():
+    catalog = defaults()["catalog"]
+    keys = [(item["axis"], item["id"]) for item in catalog["definitions"]]
+    assert len(keys) == len(set(keys))
+    for axis in ("subjects", "kinds", "stabilities", "modalities", "bases",
+                 "entity_types", "relation_types"):
+        assert set(catalog[axis]) == {ident for current_axis, ident in keys
+                                      if current_axis == axis}
+    assert ("modalities", "hypothesis") in keys
+    assert ("bases", "hypothesis") in keys
+    assert configuration({})["validation"]["valid"] is True
+
+
+def test_legacy_catalog_definitions_gain_missing_defaults_for_active_values():
+    default_catalog = defaults()["catalog"]
+    legacy_axes = {"stabilities", "modalities", "bases"}
+    legacy_definitions = [item for item in default_catalog["definitions"]
+                          if item["axis"] in legacy_axes]
+    overlay = {"memory_system": {"catalog": {"definitions": deepcopy(legacy_definitions)}}}
+
+    catalog = values_from_config(overlay)["catalog"]
+    keys = {(item["axis"], item["id"]) for item in catalog["definitions"]}
+    for axis in ("subjects", "kinds", "entity_types", "relation_types"):
+        assert set(catalog[axis]) <= {ident for current_axis, ident in keys
+                                     if current_axis == axis}
+    assert all((item["axis"], item["id"]) in keys for item in legacy_definitions)
+    assert configuration(overlay)["validation"]["valid"] is True
+
+
+def test_owner_definition_override_including_empty_description_is_preserved():
+    custom = {"axis": "bases", "id": "direct_expression", "label": "主人表达",
+              "description": "", "aliases": ["owner_words"], "examples": [], "parent_id": None}
+    overlay = {"memory_system": {"catalog": {"definitions": [custom]}}}
+
+    catalog = values_from_config(overlay)["catalog"]
+    matches = [item for item in catalog["definitions"]
+               if (item["axis"], item["id"]) == ("bases", "direct_expression")]
+    assert matches == [custom]
+    assert configuration(overlay)["validation"]["valid"] is True
+
+
+def test_removed_catalog_value_does_not_receive_a_default_definition():
+    overlay = {"memory_system": {"catalog": {"kinds": ["fact"], "definitions": []}}}
+
+    catalog = values_from_config(overlay)["catalog"]
+    kind_ids = {item["id"] for item in catalog["definitions"] if item["axis"] == "kinds"}
+    assert kind_ids == {"fact"}
+    assert configuration(overlay)["validation"]["valid"] is True
+
+
+def test_catalog_completion_is_read_only_for_existing_owner_config():
+    default_catalog = defaults()["catalog"]
+    old_definitions = [item for item in default_catalog["definitions"]
+                       if item["axis"] in {"stabilities", "modalities", "bases"}]
+    overlay = {"memory_system": {"catalog": {"definitions": deepcopy(old_definitions)}}}
+    before = deepcopy(overlay)
+
+    first = values_from_config(overlay)
+    second = values_from_config(overlay)
+
+    assert overlay == before
+    assert first == second

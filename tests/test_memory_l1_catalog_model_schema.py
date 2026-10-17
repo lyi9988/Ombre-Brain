@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
+from types import SimpleNamespace as NS
 
 from jsonschema import Draft202012Validator
 
@@ -30,6 +32,22 @@ def _validate(schema, document):
 
 def _rejects(schema, document):
     assert list(Draft202012Validator(schema).iter_errors(document))
+
+
+class FakeCompletionClient:
+    """Capture an actual routed chat completion without network access."""
+
+    def __init__(self, *, content, payload_calls):
+        self.content = content
+        self.payload_calls = payload_calls
+        self.calls = []
+        self.chat = NS(completions=self)
+
+    async def create(self, **kwargs):
+        self.calls.append(copy.deepcopy(kwargs))
+        user_message = next(message for message in kwargs["messages"] if message["role"] == "user")
+        self.payload_calls.append(json.loads(user_message["content"]))
+        return NS(choices=[NS(message=NS(content=self.content), finish_reason="stop")])
 
 
 def test_dynamic_schema_is_valid_with_default_and_empty_catalog_axes():
@@ -233,6 +251,33 @@ def test_chat_preparation_sends_schema_built_from_the_same_live_catalog_snapshot
     from test_chat_memory_preparation import setup as setup_chat_preparation
 
     env, engine, envelope, calls = setup_chat_preparation(tmp_path)
+    document = model_template(catalog=env["catalog"])
+    document["narrative"] = {"title": "后台拟题", "body": "模型尝试改写正文"}
+    statement = statement_template()
+    statement.pop("statement_revision_id")
+    statement.update(statement_id="claim1", content="合成的当次请求", evidence_refs=["source:2"])
+    document["statements"] = [statement]
+    routed_client = FakeCompletionClient(
+        content=json.dumps({"document": document, "kind": "shared_experience", "confidence": 0.95}),
+        payload_calls=calls,
+    )
+    engine.config["reflection"]["memory_task_routes"] = {
+        "chat_l1": {
+            "connection": "dehydration",
+            "model": "synthetic-chat-l1-catalog-v1",
+            "thinking_mode": "enabled",
+            "reasoning_effort": "high",
+            "max_tokens": 7654,
+        },
+    }
+    engine.config["dehydration"] = {"thinking_mode": "disabled"}
+    engine.dehydration_client = routed_client
+    engine.dehydration_model = "synthetic-dehydration-default"
+    # The shared setup helper still supports legacy tests. This case exercises
+    # the task-route method and its selected fake connection directly.
+    del engine._daily_chat_memory_model_client
+    del engine._daily_chat_memory_create_completion
+
     edited_catalog = copy.deepcopy(env["catalog"])
     edited_catalog["topics"].append("hot-edited-topic")
     edited_catalog["kinds"].append("hot-edited-kind")
@@ -245,6 +290,11 @@ def test_chat_preparation_sends_schema_built_from_the_same_live_catalog_snapshot
 
     assert result["results"][0]["memory_status"] == "pending"
     assert len(calls) == 1
+    assert len(routed_client.calls) == 1
+    assert routed_client.calls[0]["model"] == "synthetic-chat-l1-catalog-v1"
+    assert routed_client.calls[0]["max_tokens"] == 7654
+    assert routed_client.calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert routed_client.calls[0]["reasoning_effort"] == "high"
     payload = calls[0]
     assert payload["catalog_revision"] == catalog_revision
     assert payload["catalog"] == edited_catalog

@@ -239,9 +239,10 @@ async def prepare_chat_tasks(engine, bucket_mgr):
     prompt, prompt_context = engine._memory_l1_prompt('ombre.chat_memory_prepare_prompt')
     if not prompt.strip():
         return {'status': 'disabled', 'reason': 'prompt_disabled'}
-    client, model, use_daily = engine._daily_chat_memory_model_client(candidate=True)
-    if client is None:
-        return {'status': 'not_prepared', 'reason': 'model_unconfigured'}
+    route = engine._memory_task_route('chat_l1')
+    client, model, use_daily = route['client'], route['model'], route['connection'] == 'daily'
+    if not route['configured']:
+        return {'status': 'not_prepared', 'reason': route['unavailable_reason']}
     engine._chat_preparation_running = True
     tasks = ChatMemoryPreparation(engine.memory_authority_store)
     results = []
@@ -285,19 +286,21 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                                  'recorded_at': s['recorded_at']} for s, b in zip(snapshots, bindings)]}
                 response = await engine._daily_chat_memory_create_completion(client, model=model,
                     messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}],
-                    max_tokens=engine.daily_chat_memory_candidate_max_tokens, temperature=engine.temperature, use_daily_client=use_daily)
+                    max_tokens=engine.daily_chat_memory_candidate_max_tokens, temperature=engine.temperature,
+                    use_daily_client=use_daily, task_stage='chat_l1', task_route=route)
                 reported_usage = getattr(response, 'usage', None)
                 usage = {name: getattr(reported_usage, name, None) for name in
                          ('prompt_tokens', 'completion_tokens', 'total_tokens')}
                 raw_output = engine._completion_content(response) or ''
                 generation = {'prompt_revision': prompt_context['prompt_revision'],
-                    'model_route_revision': 'route_sha256:' + semantic_sha256({'model': model, 'daily_client': use_daily}),
+                    'model_route_revision': 'route_sha256:' + semantic_sha256({k: v for k, v in route.items() if k != 'client'}),
                     'task_id': memory_id + ':' + str(claimed['draft_revision']), 'actor': 'chat_memory_preparation'}
                 completion_meta = {'generation': generation, 'usage': usage,
                     'duration_ms': int((time.monotonic() - started) * 1000),
                     'preparation_output': {'draft_revision': claimed['draft_revision'],
                         'attempt': claimed['attempts'],
-                        'model': model, 'finish_reason': engine._completion_finish_reason(response),
+                        'model': model, 'model_task': {k: v for k, v in route.items() if k != 'client'},
+                        'finish_reason': engine._completion_finish_reason(response),
                         'text': raw_output}, 'output_shape': None}
                 if engine._completion_finish_reason(response) == 'length':
                     raise L1OwnerError('first_pass_output_incomplete', field_path='generation')

@@ -3489,12 +3489,12 @@
     </div>
 
     <div class="config-section">
-      <h3>自动记忆模型</h3>
+      <h3>反思与记忆共用连接</h3>
       <div class="config-row">
         <label>模型</label>
         <input type="text" id="cfg-reflection-model" placeholder="留空复用 Embedding/Persona/脱水模型" />
       </div>
-      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">同一个模型负责候选和整理；用于决定写什么、怎么写、写到哪个主域</div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">下方可分别选择各记忆任务的模型；这里配置现有反思连接。</div>
       <div class="config-row">
         <label>思考</label>
         <select id="cfg-reflection-thinking">
@@ -3520,6 +3520,7 @@
       <button class="btn-secondary" onclick="saveConfig(true, true)">应用并保存密钥到 .env</button>
     </div>
     <div id="model-config-status" style="margin-top:16px;font-size:13px;"></div>
+    <div id="memory-task-models" class="config-section"></div>
   </div>
 </div>
 
@@ -4180,6 +4181,7 @@ let bucketSortMode = 'time';
 let bucketSortDescending = true;
 let bucketBulkMode = false;
 let selectedBucketIds = new Set();
+let selectedBucketRevisions = new Map();
 let dashboardCommentAuthor = 'Rain';
 let dashboardAiAuthor = 'Haven';
 let reflectionSelectedDate = formatLocalDate(new Date());
@@ -6454,7 +6456,10 @@ function toggleBucketSelection(id) {
     return;
   }
   if (selectedBucketIds.has(id)) selectedBucketIds.delete(id);
-  else selectedBucketIds.add(id);
+  else {
+    selectedBucketIds.add(id);
+    selectedBucketRevisions.set(id, bucket.revision);
+  }
   setBucketBulkMessage('');
   renderBuckets(renderedBuckets);
 }
@@ -6463,7 +6468,10 @@ function setBucketSelection(id, checked) {
   id = String(id || '');
   var bucket = bucketById(id);
   if (!bucket || bucketBulkDeleteBlockReason(bucket)) return;
-  if (checked) selectedBucketIds.add(id);
+  if (checked) {
+    selectedBucketIds.add(id);
+    selectedBucketRevisions.set(id, bucket.revision);
+  }
   else selectedBucketIds.delete(id);
   setBucketBulkMessage('');
   renderBuckets(renderedBuckets);
@@ -6475,6 +6483,7 @@ function selectCurrentBuckets() {
     var id = String(bucket.id || '');
     if (id && !bucketBulkDeleteBlockReason(bucket) && !selectedBucketIds.has(id)) {
       selectedBucketIds.add(id);
+      selectedBucketRevisions.set(id, bucket.revision);
       added += 1;
     }
   });
@@ -6514,11 +6523,20 @@ async function bulkUpdateSelected(payload, label) {
     var res = await authFetch(BASE + '/api/buckets/bulk-update', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(Object.assign({ bucket_ids: ids }, payload))
+      body: JSON.stringify(Object.assign({ bucket_ids: ids, expected_revisions: Object.fromEntries(ids.map(function(id) {
+        return [id, selectedBucketRevisions.get(id) || (bucketById(id) || {}).revision];
+      })) }, payload))
     });
     if (!res) return;
     var data = await res.json();
     if (!res.ok) throw new Error(data.error || '批量操作失败');
+    if (data.failed) {
+      var successful = new Set(data.changed_ids || []);
+      successful.forEach(function(id) { selectedBucketIds.delete(String(id)); });
+      await loadBuckets();
+      setBucketBulkMessage('部分未保存（' + data.failed + ' 条），可能已有新版本；未完成的选择和输入已保留，请核对后重试。', 'error');
+      return;
+    }
     selectedBucketIds.clear();
     await loadBuckets();
     var changedIds = Array.isArray(data.changed_ids) ? data.changed_ids : [];
@@ -6647,6 +6665,8 @@ async function showDetail(id) {
     var res = await authFetch(BASE + '/api/bucket/' + encodeURIComponent(id));
     if (!res) return;
     var b = await res.json();
+    panel.dataset.bucketId = String(id);
+    panel.dataset.bucketRevision = b.revision == null ? '' : String(b.revision);
     var meta = b.metadata || {};
     var view = b.metadata_view || {};
     var comments = Array.isArray(meta.comments) ? meta.comments : [];
@@ -6900,6 +6920,24 @@ function cancelBucketDateEdit() {
   view.classList.remove('hidden');
 }
 
+function bucketEditArguments(form, bucketId, fields) {
+  var panel = document.getElementById('detail-panel');
+  var raw = panel && panel.dataset.bucketId === String(bucketId) ? panel.dataset.bucketRevision : '';
+  var revision = raw ? Number(raw) : null;
+  var signature = JSON.stringify({fields: fields, revision: revision});
+  if (form.dataset.operationPayload !== signature) {
+    form.dataset.operationPayload = signature;
+    form.dataset.operationId = 'dashboard-edit:' + (window.crypto && crypto.randomUUID ? crypto.randomUUID() : Date.now() + ':' + Math.random());
+  }
+  return Object.assign({}, fields, {expected_revision: revision, idempotency_key: form.dataset.operationId});
+}
+
+function bucketEditError(data) {
+  if (data.error === 'revision_conflict') return '这条记忆已有更新，当前修改已保留。请复制草稿，重新打开最新版本后核对保存。';
+  if (data.error === 'expected_revision_required') return '未取得编辑版本，当前修改已保留。请复制草稿后重新打开这条记忆。';
+  return typeof data.error === 'string' ? data.error : '保存失败，当前修改已保留';
+}
+
 async function submitBucketDateEdit(event, bucketId) {
   event.preventDefault();
   var form = event.target;
@@ -6912,12 +6950,12 @@ async function submitBucketDateEdit(event, bucketId) {
     var res = await authFetch(BASE + '/api/bucket/' + encodeURIComponent(bucketId), {
       method: 'PATCH',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({date: newDate})
+      body: JSON.stringify(bucketEditArguments(form, bucketId, {date: newDate}))
     });
     if (!res) return;
     if (!res.ok) {
       var data = await res.json().catch(() => ({}));
-      throw new Error(data.error || '保存失败');
+      throw new Error(bucketEditError(data));
     }
     await showDetail(bucketId);
     await loadBuckets();
@@ -6940,12 +6978,12 @@ async function submitBucketTitleEdit(event, bucketId) {
     var res = await authFetch(BASE + '/api/bucket/' + encodeURIComponent(bucketId), {
       method: 'PATCH',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name: newName})
+      body: JSON.stringify(bucketEditArguments(form, bucketId, {name: newName}))
     });
     if (!res) return;
     if (!res.ok) {
       var data = await res.json().catch(() => ({}));
-      throw new Error(data.error || '保存失败');
+      throw new Error(bucketEditError(data));
     }
     await showDetail(bucketId);
     await loadBuckets();
@@ -6995,12 +7033,12 @@ async function submitBucketContentEdit(event, bucketId) {
     var res = await authFetch(BASE + '/api/bucket/' + encodeURIComponent(bucketId), {
       method: 'PATCH',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({content: newContent})
+      body: JSON.stringify(bucketEditArguments(form, bucketId, {content: newContent}))
     });
     if (!res) return;
     if (!res.ok) {
       var data = await res.json().catch(() => ({}));
-      throw new Error(data.error || '保存失败');
+      throw new Error(bucketEditError(data));
     }
     await showDetail(bucketId);
     await loadBuckets();
@@ -8783,6 +8821,7 @@ async function loadConfig(explicitMemoryConflictReload) {
     });
     reflectionConfigDraftSnapshot = reflectionConfigServerValues;
     document.getElementById('cfg-reflection-model').value = (cfg.reflection && cfg.reflection.model) || '';
+    if (window.renderMemoryTaskModels) window.renderMemoryTaskModels(cfg);
     document.getElementById('cfg-reflection-thinking').value = (cfg.reflection && cfg.reflection.thinking_mode) || '';
     document.getElementById('cfg-reflection-url').value = (cfg.reflection && cfg.reflection.base_url) || '';
     document.getElementById('cfg-reflection-key').placeholder =
@@ -9468,14 +9507,18 @@ async function batchReview(idsJson, action) {
   } catch(e) {}
 }
 
-function loadDashboardModule(path) {
+function loadDashboardModule(path, onload) {
   const script = document.createElement('script');
   script.src = BASE + path;
   script.defer = true;
+  if (onload) script.onload = onload;
   document.body.appendChild(script);
 }
 
 loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261017-p2-closeout');
+loadDashboardModule('/dashboard-assets/memory-task-models.js?v=20261017-write-quality', function() {
+  if (window.renderMemoryTaskModels) window.renderMemoryTaskModels();
+});
 </script>
 </body>
 </html>

@@ -17,12 +17,28 @@ from test_memory_authority_r1 import reflection_config
 def run(coro): return asyncio.run(coro)
 
 
+class FakeCompletionClient:
+    """Capture the actual routed chat.completions.create request offline."""
+
+    def __init__(self, content):
+        self.content = content
+        self.calls = []
+        self.chat = NS(completions=self)
+
+    async def create(self, **kwargs):
+        self.calls.append(copy.deepcopy(kwargs))
+        await asyncio.sleep(0)
+        return NS(choices=[NS(
+            message=NS(content=self.content),
+            finish_reason='stop',
+        )])
+
+
 def setup(tmp_path, monkeypatch, mode='review'):
     config = reflection_config(tmp_path, mode=mode)
     engine = ReflectionEngine(config)
     buckets = BucketManager(config)
     tasks = MemoryL1SourceTasks(engine.memory_authority_store)
-    calls = []
     source = {'state': 'available', 'eligible_source': True, 'source_id': 'action-a',
         'source_revision': 'artifact-a', 'text': '执行完成：浏览了天文学资料。', 'author': {'role': 'tool'},
         'coverage': {'complete': True}}
@@ -35,13 +51,21 @@ def setup(tmp_path, monkeypatch, mode='review'):
     statement = statement_template(); statement.pop('statement_revision_id')
     statement.update(content='这次浏览了天文学资料。', evidence_refs=['source:current'])
     draft['statements'] = [statement]
-    async def completion(client, **kwargs):
-        calls.append(kwargs)
-        await asyncio.sleep(0)
-        return NS(choices=[NS(message=NS(content=json.dumps({'candidates': [
-            {'document': draft, 'kind': 'key_event', 'confidence': 0.9}]})), finish_reason='stop')])
-    engine._daily_chat_memory_model_client = lambda **kwargs: (object(), 'synthetic-route', False)
-    engine._daily_chat_memory_create_completion = completion
+    client = FakeCompletionClient(json.dumps({'candidates': [
+        {'document': draft, 'kind': 'key_event', 'confidence': 0.9}]}))
+    engine.config['reflection']['memory_task_routes'] = {
+        'action_l1': {
+            'connection': 'dehydration',
+            'model': 'synthetic-action-l1-v1',
+            'thinking_mode': 'enabled',
+            'reasoning_effort': 'medium',
+            'max_tokens': 4321,
+        },
+    }
+    engine.config['dehydration'] = {'thinking_mode': 'disabled'}
+    engine.dehydration_client = client
+    engine.dehydration_model = 'synthetic-dehydration-default'
+    calls = client.calls
     payload = {'action_id': 'action-a', 'artifact_id': 'artifact-a', 'request_id': 'run-a'}
     return engine, buckets, tasks, payload, calls, source
 
@@ -65,6 +89,10 @@ def test_review_worker_keeps_full_l1_and_does_not_claim_adoption(tmp_path, monke
     record = result['results'][0]
     assert record['status'] == 'prepared' and record['adopted'] is False
     assert len(calls) == 1
+    assert calls[0]['model'] == 'synthetic-action-l1-v1'
+    assert calls[0]['max_tokens'] == 4321
+    assert calls[0]['extra_body'] == {'thinking': {'type': 'enabled'}}
+    assert calls[0]['reasoning_effort'] == 'medium'
     item = engine.memory_authority_store.get_candidate(record['candidate_ids'][0])
     assert item['status'] == 'pending' and len(item['proposal']['proposed_body']) > 4000
     semantic = item['proposal']['metadata']['memory_l1']

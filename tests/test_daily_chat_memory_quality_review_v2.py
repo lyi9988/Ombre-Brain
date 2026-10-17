@@ -8,9 +8,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from reflection_engine import ReflectionEngine
 
@@ -110,23 +112,33 @@ class FakeResponse:
 
 
 def patch_model(engine: ReflectionEngine, script: list[dict]):
-    """Patch the model completion with scripted responses and capture payloads.
+    """Install a routed fake client with scripted responses and captured payloads.
 
     script: list of {"content": <json string>} consumed in order.
     """
     captured: list[dict] = []
 
-    async def fake_create_completion(client, *, model, messages, max_tokens, temperature, use_daily_client):
-        payload_text = ""
-        for message in messages:
-            if message.get("role") == "user":
-                payload_text = message.get("content") or ""
-        captured.append({"model": model, "payload": payload_text})
-        step = script[min(len(captured) - 1, len(script) - 1)]
-        return FakeResponse(step["content"])
+    class FakeCompletionClient:
+        def __init__(self):
+            self.calls = []
+            self.chat = SimpleNamespace(completions=self)
 
-    engine._daily_chat_memory_model_client = lambda *, candidate: (object(), "fake-model", True)
-    engine._daily_chat_memory_create_completion = fake_create_completion
+        async def create(self, **kwargs):
+            self.calls.append(copy.deepcopy(kwargs))
+            payload_text = ""
+            for message in kwargs["messages"]:
+                if message.get("role") == "user":
+                    payload_text = message.get("content") or ""
+            captured.append({"model": kwargs["model"], "payload": payload_text})
+            step = script[min(len(captured) - 1, len(script) - 1)]
+            return FakeResponse(step["content"])
+
+    client = FakeCompletionClient()
+    engine.config["reflection"]["memory_task_routes"] = {
+        "auto_l1": {"connection": "daily", "model": "fake-model"},
+    }
+    engine.daily_chat_memory_candidate_model = "fake-model"
+    engine.daily_chat_memory_client = client
     return captured
 
 

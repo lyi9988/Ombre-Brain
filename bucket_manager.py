@@ -417,10 +417,10 @@ class BucketManager:
                     continue
                 post[str(key)] = value
 
-        # --- Auto-refresh content update time and activation time ---
-        # --- 自动刷新内容更新时间与激活时间 ---
+        # Editing is not activation or evidence that the remembered event recurred.
         post["updated_at"] = kwargs.get("updated_at") or now_iso()
-        post["last_active"] = kwargs.get("last_active") or now_iso()
+        if kwargs.get("last_active"):
+            post["last_active"] = kwargs["last_active"]
 
         try:
             self._write_post_atomic(file_path, post)

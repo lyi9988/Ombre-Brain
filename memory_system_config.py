@@ -139,7 +139,33 @@ def defaults():
             "entity_types": ["user", "assistant", "third_party", "object"],
             "relation_types": ["same_event", "supplements", "revises", "limits", "supersedes",
                                "possible_conflict", "split_from", "merged_from"],
+            # Definitions are keyed by (axis, id); modalities.hypothesis and
+            # bases.hypothesis are distinct entries despite sharing an id.
             "definitions": [
+                {"axis": "subjects", "id": "user", "label": "主人", "description": "陈述所涉及或其体验、属性、行为归属的主人；不因某处出现第一人称就自动判定。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "subjects", "id": "assistant", "label": "助手", "description": "陈述所涉及的助手；说话者是助手不代表陈述主体必然是助手。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "subjects", "id": "third_party", "label": "第三方", "description": "陈述所涉及的其他人物或组织；与来源中的发言者分开判断。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "subjects", "id": "object", "label": "对象", "description": "陈述所涉及的非人物对象、地点或事物。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "experience", "label": "经历", "description": "关于实际发生的事件、互动或经历；保留参与者、范围及有据的时间。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "state", "label": "状态", "description": "关于某一时段内的情况或状态；没有时间证据时不默认为当前。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "fact", "label": "事实", "description": "有来源依据的具体陈述；不要把推断或尚未确认的说法写成已核实事实。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "preference", "label": "偏好", "description": "关于倾向或喜好的陈述；一次请求或一次接受本身不证明长期、反复偏好。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "boundary", "label": "边界", "description": "明确的限制或不可接受范围；保留适用条件和例外。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "intention", "label": "意向", "description": "关于希望、打算或计划的陈述；不等同承诺，也不证明行动已经完成。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "interpretation", "label": "解释", "description": "由来源材料归纳出的理解；保留其推断性质，不冒充来源原话或已确认事实。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "procedure", "label": "做法", "description": "关于可重复步骤或处理方式的陈述；一次发生不自动证明它是稳定流程。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "entity_types", "id": "user", "label": "主人实体", "description": "目录中代表主人的实体类型；发言者身份与每条陈述的事实主体仍需分别判断。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "entity_types", "id": "assistant", "label": "助手实体", "description": "目录中代表助手的实体类型；不能仅凭助手转述把陈述主体设为主人。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "entity_types", "id": "third_party", "label": "第三方实体", "description": "目录中代表其他人物或组织的实体类型。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "entity_types", "id": "object", "label": "对象实体", "description": "目录中代表非人物对象、地点或事物的实体类型。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "same_event", "label": "同一事件", "description": "两条陈述或场景指向同一事件；需有来源依据，不因主题相似就合并。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "supplements", "label": "补充", "description": "一项内容补充另一项而不替代它；保留各自来源和范围。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "revises", "label": "修订", "description": "新证据修正先前陈述的部分内容；只更新有依据的部分并保留修订关系。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "limits", "label": "限定", "description": "一项内容缩小另一项内容的适用范围、条件或例外。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "supersedes", "label": "取代", "description": "有依据的新陈述取代旧陈述在明确重叠范围内的效力；不等于静默删除历史。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "possible_conflict", "label": "可能冲突", "description": "两项内容可能不一致但尚未裁决；保留不确定性，不自动选边。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "split_from", "label": "拆分自", "description": "一项更具体陈述从原先合并内容拆出；保留其来源和拆分关系。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "merged_from", "label": "合并自", "description": "一项整理内容由多项来源陈述合并；不得丢失各自的来源和差异。", "aliases": [], "examples": [], "parent_id": None},
                 {"axis": "stabilities", "id": "episode", "label": "单次", "description": "限于一次事件或短时状态。", "aliases": [], "examples": [], "parent_id": None},
                 {"axis": "stabilities", "id": "phase", "label": "阶段", "description": "在明确阶段内持续。", "aliases": [], "examples": [], "parent_id": None},
                 {"axis": "stabilities", "id": "stable", "label": "相对稳定", "description": "跨阶段相对稳定，仍可修订。", "aliases": [], "examples": [], "parent_id": None},
@@ -150,11 +176,11 @@ def defaults():
                 {"axis": "modalities", "id": "commitment", "label": "承诺", "description": "表达承担履行义务。", "aliases": [], "examples": [], "parent_id": None},
                 {"axis": "modalities", "id": "hypothesis", "label": "假设", "description": "尚待确认的解释或推测。", "aliases": [], "examples": [], "parent_id": None},
                 {"axis": "modalities", "id": "question", "label": "疑问", "description": "提出问题或待确认事项。", "aliases": [], "examples": [], "parent_id": None},
-                {"axis": "bases", "id": "direct_expression", "label": "当事人表达", "description": "来源中的当事人直接表达。", "aliases": [], "examples": [], "parent_id": None},
-                {"axis": "bases", "id": "record", "label": "实际记录", "description": "来源直接记录的事件或行为。", "aliases": [], "examples": [], "parent_id": None},
-                {"axis": "bases", "id": "reported", "label": "转述", "description": "由来源转述的信息。", "aliases": [], "examples": [], "parent_id": None},
-                {"axis": "bases", "id": "interpretation", "label": "理解", "description": "基于材料形成的理解。", "aliases": [], "examples": [], "parent_id": None},
-                {"axis": "bases", "id": "hypothesis", "label": "假设", "description": "尚待材料支持或确认的假设。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "direct_expression", "label": "直接表达/明确接受", "description": "说明陈述为何有据，而非标记发言角色：当事人明确表达，或主人明确接受助手当时明确提出的内容。接受只支持当时明确提议的范围，须概述呈现，不能冒充主人逐字原话，也不覆盖助手之后补加的内容。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "record", "label": "实际记录", "description": "陈述依据是来源直接记录的事件或行为；记录时间不自动等于事件发生时间。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "reported", "label": "转述", "description": "陈述依据是来源对他人说法的转述；不等同于被转述者的直接表达或亲历记录。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "interpretation", "label": "理解", "description": "陈述依据是对现有材料的归纳或解释；保留推断性质，不当作来源原话或已确认事实。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "hypothesis", "label": "依据不足的假设", "description": "陈述依据仍不足、需要确认；这是成立依据轴，与modalities.hypothesis表达尚待确认的断言方式相互独立。", "aliases": [], "examples": [], "parent_id": None},
             ],
         },
         "features": [{"id": "relevance", "label": "文本相关性", "value_type": "number",
@@ -177,6 +203,26 @@ def merge_config(base, overlay):
     return result
 
 
+def _append_missing_default_definitions(catalog, default_catalog):
+    """Complete a read projection without replacing owner definitions or values."""
+    definitions = catalog.get("definitions")
+    if not isinstance(definitions, list):
+        return
+    present = {
+        (item.get("axis"), item.get("id"))
+        for item in definitions
+        if isinstance(item, dict)
+    }
+    for item in default_catalog.get("definitions", []):
+        axis, ident = item.get("axis"), item.get("id")
+        current_values = catalog.get(axis)
+        key = (axis, ident)
+        if (axis in CATALOG_AXES and isinstance(current_values, list)
+                and ident in current_values and key not in present):
+            definitions.append(copy.deepcopy(item))
+            present.add(key)
+
+
 def read_overlay(path):
     target = Path(path)
     if not target.exists():
@@ -194,7 +240,9 @@ def values_from_config(config):
         for key in values:
             if key in configured:
                 if key == "catalog" and isinstance(configured[key], dict):
+                    default_catalog = values[key]
                     values[key] = merge_config(values[key], configured[key])
+                    _append_missing_default_definitions(values[key], default_catalog)
                 else:
                     values[key] = copy.deepcopy(configured[key])
     limits = {}

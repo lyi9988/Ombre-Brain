@@ -309,6 +309,8 @@ class ReflectionEngine(MemoryL1Runtime):
             cfg.get("identity_role_edges")
         )
         legacy_candidate_model = str(cfg.get("daily_chat_memory_candidate_model") or "").strip()
+        self.reflection_connection_explicit = bool(cfg.get("base_url") and (
+            os.environ.get("OMBRE_REFLECTION_API_KEY", "") or cfg.get("api_key")))
         self.base_url = (
             cfg.get("base_url")
             or emb_cfg.get("base_url")
@@ -531,7 +533,9 @@ class ReflectionEngine(MemoryL1Runtime):
             self.enabled
             and self.daily_chat_memory_api_key
             and self.daily_chat_memory_base_url
-            and (self.daily_chat_memory_summary_model or self.daily_chat_memory_candidate_model)
+            and (self.daily_chat_memory_summary_model or self.daily_chat_memory_candidate_model
+                 or any(row.get("connection") == "daily" and row.get("model")
+                        for row in (cfg.get("memory_task_routes") or {}).values()))
         ):
             self.daily_chat_memory_client = AsyncOpenAI(
                 api_key=self.daily_chat_memory_api_key,
@@ -539,7 +543,10 @@ class ReflectionEngine(MemoryL1Runtime):
                 timeout=self.daily_chat_memory_timeout_seconds,
             )
         self.dehydration_client = None
-        if self.enabled and self.dehydration_api_key and self.dehydration_base_url and self.dehydration_model:
+        if self.enabled and self.dehydration_api_key and self.dehydration_base_url and (
+            self.dehydration_model or any(row.get("connection") == "dehydration" and row.get("model")
+                                         for row in (cfg.get("memory_task_routes") or {}).values())
+        ):
             self.dehydration_client = AsyncOpenAI(
                 api_key=self.dehydration_api_key,
                 base_url=self.dehydration_base_url,
@@ -2088,7 +2095,7 @@ class ReflectionEngine(MemoryL1Runtime):
     ) -> list[dict]:
         if not self.daily_chat_memory_summary_enabled:
             return []
-        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=False)
+        client, model, use_daily_client = self._memory_task_model_client("chat_summary")
         if not client:
             return []
         windows = self._daily_chat_memory_windows(turns)
@@ -2122,6 +2129,7 @@ class ReflectionEngine(MemoryL1Runtime):
                         {"role": "system", "content": self._daily_chat_memory_summary_prompt()},
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                     ],
+                    task_stage="chat_summary",
                     max_tokens=self.daily_chat_memory_summary_max_tokens,
                     temperature=self.temperature,
                     use_daily_client=use_daily_client,
@@ -2159,6 +2167,18 @@ class ReflectionEngine(MemoryL1Runtime):
         if self.client:
             return self.client, str(self.model or "").strip(), False
         return None, "", False
+
+    def _memory_task_route(self, stage, default_max_tokens=None):
+        from memory_task_routes import resolve_task_route
+        return resolve_task_route(self, stage, default_max_tokens)
+
+    def memory_task_models_public(self):
+        from memory_task_routes import public_task_models
+        return public_task_models(self)
+
+    def _memory_task_model_client(self, stage):
+        route = self._memory_task_route(stage)
+        return route["client"], route["model"], route["connection"] == "daily"
 
     def _reflect_model_client(self) -> tuple[Any, str, bool]:
         dehy_client = self._daily_dehydration_client()
@@ -2542,18 +2562,20 @@ class ReflectionEngine(MemoryL1Runtime):
         client_override: Any = None,
         model_override: str = "",
     ) -> dict:
-        if client_override is not None:
-            client = client_override
-        elif use_daily_client is False:
-            client = self.client
-        else:
-            client = self.daily_chat_memory_client or self.client
+        from memory_task_routes import normalize_task_routes
+        route = self._memory_task_route("activity_summary")
+        choice = normalize_task_routes((self.config.get("reflection") or {}).get("memory_task_routes"))["activity_summary"]
+        if client_override is not None and choice["connection"] == "legacy":
+            route = dict(route, client=client_override, model=model_override or route["model"], configured=True)
+            if client_override is self._daily_dehydration_client():
+                route["connection"] = "dehydration"
+                if choice["thinking_mode"] == "inherit":
+                    route["thinking_mode"] = (self.config.get("dehydration") or {}).get("thinking_mode", "")
+        client = route["client"]
         if not client:
             return {}
-        use_daily_client = client is self.daily_chat_memory_client
-        model = str(model_override or "").strip() or (
-            self.daily_chat_memory_summary_model if use_daily_client else self.model
-        )
+        use_daily_client = route["connection"] == "daily"
+        model = route["model"]
         fallback_turn_ids, fallback_event_ids = self._daily_chat_memory_window_source_ids(turns)
         payload = {
             "date": key,
@@ -2575,6 +2597,8 @@ class ReflectionEngine(MemoryL1Runtime):
                     {"role": "system", "content": self._daily_activity_summary_prompt()},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
+                task_stage="activity_summary",
+                task_route=route,
                 max_tokens=self.daily_activity_summary_max_tokens,
                 temperature=self.temperature,
                 use_daily_client=use_daily_client,
@@ -2592,6 +2616,10 @@ class ReflectionEngine(MemoryL1Runtime):
         )
 
     def _daily_activity_summary_dehydration_retry_available(self) -> bool:
+        from memory_task_routes import normalize_task_routes
+        selected = normalize_task_routes((self.config.get("reflection") or {}).get("memory_task_routes"))["activity_summary"]
+        if selected["connection"] != "legacy":
+            return False
         if not self._daily_dehydration_client():
             return False
         first_model = self.daily_chat_memory_summary_model if self.daily_chat_memory_client else self.model
@@ -3845,7 +3873,8 @@ class ReflectionEngine(MemoryL1Runtime):
         - last_processed_event_id: max raw event id fully processed so far
         - model_call_count / skipped_noise_window_count
         """
-        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=True)
+        route = self._memory_task_route("auto_l1")
+        client, model, use_daily_client = route["client"], route["model"], route["connection"] == "daily"
         meta: dict = {
             "partial": False,
             "last_processed_event_id": 0,
@@ -3865,6 +3894,10 @@ class ReflectionEngine(MemoryL1Runtime):
             audit["parse_failure_count"] = 0
             audit["model"] = str(model or "")
         if not client:
+            from memory_task_routes import normalize_task_routes
+            if normalize_task_routes((self.config.get("reflection") or {}).get("memory_task_routes"))["auto_l1"]["connection"] != "legacy":
+                meta.update(partial=True, window_failures=1, reason=route["unavailable_reason"])
+                return [], meta
             heuristic = self._heuristic_daily_chat_memory_candidates(
                 key,
                 turns,
@@ -3988,7 +4021,8 @@ class ReflectionEngine(MemoryL1Runtime):
         window_index: int = 1,
         window_total: int = 1,
     ) -> tuple[list[dict], dict]:
-        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=True)
+        route = self._memory_task_route("auto_l1")
+        client, model, use_daily_client = route["client"], route["model"], route["connection"] == "daily"
         payload = {
             "date": key,
             "identity": {
@@ -4038,6 +4072,8 @@ class ReflectionEngine(MemoryL1Runtime):
                 },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
+            task_stage="auto_l1",
+            task_route=route,
             max_tokens=self.daily_chat_memory_candidate_max_tokens,
             temperature=self.temperature,
             use_daily_client=use_daily_client,
@@ -4097,7 +4133,7 @@ class ReflectionEngine(MemoryL1Runtime):
                 item["_l1_sources"] = l1_sources
                 item["_l1_catalog_context"] = (l1_payload["catalog"], l1_payload["catalog_revision"])
                 item["_l1_generation"] = {"prompt_revision": prompt_context["prompt_revision"],
-                    "model_route_revision": "route_sha256:" + semantic_sha256({"model": model, "daily_client": use_daily_client}),
+                    "model_route_revision": "route_sha256:" + semantic_sha256({k: v for k, v in route.items() if k != "client"}),
                     "task_id": "daily-task-" + semantic_sha256(task_seed)[:40], "actor": "daily_chat_first_pass"}
         return result, stats
 
@@ -6650,11 +6686,8 @@ class ReflectionEngine(MemoryL1Runtime):
         max_tokens: int,
         temperature: float,
     ) -> dict[str, Any]:
-        return {
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "extra_body": {"thinking": {"type": "disabled"}},
-        }
+        return self._completion_options(max_tokens=max_tokens, temperature=temperature,
+            thinking_mode=((self.config.get("reflection") or {}).get("daily_chat_memory_thinking_mode", "")))
 
     @staticmethod
     def _completion_content(response: Any) -> str:
@@ -6679,17 +6712,22 @@ class ReflectionEngine(MemoryL1Runtime):
         max_tokens: int,
         temperature: float,
         use_daily_client: bool,
+        task_stage: str | None = None,
+        task_route: dict | None = None,
     ) -> Any:
-        if use_daily_client:
-            completion_options = self._daily_chat_memory_completion_options(
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
+        if task_stage is not None:
+            from memory_task_routes import completion_options as stage_options
+            route = task_route or self._memory_task_route(task_stage, max_tokens)
+            if not route["configured"]:
+                raise RuntimeError("memory_task_" + route["unavailable_reason"] + ":" + task_stage)
+            client, model = route["client"], route["model"]
+            completion_options = stage_options(route, temperature=temperature)
         else:
             completion_options = self._completion_options(
                 max_tokens=max_tokens,
                 temperature=temperature,
-                thinking_mode="disabled",
+                thinking_mode=((self.config.get("reflection") or {}).get("daily_chat_memory_thinking_mode", "")
+                               if use_daily_client else None),
             )
         return await client.chat.completions.create(
             model=model,
