@@ -19,6 +19,8 @@ BASE_CATALOG = {
     "stabilities": ["episode", "phase", "stable"],
     "modalities": ["assertion", "request", "wish", "plan", "commitment", "hypothesis", "question"],
     "bases": ["direct_expression", "record", "reported", "interpretation", "hypothesis"],
+    "cognition_roles": ["observation", "question", "hypothesis", "insight", "view", "practice"],
+    "cognition_statuses": ["tentative", "supported", "contested", "revised", "resolved"],
     "relation_types": ["same_event", "supplements", "revises", "limits", "supersedes", "possible_conflict", "split_from", "merged_from"],
     "definitions": [],
 }
@@ -60,7 +62,7 @@ def catalog_with_defaults(catalog=None):
     if catalog is not None:
         if not isinstance(catalog, dict): fail("object_required", "catalog")
         result.update(copy.deepcopy(catalog))
-    for axis in ("subjects", "entity_types", "kinds", "topics", "stabilities", "modalities", "bases", "relation_types"):
+    for axis in ("subjects", "entity_types", "kinds", "topics", "stabilities", "modalities", "bases", "relation_types", "cognition_roles", "cognition_statuses"):
         strings(result[axis], "catalog." + axis)
     array(result["attributes"], "catalog.attributes")
     seen = set()
@@ -100,6 +102,12 @@ def statement_template():
                                        "start": unknown(), "end": unknown(), "recurrence_text": None}},
             "conditions": conditions_template(), "property": None, "evidence_refs": [],
             "role_hint": unknown(), "attributes": []}
+
+
+def cognition_template():
+    """Optional annotation of a claim, never a second body or truth authority."""
+    return {"role": unknown(), "epistemic_status": unknown(),
+            "about_refs": [], "open_questions": []}
 
 
 def scene_template(catalog=None, catalog_revision=None):
@@ -274,7 +282,18 @@ def validate_l1_document(document: Any, *, catalog=None) -> dict:
             if a["target_namespace"] != "l0" or a["target_id"] != item["source_id"] or type(a["target_revision"]) is not type(item["source_revision"]) or a["target_revision"] != item["source_revision"]: fail("source_anchor_mismatch", p)
     for i, item in enumerate(d["statements"]):
         p = f"statements[{i}]"
-        shape(item, {"statement_id", "statement_revision_id", "content", "subject_ref", "classification", "time", "conditions", "property", "evidence_refs", "role_hint", "attributes"}, p)
+        shape(item, {"statement_id", "statement_revision_id", "content", "subject_ref", "classification", "time", "conditions", "property", "evidence_refs", "role_hint", "attributes", "cognition"}, p,
+              optional={"cognition"})
+        cognition = item.get("cognition")
+        if cognition is not None:
+            shape(cognition, {"role", "epistemic_status", "about_refs", "open_questions"}, p + ".cognition")
+            for name, axis in (("role", "cognition_roles"), ("epistemic_status", "cognition_statuses")):
+                validate_unknown_value(cognition[name], value_type="string", allowed_values=set(c[axis]),
+                                       path=p + ".cognition." + name)
+            strings(cognition["about_refs"], p + ".cognition.about_refs")
+            if set(cognition["about_refs"]) - ids["entities"]:
+                fail("dangling_cognition_subject", p + ".cognition.about_refs")
+            strings(cognition["open_questions"], p + ".cognition.open_questions")
         _revision(item["statement_revision_id"], p + ".statement_revision_id", nullable=True)
         text(item["content"], p + ".content")
         validate_unknown_value(item["subject_ref"], value_type="string", allowed_values=ids["entities"], path=p + ".subject_ref")

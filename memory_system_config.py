@@ -36,11 +36,66 @@ LIMITS = {
     "rerank_candidate_limit": ("reranker", "candidate_limit", 1, 100, 20, "重排窗口条数"),
 }
 VALUE_TYPES = {"number", "boolean", "string"}
+LOCAL_MATCH_WEIGHTS = {"keyword_match": 1.0, "tag_match": 0.8, "entity_match": 0.8,
+                       "topic_match": 0.4, "type_match": 0.15,
+                       "cognition_role_match": 0.15, "cognition_question_match": 1.0}
+RECALL_DEFAULTS = {
+    "mode": "inherit", "formula_id": None, "hierarchy_mode": "auto",
+    "semantic_threshold": None, "rerank_threshold": None, "local_threshold": None,
+    "first_card_min_score": None, "second_card_min_score": None,
+    "second_card_relative_score": None,
+    "window_formula_weight": 1.0, "rrf_constant": 60.0,
+    "scoring_profiles": [],
+    "cognition_chain_depth": 2, "cognition_chain_nodes": 8, "cognition_chain_budget": 300,
+    "local_match_weights": LOCAL_MATCH_WEIGHTS,
+}
+COGNITION_LIMITS = {"cognition_chain_depth": 32, "cognition_chain_nodes": 200,
+                    "cognition_chain_budget": 1000000}
+RUNTIME_INPUTS = [
+    ("relevance", "number", "时间策略处理后的相关性"),
+    ("base_relevance", "number", "时间策略前的融合分数"),
+    ("keyword_score", "number", "原词法通道分数"),
+    ("semantic_score", "number", "原向量通道分数"),
+    ("rerank_score", "number", "外部重排分数；未调用时未知"),
+    ("keyword_match", "number", "L1声明关键词命中"),
+    ("tag_match", "number", "L1声明标签命中"),
+    ("entity_match", "number", "L1实体或已声明别名命中"),
+    ("topic_match", "number", "L1主题目录命中"),
+    ("type_match", "number", "L1类型目录命中"),
+    ("cognition_role_match", "number", "认知角色目录或别名命中"),
+    ("cognition_question_match", "number", "明确留下的未解问题原文命中"),
+    ("event_age_days", "number", "明确事件距查询时期的天数"),
+    ("freshness", "number", "匹配时间策略的输出"),
+    ("time_weight", "number", "匹配时间策略的权重"),
+    ("time_factor", "number", "时间对相关性保留的比例；不独立增加相关性"),
+    ("review_due", "boolean", "需要复核；不代表事实结束"),
+    ("condition_match", "boolean", "结构化条件三值匹配"),
+    ("scope_match", "boolean", "明确时间范围三值匹配"),
+    ("importance", "number", "原记忆明确存储的重要性原值（旧桶1–10）"),
+    ("confidence", "number", "原记忆明确存储的置信度"),
+    ("kind", "string", "本条陈述内容类型"),
+    ("stability", "string", "本条陈述稳定性"),
+    ("modality", "string", "表达方式"),
+    ("basis", "string", "证据性质"),
+    ("query_purpose", "string", "current或history"),
+    ("role_hint", "string", "core或detail；未标注时未知"),
+    ("cognition_role", "string", "陈述的认知角色；未标注时未知"),
+    ("cognition_status", "string", "陈述的认识状态；不等于世界事实的真假"),
+    ("open_question_count", "number", "该认知明确留下的未解问题数"),
+]
+PENDING_RUNTIME_INPUTS = [
+    ("interest_affinity", "number", "兴趣亲和度（未接入，运行时未知）"),
+    ("drive_affinity", "number", "驱力亲和度（未接入，运行时未知）"),
+    ("goal_alignment", "number", "目标关联（未接入，运行时未知）"),
+    ("feedback_score", "number", "真实反馈（未接入，运行时未知）"),
+    ("repeat_penalty", "number", "跨轮重复惩罚（未接入，运行时未知）"),
+]
 _ID = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _FUNCTIONS = {"min", "max", "clamp", "coalesce", "exp", "abs"}
+COGNITION_CATALOG_AXES = ("cognition_roles", "cognition_statuses")
 CATALOG_AXES = ("subjects", "kinds", "topics", "stabilities", "modalities", "bases",
-                "entity_types", "relation_types")
-EXTENDED_CATALOG_AXES = ("stabilities", "modalities", "bases", "entity_types", "relation_types", "definitions")
+                "entity_types", "relation_types", *COGNITION_CATALOG_AXES)
+EXTENDED_CATALOG_AXES = ("stabilities", "modalities", "bases", "entity_types", "relation_types", "definitions", *COGNITION_CATALOG_AXES)
 DEFINITION_AXES = frozenset(CATALOG_AXES)
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
@@ -49,15 +104,20 @@ REQUEST_CONFIGURATION = ContextVar("memory_request_configuration", default=None)
 
 class RequestLimit:
     """A numeric setting frozen for one request, with normal runtime setters."""
-    def __init__(self, attribute, field=None):
+    def __init__(self, attribute, field=None, *, section="limits"):
         self.attribute, self.field = attribute, field or attribute
+        self.section = section
 
     def __get__(self, instance, owner=None):
         if instance is None:
             return self
         snapshot = REQUEST_CONFIGURATION.get()
         if snapshot and snapshot.get("service") == id(instance):
-            value = snapshot.get("values", {}).get("limits", {}).get(self.field)
+            value = snapshot.get("values", {}).get(self.section, {}).get(self.field)
+            if value is not None:
+                return value
+        elif self.section == "recall":
+            value = ((getattr(instance, "config", {}).get("memory_system") or {}).get("recall") or {}).get(self.field)
             if value is not None:
                 return value
         if self.attribute not in instance.__dict__:
@@ -136,10 +196,38 @@ def defaults():
             "stabilities": ["episode", "phase", "stable"],
             "modalities": ["assertion", "request", "wish", "plan", "commitment", "hypothesis", "question"],
             "bases": ["direct_expression", "record", "reported", "interpretation", "hypothesis"],
+            "cognition_roles": ["observation", "question", "hypothesis", "insight", "view", "practice"],
+            "cognition_statuses": ["tentative", "supported", "contested", "revised", "resolved"],
             "entity_types": ["user", "assistant", "third_party", "object"],
             "relation_types": ["same_event", "supplements", "revises", "limits", "supersedes",
                                "possible_conflict", "split_from", "merged_from"],
+            # Definitions are keyed by (axis, id); modalities.hypothesis and
+            # bases.hypothesis are distinct entries despite sharing an id.
             "definitions": [
+                {"axis": "subjects", "id": "user", "label": "主人", "description": "陈述所涉及或其体验、属性、行为归属的主人；不因某处出现第一人称就自动判定。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "subjects", "id": "assistant", "label": "助手", "description": "陈述所涉及的助手；说话者是助手不代表陈述主体必然是助手。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "subjects", "id": "third_party", "label": "第三方", "description": "陈述所涉及的其他人物或组织；与来源中的发言者分开判断。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "subjects", "id": "object", "label": "对象", "description": "陈述所涉及的非人物对象、地点或事物。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "experience", "label": "经历", "description": "关于实际发生的事件、互动或经历；保留参与者、范围及有据的时间。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "state", "label": "状态", "description": "关于某一时段内的情况或状态；没有时间证据时不默认为当前。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "fact", "label": "事实", "description": "有来源依据的具体陈述；不要把推断或尚未确认的说法写成已核实事实。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "preference", "label": "偏好", "description": "关于倾向或喜好的陈述；一次请求或一次接受本身不证明长期、反复偏好。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "boundary", "label": "边界", "description": "明确的限制或不可接受范围；保留适用条件和例外。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "intention", "label": "意向", "description": "关于希望、打算或计划的陈述；不等同承诺，也不证明行动已经完成。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "interpretation", "label": "解释", "description": "由来源材料归纳出的理解；保留其推断性质，不冒充来源原话或已确认事实。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "kinds", "id": "procedure", "label": "做法", "description": "关于可重复步骤或处理方式的陈述；一次发生不自动证明它是稳定流程。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "entity_types", "id": "user", "label": "主人实体", "description": "目录中代表主人的实体类型；发言者身份与每条陈述的事实主体仍需分别判断。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "entity_types", "id": "assistant", "label": "助手实体", "description": "目录中代表助手的实体类型；不能仅凭助手转述把陈述主体设为主人。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "entity_types", "id": "third_party", "label": "第三方实体", "description": "目录中代表其他人物或组织的实体类型。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "entity_types", "id": "object", "label": "对象实体", "description": "目录中代表非人物对象、地点或事物的实体类型。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "same_event", "label": "同一事件", "description": "两条陈述或场景指向同一事件；需有来源依据，不因主题相似就合并。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "supplements", "label": "补充", "description": "一项内容补充另一项而不替代它；保留各自来源和范围。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "revises", "label": "修订", "description": "新证据修正先前陈述的部分内容；只更新有依据的部分并保留修订关系。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "limits", "label": "限定", "description": "一项内容缩小另一项内容的适用范围、条件或例外。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "supersedes", "label": "取代", "description": "有依据的新陈述取代旧陈述在明确重叠范围内的效力；不等于静默删除历史。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "possible_conflict", "label": "可能冲突", "description": "两项内容可能不一致但尚未裁决；保留不确定性，不自动选边。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "split_from", "label": "拆分自", "description": "一项更具体陈述从原先合并内容拆出；保留其来源和拆分关系。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "relation_types", "id": "merged_from", "label": "合并自", "description": "一项整理内容由多项来源陈述合并；不得丢失各自的来源和差异。", "aliases": [], "examples": [], "parent_id": None},
                 {"axis": "stabilities", "id": "episode", "label": "单次", "description": "限于一次事件或短时状态。", "aliases": [], "examples": [], "parent_id": None},
                 {"axis": "stabilities", "id": "phase", "label": "阶段", "description": "在明确阶段内持续。", "aliases": [], "examples": [], "parent_id": None},
                 {"axis": "stabilities", "id": "stable", "label": "相对稳定", "description": "跨阶段相对稳定，仍可修订。", "aliases": [], "examples": [], "parent_id": None},
@@ -150,20 +238,39 @@ def defaults():
                 {"axis": "modalities", "id": "commitment", "label": "承诺", "description": "表达承担履行义务。", "aliases": [], "examples": [], "parent_id": None},
                 {"axis": "modalities", "id": "hypothesis", "label": "假设", "description": "尚待确认的解释或推测。", "aliases": [], "examples": [], "parent_id": None},
                 {"axis": "modalities", "id": "question", "label": "疑问", "description": "提出问题或待确认事项。", "aliases": [], "examples": [], "parent_id": None},
-                {"axis": "bases", "id": "direct_expression", "label": "当事人表达", "description": "来源中的当事人直接表达。", "aliases": [], "examples": [], "parent_id": None},
-                {"axis": "bases", "id": "record", "label": "实际记录", "description": "来源直接记录的事件或行为。", "aliases": [], "examples": [], "parent_id": None},
-                {"axis": "bases", "id": "reported", "label": "转述", "description": "由来源转述的信息。", "aliases": [], "examples": [], "parent_id": None},
-                {"axis": "bases", "id": "interpretation", "label": "理解", "description": "基于材料形成的理解。", "aliases": [], "examples": [], "parent_id": None},
-                {"axis": "bases", "id": "hypothesis", "label": "假设", "description": "尚待材料支持或确认的假设。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "direct_expression", "label": "直接表达/明确接受", "description": "说明陈述为何有据，而非标记发言角色：当事人明确表达，或主人明确接受助手当时明确提出的内容。接受只支持当时明确提议的范围，须概述呈现，不能冒充主人逐字原话，也不覆盖助手之后补加的内容。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "record", "label": "实际记录", "description": "陈述依据是来源直接记录的事件或行为；记录时间不自动等于事件发生时间。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "reported", "label": "转述", "description": "陈述依据是来源对他人说法的转述；不等同于被转述者的直接表达或亲历记录。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "interpretation", "label": "理解", "description": "陈述依据是对现有材料的归纳或解释；保留推断性质，不当作来源原话或已确认事实。", "aliases": [], "examples": [], "parent_id": None},
+                {"axis": "bases", "id": "hypothesis", "label": "依据不足的假设", "description": "陈述依据仍不足、需要确认；这是成立依据轴，与modalities.hypothesis表达尚待确认的断言方式相互独立。", "aliases": [], "examples": [], "parent_id": None},
+                *[{"axis": axis, "id": ident, "label": label, "description": description,
+                   "aliases": (["问题", "没想明白", "纠结"] if axis == "cognition_roles" and ident == "question" else []),
+                   "examples": [], "parent_id": None}
+                  for axis, rows in (
+                      ("cognition_roles", [
+                          ("observation", "观察", "注意到的情况，保留实际来源与范围。"),
+                          ("question", "疑问", "仍未想明白的问题，不自动当作结论。"),
+                          ("hypothesis", "假设", "可能的解释，保留反例与待验证性质。"),
+                          ("insight", "理解", "基于经历形成的理解，仍可修订。"),
+                          ("view", "观点", "某主体的看法，不等于客观事实。"),
+                          ("practice", "做法", "形成或尝试的处理方式，保留条件与效果。")]),
+                      ("cognition_statuses", [
+                          ("tentative", "暂定", "证据或理解尚不充分。"),
+                          ("supported", "已有支持", "已有支持依据，不等于主人确认或绝对正确。"),
+                          ("contested", "有争议", "存在反例或未能消解的分歧。"),
+                          ("revised", "已修订", "作为旧理解保留，并沿修订关系看当前版本。"),
+                          ("resolved", "已梳理", "该问题已有阶段性处理，不自动证明外部事情已完成。")])
+                  ) for ident, label, description in rows],
             ],
         },
         "features": [{"id": "relevance", "label": "文本相关性", "value_type": "number",
                       "source": "runtime", "missing": "unknown", "expression": "",
                       "description": "归一化文本相关性；P5接运行输入，本地试算由主人提供。",
                       "minimum": 0, "maximum": 1}],
-        "formulas": [{"id": "final", "label": "最终用途评分（待 P5 消费）",
+        "formulas": [{"id": "final", "label": "最终检索评分",
                       "expression": "relevance", "weights": {}}],
         "time_profiles": [],
+        "recall": copy.deepcopy(RECALL_DEFAULTS),
     }
 
 
@@ -175,6 +282,26 @@ def merge_config(base, overlay):
         else:
             result[key] = copy.deepcopy(value)
     return result
+
+
+def _append_missing_default_definitions(catalog, default_catalog):
+    """Complete a read projection without replacing owner definitions or values."""
+    definitions = catalog.get("definitions")
+    if not isinstance(definitions, list):
+        return
+    present = {
+        (item.get("axis"), item.get("id"))
+        for item in definitions
+        if isinstance(item, dict)
+    }
+    for item in default_catalog.get("definitions", []):
+        axis, ident = item.get("axis"), item.get("id")
+        current_values = catalog.get(axis)
+        key = (axis, ident)
+        if (axis in CATALOG_AXES and isinstance(current_values, list)
+                and ident in current_values and key not in present):
+            definitions.append(copy.deepcopy(item))
+            present.add(key)
 
 
 def read_overlay(path):
@@ -194,6 +321,10 @@ def values_from_config(config):
         for key in values:
             if key in configured:
                 if key == "catalog" and isinstance(configured[key], dict):
+                    default_catalog = values[key]
+                    values[key] = merge_config(values[key], configured[key])
+                    _append_missing_default_definitions(values[key], default_catalog)
+                elif key == "recall" and isinstance(configured[key], dict):
                     values[key] = merge_config(values[key], configured[key])
                 else:
                     values[key] = copy.deepcopy(configured[key])
@@ -249,11 +380,39 @@ def _expression(expression, allowed, field):
 
 
 def validate_values(values):
-    sections = {"limits", "catalog", "features", "formulas", "time_profiles"}
-    _object(values, sections, "values", sections)
+    sections = {"limits", "catalog", "features", "formulas", "time_profiles", "recall"}
+    _object(values, sections, "values", sections - {"recall"})
+    values = copy.deepcopy(values)
+    recall = values.setdefault("recall", copy.deepcopy(RECALL_DEFAULTS))
+    _object(recall, RECALL_DEFAULTS, "recall")
+    recall = values["recall"] = {**RECALL_DEFAULTS, **recall}
+    if recall["mode"] not in {"inherit", "fast_local", "fast_hybrid"}:
+        _fail("unknown_recall_mode", "recall.mode")
+    if recall["hierarchy_mode"] not in {"auto", "scene", "overview", "mixed"}:
+        _fail("unknown_hierarchy_mode", "recall.hierarchy_mode")
+    if recall["formula_id"] is not None:
+        _id(recall["formula_id"], "recall.formula_id")
+    for name, value in recall.items():
+        if name in {"mode", "formula_id", "hierarchy_mode", "scoring_profiles", "local_match_weights"} or value is None:
+            continue
+        _number(value, "recall." + name)
+        if name in COGNITION_LIMITS and (type(value) is not int or not 0 <= value <= COGNITION_LIMITS[name]):
+            _fail("cognition_limit_out_of_range", "recall." + name, minimum=0, maximum=COGNITION_LIMITS[name])
+        if name in {"semantic_threshold", "rerank_threshold", "second_card_relative_score"} and not 0 <= value <= 1:
+            _fail("threshold_out_of_range", "recall." + name)
+        if name in {"window_formula_weight", "rrf_constant"} and value < 0:
+            _fail("negative_rank_parameter", "recall." + name)
+    weights = _object(recall["local_match_weights"], LOCAL_MATCH_WEIGHTS, "recall.local_match_weights")
+    for name, value in weights.items():
+        if not 0 <= _number(value, "recall.local_match_weights." + name) <= 1:
+            _fail("local_weight_out_of_range", "recall.local_match_weights." + name)
+    recall["local_match_weights"] = {**LOCAL_MATCH_WEIGHTS, **weights}
     limits = _object(values["limits"], LIMITS, "limits", LIMITS)
     for key, value in limits.items():
         validate_limit(key, value)
+    if isinstance(values.get("catalog"), dict):
+        for axis in COGNITION_CATALOG_AXES:
+            values["catalog"].setdefault(axis, copy.deepcopy(defaults()["catalog"][axis]))
     catalog = _object(values["catalog"], set(CATALOG_AXES) | {"attributes", "definitions"}, "catalog",
                       set(CATALOG_AXES) | {"attributes", "definitions"})
     for name in CATALOG_AXES:
@@ -345,7 +504,7 @@ def validate_values(values):
         _fail("invalid_features", "features")
     names, dependencies = set(), {}
     for item in features:
-        _object(item, {"id", "label", "value_type", "source", "missing", "expression", "description", "minimum", "maximum"}, "features",
+        _object(item, {"id", "label", "value_type", "source", "missing", "expression", "description", "minimum", "maximum", "input_key"}, "features",
                 {"id", "value_type", "source", "missing"})
         ident = _id(item["id"], "features.id")
         if ident in names:
@@ -368,6 +527,10 @@ def validate_values(values):
             _fail("invalid_feature_range", "features." + ident)
         if item["source"] != "computed" and item.get("expression"):
             _fail("noncomputed_expression", "features.expression")
+        if item.get("input_key") is not None:
+            _id(item["input_key"], "features.input_key")
+            if item["source"] == "computed":
+                _fail("computed_input_binding", "features.input_key")
     for item in features:
         if item["source"] == "computed":
             tree = _expression(item.get("expression"), names, "features." + item["id"])
@@ -406,6 +569,27 @@ def validate_values(values):
                 _fail("weight_shadows_feature", "formulas.weights", variable=name)
             _number(value, "formulas.weights." + name)
         _expression(item["expression"], names | set(weights), "formulas." + ident)
+    if recall["formula_id"] is not None and recall["formula_id"] not in formula_names:
+        _fail("unknown_recall_formula", "recall.formula_id")
+    scoring_profiles = recall["scoring_profiles"]
+    if not isinstance(scoring_profiles, list) or len(scoring_profiles) > 256:
+        _fail("invalid_scoring_profiles", "recall.scoring_profiles")
+    profile_ids = set()
+    for item in scoring_profiles:
+        _object(item, {"id", "label", "selector", "formula_id"}, "recall.scoring_profiles",
+                {"id", "selector", "formula_id"})
+        ident = _id(item["id"], "recall.scoring_profiles.id")
+        if ident in profile_ids:
+            _fail("duplicate_identifier", "recall.scoring_profiles.id")
+        profile_ids.add(ident)
+        if "label" in item:
+            _text(item["label"], "recall.scoring_profiles.label", empty=True)
+        selector = _object(item["selector"], {"kind", "topic", "stability", "query_purpose", "cognition_role", "cognition_status"},
+                           "recall.scoring_profiles.selector")
+        for name, value in selector.items():
+            _text(value, "recall.scoring_profiles.selector." + name, maximum=120)
+        if item["formula_id"] not in formula_names:
+            _fail("unknown_recall_formula", "recall.scoring_profiles.formula_id")
     profiles = values["time_profiles"]
     if not isinstance(profiles, list) or len(profiles) > 256:
         _fail("invalid_time_profiles", "time_profiles")
@@ -419,7 +603,7 @@ def validate_values(values):
         seen.add(ident)
         if "label" in item:
             _text(item["label"], "time_profiles.label", empty=True)
-        selector = _object(item["selector"], {"kind", "topic", "stability", "query_purpose"}, "time_profiles.selector")
+        selector = _object(item["selector"], {"kind", "topic", "stability", "query_purpose", "cognition_role", "cognition_status"}, "time_profiles.selector")
         for name, value in selector.items():
             _text(value, "time_profiles.selector." + name, maximum=120)
         if item["function"] not in {"none", "exponential", "target_time"}:
@@ -566,16 +750,33 @@ def configuration(config, *, last_request=None):
         validation = {"valid": True, "errors": []}
     except ConfigurationError as exc:
         validation = {"valid": False, "errors": [exc.payload()["error"]]}
+    gateway = config.get("gateway") or {}
+    inherited = {
+        "semantic_threshold": gateway.get("recall_admission_semantic_score", gateway.get("high_confidence_semantic_score", 0.72)),
+        "rerank_threshold": gateway.get("recall_admission_rerank_score", 0.65),
+        "local_threshold": None, "first_card_min_score": gateway.get("first_card_min_score", 0.55),
+        "second_card_min_score": gateway.get("second_card_min_score", 0.50),
+        "second_card_relative_score": gateway.get("second_card_relative_score", 0.85),
+    }
+    recall = values["recall"] if isinstance(values["recall"], dict) else RECALL_DEFAULTS
+    configured_recall = (config.get("memory_system") or {}).get("recall") or {}
     return {
         "schema_version": SCHEMA_VERSION, "revision": rev, "values": values,
         "bindings": {"limits": {name: {"section": row[0], "key": row[1], "minimum": row[2],
-                      "maximum": row[3], "default": row[4], "label": row[5]} for name, row in LIMITS.items()}},
+                      "maximum": row[3], "default": row[4], "label": row[5]} for name, row in LIMITS.items()},
+            "runtime_inputs": [{"id": name, "value_type": kind, "label": label, "availability": state}
+                               for rows, state in ((RUNTIME_INPUTS, "bound"), (PENDING_RUNTIME_INPUTS, "pending"))
+                               for name, kind, label in rows],
+            "recall": {name: {"value": recall.get(name) if recall.get(name) is not None else value,
+                              "source": "owner" if name in configured_recall and recall.get(name) is not None else "inherited"}
+                       for name, value in {**RECALL_DEFAULTS, **inherited}.items()}},
         "application": {
             "limits": {"state": "active", "revision": rev},
-            "catalog": {"state": "awaiting_consumer", "consumer": "P2"},
-            "features": {"state": "awaiting_consumer", "consumer": "P5"},
-            "formulas": {"state": "awaiting_consumer", "consumer": "P5"},
-            "time_profiles": {"state": "awaiting_consumer", "consumer": "P3/P5"},
+            "catalog": {"state": "active", "consumer": "l1_generation_and_natural_recall", "revision": rev},
+            "features": {"state": "active", "consumer": "natural_recall", "revision": rev,
+                         "pending_inputs": [row[0] for row in PENDING_RUNTIME_INPUTS]},
+            "formulas": {"state": "active", "consumer": "natural_recall", "revision": rev},
+            "time_profiles": {"state": "active", "consumer": "natural_recall_statement_usage", "revision": rev},
             "last_request": last_request,
         }, "validation": validation,
     }
@@ -648,10 +849,17 @@ def save_configuration(path, base_config, payload):
         catalog = values.get("catalog")
         if not isinstance(catalog, dict):
             _fail("invalid_configuration_fields", "catalog")
-        supplied_extended = set(catalog) & set(EXTENDED_CATALOG_AXES)
-        if supplied_extended and supplied_extended != set(EXTENDED_CATALOG_AXES):
-            _fail("incomplete_extended_catalog", "catalog", required=list(EXTENDED_CATALOG_AXES))
+        old_extended = set(EXTENDED_CATALOG_AXES) - set(COGNITION_CATALOG_AXES)
+        supplied_extended = set(catalog) & old_extended
+        if supplied_extended and supplied_extended != old_extended:
+            _fail("incomplete_extended_catalog", "catalog", required=sorted(old_extended))
         effective_values = values_from_config(effective)
+        if "recall" not in values:
+            values["recall"] = copy.deepcopy(effective_values["recall"])
+        elif isinstance(values["recall"], dict):
+            # Older clients know only earlier recall keys; omission is not a
+            # request to delete subsequently added owner profiles.
+            values["recall"] = {**copy.deepcopy(effective_values["recall"]), **values["recall"]}
         for name in EXTENDED_CATALOG_AXES:
             if name not in catalog:
                 catalog[name] = copy.deepcopy(effective_values["catalog"][name])

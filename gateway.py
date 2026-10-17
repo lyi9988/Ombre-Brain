@@ -10,7 +10,7 @@ import asyncio
 import threading
 import uuid
 from contextlib import asynccontextmanager
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -59,6 +59,7 @@ from memory_system_config import (
     validate_values as validate_memory_values,
 )
 from canonical_continuation import CanonicalContinuationAdapter, ContinuationBatch
+import memory_recall_runtime as memory_use
 from dehydrator import Dehydrator
 from dream_engine import DreamEngine
 from embedding_engine import EmbeddingEngine
@@ -544,6 +545,35 @@ class GatewayService:
     semantic_candidate_top_k = RequestLimit("semantic_candidate_top_k")
     moment_search_limit = RequestLimit("moment_search_limit")
     dynamic_top_k = RequestLimit("dynamic_top_k")
+    first_card_min_score = RequestLimit("first_card_min_score", section="recall")
+    second_card_min_score = RequestLimit("second_card_min_score", section="recall")
+    second_card_relative_score = RequestLimit("second_card_relative_score", section="recall")
+
+    @property
+    def recall_policy(self):
+        base = self.__dict__.get("_recall_policy", self.__dict__.get("recall_policy"))
+        if base is None:
+            raise AttributeError("recall_policy")
+        frozen = REQUEST_CONFIGURATION.get()
+        local = frozen if frozen and frozen.get("service") == id(self) else None
+        if local is not None and "effective_recall_policy" in local:
+            return local["effective_recall_policy"]
+        base = (local or {}).get("base_recall_policy", base)
+        settings = memory_use.values(self).get("recall") or {}
+        if settings.get("semantic_threshold") is None and settings.get("rerank_threshold") is None:
+            return base
+        policy = copy(base)
+        if settings.get("semantic_threshold") is not None:
+            policy.semantic_threshold = settings["semantic_threshold"]
+        if settings.get("rerank_threshold") is not None:
+            policy.rerank_threshold = settings["rerank_threshold"]
+        if local is not None:
+            local["effective_recall_policy"] = policy
+        return policy
+
+    @recall_policy.setter
+    def recall_policy(self, policy):
+        self.__dict__["_recall_policy"] = policy
 
     def __init__(
         self,
@@ -3170,8 +3200,14 @@ class GatewayService:
             except (ValueError, UnicodeError):
                 raise ConfigurationError("invalid_json") from None
             if request.method == "POST" and request.url.path.endswith("/preview"):
-                if not isinstance(payload, dict) or set(payload) != {"values", "inputs"}:
+                if (not isinstance(payload, dict) or set(payload) - {"values", "inputs", "scenario"}
+                        or {"values", "inputs"} - set(payload)):
                     raise ConfigurationError("invalid_preview_request")
+                if "scenario" in payload:
+                    from memory_recall_semantics import preview_pipeline
+                    return JSONResponse({"status": "ok", "result": preview_pipeline(
+                        payload["values"], payload["inputs"], payload["scenario"],
+                        tz=getattr(self, "gateway_tz", timezone.utc))}, headers=headers)
                 return JSONResponse({"status": "ok", "result": preview_memory_configuration(
                     payload["values"], payload["inputs"])}, headers=headers)
             if request.method != "PUT":
@@ -3201,7 +3237,8 @@ class GatewayService:
             # A bad external overlay must not replace a working request's
             # existing numeric settings. Existing runtime diagnostics remain.
             snapshot = memory_configuration(self.config)
-        frozen = {"service": id(self), "revision": snapshot["revision"], "values": snapshot["values"]}
+        frozen = {"service": id(self), "revision": snapshot["revision"], "values": snapshot["values"],
+                  "base_recall_policy": self.recall_policy}
         token = REQUEST_CONFIGURATION.set(frozen)
         try:
             response = await self._handle_chat_unfrozen(request)
@@ -5244,6 +5281,16 @@ class GatewayService:
 
         stage_started_at = time.perf_counter()
         prompt_composer_debug = {"status": "legacy_default"}
+        if recalled_memory or targeted_memory_detail or related_memory:
+            use_request = natural_input if isinstance(natural_input, dict) else {}
+            use_sections = await memory_use.project_sections(self, use_request, recall_query, all_buckets, {
+                "direct": (recalled_memory, [str(m.get("bucket_id") or "") for m in recalled_moments], self.recalled_budget),
+                "targeted": (targeted_memory_detail, targeted_memory_detail_debug.get("accepted_ids", []), self.memory_detail_recall_budget),
+                "diffused": (related_memory, [], self.related_memory_budget),
+            })
+            recalled_memory = use_sections.get("direct", "")
+            targeted_memory_detail = use_sections.get("targeted", "")
+            related_memory = use_sections.get("diffused", "")
         memory_recall_projection = self._build_memory_recall_projection(
             recalled_memory=recalled_memory,
             targeted_memory_detail=targeted_memory_detail,
@@ -16875,6 +16922,7 @@ class GatewayService:
                 continue
             valid.append(bucket)
         self._add_timing_ms(timings, "natural.authority_validation", validation_started)
+        memory_use.prepare(self, recall_input, query, valid)
         # Keep the last *complete* candidate pool before the remote reranker.
         # A deadline must not discard finished Planner/moment work and then
         # rescan the whole library. Reuse is confined to this request and only
@@ -17034,6 +17082,12 @@ class GatewayService:
                 debug["candidate_checkpoint"] = {"status": "authority_changed"}
             elif checkpoint:
                 debug["candidate_checkpoint"] = {"status": "invalidated"}
+        pool = memory_use.add_local_candidates(self, recall_input, query, pool)
+        pool = memory_use.score_pool(self, recall_input, query, pool)
+        before_source_check = pool
+        pool = await memory_use.verify_sources(self, recall_input, query, pool)
+        surviving_ids = {str(item["bucket"]["id"]) for item in pool}
+        suppressed.extend(item for item in before_source_check if str(item["bucket"]["id"]) not in surviving_ids)
         rerank_debug = {}
         rerank_started = time.perf_counter()
         rerank_cancelled = False
@@ -17064,6 +17118,7 @@ class GatewayService:
             )
         if rerank_debug.get("provider_failed"):
             recall_input.setdefault("incomplete_reasons", []).append("reranker_unavailable")
+        pool = memory_use.score_pool(self, recall_input, query, pool, after_rerank=True)
         accepted = []
         for item in pool:
             labels = self._bucket_evidence_labels(query, item)
@@ -17073,9 +17128,17 @@ class GatewayService:
             rerank = item.get("rerank_score")
             semantic = self._safe_float(item.get("semantic_score"), 0)
             semantic_verified = (item.get("natural_semantic") or {}).get("index_status") == "verified"
-            admit = bool(hard or (rerank is not None and self._safe_float(rerank, 0) >= self.recall_policy.rerank_threshold)
-                         or (rerank is None and semantic_verified and semantic >= self.recall_policy.semantic_threshold))
-            item["admission_reason"] = "verified_local_evidence" if hard else "strong_rerank" if admit and rerank is not None else "strong_semantic" if admit else "insufficient_contextual_relevance"
+            semantic_threshold = memory_use.option(self, "semantic_threshold", self.recall_policy.semantic_threshold)
+            rerank_threshold = memory_use.option(self, "rerank_threshold", self.recall_policy.rerank_threshold)
+            local_threshold = memory_use.option(self, "local_threshold")
+            if memory_use.option(self, "mode", "inherit") == "fast_local" and local_threshold is None:
+                local_threshold = self.first_card_min_score
+            local_signal = bool(self._safe_float(item.get("keyword_score"), 0) > 0
+                                or any((item.get("l1_local_match") or {}).values()))
+            local_admit = local_threshold is not None and local_signal and item["score"] >= local_threshold
+            admit = bool(hard or local_admit or (rerank is not None and self._safe_float(rerank, 0) >= rerank_threshold)
+                         or (rerank is None and semantic_verified and semantic >= semantic_threshold))
+            item["admission_reason"] = "verified_local_evidence" if hard else "configured_local_score" if local_admit else "strong_rerank" if admit and rerank is not None else "strong_semantic" if admit else "insufficient_contextual_relevance"
             item["evidence_labels"] = labels
             item["hard_evidence_labels"] = self._hard_bucket_evidence_labels(labels)
             item["identity_evidence_status"] = (
@@ -17086,17 +17149,31 @@ class GatewayService:
                 accepted.append(item)
             else:
                 suppressed.append(item)
+        accepted = memory_use.hierarchy_pool(self, recall_input, accepted)
+        if any(item.get("_configured_score", {}).get("window_score") is not None for item in accepted):
+            accepted.sort(key=lambda item: item["score"], reverse=True)
         selected = self._pick_dynamic_cards(accepted, query=query)
         self._record_candidate_stage(
             stages, "natural.admit_candidates", len(pool), len(accepted),
             rejection_evidence=self._rejected_bucket_evidence(suppressed),
             candidate_evidence=admission_evidence(
                 pool, accepted, selected,
-                semantic_threshold=self.recall_policy.semantic_threshold,
-                rerank_threshold=self.recall_policy.rerank_threshold,
+                semantic_threshold=memory_use.option(self, "semantic_threshold", self.recall_policy.semantic_threshold),
+                rerank_threshold=memory_use.option(self, "rerank_threshold", self.recall_policy.rerank_threshold),
             ),
         )
         debug["final_bucket_ids"] = [str(item["bucket"]["id"]) for item in selected]
+        debug["configured_computation"] = {
+            "recall": dict(memory_use.values(self).get("recall") or {}),
+            "hierarchy_suppressed": list(recall_input.get("hierarchy_suppressed") or []),
+            "scores": [{"bucket_id": str(item["bucket"]["id"]), "computation": item.get("_configured_score")}
+                       for item in selected],
+            "usage_by_bucket": {bid: {"state": row["state"],
+                "claims": [{"statement_id": use.get("statement_id"), "usage": use["usage"], "reason_codes": use["reason_codes"]}
+                           for use in row.get("items", [])]}
+                for bid, row in (recall_input.get("usage_by_bucket") or {}).items()},
+        }
+        recall_input["configured_computation"] = debug["configured_computation"]
         recall_input["selected_buckets"] = debug["final_bucket_ids"]
         buckets = [self._bucket_with_recall_signal(item) for item in selected]
         if grouped_moments is None:
@@ -21712,6 +21789,9 @@ class GatewayService:
                           for item in scored_candidates]
             head_indices, notes, window = select_natural_window(
                 scored_candidates, candidate_limit, priorities,
+                configured_scores=[item.get("_configured_score", {}).get("window_score") for item in scored_candidates],
+                configured_weight=memory_use.option(self, "window_formula_weight", 1.0),
+                rrf_constant=memory_use.option(self, "rrf_constant", 60.0),
             )
             scored_candidates = [dict(item, _rerank_window=note)
                                  for item, note in zip(scored_candidates, notes)]
@@ -21780,7 +21860,9 @@ class GatewayService:
                 new_item["combined_score"] = item["score"]
             else:
                 new_item["rerank_score"] = round(rerank_score, 4)
-                new_item["combined_score"] = round(item["score"] * (1.0 - weight) + rerank_score * weight, 4)
+                raw_base = item.get("_raw_base_score", item["score"])
+                new_item["combined_score"] = round(raw_base * (1.0 - weight) + rerank_score * weight, 4)
+                new_item["_raw_fused_score"] = new_item["combined_score"]
                 new_item["score"] = new_item["combined_score"]
             reranked.append(new_item)
         reranked.sort(
@@ -23456,6 +23538,9 @@ class GatewayService:
             self._last_memory_configuration_use = {
                 "revision": configuration_use["revision"], "stage": "memory_projection",
                 "limits": dict(configuration_use["values"]["limits"]),
+                "recall": dict(configuration_use["values"].get("recall") or {}),
+                "computation": (natural_input or {}).get("configured_computation"),
+                "cognition_chain": (natural_input or {}).get("cognition_chain"),
             }
 
         def add(title: str, body: str) -> None:
@@ -23515,7 +23600,9 @@ class GatewayService:
             if semantic.get("coverage_status") == "incomplete":
                 reasons.append("semantic_index_or_provider_incomplete")
             injected = set(self._extract_bucket_ids_from_context(body))
-            if body and selected_bucket_ids and not injected:
+            if "injected_usage_bucket_ids" in natural_input:
+                injected = set(natural_input["injected_usage_bucket_ids"])
+            elif body and selected_bucket_ids and not injected:
                 # Some existing formatters expose authority refs separately;
                 # retain provenance but do not count a status-only wrapper.
                 injected = set(selected_bucket_ids)
@@ -23526,8 +23613,10 @@ class GatewayService:
                 status = "disabled"
             natural_status = {
                 "status": status, "route": natural_input.get("route", "ordinary"),
-                "selected_count": len(natural_input.get("selected_buckets") or selected_bucket_ids),
+                "selected_count": len(selected_bucket_ids),
+                "natural_selection_count": len(natural_input.get("selected_buckets") or []),
                 "injected_count": len(injected), "status_only": not bool(injected),
+                "cognition_chain_version_count": len((natural_input.get("cognition_chain") or {}).get("rendered_versions") or []),
                 "incomplete_reasons": list(dict.fromkeys(reasons)),
                 "embedding_request_count": semantic.get("provider_requests"),
                 "embedding_timing": semantic.get("http_timing"),

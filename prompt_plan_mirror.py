@@ -584,7 +584,6 @@ class PromptPlanMirrorStore:
             item for item in plan["gateway_slice"].get("blocks") or []
             if item.get("scope") == scope
             and item.get("source_id") == source_id
-            and item.get("enabled", True)
         ]
         if not blocks:
             return live_body, {
@@ -598,9 +597,9 @@ class PromptPlanMirrorStore:
                 int(item.get("order") or 0), int(item.get("priority") or 0),
                 str(item.get("block_id") or ""))):
             mode = str(block.get("mode") or "live_source")
-            if mode == "off":
+            if mode == "off" or not block.get("enabled", True):
                 selected.append({"block_id": block.get("block_id"),
-                                 "mode": mode, "sha256": None})
+                                 "mode": "off", "sha256": None})
                 continue
             body = live_body if mode == "live_source" else str(
                 block.get("owner_body") if mode == "owner_override"
