@@ -4338,6 +4338,7 @@ class GatewayService:
             "effective_config_revision": effective_config.get("revision"),
             "effective_config_sha256": effective_config.get("sha256"),
             "memory_configuration_revision": (REQUEST_CONFIGURATION.get() or {}).get("revision"),
+            "recall_signal_transport": trace_context.get("recall_signals"),
             "prompt_preset_id": prompt_preset_id,
             "prompt_preset_revision": prompt_preset_revision,
             "prompt_plan_sha256": prompt_plan_sha256,
@@ -4740,6 +4741,9 @@ class GatewayService:
             recent_turns=getattr(self, "recall_recent_turns", 4),
             trace_context=payload.get("_ombre_trace_context") or {},
         )
+        state_transport = (payload.get("_ombre_trace_context") or {}).get("recall_signals") or {}
+        natural_input["_signal_snapshots"] = deepcopy(state_transport.get("snapshots") or [])
+        natural_input["_signal_transport"] = {key: state_transport[key] for key in ("state", "reason") if key in state_transport}
         recall_query = natural_input["q_current"]
         recall_context_debug = natural_input["metadata"]
         if not recall_context_debug.get("current_input_complete"):
@@ -4956,6 +4960,9 @@ class GatewayService:
                 stage_started_at = time.perf_counter()
                 persona_state = self._get_persona_state_for_context_mode(session_id)
                 mark_step("persona_state_read", stage_started_at)
+            from memory_affinity import persona_snapshot
+            natural_input["_signal_snapshots"].append(persona_snapshot(persona_state))
+            natural_input["_signal_sampled_at"] = datetime.now(timezone.utc)
             stage_started_at = time.perf_counter()
             context_mode = self._classify_context_mode(current_user_query, persona_state)
             mark_step("context_mode", stage_started_at)
@@ -5801,6 +5808,12 @@ class GatewayService:
             worldbook = []
         if not isinstance(worldbook, list):
             worldbook = []
+        from memory_affinity import read_transport
+        recall_signals = read_transport(
+            request.headers.get("X-Guyan-Recall-Signals"),
+            conversation_id=str(request.headers.get("X-Guyan-Conversation-Id") or ""),
+            turn_id=str(request.headers.get("X-Guyan-Turn-Id") or ""),
+            source_event_id=str(request.headers.get(CANONICAL_SOURCE_EVENT_ID_HEADER) or ""))
         return {
             "trace_id": trace_id[:120], "logical_request_id": logical_id[:200],
             "request_ordinal": ordinal, "request_type": str(request_type or "initial"),
@@ -5815,6 +5828,7 @@ class GatewayService:
             "worker_operation_id": str(request.headers.get("X-Guyan-Worker-Operation-Id") or "")[:200],
             "client_id": marker, "session_id": session_id[:160],
             "coverage": coverage, "worldbook": worldbook[:64],
+            "recall_signals": recall_signals,
             "runtime_scope": self._runtime_scope_for_request(request),
             "prompt_plan_identity": {
                 "preset_id": str(request.headers.get(
@@ -17228,6 +17242,7 @@ class GatewayService:
         debug["final_bucket_ids"] = [str(item["bucket"]["id"]) for item in selected]
         debug["configured_computation"] = {
             "recall": dict(memory_use.values(self).get("recall") or {}),
+            "signal_sources": (recall_input.get("_use_context") or {}).get("signals", {}),
             "hierarchy_suppressed": list(recall_input.get("hierarchy_suppressed") or []),
             "scores": [{"bucket_id": str(item["bucket"]["id"]), "computation": item.get("_configured_score")}
                        for item in selected],

@@ -378,20 +378,23 @@ time_factor to choose a different policy. No profile means no implicit time
 adjustment. Formula errors retain the base with reasons, never a guessed input.
 """
     from memory_system_config import ConfigurationError, RUNTIME_INPUTS, PENDING_RUNTIME_INPUTS
+    from memory_affinity import TARGETS
     base = inputs.get("relevance")
     if type(base) not in (int, float) or not math.isfinite(base):
         return {"score": None, "state": "unknown", "reason_codes": ["base_score_unknown"], "statements": []}
     common = {**inputs, **lexical_features(context.get("query", ""), document, values["catalog"]),
               "base_relevance": base, "query_purpose": context.get("purpose", "current")}
     reserved = {row[0] for row in [*RUNTIME_INPUTS, *PENDING_RUNTIME_INPUTS]}
+    reserved.update(TARGETS)
+    reserved.update("signal_" + row["id"] for row in values.get("recall", {}).get("signal_bindings", []))
     def attributes(target, items, prefix="attribute_"):
         for item in items:
             key, value = item["definition_id"], known(item.get("value"))
             target[prefix + key] = value
-            if key not in reserved:
+            if key not in reserved and not key.startswith("signal_"):
                 target[key] = value
     attributes(common, document.get("attributes", []))
-    for name, _kind, _label in PENDING_RUNTIME_INPUTS:
+    for name in [*(row[0] for row in PENDING_RUNTIME_INPUTS), *TARGETS]:
         # A memory's own arbitrary attribute cannot pretend to be a live
         # interest/drive producer. Simulations may supply those inputs explicitly.
         common[name] = inputs.get(name)
@@ -415,8 +418,16 @@ adjustment. Formula errors retain the base with reasons, never a guessed input.
         prop = statement.get("property")
         if prop:
             features["property_" + prop["key"]] = known(prop.get("value"))
-            if prop["key"] not in reserved:
+            if prop["key"] not in reserved and not prop["key"].startswith("signal_"):
                 features[prop["key"]] = known(prop.get("value"))
+        affinity_trace = None
+        if "signals" in context:
+            from memory_affinity import statement_affinity
+            affinity_features, affinity_trace = statement_affinity(
+                statement, values, context["signals"], domain=inputs.get("canonical_domain"))
+            # Runtime signals are sampled independently of memory content.
+            # A document's attributes/properties cannot manufacture them.
+            features.update(affinity_features)
         weight, freshness = features["time_weight"], features["freshness"]
         features["time_factor"] = (1 - weight / (1 + weight) * (1 - freshness)
                                    if weight is not None and freshness is not None else None)
@@ -439,7 +450,8 @@ adjustment. Formula errors retain the base with reasons, never a guessed input.
         rows.append({"statement_id": statement.get("statement_id"), "score": value,
                      "formula_id": formula, "scoring_profile": profile.get("id") if profile else None,
                      "time_profile": features["time_profile"], "features": features,
-                     "calculation": calculation, "reason_codes": reasons})
+                     "calculation": calculation, "reason_codes": reasons,
+                     "affinity": affinity_trace})
     best = max(rows, key=lambda row: row["score"])
     return {"score": best["score"], "state": "computed", "formula_id": best["formula_id"],
             "reason_codes": best["reason_codes"], "statements": rows}
@@ -457,7 +469,8 @@ is explicitly simulated so that this preview can never authorize a real claim.
     # Preserve the original evaluator's unknown-input/type validations.
     preview(values, inputs)
     allowed = {"now", "event_time", "target_time", "purpose", "kind", "stability",
-               "basis", "modality", "topics", "conditions", "applicability", "facts", "cognition"}
+               "basis", "modality", "topics", "conditions", "applicability", "facts", "cognition",
+               "signal_snapshots", "canonical_domain"}
     def fail(field):
         raise ConfigurationError("invalid_preview_scenario", field="scenario." + field)
     if not isinstance(scenario, dict) or set(scenario) - allowed or not scenario.get("now"):
@@ -507,6 +520,17 @@ is explicitly simulated so that this preview can never authorize a real claim.
     facts = {name: value if isinstance(value, dict) else {"state": "known", "value": value}
              for name, value in facts.items()}
     ctx = {"now": now, "target_time": target, "purpose": purpose, "facts": facts}
+    if "signal_snapshots" in scenario:
+        from memory_affinity import resolve_signals
+        snapshots = scenario["signal_snapshots"]
+        if not isinstance(snapshots, list) or any(not isinstance(row, dict) for row in snapshots):
+            fail("signal_snapshots")
+        ctx["signals"] = resolve_signals(values, snapshots, now)
+    domain = scenario.get("canonical_domain")
+    if domain is not None:
+        from memory_metadata import CANONICAL_DOMAINS
+        if domain not in CANONICAL_DOMAINS:
+            fail("canonical_domain")
     # Validate optional semantic subtrees with the same L1 shape checks.
     from memory_l1_schema import document_template, validate_l1_document
     from memory_l1_contract import L1ContractError
@@ -518,6 +542,7 @@ is explicitly simulated so that this preview can never authorize a real claim.
         fail(str(getattr(exc, "field_path", "statement")))
     runtime_inputs = {row.get("input_key") or row["id"]: inputs.get(row["id"])
                       for row in values["features"] if row["source"] != "computed"}
+    runtime_inputs["canonical_domain"] = domain
     calculation = score_document(document, values, ctx, runtime_inputs)
     best = max(calculation["statements"], key=lambda row: row["score"]) if calculation["statements"] else {}
     statement["evidence_refs"] = ["simulation"]
@@ -526,4 +551,5 @@ is explicitly simulated so that this preview can never authorize a real claim.
             "provider_requests": 0, "saved": False,
             "pipeline": {**calculation, "usage": usage, "context": {
                 "now": now.isoformat(), "target_time": target.isoformat() if target else None,
-                "purpose": purpose, "simulation": True, "source_state": "simulated_only"}}}
+                "purpose": purpose, "simulation": True, "source_state": "simulated_only",
+                "signal_sources": ctx.get("signals", {})}}}

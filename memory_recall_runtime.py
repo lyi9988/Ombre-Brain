@@ -11,6 +11,7 @@ import httpx
 from memory_recall_semantics import (apply_relations, known, lexical_features, resolve_document,
                                      score_document, temporal_features)
 from memory_system_config import REQUEST_CONFIGURATION, values_from_config
+from memory_affinity import resolve_signals
 
 
 def values(service):
@@ -40,6 +41,8 @@ def context(service, request, query):
             "overview": bool(date_hint and getattr(plan, "auto_too_vague", False)),
             "facts": {"hour": {"state": "known", "value": now.hour},
                       "weekday": {"state": "known", "value": now.weekday()}},
+            "signals": resolve_signals(values(service), request.get("_signal_snapshots", []),
+                                       request.get("_signal_sampled_at") or datetime.now(timezone.utc)),
         }
     return request["_use_context"]
 
@@ -52,6 +55,10 @@ def prepare(service, request, query, buckets):
     elif mode == "fast_hybrid" and not request.get("local_only"):
         request["allow_semantic"] = True
     context(service, request, query)
+    request.setdefault("metadata", {})["state_signals"] = {
+        "transport": request.get("_signal_transport", {"state": "unavailable", "reason": "not_supplied"}),
+        "bindings": request["_use_context"].get("signals", {}),
+    }
     view = getattr(service, "memory_authority_view", None)
     reader = getattr(view, "memory_l1_recall_map", None)
     request["_semantic_records"] = reader([b["id"] for b in buckets]) if callable(reader) else {}
@@ -92,6 +99,10 @@ def score_pool(service, request, query, pool, *, after_rerank=False):
             item["_raw_base_score"] = item["score"]
         base = item.get("_raw_fused_score", item["_raw_base_score"]) if after_rerank else item["_raw_base_score"]
         metadata = item["bucket"].get("metadata") or {}
+        from memory_metadata import normalize_domain_key
+        # Explicit canonical/domain metadata only; inferred free tags are not
+        # evidence for a state-affinity mapping.
+        domain = normalize_domain_key(metadata.get("canonical_domain") or item["bucket"].get("canonical_domain"))
         semantic = item.get("semantic_score")
         if request.get("local_only") or request.get("allow_semantic") is False:
             semantic = None
@@ -100,6 +111,7 @@ def score_pool(service, request, query, pool, *, after_rerank=False):
             "semantic_score": semantic, "rerank_score": item.get("rerank_score"),
             "importance": metadata.get("importance", item["bucket"].get("importance")),
             "confidence": metadata.get("confidence", item["bucket"].get("confidence")),
+            "canonical_domain": domain or None,
         })
         policy_formula = calculation.get("formula_id") or "final"
         formula = next((f for f in settings["formulas"] if f["id"] == policy_formula), {})

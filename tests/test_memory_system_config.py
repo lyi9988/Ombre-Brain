@@ -16,7 +16,7 @@ def test_configuration_keeps_configured_limits_and_exposes_binding_and_pending_c
     assert result["values"]["limits"]["inject_max_cards"] == 6
     assert result["bindings"]["limits"]["inject_max_cards"]["maximum"] == 200
     assert result["application"]["limits"]["state"] == "active"
-    assert result["application"]["formulas"]["consumer"] == "P5"
+    assert result["application"]["formulas"]["consumer"] == "natural_recall"
     assert result["values"]["time_profiles"] == []
 
 
