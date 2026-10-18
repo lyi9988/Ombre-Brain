@@ -12234,7 +12234,7 @@ async def api_daily_chat_memory_run(request):
             embedding_engine=embedding_engine,
             key=str(body.get("date") or ""),
             mode=str(body.get("mode") or ""),
-            force=_bool_value(body.get("force"), False),
+            force=_bool_value(body.get("force"), False) or _bool_value(body.get("retry_failed_windows"), False),
         )
         try:
             activity_date = str(body.get("date") or result.get("date") or "")

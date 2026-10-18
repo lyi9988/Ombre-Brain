@@ -2606,6 +2606,8 @@
   function renderDailyChatMemoryRuns(data) {
     var cursor = data.cursor || {};
     var runs = data.runs || [];
+    var latestRunByDate = {};
+    runs.forEach(function(run) { latestRunByDate[run.date] = run; });
     var cursorLine = 'watermark：last_raw_event_id=' + (cursor.last_raw_event_id || 0) + (cursor.updated_at ? '（' + esc(cursor.updated_at) + '）' : '');
     var runLines = '';
     if (!runs.length) {
@@ -2616,6 +2618,9 @@
         var hardText = Object.keys(hard).length ? Object.keys(hard).map(function (k) { return k + ':' + hard[k]; }).join('，') : '0';
         var statusText = run.status === 'zero_candidates' ? '0 条候选（窗口已全部检查）' : (run.status === 'degraded_empty_outputs' ? '空转（模型答复为空，未推水位）' : run.status);
         var progress = run.progress;
+        var retryDate = /^\d{4}-\d{2}-\d{2}$/.test(String(run.date || '')) && latestRunByDate[run.date] === run &&
+          (run.status === 'needs_review' || run.status === 'failed' || run.status === 'degraded_empty_outputs' ||
+            (run.status === 'partial' && (!progress || progress.state === 'stopped')));
         var progressText = progress ? ' · 当前批窗口 ' + Number(progress.current_batch_completed_windows || 0) + '/' + Number(progress.current_batch_total_windows || 0) +
           ' · 已保存候选 ' + Number(progress.generated_candidates_saved || 0) + ' · 剩余已生成待处理 ' + Number(progress.remaining_prepared_candidates || 0) +
           ' · ' + (progress.state === 'complete' ? '该日期来源已整理完成' : progress.state === 'stopped' ? '整理已停止，待核对原因' : '全天仍在整理中') : '';
@@ -2632,7 +2637,8 @@
             ' · 进入Review ' + esc(run.pending_count || 0) +
             ' · 合并去重 ' + esc(run.merged_duplicates || 0) +
             esc(progressText) + (run.error_category ? ' · 原因 ' + esc(run.error_category) : '') +
-          '</div>' +
+          '</div>' + (retryDate ? '<button type="button" class="chat-memory-rerun-btn" data-memory-retry-date="' + escAttr(run.date) +
+            '" onclick="rerunDailyChatMemory(this)">重试该日期未完成部分</button>' : '') +
         '</div>';
       }).join('');
     }
@@ -2662,10 +2668,13 @@
   }
 
   async function rerunDailyChatMemory(button) {
-    if (!confirm('确认连续整理新增区间？会复用已生成稿，按窗口调用配置模型并产生费用，直到该日期完成或遇到真实失败。')) return;
+    var retryDate = button.getAttribute('data-memory-retry-date');
+    if (!confirm(retryDate ? '确认重试 ' + retryDate + ' 未完成的整理？会完整读取该日期、复用已保存稿，重新处理失败或缺少就绪结果的窗口，可能产生模型费用。'
+      : '确认连续整理新增区间？会复用已生成稿，按窗口调用配置模型并产生费用，直到该日期完成或遇到真实失败。')) return;
     button.disabled = true;
     try {
       var body = { request_id: newDailyChatMemoryRequestId() };
+      if (retryDate) { body.date = retryDate; body.retry_failed_windows = true; }
       var res = await authFetch(dailyChatMemoryApiBase() + '/api/daily-chat-memory/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

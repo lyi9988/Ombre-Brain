@@ -8,7 +8,7 @@ const { chromium } = require('playwright');
   const page = await browser.newPage();
   try {
     await page.route('**/*', route => route.abort());
-    await page.setContent('<div id="daily-chat-memory-message"></div><div id="daily-chat-memory-pending"></div>');
+    await page.setContent('<div id="daily-chat-memory-message"></div><div id="daily-chat-memory-pending"></div><div id="daily-chat-memory-runs"></div>');
     await page.evaluate(() => {
       window.BASE = ''; window.getActiveTab = () => 'other'; window.confirm = () => true;
       window.esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
@@ -46,6 +46,32 @@ const { chromium } = require('playwright');
     assert.equal(await page.locator('[data-source-task-load-more]').count(), 0);
     assert(await page.evaluate(() => requests.some(url => url.includes('status=review_visible') && url.includes('offset=100'))));
     assert(await page.evaluate(() => requests.some(url => url.includes('source-tasks') && url.includes('offset=100'))));
+    await page.evaluate(() => {
+      const original = window.authFetch;
+      window.retryBodies = [];
+      window.authFetch = async (url, options) => {
+        if (url.includes('/daily-chat-memory/runs')) return {ok: true, json: async () => ({runs: [
+          {date: '2026-10-16', status: 'failed'}, {date: '2026-10-16', status: 'pending'},
+          {date: '2026-10-17', status: 'partial', error_category: 'invalid_l1_document', progress: {state: 'stopped'}}]})};
+        if (options && options.method === 'POST') {
+          retryBodies.push(JSON.parse(options.body));
+          return {ok: true, json: async () => ({status: 'pending', candidates: []})};
+        }
+        return original(url, options);
+      };
+    });
+    await page.evaluate(() => window.loadDailyChatMemoryRuns());
+    assert.equal(await page.locator('[data-memory-retry-date]').count(), 1);
+    await page.locator('[data-memory-retry-date="2026-10-17"]').click();
+    await page.waitForFunction(() => retryBodies.length === 1);
+    const retry = await page.evaluate(() => retryBodies[0]);
+    assert.equal(retry.date, '2026-10-17');
+    assert.equal(retry.retry_failed_windows, true);
+    assert.equal(retry.force, undefined);
+    await page.locator('.chat-memory-runs-actions button').click();
+    await page.waitForFunction(() => retryBodies.length === 2);
+    assert.equal(await page.evaluate(() => retryBodies[1].retry_failed_windows), undefined);
     console.log('PASS candidate/source-task pagination, saved totals, retained draft badge and unsaved edit preservation');
+    console.log('PASS explicit failed-date retry parameters; completed dates and normal scan preserved');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
