@@ -34,6 +34,7 @@ def setup(tmp_path, *, mode='review', bad=False, during=None, compact=False):
             during()
         document = model_template(catalog=env['catalog'])
         document['narrative'] = {'title': '后台拟题', 'body': '模型尝试改写正文'}
+        document['retrieval'] = {'keywords': ['合成关键词'], 'tags': []}
         statement = statement_template()
         statement.pop('statement_revision_id')
         statement.update(statement_id='claim1', content='合成的当次请求', evidence_refs=['source:2'])
@@ -44,7 +45,8 @@ def setup(tmp_path, *, mode='review', bad=False, during=None, compact=False):
             document = {'format': 'semantic-v1', 'entities': [], 'statements': [{
                 'content': statement['content'], 'subject_ref': None,
                 'classification': {'kind': None, 'stability': None, 'modality': None, 'basis': None},
-                'time': None, 'conditions': None, 'evidence_refs': ['source:2']}]}
+                'time': None, 'conditions': None, 'evidence_refs': ['source:2']}],
+                'retrieval': {'keywords': ['合成关键词'], 'tags': []}}
         return NS(choices=[NS(message=NS(content=json.dumps({'document': document,
             'kind': 'shared_experience', 'confidence': 0.95})), finish_reason='stop')])
     async def locate(binding):
@@ -87,6 +89,7 @@ def test_background_prepares_full_l1_preserves_body_and_uses_real_message_eviden
     l1 = row['proposal']['metadata']['memory_l1']
     assert l1['statements'][0]['statement_id'].startswith('st_')
     assert l1['statements'][0]['evidence_refs'] == ['source:2']
+    assert l1['retrieval']['keywords'] == ['合成关键词']
     assert len(l1['evidence_bindings']) == 3
     assert l1['generation']['actor'] == 'chat_memory_preparation'
     assert len(calls) == 1

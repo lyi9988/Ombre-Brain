@@ -6,6 +6,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -27,7 +28,8 @@ def run(task):
 
 def _gateway_runtime(monkeypatch):
     brain_root = Path(__file__).resolve().parents[1]
-    gateway_root = brain_root.parent / "ombre-memory-recall-use-gateway-r2"
+    gateway_root = Path(os.environ.get('GUYAN_GATEWAY_WORKTREE',
+        str(brain_root.parent / "ombre-memory-semantic-gateway-r2")))
     runtime_path = gateway_root / "memory_recall_runtime.py"
     if not runtime_path.is_file():
         pytest.skip(f"Gateway worktree not found: {runtime_path}")
@@ -217,7 +219,7 @@ def test_real_brain_resolve_flows_through_gateway_and_stale_l2_falls_back(tmp_pa
     )
     gateway = _gateway_service(view, "brain-contract-read-token")
 
-    def project_current():
+    def project_current(budget=4000):
         bucket, record, metadata = _record_for_gateway(l2_service, authority)
         record_holder.update(bucket=bucket, record=record, metadata=metadata)
         query = "回想那次她说想要抱抱。"
@@ -225,7 +227,7 @@ def test_real_brain_resolve_flows_through_gateway_and_stale_l2_falls_back(tmp_pa
         raw = f'[bucket_id:b2] {bucket["content"]}'
         sections = run(runtime.project_sections(
             gateway, request, query, [bucket],
-            {"direct": (raw, ["b2"], 4000),
+            {"direct": (raw, ["b2"], budget),
              "targeted": ("", [], 0), "diffused": ("", [], 0)},
         ))
         return request, sections
@@ -252,6 +254,26 @@ def test_real_brain_resolve_flows_through_gateway_and_stale_l2_falls_back(tmp_pa
     assert resolve_call["payload"]["items"][0]["statement_uses"]
     assert len(model_calls) >= 1
 
+    # An owner full-text edit is locally indexed into complete new paragraphs.
+    # The existing Gateway budget can now choose the short exact paragraph;
+    # neither stale model wording nor a slice of the long paragraph is used.
+    owner_payload['expected_presentation_revision'] = saved['presentation_revision']
+    owner_payload['request_id'] = 'gateway-contract-owner-paragraphs'
+    long_paragraph = 'L2-LONG-OWNER-PARAGRAPH: ' + 'complete long owner paragraph. ' * 600
+    short_paragraph = 'L2-SHORT-OWNER-PARAGRAPH: she can decline; I will respect her decision.'
+    owner_payload['document'] = copy.deepcopy(saved['l2']['presentation']['document'])
+    owner_payload['document']['full_injection_text'] = long_paragraph + '\n\n' + short_paragraph
+    next_saved = run(l2_service.save('m2', owner_payload))
+    request, sections = project_current(budget=160)
+    assert short_paragraph in sections['direct']
+    assert 'L2-LONG-OWNER-PARAGRAPH' not in sections['direct']
+    assert 'L2-PERSISTED-V2' not in sections['direct']
+    trace = request['presentation_trace'][0]
+    assert trace['source'] == 'l2'
+    assert trace['presentation_revision'] == next_saved['presentation_revision']
+    assert trace['selected_unit_ids'] == [next_saved['l2']['presentation']['document']['coherent_sections'][1]['section_id']]
+    assert trace['partial_presentation'] is True
+
     # A new L1 dependency makes the persisted L2 stale. The same live transport
     # returns Brain's stale result, and Gateway restores only its existing L1 path.
     current = run(l2_service.revisions.detail("m2"))
@@ -271,5 +293,5 @@ def test_real_brain_resolve_flows_through_gateway_and_stale_l2_falls_back(tmp_pa
     assert trace["presentation_revision"] is None
     assert trace["fallback_reason"] == "dependency_changed"
     assert len(model_calls) >= 1
-    assert sum(call["path"].endswith("/recall-sources") for call in brain_transport.calls) == 2
-    assert sum(call["path"].endswith("/presentations/resolve") for call in brain_transport.calls) == 2
+    assert sum(call["path"].endswith("/recall-sources") for call in brain_transport.calls) == 3
+    assert sum(call["path"].endswith("/presentations/resolve") for call in brain_transport.calls) == 3

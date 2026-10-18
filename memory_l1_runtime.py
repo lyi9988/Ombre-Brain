@@ -140,6 +140,8 @@ class MemoryL1Runtime:
                     use_daily_client=use_daily, task_stage='action_l1', task_route=route)
                 if self._completion_finish_reason(response) == 'length':
                     raise L1OwnerError('first_pass_output_incomplete', field_path='generation')
+                from memory_l1_api import validate_response
+                validate_response(response)
                 parsed = self._parse_json_object(self._completion_content(response) or '')
                 candidates = parsed.get('candidates') if isinstance(parsed, dict) else None
                 if not isinstance(candidates, list) or len(candidates) > self._daily_chat_memory_candidate_limit(mode):
@@ -209,13 +211,26 @@ class MemoryL1Runtime:
                       'binding': meta.get('binding'), 'selected_blocks': meta.get('selected_blocks')}
 
     def _memory_l1_daily_context(self, window):
+        from identity import model_identity
         service = self._memory_l1_revisions()
         catalog, catalog_revision = service.catalog_provider()
         sources = daily_sources(window, profile_id=self.memory_semantic_profile_id)
         snapshots, bindings = bind_sources(sources)
-        return {'semantic_contract': semantic_contract([b['binding_id'] for b in bindings], catalog=catalog),
-                'catalog_revision': catalog_revision,
-                'source_texts': semantic_sources(snapshots, bindings)}, sources, (copy.deepcopy(catalog), catalog_revision)
+        contract = semantic_contract([b['binding_id'] for b in bindings], catalog=catalog,
+            initial_chat=True, require_keywords=True, identity=model_identity(self.config))
+        contract['document']['required'].append('narrative')
+        contract['document']['narrative'] = contract['document']['optional'].pop('narrative')
+        from memory_l1_api import AUTO_KINDS
+        contract['response_format'] = {
+            'root': {'candidates': 'Candidate[]'},
+            'Candidate': {'kind': '|'.join(AUTO_KINDS),
+                          'confidence': 'number in [0,1]', 'source_refs': 'source_id[]',
+                          'reason': 'string', 'document': 'Document (document/types above)'},
+            'rules': '只输出上述JSON对象。catalog中key为输出值，中文为释义。Candidate.kind是入库类别；Statement.classification.kind只用catalog.kinds。subject_ref/about_refs只引用本稿实体ID，例如e1，不能用user/assistant代替。保留主体、改口、否定、条件和未知；不同日期的状态分别表达，计划目标日不自动作为截止日。每份document独立填写完整narrative与非空retrieval.keywords，关键词按内容提取。',
+        }
+        return {'source_texts': semantic_sources(snapshots, bindings, chat_view=True,
+                    source_timezone=getattr(self, 'tz', None)),
+                'catalog_revision': catalog_revision, 'semantic_contract': contract}, sources, (copy.deepcopy(catalog), catalog_revision)
 
     def _memory_l1_daily_document(self, candidate, memory_id):
         sources = candidate.get('_l1_sources')
@@ -377,6 +392,8 @@ class MemoryL1Runtime:
                     max_tokens=options['diary_l1_max_tokens'], temperature=self.temperature,
                     use_daily_client=route['connection'] == 'daily', task_stage='diary_l1', task_route=route)
                 if self._completion_finish_reason(response) == 'length': raise ValueError('first_pass_output_incomplete')
+                from memory_l1_api import validate_response
+                validate_response(response)
                 parsed = self._parse_json_object(self._completion_content(response) or '')
                 if not isinstance(parsed, dict) or set(parsed) != {'document', 'scene_bodies', 'confidence'}:
                     raise ValueError('diary_task_result_required')

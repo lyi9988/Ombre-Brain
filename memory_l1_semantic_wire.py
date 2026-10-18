@@ -4,6 +4,7 @@ Only explicit semantic-v1 documents are expanded. Missing required judgments
 are errors, not evidence that a source omitted a fact. No model calls or writes.
 """
 from copy import deepcopy
+from datetime import datetime
 
 from memory_l1_schema import catalog_with_defaults, statement_template
 from memory_l1_service import L1OwnerError
@@ -86,22 +87,37 @@ def _time(value, evidence):
     return result
 
 
-def semantic_sources(snapshots, bindings):
+def semantic_sources(snapshots, bindings, *, chat_view=False, source_timezone=None):
     """Project source evidence for the model; keep identity/anchors in program custody."""
     if len(snapshots) != len(bindings):
         raise L1OwnerError('source_binding_count_mismatch', field_path='sources')
-    return [{'binding_id': binding['binding_id'], 'text': source['text'],
+    result = [{'binding_id': binding['binding_id'], 'text': source['text'],
              'author': source.get('author'), 'source_recorded_at': source.get('recorded_at')}
             for source, binding in zip(snapshots, bindings)]
+    if chat_view:
+        for source in result:
+            if source['source_recorded_at']:
+                stamp = datetime.fromisoformat(source['source_recorded_at'].replace('Z', '+00:00'))
+                if source_timezone is not None:
+                    stamp = stamp.astimezone(source_timezone)
+                source['source_recorded_at'] = stamp.isoformat(timespec='minutes')
+    return result
 
 
-def assemble_document(document, *, narrative=None):
+def assemble_document(document, *, narrative=None, require_keywords=False):
     """Expand a model draft before existing identity binding and full validation.
 
     Scalar/null are explicit known/not-stated judgments. Evidence inheritance
     is document-local shorthand, never new source authority. A full legacy
     document passes unchanged to its original validator.
     """
+    if require_keywords:
+        retrieval = document.get('retrieval') if isinstance(document, dict) else None
+        if not isinstance(retrieval, dict) or 'keywords' not in retrieval:
+            raise L1OwnerError('semantic_fields_required', field_path='retrieval.keywords')
+        keywords = _array(retrieval['keywords'], 'retrieval.keywords')
+        if not keywords or any(not isinstance(word, str) or not word.strip() for word in keywords):
+            raise L1OwnerError('nonempty_keywords_required', field_path='retrieval.keywords')
     if not isinstance(document, dict) or 'format' not in document:
         return deepcopy(document)
     doc = _shape(document, ('format', 'entities', 'statements'),
@@ -188,9 +204,9 @@ def semantic_catalog(catalog):
     return result
 
 
-def semantic_contract(source_ids, *, catalog):
+def semantic_contract(source_ids, *, catalog, initial_chat=False, require_keywords=False, identity=None):
     """Compact structural notation, not an alternate persistence schema."""
-    return {
+    result = {
         'format': 'semantic-v1', 'source_ids': list(source_ids),
         'catalog': semantic_catalog(catalog),
         'document': {
@@ -235,3 +251,29 @@ def semantic_contract(source_ids, *, catalog):
                          'evidence_refs': 'source_id[]', 'relation_id?': 'string'},
         },
     }
+    if require_keywords:
+        result['document']['required'].append('retrieval')
+        result['document']['retrieval'] = result['document']['optional'].pop('retrieval')
+        result['document']['retrieval']['keywords'] = 'non-empty string[];由模型根据材料提供'
+    if initial_chat:
+        # Only the model-facing vocabulary is abbreviated. Canonical catalog,
+        # validation, persisted Schema and owner-edited definitions stay intact.
+        from memory_system_config import defaults
+        baseline = semantic_catalog(defaults()['catalog'])
+        view = result['catalog']
+        for kind in ('revises', 'supersedes', 'split_from', 'merged_from'):
+            view.get('relation_types', {}).pop(kind, None)
+        relation_labels = {'same_event': '同一事件', 'supplements': '补充',
+                           'limits': '限定', 'possible_conflict': '可能冲突'}
+        for axis, rows in view.items():
+            if axis == 'attributes':
+                continue
+            for key, row in list(rows.items()):
+                standard = baseline.get(axis, {}).get(key, {})
+                label = row.get('label') or standard.get('label') or relation_labels.get(key, key)
+                if identity and axis in ('subjects', 'entity_types') and key in ('user', 'assistant'):
+                    label = identity[key]['name']
+                extra = {name: deepcopy(value) for name, value in row.items()
+                         if name != 'label' and value != standard.get(name)}
+                rows[key] = {'label': label, **extra} if extra else label
+    return result

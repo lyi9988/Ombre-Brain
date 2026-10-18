@@ -283,21 +283,86 @@ def test_ordinary_wording_does_not_confirm_pending_fact_proposal(tmp_path):
     assert proposal['proposal']['confirmed_presentation_revision'] == result['presentation_revision']
 
 
-def test_full_text_edit_preserves_but_retires_old_units(tmp_path):
+def test_full_text_edit_rebuilds_units_from_exact_owner_paragraphs(tmp_path):
     service, _, _ = setup(tmp_path)
     run(service.run_once(1))
     request = owner_payload(service)
-    request['document']['full_injection_text'] = '主人改好的全文。'
+    original = copy.deepcopy(request['document'])
+    request['document']['full_injection_text'] = '主人改好的第一段。\n这一行仍属于同一段。\r\n\r\n主人改好的第二段，保留条件和例外。'
     saved = run(service.save('m1', request))
-    assert saved['l2']['presentation']['units_state'] == 'stale_after_owner_text_edit'
-    assert saved['l2']['presentation']['document']['coherent_sections']
+    assert saved['l2']['presentation']['units_state'] == 'current'
+    rebuilt = saved['l2']['presentation']['document']
+    assert rebuilt['full_injection_text'] == request['document']['full_injection_text']
+    assert [unit['text'] for unit in rebuilt['coherent_sections']] == [
+        '主人改好的第一段。\n这一行仍属于同一段。', '主人改好的第二段，保留条件和例外。']
+    assert not rebuilt['optional_use_variants']
+    assert service.detail('m1', 1)['l2']['presentation']['document'] == original
+    assert request['document']['coherent_sections'] == original['coherent_sections']  # input draft remains intact
+    assert run(service.save('m1', request))['replayed']
     sid = request['document']['coherent_sections'][0]['statement_refs'][0]
     query = {'memory_id':'m1','revision':2,'statement_ids':[sid], 'allowed_uses':['historical_evidence'],
              'statement_uses':{sid:'historical_evidence'}, 'narrative_allowed':False}
     result = run(service.resolve({'items':[query]}))['items'][0]
-    assert not result['text'] and not result['units']
+    assert result['text'] == '\n\n'.join(unit['text'] for unit in rebuilt['coherent_sections'])
+    assert [unit['text'] for unit in result['units']] == [unit['text'] for unit in rebuilt['coherent_sections']]
     result = run(service.resolve({'items':[{**query, 'narrative_allowed':True}]}))['items'][0]
-    assert result['text'] == '主人改好的全文。'
+    assert result['text'] == request['document']['full_injection_text']
+
+
+def test_owner_paragraph_units_keep_large_single_paragraph_and_all_l1_refs():
+    from memory_l2_store import owner_paragraph_document
+    text = '只有她愿意才继续；如果她拒绝，我就停下。' * 600
+    document = {'full_injection_text': text, 'coherent_sections': [], 'optional_use_variants': []}
+    rebuilt = owner_paragraph_document(document, ['current', 'historical', 'current', 'shared'])
+    assert rebuilt['full_injection_text'] == text
+    assert rebuilt['coherent_sections'] == [{
+        'section_id': rebuilt['coherent_sections'][0]['section_id'], 'text': text,
+        'statement_refs': ['current', 'historical', 'shared']}]
+    assert owner_paragraph_document(document, [])['coherent_sections'] == []
+
+
+def test_resaving_legacy_stale_owner_units_creates_new_revision_without_rewriting_history(tmp_path):
+    service, authority, calls = setup(tmp_path)
+    run(service.run_once(1))
+    edit = owner_payload(service)
+    edit['document']['full_injection_text'] = '主人保留的第一段。\n\n主人保留的第二段。'
+    saved = run(service.save('m1', edit))
+    # Reproduce a persisted revision from the old owner-edit implementation.
+    legacy = copy.deepcopy(edit['document'])
+    conn = authority._connect()
+    try:
+        conn.execute("UPDATE memory_l2_revisions SET document_json=?,units_state='stale_after_owner_text_edit' WHERE memory_id='m1' AND presentation_revision=?",
+            (json.dumps(legacy, ensure_ascii=False), saved['presentation_revision']))
+        conn.commit()
+    finally:
+        conn.close()
+    resave = owner_payload(service, 'owner-reindex')
+    recovered = run(service.save('m1', resave))
+    assert recovered['presentation_revision'] == saved['presentation_revision'] + 1
+    assert recovered['l2']['presentation']['units_state'] == 'current'
+    assert [unit['text'] for unit in recovered['l2']['presentation']['document']['coherent_sections']] == [
+        '主人保留的第一段。', '主人保留的第二段。']
+    assert service.detail('m1', saved['presentation_revision'])['l2']['presentation']['document'] == legacy
+    assert len(calls) == 1
+
+
+def test_owner_paragraphs_are_not_qualified_by_only_one_of_multiple_l1_claims(tmp_path):
+    service, _, _ = setup(tmp_path)
+    payload = request_for(service.revisions, 'two-statements')
+    second = statement_template()
+    second['content'] = '另一条仍需独立核对的事实。'
+    payload['document']['statements'].append(second)
+    run(service.revisions.save('m1', payload))
+    run(service.run_once(10))
+    edit = owner_payload(service)
+    edit['document']['full_injection_text'] = '主人第一段。\n\n主人第二段。'
+    saved = run(service.save('m1', edit))
+    refs = saved['l2']['presentation']['document']['coherent_sections'][0]['statement_refs']
+    assert len(refs) == 2
+    result = run(service.resolve({'items':[{'memory_id':'m1','revision':3,
+        'statement_ids':refs[:1], 'allowed_uses':['historical_evidence'],
+        'statement_uses':{refs[0]:'historical_evidence'}, 'narrative_allowed':False}]}))['items'][0]
+    assert not result['text'] and not result['units']
 
 
 def test_pending_requests_for_same_dependency_share_one_model_run(tmp_path):

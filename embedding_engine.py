@@ -233,6 +233,8 @@ class EmbeddingEngine:
             "source_sha256": "TEXT", "input_sha256": "TEXT",
             "preparation_sha256": "TEXT", "provider": "TEXT",
             "input_truncated_chars": "INTEGER",
+            "text_projection_version": "TEXT",
+            "source_origin_unit_id": "TEXT",
         }.items():
             self._ensure_column(conn, "embeddings", name, sql_type)
         conn.commit()
@@ -347,6 +349,8 @@ class EmbeddingEngine:
         parent_memory_id: str | None = None, document_instruction: str | None = None,
         config_snapshot: dict | None = None,
         result_metadata: dict | None = None,
+        text_projection_version: str | None = None,
+        source_origin_unit_id: str | None = None,
     ) -> bool:
         """
         Generate embedding for content and store in SQLite.
@@ -367,6 +371,8 @@ class EmbeddingEngine:
                 bucket_id, embedding, source_revision=source_revision,
                 source_sha256=source_sha256, source_unit_id=source_unit_id,
                 parent_memory_id=parent_memory_id, input_text=content, config_snapshot=snapshot,
+                text_projection_version=text_projection_version,
+                source_origin_unit_id=source_origin_unit_id,
             )
             if result_metadata is not None:
                 result_metadata["dimension"] = len(embedding)
@@ -686,6 +692,8 @@ class EmbeddingEngine:
         source_revision: int | None = None, source_sha256: str | None = None,
         source_unit_id: str | None = None, parent_memory_id: str | None = None,
         input_text: str = "", config_snapshot: dict | None = None,
+        text_projection_version: str | None = None,
+        source_origin_unit_id: str | None = None,
     ):
         """Store embedding in SQLite."""
         from utils import now_iso
@@ -703,14 +711,14 @@ class EmbeddingEngine:
             INSERT OR REPLACE INTO embeddings
             (bucket_id, embedding, model, dimension, updated_at, parent_bucket_id,
              parent_memory_id, source_unit_id, source_revision, source_sha256,
-             input_sha256, preparation_sha256, provider, input_truncated_chars)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             input_sha256, preparation_sha256, provider, input_truncated_chars,text_projection_version,source_origin_unit_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (row_id, json.dumps(embedding), snapshot["model"], len(embedding), now_iso(), bucket_id,
              parent_memory_id, unit, source_revision, source_sha256,
              hashlib.sha256(prepared[:snapshot["max_chars"]].encode()).hexdigest(),
              snapshot["document_preparation"], snapshot["base_url"].rstrip("/"),
-             max(0, len(prepared) - snapshot["max_chars"])),
+             max(0, len(prepared) - snapshot["max_chars"]), text_projection_version, source_origin_unit_id),
         )
         conn.commit()
         conn.close()
@@ -849,13 +857,13 @@ class EmbeddingEngine:
             rows = conn.execute(
                 "SELECT bucket_id,embedding,model,dimension,parent_bucket_id,"
                 "parent_memory_id,source_unit_id,source_revision,source_sha256,"
-                "preparation_sha256,provider,input_truncated_chars FROM embeddings"
+                "preparation_sha256,provider,input_truncated_chars,text_projection_version,source_origin_unit_id FROM embeddings"
             ).fetchall()
         finally:
             conn.close()
         valid, rejected = [], {}
         for row in rows:
-            row_id, payload, model, dimension, parent, memory_id, unit, revision, body_sha, prep, provider, truncated = row
+            row_id, payload, model, dimension, parent, memory_id, unit, revision, body_sha, prep, provider, truncated, text_version, origin = row
             parent = str(parent or row_id)
             if parent not in eligible_ids:
                 continue
@@ -870,6 +878,9 @@ class EmbeddingEngine:
                       or body_sha != expected.get("body_sha256")
                       or (memory_id and memory_id != expected.get("memory_id"))):
                     reason = "stale_memory_revision"
+                elif (expected.get('text_projection_version')
+                      and text_version != expected['text_projection_version']):
+                    reason = 'embedding_text_projection_mismatch'
             if not reason and provider and provider.rstrip("/") != snapshot["base_url"].rstrip("/"):
                 reason = "embedding_provider_mismatch"
             if not reason and prep and prep != snapshot["document_preparation"]:
@@ -887,7 +898,7 @@ class EmbeddingEngine:
             if reason:
                 rejected[reason] = rejected.get(reason, 0) + 1
                 continue
-            valid.append((parent, str(unit or row_id), vector, int(truncated or 0)))
+            valid.append((parent, str(origin or unit or row_id), vector, int(truncated or 0)))
         query_debug = {}
         if valid and chunks:
             try:

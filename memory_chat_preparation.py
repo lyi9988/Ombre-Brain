@@ -282,10 +282,14 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                         raise L1OwnerError('source_not_currently_readable', status=409, field_path='sources')
                 service = engine._memory_l1_revisions(bucket_mgr)
                 catalog, catalog_revision = service.catalog_provider()
-                payload = {'input_kind': 'chat_authored_draft', 'draft': envelope['arguments'],
-                    'semantic_contract': semantic_contract([b['binding_id'] for b in bindings], catalog=catalog),
+                from identity import model_identity
+                identity = model_identity(engine.config)
+                payload = {'input_kind': 'chat_authored_draft', 'draft': envelope['arguments'], 'identity': identity,
                     'narrative_from_draft': True, 'catalog_revision': catalog_revision,
-                    'sources': semantic_sources(snapshots, bindings)}
+                    'sources': semantic_sources(snapshots, bindings, chat_view=True,
+                        source_timezone=getattr(engine, 'tz', None)),
+                    'semantic_contract': semantic_contract([b['binding_id'] for b in bindings], catalog=catalog,
+                        initial_chat=True, require_keywords=True, identity=identity)}
                 serialized_payload = json.dumps(payload, ensure_ascii=False)
                 input_metrics = {'contract': 'semantic-v1', 'catalog_revision': catalog_revision,
                     'system_characters': len(prompt), 'payload_characters': len(serialized_payload),
@@ -307,7 +311,7 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 response = await engine._daily_chat_memory_create_completion(client, model=model,
                     messages=messages,
                     max_tokens=engine.daily_chat_memory_candidate_max_tokens, temperature=engine.temperature,
-                    use_daily_client=use_daily, task_stage='chat_l1', task_route=route)
+                    use_daily_client=use_daily, task_stage='chat_l1', task_route=route, model_io_id=io_id)
                 raw_output = engine._completion_content(response) or ''
                 model_io.returned(io_id, response=response, raw_output=raw_output,
                                   finish_reason=engine._completion_finish_reason(response))
@@ -332,6 +336,8 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                         'text': raw_output}, 'output_shape': None}
                 if engine._completion_finish_reason(response) == 'length':
                     raise L1OwnerError('first_pass_output_incomplete', field_path='generation')
+                from memory_l1_api import validate_response
+                validate_response(response)
                 parsed = engine._parse_json_object(raw_output)
                 from memory_l1_ingestion import MODEL_FIELDS
                 output_shape = {'draft_revision': claimed['draft_revision'],
@@ -351,7 +357,8 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                         else 'complete_document_root')
                 if not isinstance(parsed, dict) or set(parsed) - {'document', 'kind', 'confidence', 'sensitive'} or not isinstance(parsed.get('document'), dict):
                     raise L1OwnerError('model_document_fields_required', field_path='document')
-                document = assemble_document(parsed['document'], narrative=envelope['arguments']['narrative'])
+                document = assemble_document(parsed['document'], narrative=envelope['arguments']['narrative'],
+                    require_keywords=True)
                 # The model proposes semantics. The first-pass author keeps its
                 # complete prose; silently replacing it would lose that product.
                 draft = envelope['arguments']['narrative']

@@ -92,8 +92,13 @@ def test_route_normalization_returns_all_stages_and_validates_values():
     routes = normalize_task_routes({"auto_l1": {"model": "  route-model  "}})
 
     assert set(routes) == set(STAGES)
-    assert routes["auto_l1"] == {**DEFAULT_ROUTE, "model": "route-model"}
-    assert all(routes[stage] == DEFAULT_ROUTE for stage in STAGES if stage != "auto_l1")
+    assert routes["auto_l1"] == {**DEFAULT_ROUTE, "model": "route-model",
+                                  "thinking_mode": "enabled", "reasoning_effort": "low", "max_tokens": 32000}
+    for stage in ("chat_l1", "diary_l1", "action_l1"):
+        assert routes[stage]["max_tokens"] == 32000
+        assert routes[stage]["reasoning_effort"] == "low"
+    assert routes["presentation_l2"] == DEFAULT_ROUTE
+    assert all(routes[stage] == DEFAULT_ROUTE for stage in ("presentation_l2", "chat_summary", "activity_summary"))
 
     invalid = [
         [],

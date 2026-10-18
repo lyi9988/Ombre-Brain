@@ -166,6 +166,9 @@ def test_canonical_source_reader_checks_versions_withdrawal_and_retained_copy(tm
             assert current["eligible_source"] is True
             assert current["view"] == "source"
             assert current["text"] == "合成原始答复。"
+            # Bridge returns the authoritative created_at_ms, not recorded_at.
+            assert current["recorded_at"] == datetime.fromtimestamp(
+                event["created_at_ms"] / 1000, timezone.utc).isoformat()
 
             edited = store.owner_edit_assistant(
                 CONVERSATION_ID,

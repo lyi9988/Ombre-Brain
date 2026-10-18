@@ -106,8 +106,27 @@ class MemoryModelIO:
             db.close()
 
     def returned(self, io_id, *, response, raw_output, finish_reason):
+        wire = getattr(response, 'native_request', None)
+        actual = {}
+        if isinstance(wire, dict):
+            allowed = {'model', 'input', 'messages', 'max_output_tokens', 'max_tokens',
+                       'temperature', 'reasoning', 'text', 'response_format', 'reasoning_effort', 'extra_body'}
+            request = {k: copy.deepcopy(v) for k, v in wire.items() if k in allowed}
+            actual = {'native_request': request,
+                      'messages': request.get('input', request.get('messages', [])),
+                      'completion_parameters': {k: v for k, v in request.items() if k not in ('input', 'messages')}}
         self._update(io_id, status='validating', ended_at=_stamp(), raw_output=raw_output,
-                     finish_reason=finish_reason, usage=response_usage(response))
+                     finish_reason=finish_reason, usage=response_usage(response), **actual)
+
+    def requested(self, io_id, request, *, timeout_seconds):
+        """Capture the real native wire before dispatch, including on timeout."""
+        allowed = {'model', 'input', 'messages', 'max_output_tokens', 'max_tokens',
+                   'temperature', 'reasoning', 'text', 'response_format', 'reasoning_effort', 'extra_body'}
+        wire = {key: copy.deepcopy(value) for key, value in request.items() if key in allowed}
+        self._update(io_id, native_request=wire,
+            messages=wire.get('input', wire.get('messages', [])),
+            completion_parameters={key: value for key, value in wire.items() if key not in ('input', 'messages')},
+            transport={'timeout_seconds': timeout_seconds, 'max_retries': 0})
 
     def finish(self, io_id, *, error=None):
         changes = {'status': 'failed' if error else 'succeeded',

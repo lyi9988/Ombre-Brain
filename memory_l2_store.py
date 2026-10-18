@@ -5,7 +5,9 @@ All head changes and task claims use the Authority transaction boundary.
 """
 from __future__ import annotations
 
+import copy
 import json
+import re
 import time
 import uuid
 
@@ -89,6 +91,26 @@ def validate_document(document, statement_ids):
             seen.add(row[key])
     canonical_json(document)
     return document
+
+
+def owner_paragraph_document(document, statement_ids):
+    """Index exact owner paragraphs, conservatively qualified by the whole L1.
+
+    A single newline may be a soft wrap, so only blank-line boundaries split
+    units. No sentence splitting, rewriting, summary, or old generated text is
+    used. Complete L1 refs avoid guessing a new paragraph's factual alignment.
+    """
+    result = copy.deepcopy(document)
+    refs = list(dict.fromkeys(statement_ids))
+    paragraphs = [text.strip() for text in re.split(r'\r?\n[ \t]*\r?\n(?:[ \t]*\r?\n)*', document['full_injection_text'])
+                  if text.strip()]
+    result['coherent_sections'] = [
+        {'section_id': 'owner-paragraph:' + str(index) + ':' + semantic_sha256({'text': text})[:16],
+         'text': text, 'statement_refs': list(refs)}
+        for index, text in enumerate(paragraphs, 1)
+    ] if refs else []
+    result['optional_use_variants'] = []
+    return result
 
 
 class MemoryL2Store:
@@ -283,11 +305,19 @@ class MemoryL2Store:
             sync = 'pending_l1' if actor == 'owner' and (change_kind == 'facts' or pending - confirmed) else 'not_required'
             before = conn.execute('SELECT document_json,units_state FROM memory_l2_revisions WHERE memory_id=? AND presentation_revision=?', (memory_id, current_revision)).fetchone()
             units_state = 'current'
-            if actor == 'owner' and before:
-                previous = json.loads(before['document_json'])
-                if all(previous[key] == document[key] for key in ('coherent_sections','optional_use_variants')):
-                    units_state = ('stale_after_owner_text_edit' if previous['full_injection_text'] != document['full_injection_text']
-                                   and any(document[key] for key in ('coherent_sections','optional_use_variants')) else before['units_state'])
+            if actor == 'owner':
+                previous = json.loads(before['document_json']) if before else None
+                unchanged_units = previous is None or all(previous[key] == document[key]
+                    for key in ('coherent_sections','optional_use_variants'))
+                changed_text = previous is None or previous['full_injection_text'] != document['full_injection_text']
+                if unchanged_units and (changed_text or before['units_state'] != 'current'):
+                    row = conn.execute('SELECT metadata_json FROM memory_revisions WHERE memory_id=? AND revision=?',
+                        (memory_id, dependency['first_pass_revision'])).fetchone()
+                    semantic = json.loads(row[0]).get('memory_l1') or {}
+                    refs = [s['statement_id'] for s in semantic.get('statements', [])]
+                    refs.extend(semantic.get('entry', {}).get('shared_statement_refs', []))
+                    document = owner_paragraph_document(document, refs)
+                    validate_document(document, refs)
             conn.execute('''INSERT INTO memory_l2_revisions
                 (memory_id,presentation_revision,first_pass_revision,dependency_json,document_json,actor,created_at,request_id,request_sha256,sync_state,edit_note,publication,units_state)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',

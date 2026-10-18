@@ -60,6 +60,15 @@ def generic_identity_names() -> dict:
     )
 
 
+def model_identity(config: dict | None = None) -> dict:
+    """Owner-approved L1 role names; retain aliases from existing settings."""
+    names = identity_names(config)
+    return {
+        "user": {"name": "润润", "aliases": names["user_aliases"]},
+        "assistant": {"name": "顾衍", "aliases": []},
+    }
+
+
 def render_identity_template(template: str, names: dict) -> str:
     text = template
     for key, value in names.items():

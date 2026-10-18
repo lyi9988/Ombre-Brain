@@ -44,14 +44,24 @@ def semantic_input_projection(material):
         for binding in material['l1_document'].get('evidence_bindings', [])]
     sources = []
     for source in material['sources']:
-        sources.append({'binding_id': source['binding']['binding_id'],
+        projected = {'binding_id': source['binding']['binding_id'],
             **{key: copy.deepcopy(source.get(key)) for key in
-               ('text', 'title', 'author', 'speaker', 'eligible_source', 'state', 'view', 'limitations')},
-            'source_recorded_at': source.get('recorded_at')})
+               ('text', 'title', 'author', 'speaker')},
+            'source_recorded_at': source.get('recorded_at')}
+        # Current-source qualification is completed by _material, not by the
+        # model. Keep substantive source limitations without repeating the
+        # snapshot reader's technical disclaimer as if it were an experience.
+        limitations = [copy.deepcopy(value) for value in source.get('limitations') or []
+                      if value and value != '来源记录时间不代表事件发生时间；源快照不是主人确认事实。']
+        if limitations:
+            projected['limitations'] = limitations
+        sources.append(projected)
     result = {'l1_document': doc,
               'shared_statements': [member(item, 'statement_revision_id') for item in material['shared_statements']],
-              'sources': sources, 'rings': [omit(item, {'memory_id', 'operation_id', 'content_sha256', 'ring_id'})
-                                           for item in material['rings']]}
+              'sources': sources}
+    if material['rings']:
+        result['rings'] = [omit(item, {'memory_id', 'operation_id', 'content_sha256', 'ring_id', 'state'})
+                           for item in material['rings']]
     # Keep custom meanings used by this document without resending the whole
     # generation catalog snapshot and its unused vocabulary.
     from memory_l1_semantic_wire import semantic_catalog

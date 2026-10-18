@@ -156,10 +156,29 @@ def test_l2_projection_preserves_complex_semantics_full_sources_and_local_refs()
     assert projected['shared_statements'][0]['content'] == shared['content']
     assert projected['sources'][0]['text'] == body
     assert projected['sources'][0]['binding_id'] == stmt['evidence_refs'][0]
-    assert projected['sources'][0]['author'] == '她' and projected['sources'][0]['eligible_source']
+    assert projected['sources'][0]['author'] == '她'
+    assert not {'eligible_source', 'state', 'view', 'limitations'} & projected['sources'][0].keys()
     assert projected['sources'][0]['source_recorded_at'] == material['sources'][0]['recorded_at']
     assert projected['rings'][0]['content'] == material['rings'][0]['content']
     assert projected['semantic_definitions']['attributes']['custom-context']['description'] == '具体会面情境'
     assert 'generation' not in p and 'statement_revision_id' not in p['statements'][0]
     assert 'source_revision' not in p['evidence_bindings'][0]
     assert p['evidence_bindings'][0]['anchors'] == [{'start':3, 'end':15}]
+
+
+def test_l2_projection_keeps_source_content_restrictions_without_empty_or_technical_audit():
+    from memory_l1_ingestion import source_snapshot
+    doc = document_template('没有承诺；她是否愿意仍未说明。', '条件未知')
+    source = source_snapshot({'namespace':'canonical_event', 'system':'aiz', 'profile_id':'owner',
+        'conversation_id':'conversation', 'event_id':'event', 'role':'user',
+        'text':'仅限这次会面；之后是否适用仍未知。', 'recorded_at':None})
+    source['binding'] = {'binding_id':'source:1'}
+    source.update(state='verified_snapshot', eligible_source=True, view='source')
+    source['limitations'].extend(['', '原文引用的是过去看法，不表示当下认同。'])
+    material = {'l1_document':doc, 'shared_statements':[], 'sources':[source], 'rings':[]}
+    projected = semantic_input_projection(material)
+    assert projected['sources'][0]['text'] == source['text']
+    assert projected['sources'][0]['source_recorded_at'] is None
+    assert projected['sources'][0]['limitations'] == ['原文引用的是过去看法，不表示当下认同。']
+    assert 'rings' not in projected
+    assert not {'eligible_source', 'state', 'view'} & projected['sources'][0].keys()

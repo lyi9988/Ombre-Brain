@@ -1956,8 +1956,8 @@ class ReflectionEngine(MemoryL1Runtime):
                     "session_id": str(turn.get("session_id") or ""),
                     "round_id": turn.get("round_id"),
                     "created_at": str(turn.get("created_at") or ""),
-                    "user_text": user_text[:1200],
-                    "assistant_text": assistant_text[:1200],
+                    "user_text": user_text,
+                    "assistant_text": assistant_text,
                     "model": str(turn.get("model") or ""),
                     "client": str(turn.get("client") or ""),
                     "route": str(turn.get("route") or ""),
@@ -2033,8 +2033,8 @@ class ReflectionEngine(MemoryL1Runtime):
                 {
                     **row,
                     "id": turn_id,
-                    "user_text": row["user_text"][:1200],
-                    "assistant_text": row["assistant_text"][:1200],
+                    "user_text": row["user_text"],
+                    "assistant_text": row["assistant_text"],
                 }
             )
         selected.sort(key=lambda item: (str(item.get("created_at") or ""), int(item.get("id") or 0)))
@@ -2878,12 +2878,34 @@ class ReflectionEngine(MemoryL1Runtime):
         max_candidates = self._daily_chat_memory_candidate_limit(effective_mode)
         if max_candidates == 0:
             return {"status": "disabled", "reason": "configured_candidate_limit_zero", "date": key, "mode": effective_mode}
+        if not force:
+            # Reuse the existing audit as a retry receipt. A window that itself
+            # exceeded the whole run budget cannot improve by paying for the
+            # identical request every scheduler tick. This check precedes even
+            # the optional summary calls. Manual rescan or a changed source,
+            # prompt, model route, or owner budget permits a fresh attempt.
+            blocked = {row.get("candidate_budget_block_key"): row
+                       for row in self._load_daily_chat_memory_run_audit()
+                       if row.get("date") == key and row.get("candidate_budget_block_key")}
+            if blocked:
+                for window in self._daily_chat_memory_extraction_windows(turns):
+                    receipt = blocked.get(self._daily_chat_memory_window_budget_key(key, window, max_candidates))
+                    if receipt:
+                        return {"status": "partial", "reason": "candidate_window_exceeds_total_budget_requires_change",
+                                "error_category": "candidate_window_exceeds_total_budget_requires_change",
+                                "date": key, "mode": effective_mode, "source_start_seq": raw_event_cursor_id,
+                                "processed_until_seq": raw_event_cursor_id, "cursor_updated": False,
+                                "candidate_budget": max_candidates,
+                                "required_candidate_count": receipt.get("required_candidate_count"),
+                                "retry_requires": "change_budget_source_prompt_or_route_or_manual_rescan"}
         min_confidence = self._daily_chat_memory_min_confidence_for_mode(effective_mode)
-        window_summaries = await self._summarize_daily_chat_memory_windows(
-            key,
-            turns,
-            self_context=self_context,
-        )
+        # Structured L1 reads the complete original sources directly. The old
+        # intermediate summaries were only counted, never consumed by L1.
+        # Keep that legacy pipeline and the independent summary capability.
+        window_summaries = []
+        if not self.memory_authority_enabled:
+            window_summaries = await self._summarize_daily_chat_memory_windows(
+                key, turns, self_context=self_context)
         run_id = hashlib.sha1(
             f"daily_chat_memory|{key}|{raw_event_cursor_id}|{datetime.now(timezone.utc).isoformat(timespec='seconds')}"
             .encode("utf-8")
@@ -2908,6 +2930,7 @@ class ReflectionEngine(MemoryL1Runtime):
             "model": "",
             "status": "failed",
             "error_category": "",
+            "summary_stage": "not_needed_for_source_based_l1" if self.memory_authority_enabled else "legacy",
             "prompt_version": "daily_chat_memory_v4.2",
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "completed_at": "",
@@ -2919,9 +2942,11 @@ class ReflectionEngine(MemoryL1Runtime):
             window_summaries=window_summaries,
             max_candidates=max_candidates,
             audit=audit,
+            mode=effective_mode,
+            min_confidence=min_confidence,
         )
-        audit["model_candidate_count"] = len(raw_candidates)
-        candidates = self._normalize_daily_chat_memory_candidates(
+        audit["model_candidate_count"] = extraction_meta.get("model_candidate_count", len(raw_candidates))
+        candidates = raw_candidates if extraction_meta.get("candidates_normalized") else self._normalize_daily_chat_memory_candidates(
             key,
             raw_candidates,
             turns,
@@ -2935,6 +2960,7 @@ class ReflectionEngine(MemoryL1Runtime):
         # checked); partial stops at the last successfully processed window; the
         # failed range is re-scanned on retry (idempotent, no double pending).
         partial = bool(extraction_meta.get("partial"))
+        partial_reason = str(extraction_meta.get("reason") or "window_extraction_failed")
         # A malformed semantic document is a preparation failure, not a genuine
         # zero-memory window. Keep its source range retryable after correction.
         if (audit.get('hard_rejects') or {}).get('invalid_l1_document'):
@@ -2946,22 +2972,27 @@ class ReflectionEngine(MemoryL1Runtime):
             else max(extraction_meta.get("last_processed_event_id") or 0, raw_event_cursor_id)
         )
         if not candidates and partial:
+            cursor_updated = (
+                self._update_daily_chat_memory_raw_cursor(profile_id, cursor_target, key)
+                if turn_source == "raw_events" and cursor_target > raw_event_cursor_id
+                else False
+            )
             audit["status"] = "partial"
-            audit["error_category"] = "window_extraction_failed"
+            audit["error_category"] = partial_reason
             audit["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self._store_daily_chat_memory_run_audit(audit)
             return {
                 "status": "partial",
-                "reason": "window_extraction_failed",
+                "reason": partial_reason,
                 "date": key,
                 "mode": effective_mode,
                 "turns": len(turns),
                 "source_start_seq": raw_event_cursor_id,
                 "source_end_seq": audit["source_end_seq"],
                 "processed_until_seq": cursor_target,
-                "cursor_updated": False,
+                "cursor_updated": cursor_updated,
                 "run_id": run_id,
-                "error_category": "window_extraction_failed",
+                "error_category": partial_reason,
             }
         empty_outputs = int(extraction_meta.get("empty_output_count") or 0)
         model_calls = int(extraction_meta.get("model_call_count") or 0)
@@ -3033,7 +3064,7 @@ class ReflectionEngine(MemoryL1Runtime):
             self._store_daily_chat_memory_run_audit(audit)
             return {
                 "status": "partial" if partial else "pending",
-                "reason": "window_extraction_failed" if partial else "",
+                "reason": partial_reason if partial else "",
                 "date": key,
                 "mode": effective_mode,
                 "turns": len(turns),
@@ -3071,6 +3102,11 @@ class ReflectionEngine(MemoryL1Runtime):
             }
             for candidate in candidates
         ]
+        if any(candidate.get("status") == "apply_failed" for candidate in candidates):
+            # Failed persistence must not consume its original source range.
+            partial = True
+            partial_reason = "candidate_persistence_failed"
+            cursor_target = raw_event_cursor_id
         cursor_updated = (
             self._update_daily_chat_memory_raw_cursor(profile_id, cursor_target, key)
             if turn_source == "raw_events" and cursor_target > raw_event_cursor_id
@@ -3078,12 +3114,13 @@ class ReflectionEngine(MemoryL1Runtime):
         )
         applied_count = sum(1 for candidate in candidates if candidate.get("status") == "applied")
         audit["status"] = "partial" if partial else ("success" if write_result.get("created") else "exists")
+        audit["error_category"] = partial_reason if partial else ""
         audit["auto_applied_count"] = applied_count
         audit["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self._store_daily_chat_memory_run_audit(audit)
         return {
             "status": "partial" if partial else ("created" if write_result.get("created") else "exists"),
-            "reason": "window_extraction_failed" if partial else "",
+            "reason": partial_reason if partial else "",
             "date": key,
             "mode": effective_mode,
             "turns": len(turns),
@@ -3859,6 +3896,8 @@ class ReflectionEngine(MemoryL1Runtime):
         window_summaries: list[dict] | None = None,
         max_candidates: int | None = None,
         audit: dict | None = None,
+        mode: str | None = None,
+        min_confidence: float | None = None,
     ) -> tuple[list[dict], dict]:
         """V4 full-day windowed extraction.
 
@@ -3898,38 +3937,52 @@ class ReflectionEngine(MemoryL1Runtime):
             if normalize_task_routes((self.config.get("reflection") or {}).get("memory_task_routes"))["auto_l1"]["connection"] != "legacy":
                 meta.update(partial=True, window_failures=1, reason=route["unavailable_reason"])
                 return [], meta
-            heuristic = self._heuristic_daily_chat_memory_candidates(
-                key,
-                turns,
-                max_candidates=max_candidates,
-            )
-            return heuristic, meta
-        windows = self._daily_chat_memory_extraction_windows(turns)
+        from memory_daily_windows import daily_memory_windows, safe_prefix_event_id
+        plans = daily_memory_windows(turns,
+            window_turns=self.daily_chat_memory_window_turns,
+            stride_turns=self.daily_chat_memory_window_stride_turns,
+            max_input_chars=self.daily_chat_memory_window_max_input_chars)
+        windows = [plan.turns for plan in plans]
+        candidate_budget = int(max_candidates or self.daily_chat_memory_max_per_day or 1)
+        meta["candidates_normalized"] = mode is not None
+        meta["model_candidate_count"] = 0
         if audit is not None:
             audit["window_count"] = len(windows)
+            audit["processed_window_count"] = 0
+            audit["source_char_target_exceeded_windows"] = [
+                index + 1 for index, plan in enumerate(plans) if plan.exceeds_char_target]
         raw_candidates: list[dict] = []
-        processed_event_id = 0
+        processed_stop = 0
         for index, window in enumerate(windows):
-            window_max_event = max(
-                (int(v) for turn in window for v in (turn.get("raw_event_ids") or []) if str(v).isdigit()),
-                default=0,
-            )
+            remaining = candidate_budget - len(raw_candidates)
+            if index >= self.daily_chat_memory_max_windows_per_run or remaining <= 0:
+                meta.update(partial=True, reason=("window_budget_exhausted"
+                    if index >= self.daily_chat_memory_max_windows_per_run else "candidate_budget_exhausted"))
+                break
             if self._daily_chat_memory_window_is_noise(window):
-                processed_event_id = max(processed_event_id, window_max_event)
+                processed_stop = plans[index].next_start
                 meta["skipped_noise_window_count"] += 1
                 if audit is not None:
                     audit["skipped_noise_window_count"] = meta["skipped_noise_window_count"]
+                    audit["processed_window_count"] = index + 1
                 continue
             try:
-                window_candidates, window_stats = await self._extract_window_candidates(
-                    key,
-                    window,
-                    self_context=self_context,
-                    max_candidates=max_candidates,
-                    window_index=index + 1,
-                    window_total=len(windows),
-                )
-                meta["model_call_count"] += 1
+                if client:
+                    window_candidates, window_stats = await self._extract_window_candidates(
+                        key,
+                        window,
+                        self_context=self_context,
+                        max_candidates=remaining,
+                        window_index=index + 1,
+                        window_total=len(windows),
+                    )
+                    meta["model_call_count"] += 1
+                else:
+                    # The legacy fallback shares the same full-window budget
+                    # and continuation semantics as the model path.
+                    window_candidates = self._heuristic_daily_chat_memory_candidates(
+                        key, window, max_candidates=len(window) + 1)
+                    window_stats = {}
                 if window_stats.get("empty_output"):
                     meta["empty_output_count"] += 1
                     logger.warning(
@@ -3944,6 +3997,51 @@ class ReflectionEngine(MemoryL1Runtime):
                     audit["model_call_count"] = meta["model_call_count"]
                     audit["empty_output_count"] = meta["empty_output_count"]
                     audit["parse_failure_count"] = meta["parse_failure_count"]
+                meta["model_candidate_count"] += len(window_candidates)
+                if window_stats.get("empty_output") or window_stats.get("parse_failure"):
+                    # A provider failure is not an intentional empty candidate
+                    # list. Retain this window's sources for recovery.
+                    meta.update(partial=True, reason="empty_model_outputs" if window_stats.get("empty_output")
+                                else "window_parse_failure", failed_window_index=index + 1)
+                    break
+                if mode is not None:
+                    window_audit = {}
+                    window_candidates = self._normalize_daily_chat_memory_candidates(
+                        key, window_candidates, window,
+                        # Validate the complete response before applying the run
+                        # budget. Never hide overflow behind normalization's cap.
+                        max_candidates=max(1, len(window_candidates) + 1),
+                        min_confidence=min_confidence, mode=mode, audit=window_audit)
+                    if audit is not None:
+                        for field in ("hard_rejects", "soft_flags"):
+                            for reason, count in window_audit.get(field, {}).items():
+                                aggregate = audit.setdefault(field, {})
+                                aggregate[reason] = aggregate.get(reason, 0) + count
+                        audit["merged_duplicates"] = audit.get("merged_duplicates", 0) + window_audit.get("merged_duplicates", 0)
+                        audit.setdefault("l1_issues", []).extend(window_audit.get("l1_issues", []))
+                    if window_audit.get("hard_rejects", {}).get("invalid_l1_document"):
+                        meta.update(partial=True, reason="invalid_l1_document", failed_window_index=index + 1)
+                        break
+                    unique = []
+                    for candidate in window_candidates:
+                        if self._daily_chat_memory_exact_duplicate(candidate, raw_candidates + unique):
+                            if audit is not None:
+                                audit["merged_duplicates"] = audit.get("merged_duplicates", 0) + 1
+                        else:
+                            unique.append(candidate)
+                    window_candidates = unique
+                if len(window_candidates) > remaining:
+                    # No candidate in this window is consumed. The previous
+                    # window's overlap-safe cursor keeps this entire range
+                    # available for a fresh run with its full owner budget.
+                    meta.update(partial=True, reason="candidate_window_exceeds_remaining_budget",
+                                failed_window_index=index + 1,
+                                candidate_overflow_count=len(window_candidates) - remaining)
+                    if audit is not None and len(window_candidates) > candidate_budget:
+                        audit["candidate_budget_block_key"] = self._daily_chat_memory_window_budget_key(
+                            key, window, candidate_budget)
+                        audit["required_candidate_count"] = len(window_candidates)
+                    break
             except Exception as exc:
                 logger.warning("Daily chat memory window %s extraction failed: %s", index + 1, exc)
                 meta["partial"] = True
@@ -3953,45 +4051,36 @@ class ReflectionEngine(MemoryL1Runtime):
                     audit["window_failures"] = 1
                     audit["partial"] = True
                 break
-            processed_event_id = max(processed_event_id, window_max_event)
+            processed_stop = plans[index].next_start
             raw_candidates.extend(window_candidates)
-        meta["last_processed_event_id"] = processed_event_id
+            if audit is not None:
+                audit["processed_window_count"] = index + 1
+        meta["last_processed_event_id"] = safe_prefix_event_id(turns, processed_stop)
+        if audit is not None:
+            audit["partial"] = meta["partial"]
+            if meta["partial"]:
+                audit["error_category"] = meta.get("reason") or "window_extraction_failed"
         return raw_candidates, meta
 
     def _daily_chat_memory_extraction_windows(self, turns: list[dict]) -> list[list[dict]]:
-        """Deterministic pre-filtered, bounded windows covering the whole day.
+        """Complete-source plan; per-run budgets are applied during extraction."""
+        from memory_daily_windows import daily_memory_windows
+        return [window.turns for window in daily_memory_windows(turns,
+            window_turns=self.daily_chat_memory_window_turns,
+            stride_turns=self.daily_chat_memory_window_stride_turns,
+            max_input_chars=self.daily_chat_memory_window_max_input_chars)]
 
-        Window size/stride adapt so the entire day fits within the per-run model
-        call budget; the per-window input is also bounded by characters."""
-        if not turns:
-            return []
-        size = self.daily_chat_memory_window_turns
-        stride = self.daily_chat_memory_window_stride_turns
-        max_windows = self.daily_chat_memory_max_windows_per_run
-        total_len = sum(
-            len(str(turn.get("user_text") or "")) + len(str(turn.get("assistant_text") or ""))
-            for turn in turns
-        )
-        if len(turns) > size:
-            needed = (len(turns) - size) // stride + 2
-            if needed > max_windows:
-                size = max(4, -(-len(turns) // max_windows))
-                stride = max(1, size // 2)
-        avg_len = max(1, total_len // max(1, len(turns)))
-        char_bounded_size = max(
-            4,
-            min(size, self.daily_chat_memory_window_max_input_chars // max(1, avg_len)),
-        )
-        size = char_bounded_size
-        stride = min(stride, size)
-        windows: list[list[dict]] = []
-        start = 0
-        while start < len(turns):
-            windows.append(turns[start : start + size])
-            if start + size >= len(turns):
-                break
-            start += stride
-        return windows
+    def _daily_chat_memory_window_budget_key(self, key: str, window: list[dict], budget: int) -> str:
+        """Metadata-only fingerprint for an unchanged over-budget retry."""
+        route = self._memory_task_route("auto_l1")
+        payload = {"date": key, "window": window, "candidate_budget": budget,
+                   "window_turns": self.daily_chat_memory_window_turns,
+                   "stride_turns": self.daily_chat_memory_window_stride_turns,
+                   "char_target": self.daily_chat_memory_window_max_input_chars,
+                   "route": {name: value for name, value in route.items() if name != "client"},
+                   "prompt": self._daily_chat_memory_prompt(max_candidates=budget)}
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                        default=str).encode("utf-8")).hexdigest()
 
     @classmethod
     def _daily_chat_memory_window_is_noise(cls, window: list[dict]) -> bool:
@@ -4039,6 +4128,9 @@ class ReflectionEngine(MemoryL1Runtime):
         prompt_context = None
         if self.memory_authority_enabled and self.memory_authority_store:
             l1_payload, l1_sources, l1_catalog_context = self._memory_l1_daily_context(window)
+            from identity import model_identity
+            payload['identity'] = model_identity(self.config)
+            payload.pop('conversation_turns', None)
             payload["l1_contract"] = l1_payload
             prompt, prompt_context = self._memory_l1_prompt("ombre.daily_chat_memory_prompt",
                 runtime_values={"max_candidates": max(1, int(max_candidates or self.daily_chat_memory_max_per_day or 1))})
@@ -4062,6 +4154,10 @@ class ReflectionEngine(MemoryL1Runtime):
                 remaining -= len(excerpt)
             if comparisons:
                 payload["existing_source_memories"] = comparisons
+        if "l1_contract" in payload:
+            # Keep sources in the middle and the output contract last, including
+            # when comparison-only records have been added above.
+            payload["l1_contract"] = payload.pop("l1_contract")
         response = await self._daily_chat_memory_create_completion(
             client,
             model=model,
@@ -4087,10 +4183,15 @@ class ReflectionEngine(MemoryL1Runtime):
         if stats['finish_reason'] == 'length':
             from memory_l1_service import L1OwnerError
             raise L1OwnerError('first_pass_output_incomplete', field_path='generation')
+        from memory_l1_api import validate_response
+        validate_response(response)
         parsed = self._parse_json_object(raw or "")
         candidates = parsed.get("candidates") if isinstance(parsed, dict) else []
         if not isinstance(candidates, list):
             stats["parse_failure"] = bool(str(raw or "").strip())
+            if l1_sources is not None:
+                from memory_l1_service import L1OwnerError
+                raise L1OwnerError('first_pass_candidates_required', field_path='candidates')
             return [], stats
         result = [item for item in candidates if isinstance(item, dict)]
         if l1_sources is not None:
@@ -4102,7 +4203,7 @@ class ReflectionEngine(MemoryL1Runtime):
                     item["l1_state"] = "legacy_body_only"
                     continue
                 from memory_l1_semantic_wire import assemble_document
-                draft = assemble_document(draft)
+                draft = assemble_document(draft, require_keywords=True)
                 item['document'] = draft
                 item["content"] = draft.get("narrative", {}).get("body", "")
                 item["title"] = draft.get("narrative", {}).get("title", "")
@@ -6267,18 +6368,8 @@ class ReflectionEngine(MemoryL1Runtime):
     @staticmethod
     def _normalize_diary_memory_kind(value: Any) -> str:
         kind = str(value or "").strip()
-        allowed = {
-            "key_event",
-            "stable_preference",
-            "boundary",
-            "signal",
-            "commitment",
-            "project_state",
-            "relationship_anchor",
-            "self_insight",
-            "love_letter",
-        }
-        return kind if kind in allowed else ""
+        from memory_l1_api import AUTO_KINDS
+        return kind if kind in AUTO_KINDS else ""
 
     def _normalize_auto_memory_kind(
         self,
@@ -6717,6 +6808,7 @@ class ReflectionEngine(MemoryL1Runtime):
         use_daily_client: bool,
         task_stage: str | None = None,
         task_route: dict | None = None,
+        model_io_id: str | None = None,
     ) -> Any:
         if task_stage is not None:
             from memory_task_routes import completion_options as stage_options
@@ -6724,6 +6816,17 @@ class ReflectionEngine(MemoryL1Runtime):
             if not route["configured"]:
                 raise RuntimeError("memory_task_" + route["unavailable_reason"] + ":" + task_stage)
             client, model = route["client"], route["model"]
+            from memory_task_routes import L1_STAGES
+            if task_stage in L1_STAGES and getattr(self, 'memory_authority_enabled', False):
+                from memory_l1_api import create_completion
+                capture = None
+                if model_io_id:
+                    from memory_model_io import MemoryModelIO
+                    recorder = MemoryModelIO(self.memory_authority_store)
+                    capture = lambda wire: recorder.requested(model_io_id, wire,
+                        timeout_seconds=route.get('timeout_seconds', 180))
+                return await create_completion(client, model=model, messages=messages,
+                    route=route, temperature=temperature, capture=capture)
             completion_options = stage_options(route, temperature=temperature)
         else:
             completion_options = self._completion_options(

@@ -7,6 +7,8 @@ STAGES = ("auto_l1", "chat_l1", "action_l1", "diary_l1", "presentation_l2",
           "chat_summary", "activity_summary")
 DEFAULT_ROUTE = {"connection": "legacy", "model": "", "thinking_mode": "inherit",
                  "reasoning_effort": "", "max_tokens": None}
+L1_STAGES = frozenset(("auto_l1", "chat_l1", "action_l1", "diary_l1"))
+L1_DEFAULTS = {"thinking_mode": "enabled", "reasoning_effort": "low", "max_tokens": 32000}
 
 
 def normalize_task_routes(raw=None):
@@ -19,7 +21,7 @@ def normalize_task_routes(raw=None):
         value = raw.get(stage, {})
         if not isinstance(value, dict) or set(value) - set(DEFAULT_ROUTE):
             raise ValueError("invalid_memory_task_route:" + stage)
-        row = {**DEFAULT_ROUTE, **value}
+        row = {**DEFAULT_ROUTE, **(L1_DEFAULTS if stage in L1_STAGES else {}), **value}
         if row["connection"] not in ("legacy", "reflection", "dehydration", "daily"):
             raise ValueError("invalid_memory_task_connection:" + stage)
         if not isinstance(row["model"], str) or len(row["model"]) > 200:
@@ -90,6 +92,7 @@ def resolve_task_route(engine, stage, default_max_tokens=None):
     return {"stage": stage, "connection": source, "client": client, "model": str(model or ""),
             "thinking_mode": str(thinking or ""), "reasoning_effort": row["reasoning_effort"],
             "max_tokens": row["max_tokens"] if row["max_tokens"] is not None else default_max_tokens,
+            "timeout_seconds": reflection.get("daily_chat_memory_timeout_seconds", 180) if stage in L1_STAGES else None,
             "configured": configured,
             "unavailable_reason": "" if configured else "connection_unconfigured" if client is None else "model_unconfigured",
             "model_source": "stage" if row["model"] else source,

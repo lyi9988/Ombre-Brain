@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 
@@ -10,6 +11,20 @@ import httpx
 
 from memory_l1_ingestion import source_snapshot
 from memory_l1_service import L1OwnerError
+
+
+def canonical_recorded_at(source):
+    """Keep the authority's record time; never substitute event or local time."""
+    recorded = source.get('recorded_at')
+    if isinstance(recorded, str) and recorded.strip():
+        return recorded
+    milliseconds = source.get('created_at_ms')
+    if type(milliseconds) not in (int, float):
+        return None
+    try:
+        return datetime.fromtimestamp(milliseconds / 1000, timezone.utc).isoformat()
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 class LocalMemorySourceReader:
@@ -84,7 +99,7 @@ class CanonicalMemorySourceReader:
         if result.get('source_id') != locator['event_id'] or result.get('source_revision') != version:
             return {'state': 'unavailable', 'reason': 'source_identity_mismatch'}
         actual = {**locator, 'namespace': 'canonical_event', 'text': result['text'], 'version_id': version,
-                  'recorded_at': result.get('recorded_at')}
+                  'recorded_at': canonical_recorded_at(result)}
         return source_snapshot(actual)
 
 
