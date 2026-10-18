@@ -37,7 +37,7 @@ def _gateway_runtime(monkeypatch):
     # The runtime is imported under a private alias. Its small pure dependencies
     # are loaded by path from the Gateway checkout so Brain's modules do not
     # shadow the implementation under test.
-    for name in ("memory_recall_semantics", "memory_system_config", "utils"):
+    for name in ("memory_recall_semantics", "memory_system_config", "utils", "memory_readable_projection"):
         path = gateway_root / f"{name}.py"
         spec = importlib.util.spec_from_file_location(name, path)
         assert spec and spec.loader
@@ -123,12 +123,8 @@ def _gateway_service(view, token):
     def wrapper(source_id, *, runtime_values):
         if source_id != "ombre.memory_usage_card_prompt":
             return ""
-        return (
-            f'{runtime_values.get("header", "")}\n'
-            f'{runtime_values.get("statements", "")}\n'
-            "Historical narrative (record date is not event date):\n"
-            f'{runtime_values.get("narrative", "")}'
-        )
+        from prompt_source_registry import factory_body, render_runtime_placeholders
+        return render_runtime_placeholders(source_id, factory_body(source_id), runtime_values)
 
     return NS(
         config={"memory_system": {}}, gateway_token=token,
