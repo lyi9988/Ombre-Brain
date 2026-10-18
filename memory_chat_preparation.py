@@ -226,7 +226,7 @@ async def prepare_chat_tasks(engine, bucket_mgr):
     """Runs outside the chat request; never executes the original tool again."""
     from chat_memory_tool import ChatMemoryTool
     from memory_l1_ingestion import bind_sources
-    from memory_l1_semantic_wire import assemble_document, semantic_contract
+    from memory_l1_semantic_wire import assemble_document, semantic_contract, semantic_sources
     from memory_source_provenance import canonical_source
     from memory_l1_runtime import task_options
     if getattr(engine, '_chat_preparation_running', False):
@@ -282,13 +282,15 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 payload = {'input_kind': 'chat_authored_draft', 'draft': envelope['arguments'],
                     'semantic_contract': semantic_contract([b['binding_id'] for b in bindings], catalog=catalog),
                     'narrative_from_draft': True, 'catalog_revision': catalog_revision,
-                    'sources': [{'binding_id': b['binding_id'], 'text': s['text'], 'author': s['author'],
-                                 'recorded_at': s['recorded_at']} for s, b in zip(snapshots, bindings)]}
+                    'sources': semantic_sources(snapshots, bindings)}
                 serialized_payload = json.dumps(payload, ensure_ascii=False)
                 input_metrics = {'contract': 'semantic-v1', 'catalog_revision': catalog_revision,
                     'system_characters': len(prompt), 'payload_characters': len(serialized_payload),
                     'payload_utf8_bytes': len(serialized_payload.encode('utf-8')),
                     'components': {key: len(json.dumps(value, ensure_ascii=False)) for key, value in payload.items()}}
+                from memory_task_routes import completion_options
+                input_metrics['completion_parameters'] = {'model': model,
+                    **completion_options(route, temperature=engine.temperature)}
                 completion_meta['input_metrics'] = input_metrics
                 response = await engine._daily_chat_memory_create_completion(client, model=model,
                     messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': serialized_payload}],
@@ -302,6 +304,10 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                                     else getattr(token_details, 'reasoning_tokens', None))
                 if type(reasoning_tokens) is int:
                     usage['reasoning_tokens'] = reasoning_tokens
+                for name in ('prompt_cache_hit_tokens', 'prompt_cache_miss_tokens'):
+                    count = getattr(reported_usage, name, None)
+                    if type(count) is int:
+                        usage[name] = count
                 raw_output = engine._completion_content(response) or ''
                 generation = {'prompt_revision': prompt_context['prompt_revision'],
                     'model_route_revision': 'route_sha256:' + semantic_sha256({k: v for k, v in route.items() if k != 'client'}),
@@ -319,6 +325,8 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 from memory_l1_ingestion import MODEL_FIELDS
                 output_shape = {'draft_revision': claimed['draft_revision'],
                     'attempt': claimed['attempts'],
+                    'finish_reason': engine._completion_finish_reason(response),
+                    'output_characters': len(raw_output),
                     'top_level_keys': sorted(parsed) if isinstance(parsed, dict) else [],
                     'normalization': 'document_wrapper' if isinstance(parsed, dict)
                         and isinstance(parsed.get('document'), dict) else 'unrecognized'}

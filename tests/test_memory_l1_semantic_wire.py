@@ -7,7 +7,7 @@ from memory_l1_catalog_schema import model_document_schema
 from memory_l1_contract import L1ContractError
 from memory_l1_ingestion import prepare_model_document
 from memory_l1_schema import catalog_with_defaults, unknown
-from memory_l1_semantic_wire import assemble_document, semantic_contract
+from memory_l1_semantic_wire import assemble_document, semantic_contract, semantic_sources
 from memory_l1_service import L1OwnerError
 from test_memory_l1_ingestion_p2c import setup
 
@@ -135,3 +135,58 @@ def test_single_catalog_view_retains_owner_semantics_without_repeated_machine_sc
     assert '$defs' not in json.dumps(contract)
     old = {'document_schema': model_document_schema(['source:1'], catalog=catalog), 'catalog': catalog}
     assert len(json.dumps(contract, ensure_ascii=False)) < len(json.dumps(old, ensure_ascii=False)) * .65
+
+
+def test_explicit_unknown_scope_expands_without_inventing_event_or_validity(tmp_path):
+    service, source, _, generation = setup(tmp_path)
+    source['recorded_at'] = '2026-10-18T06:08:33Z'
+    draft = compact()
+    draft['statements'][0]['time'] = {'event': None,
+        'applicability': {'temporal_scope': 'unknown'}}
+    assembled = assemble_document(draft, narrative={'body': '完整回忆'})
+    result = prepare_model_document(service, memory_id='m1', document=assembled,
+        sources=[source], generation=generation, request_id='unknown-scope')
+    time = result['statements'][0]['time']
+    assert time['event']['start'] == unknown()
+    assert time['event']['end'] == unknown()
+    assert time['applicability']['start'] == unknown()
+    assert time['applicability']['end'] == unknown()
+    assert result['statements'][0]['conditions']['state'] == 'not_stated'
+
+
+def test_sparse_known_event_preserves_supplied_time_and_special_unknown_states(tmp_path):
+    service, source, _, generation = setup(tmp_path)
+    draft = compact()
+    draft['statements'][0]['time'] = {
+        'event': {'start': '2026-09-10', 'precision': 'day', 'interpretation': 'instant'},
+        'applicability': {'temporal_scope': 'unknown', 'end': {'state': 'unresolved'}}}
+    result = prepare_model_document(service, memory_id='m1',
+        document=assemble_document(draft, narrative={'body': '那次的完整回忆'}),
+        sources=[source], generation=generation, request_id='explicit-date')
+    time = result['statements'][0]['time']
+    assert time['event']['start']['value'] == '2026-09-10'
+    assert time['event']['precision'] == 'day'
+    assert time['event']['end'] == unknown() and time['event']['timezone'] == unknown()
+    assert time['applicability']['end']['state'] == 'unresolved'
+
+
+@pytest.mark.parametrize('time', [{}, {'event': None}, {'event': {}, 'applicability': None},
+                                  {'event': None, 'applicability': {}}])
+def test_time_semantic_decisions_are_still_required(time):
+    draft = compact()
+    draft['statements'][0]['time'] = time
+    with pytest.raises(L1OwnerError, match='semantic_fields_required'):
+        assemble_document(draft, narrative={'body': '正文'})
+
+
+def test_model_source_view_preserves_evidence_without_managed_identity_or_time_alias():
+    snapshots = [{'text': '未裁剪的原文。' * 1500, 'author': 'user',
+                  'recorded_at': '2026-10-18T06:08:33Z', 'source_revision': 'program-only'}]
+    bindings = [{'binding_id': 'source:1', 'source_revision': 'program-only', 'anchors': [{'sha': 'program-only'}]}]
+    original = copy.deepcopy((snapshots, bindings))
+    projected = semantic_sources(snapshots, bindings)
+    assert (snapshots, bindings) == original
+    assert projected == [{'binding_id': 'source:1', 'text': snapshots[0]['text'], 'author': 'user',
+                          'source_recorded_at': '2026-10-18T06:08:33Z'}]
+    with pytest.raises(L1OwnerError, match='source_binding_count_mismatch'):
+        semantic_sources(snapshots, [])

@@ -12,7 +12,7 @@ import math
 
 from memory_l1_contract import canonical_json, make_text_anchor, semantic_sha256
 from memory_l1_ingestion import bind_sources, expand_model_document, model_template, prepare_model_document
-from memory_l1_semantic_wire import assemble_document, semantic_contract
+from memory_l1_semantic_wire import assemble_document, semantic_contract, semantic_sources
 from memory_l1_schema import document_template, join_document, split_document
 from memory_l1_service import L1OwnerError, MemoryL1RevisionService
 from memory_source_provenance import daily_sources
@@ -132,8 +132,8 @@ class MemoryL1Runtime:
                 payload = {'input_kind': 'completed_action_receipt', 'conversation_turns': [],
                     'l1_contract': {'semantic_contract': semantic_contract([b['binding_id'] for b in bindings], catalog=catalog),
                         'catalog_revision': catalog_revision,
-                        'source_bindings': bindings, 'source_texts': [{'binding_id': 'source:1', 'text': source['text'],
-                            'author': source.get('author'), 'coverage': source.get('coverage')}]} }
+                        'source_texts': [{**semantic_sources(snapshots, bindings)[0],
+                            'coverage': source.get('coverage')}]} }
                 response = await self._daily_chat_memory_create_completion(client, model=model,
                     messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}],
                     max_tokens=self.daily_chat_memory_candidate_max_tokens, temperature=self.temperature,
@@ -215,9 +215,7 @@ class MemoryL1Runtime:
         snapshots, bindings = bind_sources(sources)
         return {'semantic_contract': semantic_contract([b['binding_id'] for b in bindings], catalog=catalog),
                 'catalog_revision': catalog_revision,
-                'source_bindings': bindings,
-                'source_texts': [{'binding_id': b['binding_id'], 'text': s['text'], 'author': s['author'],
-                    'recorded_at': s['recorded_at']} for s, b in zip(snapshots, bindings)]}, sources, (copy.deepcopy(catalog), catalog_revision)
+                'source_texts': semantic_sources(snapshots, bindings)}, sources, (copy.deepcopy(catalog), catalog_revision)
 
     def _memory_l1_daily_document(self, candidate, memory_id):
         sources = candidate.get('_l1_sources')
@@ -365,8 +363,10 @@ class MemoryL1Runtime:
             end = min(start + width, len(text))
             anchor = make_text_anchor(text, target_namespace='l0', target_id=source['source_id'],
                 target_revision=source['source_revision'], text_view_id=source['text_view_id'], start=start, end=end)
-            payload = {'date': key, 'source': {k: v for k, v in source.items() if k != 'text'},
-                'source_text': text[start:end], 'input_range': {'start': start, 'end': end}, 'source_anchor': anchor,
+            payload = {'date': key, 'source': {**{k: source.get(k) for k in
+                    ('title', 'author', 'speaker', 'kind', 'limitations')},
+                    'source_recorded_at': source.get('recorded_at')},
+                'source_text': text[start:end], 'input_range': {'start': start, 'end': end},
                 'binding_id': binding['binding_id'], 'semantic_contract': semantic_contract([binding['binding_id']], catalog=catalog),
                 'catalog_revision': catalog_revision, 'options': options,
                 'existing_members': {module: (previous or {}).get(module, []) for module in ('entities', 'scenes', 'statements', 'relations')},

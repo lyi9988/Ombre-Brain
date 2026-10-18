@@ -78,6 +78,8 @@ def test_memory_l2_generation_options_have_bounded_defaults():
 def test_diary_actual_task_covers_all_segments_and_prepares_full_root_and_scene_bodies(tmp_path, compact):
     text = ('合成日记正文🙂，这是完整资料。' * 90)
     env, engine, calls = runtime(tmp_path, text, compact=compact)
+    env['source_state']['record'].update(title='仅标题中写明的阶段', speaker='顾衍',
+        author=None, kind='private', created_at='2026-10-18T06:08:33Z')
     result = run(engine._memory_l1_diary_task(DAY, env['buckets']))
     assert result['status'] == 'pending'
     assert ''.join(call['source_text'] for call in calls) == text
@@ -87,6 +89,12 @@ def test_diary_actual_task_covers_all_segments_and_prepares_full_root_and_scene_
     assert len(semantic['scenes']) == len(calls) > 1
     assert len(row['proposal']['metadata']['diary_l1_bundle']['scene_bodies']) == len(calls)
     for scene, call in zip(semantic['scenes'], calls):
+        assert {'title', 'author', 'speaker', 'kind', 'limitations', 'source_recorded_at'} == set(call['source'])
+        assert call['source']['title'] == '仅标题中写明的阶段'
+        assert call['source']['speaker'] == '顾衍' and call['source']['author'] is None
+        assert call['source']['kind'] == 'private'
+        assert call['source']['source_recorded_at'] == '2026-10-18T06:08:33Z'
+        assert 'source_anchor' not in call
         assert scene['anchors'][0]['start'] == call['input_range']['start']
         assert scene['anchors'][0]['end'] == call['input_range']['end']
     assert row['proposal']['proposed_body'].replace('我记下这个完整片段：', '').replace('\n\n', '') == text

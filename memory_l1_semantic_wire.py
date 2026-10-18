@@ -68,21 +68,31 @@ def _time(value, evidence):
     if result['event'] is None:
         result['event'] = defaults['event']
     else:
-        event = _shape(result['event'], ('start', 'end', 'precision', 'interpretation', 'timezone'), path='time.event')
+        event = _shape(result['event'], ('precision', 'interpretation'),
+                       ('start', 'end', 'timezone'), path='time.event')
         for key in ('start', 'end', 'timezone'):
-            event[key] = _value(event[key], evidence)
+            event[key] = _value(event[key], evidence) if key in event else deepcopy(defaults['event'][key])
         result['event'] = event
     if result['applicability'] is None:
         result['applicability'] = defaults['applicability']
     else:
-        scope = _shape(result['applicability'], ('temporal_scope', 'start', 'end'),
-                       ('scene_ref', 'recurrence_text'), 'time.applicability')
+        scope = _shape(result['applicability'], ('temporal_scope',),
+                       ('start', 'end', 'scene_ref', 'recurrence_text'), 'time.applicability')
         scope.setdefault('scene_ref', None)
         scope.setdefault('recurrence_text', None)
         for key in ('start', 'end'):
-            scope[key] = _value(scope[key], evidence)
+            scope[key] = _value(scope[key], evidence) if key in scope else deepcopy(defaults['applicability'][key])
         result['applicability'] = scope
     return result
+
+
+def semantic_sources(snapshots, bindings):
+    """Project source evidence for the model; keep identity/anchors in program custody."""
+    if len(snapshots) != len(bindings):
+        raise L1OwnerError('source_binding_count_mismatch', field_path='sources')
+    return [{'binding_id': binding['binding_id'], 'text': source['text'],
+             'author': source.get('author'), 'source_recorded_at': source.get('recorded_at')}
+            for source, binding in zip(snapshots, bindings)]
 
 
 def assemble_document(document, *, narrative=None):
@@ -202,11 +212,11 @@ def semantic_contract(source_ids, *, catalog):
                           'optional': {'statement_id': 'string', 'property': 'Property|null', 'attributes': 'Attribute[]',
                                        'role_hint': 'Value:core|detail', 'cognition': 'Cognition|null'}},
             'Time': {'event': 'EventTime|null', 'applicability': 'Applicability|null'},
-            'EventTime': {'start': 'Value:ISO8601', 'end': 'Value:ISO8601', 'timezone': 'Value:string',
-                          'precision': 'instant|day|month|year|approximate|unknown',
-                          'interpretation': 'instant|duration|uncertainty_window|unknown'},
-            'Applicability': {'temporal_scope': 'episode|time_range|recurring|unknown', 'start': 'Value:ISO8601',
-                              'end': 'Value:ISO8601', 'scene_ref?': 'scene_id|null', 'recurrence_text?': 'string|null'},
+            'EventTime': {'precision': 'instant|day|month|year|approximate|unknown',
+                          'interpretation': 'instant|duration|uncertainty_window|unknown',
+                          'start?': 'Value:ISO8601', 'end?': 'Value:ISO8601', 'timezone?': 'Value:string'},
+            'Applicability': {'temporal_scope': 'episode|time_range|recurring|unknown', 'start?': 'Value:ISO8601',
+                              'end?': 'Value:ISO8601', 'scene_ref?': 'scene_id|null', 'recurrence_text?': 'string|null'},
             'Condition': {'state': 'known|not_stated|unresolved|not_applicable', 'text?': 'string|null',
                           'predicate?': 'Predicate|null', 'evidence_refs?': 'source_id[]', 'exceptions?': 'ConditionException[]'},
             'ConditionException': {'state': 'known|not_stated|unresolved|not_applicable', 'text?': 'string|null',

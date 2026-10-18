@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+from datetime import datetime
 from types import SimpleNamespace as NS
 
 import pytest
@@ -91,6 +92,14 @@ def test_background_prepares_full_l1_preserves_body_and_uses_real_message_eviden
     assert len(calls) == 1
     assert calls[0]['narrative_from_draft'] is True
     assert 'semantic_contract' in calls[0]
+    assert datetime.fromisoformat(calls[0]['sources'][0]['source_recorded_at']) == datetime.fromisoformat(
+        envelope['context']['sources'][0]['created_at'].replace('Z', '+00:00'))
+    assert all(set(s) == {'binding_id', 'text', 'author', 'source_recorded_at'} for s in calls[0]['sources'])
+    assert l1['statements'][0]['time']['event']['start']['state'] == 'not_stated'
+    task = tasks.get(candidate_id(envelope['operation_id']))
+    assert task['input_metrics']['completion_parameters']['model'] == 'synthetic-model'
+    assert task['input_metrics']['completion_parameters']['max_tokens'] == 16000
+    assert task['output_shape']['finish_reason'] == 'stop'
     assert not {'document_schema', 'document_template', 'catalog'}.intersection(calls[0])
     asyncio.run(prepare_chat_tasks(engine, env['buckets']))
     assert len(calls) == 1
