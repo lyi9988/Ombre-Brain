@@ -12349,11 +12349,12 @@ async def api_daily_chat_memory_pending(request):
     if err:
         return err
     params = request.query_params
-    items = reflection_engine.list_daily_chat_memory_pending(
+    page = reflection_engine.daily_chat_memory_pending_page(
         status=str(params.get("status") or "pending"),
         limit=_int_between(params.get("limit"), 50, 1, 200),
+        offset=_int_between(params.get("offset"), 0, 0, 2147483647),
     )
-    return JSONResponse({"status": "ok", "items": items})
+    return JSONResponse({"status": "ok", **page})
 
 
 def _require_owner_or_internal_index_maintenance(request):
@@ -12620,13 +12621,14 @@ async def api_memory_l1_source_tasks(request):
             result = chat_tasks.edit(str(task_id), json.loads(raw))
             return JSONResponse(result, headers=headers)
         if request.method == "GET":
-            if set(request.query_params) - {"limit"} or len(request.query_params.getlist("limit")) > 1:
+            if set(request.query_params) - {"limit", "offset"} or any(len(request.query_params.getlist(key)) > 1 for key in ('limit', 'offset')):
                 raise L1OwnerError("invalid_task_query", field_path="query")
             value = request.query_params.get("limit", "100")
             if not value.isascii() or not value.isdigit(): raise L1OwnerError("invalid_task_page_limit", field_path="limit")
-            combined = tasks.list(limit=int(value)) + chat_tasks.list(limit=int(value))
-            combined.sort(key=lambda row: (row.get('created_at', ''), row['task_id']), reverse=True)
-            return JSONResponse({"status": "ok", "tasks": combined[:int(value)],
+            offset = request.query_params.get("offset", "0")
+            if not offset.isascii() or not offset.isdigit(): raise L1OwnerError("invalid_task_page_limit", field_path="offset")
+            page = tasks.page_with_chat(limit=int(value), offset=int(offset))
+            return JSONResponse({"status": "ok", **page,
                 "adoption_is_separate": True}, headers=headers)
         raw = await request.body()
         if len(raw) > 8192: return JSONResponse({"error": "request_too_large"}, status_code=413, headers=headers)
@@ -14982,12 +14984,7 @@ if __name__ == "__main__":
                         0,
                         10000,
                     )
-                    local_reflection_engine.daily_chat_memory_max_per_day = _int_between(
-                        reflection_cfg.get("daily_chat_memory_max_per_day"),
-                        3,
-                        0,
-                        10,
-                    )
+                    local_reflection_engine.refresh_daily_chat_memory_options(config)
                     results = await local_reflection_engine.run_due(
                         local_bucket_mgr,
                         local_persona_engine,

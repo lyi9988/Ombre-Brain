@@ -4,6 +4,9 @@
   var memoryRequests = new Map();
   var memoryLoadEpoch = 0;
   var memorySourceLoadEpoch = 0;
+  var memoryVisibleItems = [];
+  var memoryPage = {};
+  var sourceTaskPage = {};
   var memoryBusy = false;
   var memoryStateRestored = false;
   var sourceTaskDetails = new Map();
@@ -1468,13 +1471,14 @@
     captureMemoryDraft(card);
   }
 
-  function loadDailyChatMemoryPending() {
+  function loadDailyChatMemoryPending(append) {
     var target = document.getElementById('daily-chat-memory-pending');
     if (!target || memoryBusy) return;
-    loadMemorySourceTasks(target);
+    if (!append) loadMemorySourceTasks(target);
     captureMemoryDrafts();
     var epoch = ++memoryLoadEpoch;
-    return authFetch(dailyChatMemoryApiBase() + '/api/daily-chat-memory/pending?limit=100')
+    var offset = append ? Number(memoryPage.next_offset || 0) : 0;
+    return authFetch(dailyChatMemoryApiBase() + '/api/daily-chat-memory/pending?status=review_visible&limit=100&offset=' + offset)
       .then(function (res) {
         if (!res) throw new Error('未连接，保留当前内容和草稿');
         if (!res.ok) throw new Error('读取失败 (HTTP ' + res.status + ')');
@@ -1486,6 +1490,12 @@
         restoreMemoryState();
         captureMemoryDrafts();
         var items = (data && data.items) || [];
+        if (append) {
+          var merged = new Map(memoryVisibleItems.map(function(item) { return [item.id, item]; }));
+          items.forEach(function(item) { merged.set(item.id, item); }); items = Array.from(merged.values());
+        }
+        memoryVisibleItems = items.slice();
+        memoryPage = data || {};
         var seen = new Set(items.map(function (item) { return item.id; }));
         memoryDrafts.forEach(function (draft, id) {
           if (!seen.has(id) && memoryItems.has(id)) { items.push(Object.assign({}, memoryItems.get(id), { draft_orphan: true })); seen.add(id); }
@@ -1497,15 +1507,28 @@
         });
         items.forEach(function (item) { memoryItems.set(item.id, item); });
         target.innerHTML = renderDailyChatMemoryPending(items);
+        var paging = document.createElement('div'); paging.setAttribute('data-memory-pagination', '');
+        var count = document.createElement('p');
+        count.textContent = '已保存候选共 ' + Number(data.saved_total == null ? data.total || 0 : data.saved_total) +
+          ' 条；当前列表共 ' + Number(data.total || 0) + ' 条，已加载 ' + memoryVisibleItems.length + ' 条。';
+        paging.appendChild(count);
+        if (data.has_more) {
+          var more = document.createElement('button'); more.type = 'button'; more.textContent = '加载更多候选';
+          more.setAttribute('data-memory-load-more', '');
+          more.addEventListener('click', function() { more.disabled = true; loadDailyChatMemoryPending(true); });
+          paging.appendChild(more);
+        }
+        target.appendChild(paging);
         restoreDailyChatMemoryModelIoPanels(target);
         syncUncertainLocks();
       })
       .catch(function (e) {
       if (epoch === memoryLoadEpoch) setDailyChatMemoryMessage('读取失败，草稿保留: ' + e.message, 'error');
+      var more = target.querySelector('[data-memory-load-more]'); if (more) more.disabled = false;
       });
   }
 
-  function loadMemorySourceTasks(target) {
+  function loadMemorySourceTasks(target, append) {
     var panel = document.getElementById('memory-source-tasks');
     if (!panel) {
       panel = document.createElement('details'); panel.id = 'memory-source-tasks';
@@ -1520,15 +1543,28 @@
     var list = panel.querySelector('[data-source-task-list]');
     var notice = panel.querySelector('[data-source-task-notice]');
     var epoch = ++memorySourceLoadEpoch; notice.textContent = '正在刷新准备状态…';
-    authFetch(dailyChatMemoryApiBase() + '/api/memory-authority/source-tasks?limit=100').then(function(res) {
+    var offset = append ? Number(sourceTaskPage.next_offset || 0) : 0;
+    authFetch(dailyChatMemoryApiBase() + '/api/memory-authority/source-tasks?limit=100&offset=' + offset).then(function(res) {
       if (!res || !res.ok) throw new Error('暂不可读'); return res.json();
     }).then(function(data) {
       if (epoch !== memorySourceLoadEpoch) return;
       if (!data || !Array.isArray(data.tasks)) throw new Error('回执格式不符');
-      notice.textContent = '准备状态已刷新。';
       captureSourceTaskEditors(list);
-      sourceTaskTasks = data.tasks.slice();
+      if (append) {
+        var merged = new Map(sourceTaskTasks.map(function(task) { return [task.task_id, task]; }));
+        data.tasks.forEach(function(task) { merged.set(task.task_id, task); }); sourceTaskTasks = Array.from(merged.values());
+      } else sourceTaskTasks = data.tasks.slice();
+      sourceTaskPage = data;
+      notice.textContent = '已保存准备任务 ' + Number(data.total || 0) + ' 条，已加载 ' + sourceTaskTasks.length + ' 条。';
       renderSourceTaskList(list, target);
+      var more = panel.querySelector('[data-source-task-load-more]');
+      if (more) more.remove();
+      if (data.has_more) {
+        more = document.createElement('button'); more.type = 'button'; more.textContent = '加载更多准备任务';
+        more.setAttribute('data-source-task-load-more', '');
+        more.addEventListener('click', function() { more.disabled = true; loadMemorySourceTasks(target, true); });
+        panel.appendChild(more);
+      }
       sourceTaskTasks.forEach(function(task) {
         if (task && task.source_kind === 'chat_submission' && sourceTaskOpenIds.has(String(task.task_id || ''))) {
           var cached = sourceTaskDetails.get(String(task.task_id || ''));
@@ -1551,6 +1587,7 @@
     }).catch(function() {
       if (epoch !== memorySourceLoadEpoch) return;
       notice.textContent = '准备状态刷新失败；以下保留上次回执，可能已过期。已有候选和草稿保持。';
+      var more = panel.querySelector('[data-source-task-load-more]'); if (more) more.disabled = false;
     });
   }
 
@@ -1671,7 +1708,7 @@
     captureSourceTaskEditors(list);
     list.replaceChildren();
     var help = document.createElement('p');
-    help.textContent = '聊天提交稿与正式记忆采用分开。提交稿可在这里查看和编辑；候选生成后，请到下方现有 Review 卡片完成审核与完整 L1 编辑。行动结果继续显示在同一列表。这里只显示前100条任务。';
+    help.textContent = '聊天提交稿与正式记忆采用分开。提交稿可在这里查看和编辑；候选生成后，请到下方现有 Review 卡片完成审核与完整 L1 编辑。行动结果继续显示在同一列表；使用“加载更多准备任务”查看后续记录。';
     list.appendChild(help);
     if (!sourceTaskTasks.length) {
       var empty = document.createElement('p'); empty.textContent = '暂无来源提交任务。'; list.appendChild(empty); return;
@@ -2158,6 +2195,13 @@
     var sourceText = bindings.length ? '来源材料 ' + bindings.length + ' 项；具体引用见下方来源定位。'
       : (sourceParts.length ? sourceParts.join(' · ') : '未提供来源定位');
     var sourceHash = String(candidate.source_hash || '').slice(0, 8);
+    var preparation = item.preparation_status || candidate.preparation_status;
+    var preparationCounts = item.preparation_counts || candidate.preparation_counts || {};
+    var preparationLabels = { waiting_budget: '已保留，等待后续处理', stale_source: '来源已变化，保留原稿待核对', processed: '已处理',
+      requires_manual_retry: '原响应部分校验失败；完整合法稿已保存，补扫可重试错误部分' };
+    var preparationNote = preparation ? '<p class="chat-memory-edit-needed">' + esc(preparationLabels[preparation] || preparation) +
+      ' · 已生成 ' + Number(preparationCounts.generated || 0) + ' / 已排队 ' + Number(preparationCounts.queued || 0) +
+      ' / 已处理 ' + Number(preparationCounts.processed || 0) + ' / 已采用 ' + Number(preparationCounts.adopted || 0) + '</p>' : '';
     var staleNote = item.stale
       ? '<div class="chat-memory-stale">来源无法核对（' + esc(String(item.stale_reason || 'candidate_source_invalid')) + '），不可写入，请拒绝。</div>'
       : '';
@@ -2204,7 +2248,7 @@
         '<div class="chat-memory-source-panel" hidden>' +
           '<div class="chat-memory-source-loading">读取完整原文...</div>' +
         '</div>' +
-        '<div class="chat-memory-semantics">' + (l1Document ? renderL1ReviewDetails(item, l1Draft ? l1Draft.document : l1Document) : renderMemorySemantics(item, draft)) + '</div>' + staleNote + blockedNote + editNote +
+        preparationNote + '<div class="chat-memory-semantics">' + (l1Document ? renderL1ReviewDetails(item, l1Draft ? l1Draft.document : l1Document) : renderMemorySemantics(item, draft)) + '</div>' + staleNote + blockedNote + editNote +
         (draft ? '<p class="chat-memory-edit-needed">有未保存修改' + (item.draft_orphan || revision !== item.authority_revision ? '；服务器版本或状态已变化，请核对后再操作' : '') + '。</p>' : '') +
         '<div class="chat-memory-edit-panel"' + (draft && draft.expanded ? '' : ' hidden') + '>' +
           (l1Document ? renderL1EditPanel(item, l1Document, l1Draft) :
@@ -2571,6 +2615,10 @@
         var hard = run.hard_rejects || {};
         var hardText = Object.keys(hard).length ? Object.keys(hard).map(function (k) { return k + ':' + hard[k]; }).join('，') : '0';
         var statusText = run.status === 'zero_candidates' ? '0 条候选（窗口已全部检查）' : (run.status === 'degraded_empty_outputs' ? '空转（模型答复为空，未推水位）' : run.status);
+        var progress = run.progress;
+        var progressText = progress ? ' · 当前批窗口 ' + Number(progress.current_batch_completed_windows || 0) + '/' + Number(progress.current_batch_total_windows || 0) +
+          ' · 已保存候选 ' + Number(progress.generated_candidates_saved || 0) + ' · 剩余已生成待处理 ' + Number(progress.remaining_prepared_candidates || 0) +
+          ' · ' + (progress.state === 'complete' ? '该日期来源已整理完成' : progress.state === 'stopped' ? '整理已停止，待核对原因' : '全天仍在整理中') : '';
         return '<div class="chat-memory-run-item">' +
           '<div class="chat-memory-run-head">' + esc(run.date || '') + ' · ' + esc(statusText) + ' · ' + esc(String(run.completed_at || run.created_at || '').slice(0, 19)) + '</div>' +
           '<div class="chat-memory-run-meta">seq ' + esc(run.source_start_seq || 0) + '→' + esc(run.source_end_seq || 0) +
@@ -2583,7 +2631,7 @@
             ' · 硬拒绝 ' + esc(hardText) +
             ' · 进入Review ' + esc(run.pending_count || 0) +
             ' · 合并去重 ' + esc(run.merged_duplicates || 0) +
-            (run.error_category ? ' · 错误 ' + esc(run.error_category) : '') +
+            esc(progressText) + (run.error_category ? ' · 原因 ' + esc(run.error_category) : '') +
           '</div>' +
         '</div>';
       }).join('');
@@ -2594,7 +2642,7 @@
       runLines +
       '<div class="chat-memory-runs-actions">' +
         '<button type="button" class="chat-memory-rerun-btn" onclick="rerunDailyChatMemory(this)">补扫新增区间</button>' +
-        '<span class="chat-memory-runs-hint">仅扫描尚未处理区间；会发起一次真实模型调用并产生费用。</span>' +
+        '<span class="chat-memory-runs-hint">按窗口连续整理尚未处理区间；复用已生成稿，可能多次调用配置模型并产生费用。</span>' +
       '</div>' +
     '</div>';
   }
@@ -2614,7 +2662,7 @@
   }
 
   async function rerunDailyChatMemory(button) {
-    if (!confirm('确认补扫新增区间？这会发起一次真实模型调用并产生费用。')) return;
+    if (!confirm('确认连续整理新增区间？会复用已生成稿，按窗口调用配置模型并产生费用，直到该日期完成或遇到真实失败。')) return;
     button.disabled = true;
     try {
       var body = { request_id: newDailyChatMemoryRequestId() };
@@ -2628,6 +2676,8 @@
       if (!res.ok) throw new Error(data.error || '补扫失败');
       if (data.status === 'locked') {
         setDailyChatMemoryMessage('已有运行在进行中，请稍后再试。', 'error');
+      } else if (data.status === 'partial' || data.status === 'needs_review' || data.status === 'failed') {
+        setDailyChatMemoryMessage('整理尚未完成：' + String(data.reason || data.error_category || data.status) + '；已生成的候选保持可查看。', 'error');
       } else {
         setDailyChatMemoryMessage('补扫完成：' + (data.status === 'zero_candidates' ? '0 条候选（区间已检查）' : data.status + '，候选 ' + (data.candidates || []).length + ' 条'), 'ok');
       }

@@ -583,7 +583,29 @@ class GatewayStateStore:
         start_at: datetime,
         end_at: datetime,
         limit: int = 12,
+        chronological: bool = False,
+        after_turn_id: int = 0,
     ) -> list[dict[str, Any]]:
+        if chronological:
+            from raw_events import _date_range_predicate
+            safe_limit = max(0, min(10001, int(limit)))
+            conn = self._connect()
+            try:
+                conn.create_function("memory_in_date", 1, _date_range_predicate(start_at, end_at))
+                query = ("SELECT id,profile_id,session_id,round_id,created_at,user_text,assistant_text,model,client,route "
+                         "FROM conversation_turns WHERE profile_id=? AND id>? AND memory_in_date(created_at)=1 ORDER BY id ASC")
+                params = [str(profile_id or "default").strip() or "default", max(0, int(after_turn_id))]
+                if safe_limit:
+                    query += " LIMIT ?"
+                    params.append(safe_limit)
+                result = []
+                cursor = conn.execute(query, params)
+                while rows := cursor.fetchmany(256):
+                    result.extend({**dict(row), "user_text": row["user_text"] or "",
+                                   "assistant_text": row["assistant_text"] or ""} for row in rows)
+                return result
+            finally:
+                conn.close()
         safe_limit = max(1, min(80, int(limit or 12)))
         safe_profile_id = str(profile_id or "default").strip() or "default"
         conn = self._connect()

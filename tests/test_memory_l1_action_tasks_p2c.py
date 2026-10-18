@@ -24,6 +24,10 @@ class FakeCompletionClient:
         self.content = content
         self.calls = []
         self.chat = NS(completions=self)
+        self.base_url = 'https://offline.example/v1'
+
+    def with_options(self, **kwargs):
+        return self
 
     async def create(self, **kwargs):
         self.calls.append(copy.deepcopy(kwargs))
@@ -46,13 +50,14 @@ def setup(tmp_path, monkeypatch, mode='review'):
         assert action_id == 'action-a' and artifact_id == 'artifact-a'
         return copy.deepcopy(source)
     monkeypatch.setattr('memory_l1_source_readers.AizActionSourceReader.capture', capture)
-    draft = model_template()
-    draft['narrative'] = {'title': '浏览天文学之后', 'body': '我完成浏览，留下这次经历。' * 600}
-    statement = statement_template(); statement.pop('statement_revision_id')
-    statement.update(content='这次浏览了天文学资料。', evidence_refs=['source:current'])
-    draft['statements'] = [statement]
+    draft = {'format': 'semantic-v1', 'entities': [],
+        'narrative': {'title': '浏览天文学之后', 'body': '我完成浏览，留下这次经历。' * 600},
+        'retrieval': {'keywords': ['天文学']}, 'statements': [{
+            'content': '这次浏览了天文学资料。', 'subject_ref': None,
+            'classification': {'kind': 'experience', 'stability': 'episode', 'modality': 'assertion', 'basis': 'record'},
+            'time': None, 'conditions': None, 'evidence_refs': ['source:1']}]}
     client = FakeCompletionClient(json.dumps({'candidates': [
-        {'document': draft, 'kind': 'key_event', 'confidence': 0.9}]}))
+        {'document': draft, 'kind': 'key_event', 'confidence': 0.9, 'source_refs': ['source:1'], 'reason': '实际回执'}]}))
     engine.config['reflection']['memory_task_routes'] = {
         'action_l1': {
             'connection': 'dehydration',
@@ -85,9 +90,9 @@ def test_queue_is_identifiers_only_idempotent_and_conflicting_request_is_not_rep
 def test_action_semantic_draft_assembles_full_l1_with_original_receipt_and_route(tmp_path, monkeypatch):
     engine, buckets, tasks, payload, calls, source = setup(tmp_path, monkeypatch)
     engine.dehydration_client.content = json.dumps({'candidates': [{
-        'kind': 'key_event', 'confidence': 0.9, 'document': {
+        'kind': 'key_event', 'confidence': 0.9, 'source_refs': ['source:1'], 'reason': '实际回执', 'document': {
             'format': 'semantic-v1', 'narrative': {'title': '行动经验', 'body': '我完成浏览并留下完整经验。'},
-            'entities': [], 'statements': [{'content': '这次浏览了天文学资料。', 'subject_ref': None,
+            'entities': [], 'retrieval': {'keywords': ['天文学']}, 'statements': [{'content': '这次浏览了天文学资料。', 'subject_ref': None,
                 'classification': {'kind': 'experience', 'stability': 'episode', 'modality': 'assertion', 'basis': 'record'},
                 'time': None, 'conditions': None, 'evidence_refs': ['source:1']}]}}]})
     tasks.enqueue_action(payload)

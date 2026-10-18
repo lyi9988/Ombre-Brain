@@ -685,9 +685,9 @@ reflection:
   daily_chat_memory_mode: review   # review = pending candidates; auto = write selected Gateway chat memories; off = disabled
   daily_chat_memory_hour: 0        # organize the previous day's Gateway chats after local midnight
   daily_chat_memory_turn_limit: 0  # 0 = use all raw_events for that date; >0 caps restored turns
-  daily_chat_memory_max_per_day: 10 # cap for selected long-term memory candidates
+  daily_chat_memory_max_per_day: 10 # compatibility name: internal candidate batch size; the same job continues until the date is complete
   daily_chat_memory_min_confidence: 0.68 # auto-write threshold
-  daily_chat_memory_review_max_per_day: 10 # review mode can surface more candidates without auto-writing them
+  daily_chat_memory_review_max_per_day: 10 # internal Review batch size, not a daily candidate cap; all valid drafts are retained
   daily_chat_memory_review_min_confidence: 0.55 # review stays recall-friendly; owner filters. Strict confidence is auto-only (daily_chat_memory_min_confidence)
   daily_chat_memory_summary_enabled: true       # first compress chat windows (locate windows only), then extract candidates from original turns
   daily_chat_memory_summary_window_turns: 14    # overlapping context window so boundaries do not split causality

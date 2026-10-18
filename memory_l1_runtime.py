@@ -100,6 +100,7 @@ class MemoryL1Runtime:
         from memory_authority import MemoryProposal
         from memory_l1_source_readers import AizActionSourceReader
         from memory_l1_source_tasks import MemoryL1SourceTasks
+        from memory_candidate_preparation import MemoryCandidatePreparation
         tasks = MemoryL1SourceTasks(self.memory_authority_store)
         options = task_options(self.config)
         maximum = options['action_l1_jobs_per_run']
@@ -116,75 +117,105 @@ class MemoryL1Runtime:
         service = self._memory_l1_revisions(bucket_mgr)
         catalog, catalog_revision = service.catalog_provider()
         results = []
-        for task in tasks.list(limit=maximum, phase='queued'):
-            claimed = tasks.transition(task['task_id'], 'queued', 'generating')
+        queue = MemoryCandidatePreparation(self.memory_authority_store)
+        candidate_budget = self._daily_chat_memory_candidate_limit(mode)
+        for task in tasks.runnable(limit=maximum):
+            if candidate_budget <= 0: break
+            claimed = tasks.transition(task['task_id'], task['phase'], 'generating')
             if claimed is None: continue
             try:
-                source = await reader.capture(task['action_id'], task['artifact_id'])
-                if source.get('state') != 'available' or source.get('eligible_source') is not True:
-                    raise L1OwnerError('action_source_not_available', status=409, field_path='source')
-                raw_source = {'namespace': 'action_receipt', 'system': 'aizizhu',
-                    'conversation_id': reader.options.get('conversation_id', 'conv-jiajia-main'),
-                    'profile_id': self.memory_semantic_profile_id, 'event_id': task['action_id'],
-                    'version_id': task['artifact_id'], 'role': 'tool', 'text': source['text'],
-                    'recorded_at': source.get('recorded_at')}
-                snapshots, bindings = bind_sources([raw_source])
-                payload = {'input_kind': 'completed_action_receipt', 'conversation_turns': [],
-                    'l1_contract': {'semantic_contract': semantic_contract([b['binding_id'] for b in bindings], catalog=catalog),
-                        'catalog_revision': catalog_revision,
-                        'source_texts': [{**semantic_sources(snapshots, bindings)[0],
-                            'coverage': source.get('coverage')}]} }
-                response = await self._daily_chat_memory_create_completion(client, model=model,
-                    messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}],
-                    max_tokens=self.daily_chat_memory_candidate_max_tokens, temperature=self.temperature,
-                    use_daily_client=use_daily, task_stage='action_l1', task_route=route)
-                if self._completion_finish_reason(response) == 'length':
-                    raise L1OwnerError('first_pass_output_incomplete', field_path='generation')
-                from memory_l1_api import validate_response
-                validate_response(response)
-                parsed = self._parse_json_object(self._completion_content(response) or '')
-                candidates = parsed.get('candidates') if isinstance(parsed, dict) else None
-                if not isinstance(candidates, list) or len(candidates) > self._daily_chat_memory_candidate_limit(mode):
-                    raise L1OwnerError('action_task_result_invalid', field_path='candidates')
-                prepared = []
-                for index, item in enumerate(candidates):
-                    if not isinstance(item, dict) or not isinstance(item.get('document'), dict):
-                        raise L1OwnerError('model_document_fields_required', field_path='candidates')
-                    confidence = item.get('confidence', 0)
-                    if type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
-                        raise L1OwnerError('invalid_confidence', field_path='candidates.confidence')
-                    if type(item.get('sensitive', False)) is not bool:
-                        raise L1OwnerError('boolean_required', field_path='candidates.sensitive')
-                    memory_id = 'action_l1_' + hashlib.sha256((task['task_id'] + ':' + str(index)).encode()).hexdigest()[:40]
-                    generation = {'prompt_revision': context['prompt_revision'], 'model_route_revision': 'route_sha256:'
-                        + semantic_sha256({k: v for k, v in route.items() if k != 'client'}),
-                        'task_id': task['task_id'], 'actor': 'action_first_pass'}
-                    doc = prepare_model_document(service, memory_id=memory_id, document=assemble_document(item['document']), sources=[raw_source],
-                        generation=generation, request_id=task['task_id'] + ':' + str(index), catalog_context=(catalog, catalog_revision))
-                    body, semantic = split_document(doc)
-                    proposal = MemoryProposal.from_mapping({'proposal_id': memory_id, 'source_type': 'action_receipt',
-                        'proposed_body': body, 'source_status': 'verified',
-                        'source_refs': ['action_receipt:' + task['action_id'] + '@' + task['artifact_id']],
-                        'memory_type': item.get('kind', 'key_event'), 'confidence': item.get('confidence', 0),
-                        'sensitive': item.get('sensitive', False), 'requested_mode': mode,
-                        'metadata': {'memory_l1': semantic, 'source_task_id': task['task_id'],
-                            'legacy_candidate': {'title': doc['narrative']['title'], 'content': body, 'proposed_memory': body}}})
-                    prepared.append(proposal)
-                ids = []
-                for proposal in prepared:
-                    row = self.memory_authority_store.put_candidate(proposal, self.memory_ingestion_policy.evaluate(proposal))
-                    ids.append(row['candidate_id'])
-                tasks.transition(task['task_id'], 'generating', 'prepared', candidate_ids=ids)
-                adoption_issues = []
-                for ident in ids:
-                    row = self.memory_authority_store.get_candidate(ident)
-                    if row['status'] == 'accepted':
+                prep_key = 'action_l1:' + task['task_id']
+                receipt = queue.get(prep_key)
+                replace_failure = bool(receipt and receipt.get('issue') and task['phase'] == 'queued')
+                if replace_failure: receipt = None
+                if not receipt:
+                    source = await reader.capture(task['action_id'], task['artifact_id'])
+                    if source.get('state') != 'available' or source.get('eligible_source') is not True:
+                        raise L1OwnerError('action_source_not_available', status=409, field_path='source')
+                    raw_source = {'namespace': 'action_receipt', 'system': 'aizizhu',
+                        'conversation_id': reader.options.get('conversation_id', 'conv-jiajia-main'),
+                        'profile_id': self.memory_semantic_profile_id, 'event_id': task['action_id'],
+                        'version_id': task['artifact_id'], 'role': 'tool', 'text': source['text'],
+                        'recorded_at': source.get('recorded_at')}
+                    snapshots, bindings = bind_sources([raw_source])
+                    payload = {'input_kind': 'completed_action_receipt', 'conversation_turns': [],
+                        'l1_contract': {'semantic_contract': semantic_contract([b['binding_id'] for b in bindings], catalog=catalog),
+                            'catalog_revision': catalog_revision,
+                            'source_texts': [{**semantic_sources(snapshots, bindings)[0],
+                                'coverage': source.get('coverage')}]} }
+                    response = await self._daily_chat_memory_create_completion(client, model=model,
+                        messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}],
+                        max_tokens=self.daily_chat_memory_candidate_max_tokens, temperature=self.temperature,
+                        use_daily_client=use_daily, task_stage='action_l1', task_route=route)
+                    if self._completion_finish_reason(response) == 'length':
+                        raise L1OwnerError('first_pass_output_incomplete', field_path='generation')
+                    from memory_l1_api import validate_candidate_items
+                    candidates, schema_error = validate_candidate_items(response)
+                    prepared = []
+                    candidate_issues = []
+                    for index, item in enumerate(candidates):
                         try:
-                            await self._memory_l1_adopt_candidate(row, bucket_mgr, request_id=task['task_id'], owner=False)
+                            if item.get('_candidate_validation_issue'):
+                                raise L1OwnerError(item['_candidate_validation_issue']['code'], field_path='candidates')
+                            if not isinstance(item, dict) or not isinstance(item.get('document'), dict):
+                                raise L1OwnerError('model_document_fields_required', field_path='candidates')
+                            confidence = item.get('confidence', 0)
+                            if type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                                raise L1OwnerError('invalid_confidence', field_path='candidates.confidence')
+                            if type(item.get('sensitive', False)) is not bool:
+                                raise L1OwnerError('boolean_required', field_path='candidates.sensitive')
+                            memory_id = 'action_l1_' + hashlib.sha256((task['task_id'] + ':' + semantic_sha256(item)).encode()).hexdigest()[:40]
+                            generation = {'prompt_revision': context['prompt_revision'], 'model_route_revision': 'route_sha256:'
+                                + semantic_sha256({k: v for k, v in route.items() if k != 'client'}),
+                                'task_id': task['task_id'], 'actor': 'action_first_pass'}
+                            doc = prepare_model_document(service, memory_id=memory_id, document=assemble_document(item['document']), sources=[raw_source],
+                                generation=generation, request_id=task['task_id'] + ':' + str(index), catalog_context=(catalog, catalog_revision))
+                            body, semantic = split_document(doc)
+                            proposal = MemoryProposal.from_mapping({'proposal_id': memory_id, 'source_type': 'action_receipt',
+                                'proposed_body': body, 'source_status': 'verified',
+                                'source_refs': ['action_receipt:' + task['action_id'] + '@' + task['artifact_id']],
+                                'memory_type': item.get('kind', 'key_event'), 'confidence': item.get('confidence', 0),
+                                'sensitive': item.get('sensitive', False), 'requested_mode': mode,
+                                'metadata': {'memory_l1': semantic, 'source_task_id': task['task_id'],
+                                    'legacy_candidate': {'title': doc['narrative']['title'], 'content': body, 'proposed_memory': body}}})
+                            prepared.append(proposal)
+                        except Exception as exc:
+                            from memory_chat_preparation import issue
+                            candidate_issues.append(issue(exc))
+                    receipt = queue.prepare(prep_key, prepared, self.memory_ingestion_policy,
+                        scope=prep_key, source_fingerprint=task['task_id'], generated_count=len(candidates),
+                        replace_failure=replace_failure, issue=({'code': 'invalid_l1_document', 'schema_error': schema_error,
+                            'rejected_count': len(candidate_issues), 'candidate_issues': candidate_issues} if candidate_issues else None))
+                ids = receipt['candidate_ids']
+                selected = queue.remaining(receipt)[:candidate_budget]
+                candidate_budget -= len(selected)
+                adoption_issues = []
+                handled = []
+                for row in selected:
+                    ident = row['candidate_id']
+                    if row['status'] == 'accepted':
+                        if mode != 'auto' and row['proposal'].get('requested_mode') == 'auto':
+                            continue  # A current Review setting never auto-adopts a retained Auto draft.
+                        try:
+                            result = await self._memory_l1_adopt_candidate(row, bucket_mgr,
+                                request_id=task['task_id'], owner=False)
+                            if result['status'] in ('created', 'exists'): handled.append(ident)
                         except Exception as exc:
                             adoption_issues.append({'candidate_id': ident, 'code': getattr(exc, 'code', type(exc).__name__)})
+                    else:
+                        handled.append(ident)
+                queue.acknowledge(prep_key, handled)
+                receipt = queue.get(prep_key)
+                remaining = [row['candidate_id'] for row in queue.remaining(receipt)]
+                phase = 'failed' if receipt.get('issue') and not remaining else 'prepared'
+                tasks.transition(task['task_id'], 'generating', phase, candidate_ids=ids,
+                    issue=receipt.get('issue'),
+                    remaining_candidate_ids=remaining, preparation_key=prep_key,
+                    preparation_counts=queue.counts(receipt), adoption_issues=adoption_issues)
                 states = {ident: self.memory_authority_store.get_candidate(ident)['status'] for ident in ids}
-                results.append({'task_id': task['task_id'], 'status': 'prepared', 'candidate_ids': ids,
+                results.append({'task_id': task['task_id'], 'status': 'partial' if receipt.get('issue') else 'prepared', 'candidate_ids': ids,
+                    'issue': receipt.get('issue'),
+                    'remaining_candidate_ids': remaining, 'preparation_counts': queue.counts(receipt),
                     'candidate_states': states, 'adoption_issues': adoption_issues,
                     'adopted': bool(ids) and all(state == 'committed' for state in states.values())})
             except Exception as exc:

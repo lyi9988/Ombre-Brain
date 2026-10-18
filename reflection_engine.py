@@ -1,11 +1,12 @@
 import copy
+import asyncio
 import hashlib
 import json
 import math
 import logging
 import os
 import re
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -776,14 +777,16 @@ class ReflectionEngine(MemoryL1Runtime):
             "generic": bool(mode == "review" and "possibly_generic" in soft_flags),
             "duplicate_of": str(candidate.get("duplicate_of") or ""),
             "proposed_aliases": list(candidate.get("proposed_aliases") or []),
-            "metadata": {"legacy_candidate": dict(candidate), "narrative": dict(candidate.get("narrative") or {}),
+            "metadata": {"legacy_candidate": {k: v for k, v in candidate.items()
+                             if k not in ('preparation_key', 'preparation_status', 'preparation_counts')},
+                         "narrative": dict(candidate.get("narrative") or {}),
+                         **({'preparation_key': candidate['preparation_key']} if candidate.get('preparation_key') else {}),
                          **({"memory_l1": candidate["memory_l1"]} if isinstance(candidate.get("memory_l1"), dict) else {}),
                          **({"semantic_annotations": candidate["semantic_annotations"]}
                             if isinstance(candidate.get("semantic_annotations"), dict) else {})},
         })
 
-    @staticmethod
-    def _authority_candidate_legacy_item(row: dict) -> dict:
+    def _authority_candidate_legacy_item(self, row: dict) -> dict:
         proposal = row.get("proposal") if isinstance(row.get("proposal"), dict) else {}
         metadata = proposal.get("metadata") if isinstance(proposal.get("metadata"), dict) else {}
         candidate = dict(metadata.get("legacy_candidate") or {})
@@ -821,6 +824,20 @@ class ReflectionEngine(MemoryL1Runtime):
                 candidate["date"] = candidate.get("date") or metadata.get("date", "")
         if isinstance(metadata.get("semantic_annotations"), dict):
             candidate["semantic_annotations"] = metadata["semantic_annotations"]
+        preparation = {}
+        if metadata.get('preparation_key'):
+            from memory_candidate_preparation import MemoryCandidatePreparation
+            queue = MemoryCandidatePreparation(self.memory_authority_store)
+            receipt = queue.get(metadata['preparation_key'])
+            if receipt:
+                preparation = {'preparation_key': receipt['key'],
+                    'preparation_status': ('stale_source' if receipt.get('stale') else
+                        'requires_manual_retry' if receipt.get('issue') else
+                        'waiting_budget' if candidate_id not in receipt['processed_ids'] and authority_status not in
+                            ('rejected', 'deferred', 'committed') else 'processed'),
+                    'preparation_counts': queue.counts(receipt),
+                    'preparation_issue': receipt.get('issue'), 'requires_manual_retry': bool(receipt.get('issue'))}
+                candidate.update(preparation)
         return {
             "id": candidate_id,
             "date": candidate.get("date") or "",
@@ -829,6 +846,7 @@ class ReflectionEngine(MemoryL1Runtime):
             "updated_at": row.get("updated_at") or "",
             "candidate": candidate,
             "authority_revision": int(row.get("revision") or 1),
+            **preparation,
         }
 
     def _load_daily_chat_memory_payload(self) -> dict:
@@ -875,6 +893,25 @@ class ReflectionEngine(MemoryL1Runtime):
         except (TypeError, ValueError):
             return 0
 
+    def _daily_chat_memory_last_conversation_turn_id(self, profile_id: str) -> int:
+        raw = self._load_daily_chat_memory_cursor().get("raw_events") or {}
+        entry = raw.get(self._daily_chat_memory_cursor_key(profile_id)) or {}
+        return max(0, int(entry.get("last_conversation_turn_id") or 0))
+
+    def _update_daily_chat_memory_conversation_cursor(self, profile_id: str, turn_id: int, key: str) -> bool:
+        cursor = self._load_daily_chat_memory_cursor()
+        entries = cursor.setdefault("raw_events", {})
+        entry = entries.setdefault(self._daily_chat_memory_cursor_key(profile_id), {})
+        if turn_id <= int(entry.get("last_conversation_turn_id") or 0):
+            return False
+        entry.update(last_conversation_turn_id=turn_id, conversation_date=key,
+                     updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        if self.memory_authority_enabled and self.memory_authority_store:
+            self.memory_authority_store.set_meta("daily_chat_memory_cursor", cursor)
+        else:
+            self._save_daily_chat_memory_pending(self._load_daily_chat_memory_payload().get("items") or [], cursor=cursor)
+        return True
+
     def _update_daily_chat_memory_raw_cursor(self, profile_id: str, raw_event_id: int, key: str) -> bool:
         try:
             safe_id = max(0, int(raw_event_id or 0))
@@ -883,7 +920,7 @@ class ReflectionEngine(MemoryL1Runtime):
         if safe_id <= 0:
             return False
         payload = self._load_daily_chat_memory_payload()
-        cursor = payload.get("cursor") if isinstance(payload.get("cursor"), dict) else {}
+        cursor = self._load_daily_chat_memory_cursor()
         raw_events = cursor.get("raw_events") if isinstance(cursor.get("raw_events"), dict) else {}
         cursor_key = self._daily_chat_memory_cursor_key(profile_id)
         previous = raw_events.get(cursor_key) if isinstance(raw_events.get(cursor_key), dict) else {}
@@ -893,7 +930,7 @@ class ReflectionEngine(MemoryL1Runtime):
             previous_id = 0
         if safe_id <= previous_id:
             return False
-        raw_events[cursor_key] = {
+        raw_events[cursor_key] = {**previous,
             "last_raw_event_id": safe_id,
             "date": key,
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1405,8 +1442,45 @@ class ReflectionEngine(MemoryL1Runtime):
         chat_candidates: list[dict] = []
         if self.daily_chat_memory_mode != "off" and now_local.hour >= self.daily_chat_memory_hour:
             chat_date = (now_local - timedelta(days=1)).date()
+            profile_id = str(getattr(persona_engine, "profile_id", "") or "default")
+            latest_by_date = {}
+            for row in reversed(self._load_daily_chat_memory_run_audit()):
+                date_key = str(row.get("date") or "")
+                if (date_key and date_key <= chat_date.isoformat()
+                        and row.get("profile_id", profile_id) == profile_id):
+                    latest_by_date.setdefault(date_key, row)
+            automatic_reasons = {"window_budget_exhausted", "candidate_budget_exhausted", "source_batch_exhausted",
+                                 "candidate_budget_exhausted_prepared", "retained_candidates_need_processing"}
+            outstanding, unresolved = [], {}
+            resume_problem = None
+            for date_key, prior in sorted(latest_by_date.items()):
+                if prior.get("status") not in {"partial", "needs_review"}:
+                    continue
+                fallback = prior.get("turn_source") == "conversation_turns"
+                current = (self._daily_chat_memory_last_conversation_turn_id(profile_id) if fallback
+                           else self._daily_chat_memory_last_raw_event_id(profile_id))
+                expected = prior.get("processed_until_turn_id" if fallback else "processed_until_seq")
+                # Old audits may not record a safe processed watermark. A later
+                # profile-global cursor must not silently erase an older day.
+                safe = expected if expected is not None else prior.get("source_start_seq", 0)
+                reason = prior.get("error_category") or prior.get("reason") or "partial_requires_review"
+                if prior.get("status") == "needs_review" or current > int(safe or 0) or reason not in automatic_reasons:
+                    problem = {"status": "needs_review", "reason": "source_cursor_ahead_of_partial" if current > int(safe or 0) else reason,
+                        "date": date_key, "profile_id": profile_id, "cursor_updated": False,
+                        "expected_processed_until": expected, "current_source_cursor": current}
+                    unresolved[date_key] = problem
+                    if prior.get("status") != "needs_review":
+                        self._store_daily_chat_memory_run_audit({**prior, **problem,
+                            "model_call_count": 0, "error_category": problem["reason"],
+                            "completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+                else:
+                    outstanding.append(date_key)
+            if outstanding:
+                chat_date = date.fromisoformat(outstanding[0])
+            elif chat_date.isoformat() in unresolved:
+                resume_problem = unresolved[chat_date.isoformat()]
             chat_target = datetime.combine(chat_date, time.max, tzinfo=self.tz)
-            chat_result = await self.run_daily_chat_memory(
+            chat_result = resume_problem or await self.run_daily_chat_memory(
                 bucket_mgr,
                 conversation_turn_store=conversation_turn_store,
                 raw_event_store=raw_event_store,
@@ -1414,10 +1488,20 @@ class ReflectionEngine(MemoryL1Runtime):
                 embedding_engine=embedding_engine,
                 now=chat_target,
             )
+            yesterday = (now_local - timedelta(days=1)).date().isoformat()
+            if unresolved:
+                chat_result["unresolved_dates"] = [unresolved[day] for day in sorted(unresolved)]
+            remaining_dates = [day for day in outstanding if day != chat_date.isoformat()]
+            if chat_date.isoformat() != yesterday:
+                remaining_dates.append(yesterday)
+            if remaining_dates:
+                chat_result["remaining_dates"] = sorted(set(remaining_dates))
+                chat_result["next_date"] = min(remaining_dates)
             if chat_result.get("status") not in {"disabled", "skipped"}:
                 results.append(chat_result)
             chat_candidates = [
                 item for item in (chat_result.get("candidates") or []) if isinstance(item, dict)
+                and str(item.get("date") or chat_result.get("date") or chat_date.isoformat()) == yesterday
             ]
         if self.daily_enabled and now_local.hour >= self.daily_hour:
             daily_date = (now_local - timedelta(days=1)).date()
@@ -2044,6 +2128,18 @@ class ReflectionEngine(MemoryL1Runtime):
         if self._normalize_daily_chat_memory_mode(mode) == "review":
             return self.daily_chat_memory_review_max_per_day
         return self.daily_chat_memory_max_per_day
+
+    def refresh_daily_chat_memory_options(self, config: dict) -> None:
+        """Apply the same owner option validation to the background instance."""
+        values = task_options(config)
+        for key in ("daily_chat_memory_max_per_day", "daily_chat_memory_review_max_per_day",
+                    "daily_chat_memory_max_windows_per_run", "daily_chat_memory_window_max_input_chars",
+                    "daily_chat_memory_candidate_max_tokens"):
+            setattr(self, key, values[key])
+        cfg = config.get("reflection") or {}
+        self.daily_chat_memory_window_turns = max(4, min(100, int(cfg.get("daily_chat_memory_window_turns", 24))))
+        self.daily_chat_memory_window_stride_turns = max(1, min(self.daily_chat_memory_window_turns,
+            int(cfg.get("daily_chat_memory_window_stride_turns", 12))))
 
     def _daily_chat_memory_min_confidence_for_mode(self, mode: str) -> float:
         if self._normalize_daily_chat_memory_mode(mode) == "review":
@@ -2753,7 +2849,7 @@ class ReflectionEngine(MemoryL1Runtime):
         The lock guarantees a manual dashboard "补扫" cannot overlap a scheduled
         run (request_id + concurrency lock semantics)."""
         effective_mode = self._normalize_daily_chat_memory_mode(mode or self.daily_chat_memory_mode)
-        if effective_mode == "off" or self.daily_chat_memory_max_per_day <= 0:
+        if effective_mode == "off" or self._daily_chat_memory_candidate_limit(effective_mode) <= 0:
             return {"status": "disabled", "reason": "daily_chat_memory_off", "mode": effective_mode}
         if not conversation_turn_store:
             return {"status": "skipped", "reason": "no_conversation_turn_store", "mode": effective_mode}
@@ -2765,17 +2861,72 @@ class ReflectionEngine(MemoryL1Runtime):
                 "mode": effective_mode,
             }
         try:
-            result = await self._run_daily_chat_memory_impl(
-                bucket_mgr,
-                conversation_turn_store=conversation_turn_store,
-                raw_event_store=raw_event_store,
-                persona_engine=persona_engine,
-                embedding_engine=embedding_engine,
-                key=key,
-                mode=mode,
-                force=force,
-                now=now,
-            )
+            continuing = {"window_budget_exhausted", "candidate_budget_exhausted", "source_batch_exhausted",
+                          "candidate_budget_exhausted_prepared", "retained_candidates_need_processing"}
+            all_candidates, progress_keys = {}, {}
+            batch_count = 0
+            source_cursor = None
+            while True:
+                if (self.config.get("reflection") or {}).get("daily_chat_memory_mode", effective_mode) == "off" or getattr(self, "_daily_chat_memory_cancel_requested", False):
+                    result = {"status": "partial", "reason": "cancelled_or_disabled", "date": key}
+                    break
+                result = await self._run_daily_chat_memory_impl(
+                    bucket_mgr, conversation_turn_store=conversation_turn_store, raw_event_store=raw_event_store,
+                    persona_engine=persona_engine, embedding_engine=embedding_engine, key=key,
+                    mode=mode, force=force if batch_count == 0 else False, now=now,
+                    source_cursor=source_cursor)
+                self._ack_daily_chat_memory_preparation(result)
+                batch_count += 1
+                for candidate in result.get("candidates") or []:
+                    all_candidates[candidate["id"]] = candidate
+                saved_count, queued_count, receipt_progress = len(all_candidates), 0, ()
+                if self.memory_authority_enabled and self.memory_authority_store:
+                    from memory_candidate_preparation import MemoryCandidatePreparation
+                    receipts = MemoryCandidatePreparation(self.memory_authority_store)
+                    keys = {candidate["preparation_key"] for candidate in all_candidates.values() if candidate.get("preparation_key")}
+                    counts = [receipts.counts(receipts.get(key)) for key in keys]
+                    saved_count = sum(count["validated"] for count in counts) + sum(not c.get("preparation_key") for c in all_candidates.values())
+                    queued_count = sum(count["queued"] for count in counts)
+                    receipt_progress = tuple(sorted((key, len(receipts.get(key)["processed_ids"])) for key in keys))
+                audits = self._load_daily_chat_memory_run_audit()
+                audit = audits[-1] if audits and audits[-1].get("run_id") == result.get("run_id") else {}
+                next_cursor = {"raw": int(audit.get("processed_until_seq", 0)),
+                               "turn": int(audit.get("processed_until_turn_id", 0))}
+                marker = (next_cursor["raw"], next_cursor["turn"], receipt_progress)
+                result["progress"] = {"batches_completed": batch_count,
+                    "current_batch_completed_windows": audit.get("processed_window_count", 0),
+                    "current_batch_total_windows": audit.get("window_count", 0),
+                    "generated_candidates_saved": saved_count,
+                    "remaining_prepared_candidates": queued_count,
+                    "remaining_source_batches": bool(audit.get("source_batch_has_more")),
+                    "state": "processing" if result.get("status") == "partial" else
+                             "complete" if result.get("status") in {"zero_candidates", "pending", "created", "exists"} else "stopped"}
+                if queued_count and result["progress"]["state"] == "complete":
+                    result.update(status="partial", reason="retained_candidates_need_processing")
+                    result["progress"]["state"] = "processing"
+                if audit:
+                    # A zero-model metadata progress receipt uses the existing
+                    # run audit. It does not claim suffix window counts sum to a
+                    # fixed full-day denominator.
+                    self._store_daily_chat_memory_run_audit({**audit, "progress": result["progress"]})
+                if result.get("status") != "partial" or result.get("reason") not in continuing:
+                    break
+                if marker in progress_keys:
+                    result.update(reason="continuation_requires_progress")
+                    result["progress"]["state"] = "stopped"
+                    break
+                progress_keys[marker] = True
+                if (not receipt_progress and next_cursor["raw"] <= int(result.get("source_start_seq") or 0)
+                        and next_cursor["turn"] <= int(audit.get("source_start_turn_id") or 0)):
+                    result.update(reason="continuation_requires_progress")
+                    result["progress"]["state"] = "stopped"
+                    break
+                source_cursor = next_cursor
+                await asyncio.sleep(0)
+            if all_candidates:
+                result["candidates"] = list(all_candidates.values())
+                if result.get("status") == "zero_candidates":
+                    result["status"] = "pending" if effective_mode == "review" else "created"
             if self.memory_authority_enabled and self.memory_authority_store:
                 result['action_memory_preparation'] = await self._memory_l1_action_tasks(bucket_mgr, mode=effective_mode)
             return result
@@ -2794,9 +2945,10 @@ class ReflectionEngine(MemoryL1Runtime):
         mode: str = "",
         force: bool = False,
         now: datetime | None = None,
+        source_cursor: dict | None = None,
     ) -> dict:
         effective_mode = self._normalize_daily_chat_memory_mode(mode or self.daily_chat_memory_mode)
-        if effective_mode == "off" or self.daily_chat_memory_max_per_day <= 0:
+        if effective_mode == "off" or self._daily_chat_memory_candidate_limit(effective_mode) <= 0:
             return {"status": "disabled", "reason": "daily_chat_memory_off", "mode": effective_mode}
         if not conversation_turn_store:
             return {"status": "skipped", "reason": "no_conversation_turn_store", "mode": effective_mode}
@@ -2808,6 +2960,13 @@ class ReflectionEngine(MemoryL1Runtime):
         turns = []
         turn_source = ""
         raw_event_cursor_id = 0 if force else self._daily_chat_memory_last_raw_event_id(profile_id)
+        turn_cursor_id = 0 if force else self._daily_chat_memory_last_conversation_turn_id(profile_id)
+        if source_cursor is not None:
+            raw_event_cursor_id = source_cursor["raw"]
+            turn_cursor_id = source_cursor["turn"]
+        source_has_more = False
+        source_limit = self.daily_chat_memory_turn_limit
+        read_limit = source_limit + 1 if source_limit else 0
         max_seen_raw_event_id = 0
         raw_events_cursor_exhausted = False
         if raw_event_store:
@@ -2815,8 +2974,14 @@ class ReflectionEngine(MemoryL1Runtime):
                 raw_events = raw_event_store.list_events_between(
                     start_at=start,
                     end_at=end,
-                    limit=self.daily_chat_memory_turn_limit,
+                    limit=source_limit,
+                    chronological=True,
+                    after_event_id=raw_event_cursor_id,
+                    profile_id=profile_id,
+                    complete_rounds=True,
                 )
+                if raw_event_cursor_id > 0 and not raw_events:
+                    raw_events_cursor_exhausted = True
             except Exception as exc:
                 logger.warning("Daily chat memory raw event read failed: %s", exc)
                 raw_events = []
@@ -2837,9 +3002,12 @@ class ReflectionEngine(MemoryL1Runtime):
                         if int(event.get("id") or 0) > raw_event_cursor_id
                     ]
                     raw_events_cursor_exhausted = not raw_events
+                if source_limit and raw_events:
+                    source_has_more = bool(raw_event_store.list_events_between(start_at=start, end_at=end, limit=1,
+                        chronological=True, after_event_id=max(int(event['id']) for event in raw_events), profile_id=profile_id))
                 turns = self._raw_event_turn_payloads(
                     raw_events,
-                    limit=self.daily_chat_memory_turn_limit,
+                    limit=0,
                 )
                 if turns:
                     turn_source = "raw_events"
@@ -2854,8 +3022,14 @@ class ReflectionEngine(MemoryL1Runtime):
                     profile_id=profile_id,
                     start_at=start,
                     end_at=end,
-                    limit=self.daily_chat_memory_turn_limit or 80,
+                    limit=read_limit,
+                    chronological=True,
+                    after_turn_id=turn_cursor_id,
                 )
+                raw_turns = [turn for turn in raw_turns if int(turn.get("id") or 0) > turn_cursor_id]
+                if source_limit and len(raw_turns) > source_limit:
+                    source_has_more = True
+                    raw_turns = raw_turns[:source_limit]
         except Exception as exc:
             logger.warning("Daily chat memory turn read failed: %s", exc)
             raw_turns = []
@@ -2868,7 +3042,7 @@ class ReflectionEngine(MemoryL1Runtime):
                     "mode": effective_mode,
                     "last_raw_event_id": raw_event_cursor_id,
                 }
-            turns = self._conversation_turn_payloads(raw_turns, limit=self.daily_chat_memory_turn_limit)
+            turns = self._conversation_turn_payloads(raw_turns, limit=0)
             if turns:
                 turn_source = "conversation_turns"
         if not turns:
@@ -2878,7 +3052,7 @@ class ReflectionEngine(MemoryL1Runtime):
         max_candidates = self._daily_chat_memory_candidate_limit(effective_mode)
         if max_candidates == 0:
             return {"status": "disabled", "reason": "configured_candidate_limit_zero", "date": key, "mode": effective_mode}
-        if not force:
+        if not force and not self.memory_authority_enabled:
             # Reuse the existing audit as a retry receipt. A window that itself
             # exceeded the whole run budget cannot improve by paying for the
             # identical request every scheduler tick. This check precedes even
@@ -2914,6 +3088,10 @@ class ReflectionEngine(MemoryL1Runtime):
             "run_id": run_id,
             "date": key,
             "source_start_seq": raw_event_cursor_id,
+            "source_start_turn_id": turn_cursor_id,
+            "profile_id": profile_id,
+            "turn_source": turn_source,
+            "source_batch_has_more": source_has_more,
             "source_end_seq": max_seen_raw_event_id or raw_event_cursor_id,
             "eligible_turn_count": len(turns),
             "window_count": 0,
@@ -2944,6 +3122,7 @@ class ReflectionEngine(MemoryL1Runtime):
             audit=audit,
             mode=effective_mode,
             min_confidence=min_confidence,
+            force=force,
         )
         audit["model_candidate_count"] = extraction_meta.get("model_candidate_count", len(raw_candidates))
         candidates = raw_candidates if extraction_meta.get("candidates_normalized") else self._normalize_daily_chat_memory_candidates(
@@ -2961,22 +3140,41 @@ class ReflectionEngine(MemoryL1Runtime):
         # failed range is re-scanned on retry (idempotent, no double pending).
         partial = bool(extraction_meta.get("partial"))
         partial_reason = str(extraction_meta.get("reason") or "window_extraction_failed")
+        processed_stop = int(extraction_meta.get("processed_turn_stop", len(turns) if not partial else 0))
+        if source_has_more and not partial:
+            # Keep the boundary overlap for the next source batch as well as
+            # between model windows within this batch.
+            from memory_daily_windows import safe_prefix_event_id
+            overlap = self.daily_chat_memory_window_turns - self.daily_chat_memory_window_stride_turns
+            processed_stop = max(1, len(turns) - overlap)
+            extraction_meta["last_processed_event_id"] = safe_prefix_event_id(turns, processed_stop)
+            partial = True
+            partial_reason = "source_batch_exhausted"
         # A malformed semantic document is a preparation failure, not a genuine
         # zero-memory window. Keep its source range retryable after correction.
         if (audit.get('hard_rejects') or {}).get('invalid_l1_document'):
             partial = True
             extraction_meta['last_processed_event_id'] = raw_event_cursor_id
+            processed_stop = 0
         cursor_target = (
             max_seen_raw_event_id
             if not partial
             else max(extraction_meta.get("last_processed_event_id") or 0, raw_event_cursor_id)
         )
+        from memory_daily_windows import safe_prefix_event_id
+        turn_cursor_target = max(turn_cursor_id, safe_prefix_event_id(
+            [{"raw_event_ids": [turn.get("id")]} for turn in turns], processed_stop))
+        audit["processed_until_seq"] = cursor_target
+        audit["processed_until_turn_id"] = turn_cursor_target
+        audit["error_category"] = partial_reason if partial else ""
+        def advance_source_cursor():
+            if turn_source == "raw_events" and cursor_target > raw_event_cursor_id:
+                return self._update_daily_chat_memory_raw_cursor(profile_id, cursor_target, key)
+            if turn_source == "conversation_turns" and turn_cursor_target > turn_cursor_id:
+                return self._update_daily_chat_memory_conversation_cursor(profile_id, turn_cursor_target, key)
+            return False
         if not candidates and partial:
-            cursor_updated = (
-                self._update_daily_chat_memory_raw_cursor(profile_id, cursor_target, key)
-                if turn_source == "raw_events" and cursor_target > raw_event_cursor_id
-                else False
-            )
+            cursor_updated = advance_source_cursor()
             audit["status"] = "partial"
             audit["error_category"] = partial_reason
             audit["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -3021,11 +3219,7 @@ class ReflectionEngine(MemoryL1Runtime):
         if not candidates:
             # All windows scanned, none produced: zero_candidates (allowed), and
             # the processed watermark advances to the actual scanned end.
-            cursor_updated = (
-                self._update_daily_chat_memory_raw_cursor(profile_id, cursor_target, key)
-                if turn_source == "raw_events" and cursor_target > raw_event_cursor_id
-                else False
-            )
+            cursor_updated = advance_source_cursor()
             audit["status"] = "zero_candidates"
             audit["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self._store_daily_chat_memory_run_audit(audit)
@@ -3053,11 +3247,7 @@ class ReflectionEngine(MemoryL1Runtime):
                 for candidate in candidates
             ]
             pending = self._store_daily_chat_memory_pending(candidates, force=force)
-            cursor_updated = (
-                self._update_daily_chat_memory_raw_cursor(profile_id, cursor_target, key)
-                if turn_source == "raw_events" and cursor_target > raw_event_cursor_id
-                else False
-            )
+            cursor_updated = advance_source_cursor()
             audit["status"] = "partial" if partial else "success"
             audit["pending_count"] = pending.get("added", 0)
             audit["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -3107,11 +3297,10 @@ class ReflectionEngine(MemoryL1Runtime):
             partial = True
             partial_reason = "candidate_persistence_failed"
             cursor_target = raw_event_cursor_id
-        cursor_updated = (
-            self._update_daily_chat_memory_raw_cursor(profile_id, cursor_target, key)
-            if turn_source == "raw_events" and cursor_target > raw_event_cursor_id
-            else False
-        )
+            turn_cursor_target = turn_cursor_id
+            audit["processed_until_seq"] = cursor_target
+            audit["processed_until_turn_id"] = turn_cursor_target
+        cursor_updated = advance_source_cursor()
         applied_count = sum(1 for candidate in candidates if candidate.get("status") == "applied")
         audit["status"] = "partial" if partial else ("success" if write_result.get("created") else "exists")
         audit["error_category"] = partial_reason if partial else ""
@@ -3134,6 +3323,20 @@ class ReflectionEngine(MemoryL1Runtime):
             "candidates": candidates,
             **write_result,
         }
+
+    def _ack_daily_chat_memory_preparation(self, result):
+        """Acknowledge only candidates actually handled by this batch."""
+        if not self.memory_authority_enabled or not self.memory_authority_store: return result
+        from memory_candidate_preparation import MemoryCandidatePreparation
+        queue = MemoryCandidatePreparation(self.memory_authority_store)
+        for candidate in result.get('candidates') or []:
+            prep_key = candidate.get('preparation_key')
+            if prep_key and candidate.get('status') in ('pending', 'applied'):
+                queue.acknowledge(prep_key, [candidate['id']])
+        keys = {c['preparation_key'] for c in result.get('candidates') or [] if c.get('preparation_key')}
+        if keys:
+            result['preparation_batches'] = [queue.counts(queue.get(k)) for k in sorted(keys)]
+        return result
 
     async def _daily_chat_memory_self_context(self, bucket_mgr) -> str:
         try:
@@ -3200,7 +3403,10 @@ class ReflectionEngine(MemoryL1Runtime):
             return content[match.end() : end].strip()
         return ""
 
-    def list_daily_chat_memory_pending(self, *, status: str = "pending", limit: int = 50) -> list[dict]:
+    def list_daily_chat_memory_pending(self, *, status: str = "pending", limit: int = 50, offset: int = 0) -> list[dict]:
+        return self.daily_chat_memory_pending_page(status=status, limit=limit, offset=offset)["items"]
+
+    def daily_chat_memory_pending_page(self, *, status: str = "pending", limit: int = 50, offset: int = 0) -> dict:
         """Strictly read-only listing. Never mutates or persists anything.
 
         Opening/refreshing/leaving this page must not change candidate status;
@@ -3208,11 +3414,31 @@ class ReflectionEngine(MemoryL1Runtime):
         """
         safe_status = str(status or "pending").strip()
         safe_limit = max(1, min(200, int(limit or 50)))
-        items = self._load_daily_chat_memory_pending()
-        if safe_status and safe_status != "all":
-            items = [item for item in items if str(item.get("status") or "") == safe_status]
-        items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
-        return [self._display_daily_chat_memory_item(item) for item in items[:safe_limit]]
+        offset = max(0, int(offset))
+        if self.memory_authority_enabled and self.memory_authority_store:
+            authority_status = {"confirmed": "committed", "applied": "committed",
+                                "applying": "accepted", "apply_failed": "commit_failed"}.get(safe_status, safe_status)
+            mode = "auto" if safe_status == "applied" else "review" if safe_status == "confirmed" else None
+            total = self.memory_authority_store.count_candidates(status=authority_status, requested_mode=mode)
+            saved_total = self.memory_authority_store.count_candidates(status="all")
+            rows = self.memory_authority_store.list_candidates(status=authority_status, requested_mode=mode,
+                                                               limit=safe_limit, offset=offset)
+            items = [self._authority_candidate_legacy_item(row) for row in rows]
+        else:
+            items = self._load_daily_chat_memory_pending()
+            saved_total = len(items)
+            if safe_status == "review_visible":
+                safe_status = "pending"
+            if safe_status and safe_status != "all":
+                items = [item for item in items if str(item.get("status") or "") == safe_status]
+            items.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")), reverse=True)
+            total = len(items)
+            items = items[offset:offset + safe_limit]
+        items = [self._display_daily_chat_memory_item(item) for item in items]
+        next_offset = offset + len(items)
+        return {"items": items, "limit": safe_limit, "offset": offset, "total": total,
+                "saved_total": saved_total, "has_more": next_offset < total,
+                "next_offset": next_offset if next_offset < total else None}
 
     @staticmethod
     def _display_daily_chat_memory_item(item: dict) -> dict:
@@ -3898,6 +4124,7 @@ class ReflectionEngine(MemoryL1Runtime):
         audit: dict | None = None,
         mode: str | None = None,
         min_confidence: float | None = None,
+        force: bool = False,
     ) -> tuple[list[dict], dict]:
         """V4 full-day windowed extraction.
 
@@ -3953,6 +4180,10 @@ class ReflectionEngine(MemoryL1Runtime):
                 index + 1 for index, plan in enumerate(plans) if plan.exceeds_char_target]
         raw_candidates: list[dict] = []
         processed_stop = 0
+        preparation_queue = None
+        if self.memory_authority_enabled and self.memory_authority_store and mode is not None:
+            from memory_candidate_preparation import MemoryCandidatePreparation
+            preparation_queue = MemoryCandidatePreparation(self.memory_authority_store)
         for index, window in enumerate(windows):
             remaining = candidate_budget - len(raw_candidates)
             if index >= self.daily_chat_memory_max_windows_per_run or remaining <= 0:
@@ -3967,7 +4198,33 @@ class ReflectionEngine(MemoryL1Runtime):
                     audit["processed_window_count"] = index + 1
                 continue
             try:
-                if client:
+                preparation_key = None
+                receipt = None
+                replace_failure = False
+                if preparation_queue:
+                    source_fingerprint = hashlib.sha256(json.dumps(
+                        {'date': key, 'profile': self.memory_semantic_profile_id, 'window': window},
+                        ensure_ascii=False, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+                    preparation_key = 'daily_chat:' + source_fingerprint
+                    first_source = {k: window[0].get(k) for k in ('id', 'raw_event_ids', 'session_id')}
+                    scope = 'daily_chat:' + self.memory_semantic_profile_id + ':' + key + ':' + hashlib.sha256(json.dumps(first_source, sort_keys=True).encode()).hexdigest()
+                    preparation_queue.invalidate_scope(scope, preparation_key)
+                    receipt = preparation_queue.get(preparation_key)
+                    generation_fingerprint = self._daily_chat_memory_window_budget_key(key, window, 1)
+                    if receipt and receipt.get('issue') and (force or receipt.get('generation_fingerprint') != generation_fingerprint):
+                        replace_failure = True
+                        receipt = None
+                if receipt:
+                    if receipt.get('stale'):
+                        meta.update(partial=True, reason='source_preparation_stale', failed_window_index=index + 1)
+                        break
+                    window_candidates = [self._authority_candidate_legacy_item(row)['candidate']
+                        for row in preparation_queue.remaining(receipt)]
+                    window_stats = {'prepared_reuse': True}
+                    if audit is not None:
+                        audit['prepared_reused_count'] = audit.get('prepared_reused_count', 0) + len(window_candidates)
+                elif client:
+                    meta["model_call_count"] += 1
                     window_candidates, window_stats = await self._extract_window_candidates(
                         key,
                         window,
@@ -3976,7 +4233,6 @@ class ReflectionEngine(MemoryL1Runtime):
                         window_index=index + 1,
                         window_total=len(windows),
                     )
-                    meta["model_call_count"] += 1
                 else:
                     # The legacy fallback shares the same full-window budget
                     # and continuation semantics as the model path.
@@ -3997,14 +4253,22 @@ class ReflectionEngine(MemoryL1Runtime):
                     audit["model_call_count"] = meta["model_call_count"]
                     audit["empty_output_count"] = meta["empty_output_count"]
                     audit["parse_failure_count"] = meta["parse_failure_count"]
-                meta["model_candidate_count"] += len(window_candidates)
+                if not receipt:
+                    meta["model_candidate_count"] += len(window_candidates)
+                window_generated_count = len(window_candidates)
                 if window_stats.get("empty_output") or window_stats.get("parse_failure"):
                     # A provider failure is not an intentional empty candidate
                     # list. Retain this window's sources for recovery.
                     meta.update(partial=True, reason="empty_model_outputs" if window_stats.get("empty_output")
                                 else "window_parse_failure", failed_window_index=index + 1)
+                    if preparation_queue:
+                        preparation_queue.prepare(preparation_key, [], self.memory_ingestion_policy,
+                            scope=scope, source_fingerprint=source_fingerprint, generated_count=window_generated_count,
+                            generation_fingerprint=generation_fingerprint, replace_failure=replace_failure,
+                            issue={'code': meta['reason']})
+                        meta['requires_manual_retry'] = True
                     break
-                if mode is not None:
+                if mode is not None and not receipt:
                     window_audit = {}
                     window_candidates = self._normalize_daily_chat_memory_candidates(
                         key, window_candidates, window,
@@ -4019,7 +4283,7 @@ class ReflectionEngine(MemoryL1Runtime):
                                 aggregate[reason] = aggregate.get(reason, 0) + count
                         audit["merged_duplicates"] = audit.get("merged_duplicates", 0) + window_audit.get("merged_duplicates", 0)
                         audit.setdefault("l1_issues", []).extend(window_audit.get("l1_issues", []))
-                    if window_audit.get("hard_rejects", {}).get("invalid_l1_document"):
+                    if window_audit.get("hard_rejects", {}).get("invalid_l1_document") and not preparation_queue:
                         meta.update(partial=True, reason="invalid_l1_document", failed_window_index=index + 1)
                         break
                     unique = []
@@ -4030,7 +4294,25 @@ class ReflectionEngine(MemoryL1Runtime):
                         else:
                             unique.append(candidate)
                     window_candidates = unique
+                    if preparation_queue:
+                        invalid_count = window_audit.get('hard_rejects', {}).get('invalid_l1_document', 0)
+                        receipt = preparation_queue.prepare(preparation_key,
+                            [self._daily_chat_memory_proposal(candidate, mode=mode) for candidate in window_candidates],
+                            self.memory_ingestion_policy, scope=scope, source_fingerprint=source_fingerprint,
+                            generated_count=window_generated_count, generation_fingerprint=generation_fingerprint,
+                            issue=({'code': 'invalid_l1_document', 'rejected_count': invalid_count,
+                                    'schema_error': window_stats.get('schema_error')} if invalid_count else None),
+                            replace_failure=replace_failure)
+                        window_candidates = [self._authority_candidate_legacy_item(row)['candidate']
+                            for row in preparation_queue.remaining(receipt)]
                 if len(window_candidates) > remaining:
+                    if preparation_queue:
+                        raw_candidates.extend(window_candidates[:remaining])
+                        meta.update(partial=True, reason='candidate_budget_exhausted_prepared',
+                            failed_window_index=index + 1, candidate_overflow_count=len(window_candidates) - remaining)
+                        if audit is not None:
+                            audit['preparation_counts'] = preparation_queue.counts(receipt)
+                        break
                     # No candidate in this window is consumed. The previous
                     # window's overlap-safe cursor keeps this entire range
                     # available for a fresh run with its full owner budget.
@@ -4042,11 +4324,27 @@ class ReflectionEngine(MemoryL1Runtime):
                             key, window, candidate_budget)
                         audit["required_candidate_count"] = len(window_candidates)
                     break
+                if receipt and receipt.get('issue'):
+                    raw_candidates.extend(window_candidates)
+                    meta.update(partial=True, reason=receipt['issue']['code'], failed_window_index=index + 1,
+                        requires_manual_retry=True)
+                    if audit is not None: audit['preparation_issue'] = receipt['issue']
+                    break
             except Exception as exc:
                 logger.warning("Daily chat memory window %s extraction failed: %s", index + 1, exc)
                 meta["partial"] = True
                 meta["window_failures"] = 1
                 meta["failed_window_index"] = index + 1
+                meta['reason'] = getattr(exc, 'code', 'window_extraction_failed')
+                if preparation_queue and preparation_key:
+                    try:
+                        preparation_queue.prepare(preparation_key, [], self.memory_ingestion_policy,
+                            scope=scope, source_fingerprint=source_fingerprint, generated_count=0,
+                            generation_fingerprint=generation_fingerprint, replace_failure=replace_failure,
+                            issue={'code': meta['reason']})
+                        meta['requires_manual_retry'] = True
+                    except Exception:
+                        logger.exception('Daily candidate failure receipt could not be saved')
                 if audit is not None:
                     audit["window_failures"] = 1
                     audit["partial"] = True
@@ -4056,6 +4354,7 @@ class ReflectionEngine(MemoryL1Runtime):
             if audit is not None:
                 audit["processed_window_count"] = index + 1
         meta["last_processed_event_id"] = safe_prefix_event_id(turns, processed_stop)
+        meta['processed_turn_stop'] = processed_stop
         if audit is not None:
             audit["partial"] = meta["partial"]
             if meta["partial"]:
@@ -4183,62 +4482,68 @@ class ReflectionEngine(MemoryL1Runtime):
         if stats['finish_reason'] == 'length':
             from memory_l1_service import L1OwnerError
             raise L1OwnerError('first_pass_output_incomplete', field_path='generation')
-        from memory_l1_api import validate_response
-        validate_response(response)
-        parsed = self._parse_json_object(raw or "")
-        candidates = parsed.get("candidates") if isinstance(parsed, dict) else []
-        if not isinstance(candidates, list):
-            stats["parse_failure"] = bool(str(raw or "").strip())
-            if l1_sources is not None:
-                from memory_l1_service import L1OwnerError
-                raise L1OwnerError('first_pass_candidates_required', field_path='candidates')
-            return [], stats
+        if l1_sources is not None:
+            from memory_l1_api import validate_candidate_items
+            candidates, stats['schema_error'] = validate_candidate_items(response)
+        else:
+            from memory_l1_api import validate_response
+            validate_response(response)
+            parsed = self._parse_json_object(raw or "")
+            candidates = parsed.get("candidates") if isinstance(parsed, dict) else []
+            if not isinstance(candidates, list):
+                stats["parse_failure"] = bool(str(raw or "").strip())
+                return [], stats
         result = [item for item in candidates if isinstance(item, dict)]
         if l1_sources is not None:
             for index, item in enumerate(result):
-                draft = item.get("document")
-                if not isinstance(draft, dict):
-                    # Owner custom legacy prompts remain identifiable; they
-                    # cannot masquerade as a generated structured first pass.
-                    item["l1_state"] = "legacy_body_only"
-                    continue
-                from memory_l1_semantic_wire import assemble_document
-                draft = assemble_document(draft, require_keywords=True)
-                item['document'] = draft
-                item["content"] = draft.get("narrative", {}).get("body", "")
-                item["title"] = draft.get("narrative", {}).get("title", "")
-                # The model selects binding labels; only the program maps them
-                # to archive/event/turn identities used by the existing policy.
-                refs = set(item.get('source_refs') or [])
-                def collect_refs(node):
-                    if isinstance(node, list):
-                        for child in node: collect_refs(child)
-                    elif isinstance(node, dict):
-                        refs.update(v for v in node.get('evidence_refs', []) if isinstance(v, str))
-                        refs.update(v for v in node.get('source_refs', []) if isinstance(v, str))
-                        for child in node.values(): collect_refs(child)
-                collect_refs(draft)
-                available = {'source:' + str(i + 1): source for i, source in enumerate(l1_sources)}
-                if refs - set(available):
-                    from memory_l1_service import L1OwnerError
-                    raise L1OwnerError('unknown_source_binding', field_path='candidate.source_refs')
-                if refs:
-                    selected_keys = {available[ref]['source_key'] for ref in refs}
-                    selected_turns = [turn for turn in window if selected_keys.intersection(
-                        s['source_key'] for s in daily_sources([turn], profile_id=self.memory_semantic_profile_id))]
-                    item['source_turn_ids'] = [str(turn['id']) for turn in selected_turns if str(turn.get('id', '')).isdigit()]
-                    from memory_source_provenance import raw_event_source
-                    item['source_event_ids'] = [str(event['id']) for turn in selected_turns
-                        for event in turn.get('_semantic_sources', []) if str(event.get('id', '')).isdigit()
-                        and raw_event_source(event, profile_id=self.memory_semantic_profile_id)['source_key'] in selected_keys]
-                task_seed = {"date": key, "window": window_index, "candidate": index,
-                    "prompt": prompt_context["prompt_revision"], "sources": [s["source_key"] for s in l1_sources]}
-                from memory_l1_contract import semantic_sha256
-                item["_l1_sources"] = l1_sources
-                item["_l1_catalog_context"] = l1_catalog_context
-                item["_l1_generation"] = {"prompt_revision": prompt_context["prompt_revision"],
-                    "model_route_revision": "route_sha256:" + semantic_sha256({k: v for k, v in route.items() if k != "client"}),
-                    "task_id": "daily-task-" + semantic_sha256(task_seed)[:40], "actor": "daily_chat_first_pass"}
+                if item.get('_candidate_validation_issue'): continue
+                try:
+                    draft = item.get("document")
+                    if not isinstance(draft, dict):
+                        # Owner custom legacy prompts remain identifiable; they
+                        # cannot masquerade as a generated structured first pass.
+                        item["l1_state"] = "legacy_body_only"
+                        continue
+                    from memory_l1_semantic_wire import assemble_document
+                    draft = assemble_document(draft, require_keywords=True)
+                    item['document'] = draft
+                    item["content"] = draft.get("narrative", {}).get("body", "")
+                    item["title"] = draft.get("narrative", {}).get("title", "")
+                    # The model selects binding labels; only the program maps them
+                    # to archive/event/turn identities used by the existing policy.
+                    refs = set(item.get('source_refs') or [])
+                    def collect_refs(node):
+                        if isinstance(node, list):
+                            for child in node: collect_refs(child)
+                        elif isinstance(node, dict):
+                            refs.update(v for v in node.get('evidence_refs', []) if isinstance(v, str))
+                            refs.update(v for v in node.get('source_refs', []) if isinstance(v, str))
+                            for child in node.values(): collect_refs(child)
+                    collect_refs(draft)
+                    available = {'source:' + str(i + 1): source for i, source in enumerate(l1_sources)}
+                    if refs - set(available):
+                        from memory_l1_service import L1OwnerError
+                        raise L1OwnerError('unknown_source_binding', field_path='candidate.source_refs')
+                    if refs:
+                        selected_keys = {available[ref]['source_key'] for ref in refs}
+                        selected_turns = [turn for turn in window if selected_keys.intersection(
+                            s['source_key'] for s in daily_sources([turn], profile_id=self.memory_semantic_profile_id))]
+                        item['source_turn_ids'] = [str(turn['id']) for turn in selected_turns if str(turn.get('id', '')).isdigit()]
+                        from memory_source_provenance import raw_event_source
+                        item['source_event_ids'] = [str(event['id']) for turn in selected_turns
+                            for event in turn.get('_semantic_sources', []) if str(event.get('id', '')).isdigit()
+                            and raw_event_source(event, profile_id=self.memory_semantic_profile_id)['source_key'] in selected_keys]
+                    task_seed = {"date": key, "window": window_index, "candidate": index,
+                        "prompt": prompt_context["prompt_revision"], "sources": [s["source_key"] for s in l1_sources]}
+                    from memory_l1_contract import semantic_sha256
+                    item["_l1_sources"] = l1_sources
+                    item["_l1_catalog_context"] = l1_catalog_context
+                    item["_l1_generation"] = {"prompt_revision": prompt_context["prompt_revision"],
+                        "model_route_revision": "route_sha256:" + semantic_sha256({k: v for k, v in route.items() if k != "client"}),
+                        "task_id": "daily-task-" + semantic_sha256(task_seed)[:40], "actor": "daily_chat_first_pass"}
+                except Exception as exc:
+                    from memory_chat_preparation import issue
+                    result[index] = {'_candidate_validation_issue': issue(exc)}
         return result, stats
 
     def _heuristic_daily_chat_memory_candidates(
@@ -4932,6 +5237,10 @@ class ReflectionEngine(MemoryL1Runtime):
                 flags[flag] = flags.get(flag, 0) + 1
 
         for candidate in candidates or []:
+            if candidate.get('_candidate_validation_issue'):
+                record_hard('invalid_l1_document')
+                if audit is not None: audit.setdefault('l1_issues', []).append(candidate['_candidate_validation_issue'])
+                continue
             if candidate.get("should_write") is False:
                 continue
             candidate_tags = self._string_list(candidate.get("tags"), limit=8)
@@ -5770,6 +6079,11 @@ class ReflectionEngine(MemoryL1Runtime):
                 decision = self.memory_ingestion_policy.evaluate(proposal)
                 before = self.memory_authority_store.get_candidate(proposal.proposal_id)
                 if before:
+                    if candidate.get('preparation_key'):
+                        # Resuming a generated batch reads the current owner
+                        # revision; even a forced source rescan must not rewrite it.
+                        existing += 1
+                        continue
                     if force and before.get("status") in {"pending", "deferred", "commit_failed"}:
                         if before.get("proposal_sha256") != self.memory_authority_store.fingerprint(proposal.payload()):
                             self.memory_authority_store.revise_candidate(

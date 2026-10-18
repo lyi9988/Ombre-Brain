@@ -4078,7 +4078,7 @@
       </div>
       <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">默认 0；0 表示按日期读取当天全部原文，只影响自动记忆候选</div>
       <div style="margin:14px 0 8px;padding:10px 12px;background:var(--surface);border-radius:8px;font-size:12px;color:var(--text-dim);line-height:1.7;">
-        <strong>后台 L1 候选生成预算</strong><br />以下值控制后台整理任务的输入窗口、模型调用与候选数量；它们不控制最终记忆召回或 Prompt 注入条数。后者在“记忆浮现”页单独配置。保存值以服务器配置回读为准。
+        <strong>后台 L1 候选生成预算</strong><br />以下值控制输入窗口、单次模型输出与内部批次节奏；同一任务按窗口连续处理该日期来源，单批候选额度不是全天总上限。它们不控制最终记忆召回或 Prompt 注入条数，后者在“记忆浮现”页单独配置。保存值以服务器配置回读为准。
       </div>
       <div class="config-row">
         <label>Diary 输入字符</label>
@@ -4136,7 +4136,7 @@
         <input type="number" id="cfg-reflection-chat-memory-candidate-max-tokens" step="1" placeholder="从服务器配置读取" />
       </div>
       <div class="config-row">
-        <label>每次最大窗口</label>
+        <label>每批最大窗口</label>
         <input type="number" id="cfg-reflection-chat-memory-max-windows" step="1" placeholder="从服务器配置读取" />
       </div>
       <div class="config-row">
@@ -4144,11 +4144,11 @@
         <input type="number" id="cfg-reflection-chat-memory-window-max-input-chars" step="1" placeholder="从服务器配置读取" />
       </div>
       <div class="config-row">
-        <label>每日候选上限</label>
+        <label>每批候选额度</label>
         <input type="number" id="cfg-reflection-chat-memory-max-per-day" step="1" placeholder="从服务器配置读取" />
       </div>
       <div class="config-row">
-        <label>每日 Review 上限</label>
+        <label>每批 Review 额度</label>
         <input type="number" id="cfg-reflection-chat-memory-review-max-per-day" step="1" placeholder="从服务器配置读取" />
       </div>
       <div class="config-row">
@@ -9137,8 +9137,8 @@ async function saveConfig(persist, persistEnv) {
       daily_chat_memory_candidate_max_tokens: generationIntegerValue('cfg-reflection-chat-memory-candidate-max-tokens', 'Daily 候选最大 tokens', 'daily_chat_memory_candidate_max_tokens'),
       daily_chat_memory_max_windows_per_run: generationIntegerValue('cfg-reflection-chat-memory-max-windows', 'Daily 每次最大窗口', 'daily_chat_memory_max_windows_per_run'),
       daily_chat_memory_window_max_input_chars: generationIntegerValue('cfg-reflection-chat-memory-window-max-input-chars', 'Daily 窗口输入字符', 'daily_chat_memory_window_max_input_chars'),
-      daily_chat_memory_max_per_day: generationIntegerValue('cfg-reflection-chat-memory-max-per-day', 'Daily 每日候选上限', 'daily_chat_memory_max_per_day'),
-      daily_chat_memory_review_max_per_day: generationIntegerValue('cfg-reflection-chat-memory-review-max-per-day', 'Daily Review 上限', 'daily_chat_memory_review_max_per_day'),
+      daily_chat_memory_max_per_day: generationIntegerValue('cfg-reflection-chat-memory-max-per-day', 'Daily 每批候选额度', 'daily_chat_memory_max_per_day'),
+      daily_chat_memory_review_max_per_day: generationIntegerValue('cfg-reflection-chat-memory-review-max-per-day', 'Daily Review 每批额度', 'daily_chat_memory_review_max_per_day'),
     };
     if (Object.keys(generationConfig).some(function(key) { return generationConfig[key] === null; })) return;
     candidate.dehydration = {
@@ -9601,7 +9601,7 @@ function loadDashboardModule(path, onload) {
   document.body.appendChild(script);
 }
 
-loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261018-model-io-r1');
+loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261018-candidate-retention-r1');
 loadDashboardModule('/dashboard-assets/memory-task-models.js?v=20261018-memory-l2-schema-p4', function() {
   if (window.renderMemoryTaskModels) window.renderMemoryTaskModels();
 });

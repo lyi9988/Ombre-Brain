@@ -71,6 +71,42 @@ class MemoryL1SourceTasks:
             return [json.loads(row['value']) for row in rows]
         finally: db.close()
 
+    def page_with_chat(self, *, limit=100, offset=0):
+        """One ordered SQL page across the two existing task families."""
+        if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0:
+            raise L1OwnerError('invalid_task_page_limit', field_path='limit')
+        from memory_chat_preparation import PREFIX as CHAT_PREFIX, ChatMemoryPreparation
+        action_prefix = PREFIX + 'action_source_'
+        where = '((key>=? AND key<?) OR (key>=? AND key<?))'
+        params = (action_prefix, action_prefix + '\uffff', CHAT_PREFIX, CHAT_PREFIX + '\uffff')
+        db = self.authority._connect()
+        try:
+            total = db.execute('SELECT count(*) FROM authority_meta WHERE ' + where, params).fetchone()[0]
+            rows = db.execute('SELECT key,value FROM authority_meta WHERE ' + where
+                + " ORDER BY json_extract(value,'$.created_at') DESC,json_extract(value,'$.task_id') DESC,key DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset)).fetchall()
+            values = [ChatMemoryPreparation.public(json.loads(row['value'])) if row['key'].startswith(CHAT_PREFIX)
+                      else json.loads(row['value']) for row in rows]
+        finally:
+            db.close()
+        next_offset = offset + len(values)
+        return {'tasks': values, 'limit': limit, 'offset': offset, 'total': total,
+                'has_more': next_offset < total, 'next_offset': next_offset if next_offset < total else None}
+
+    def runnable(self, *, limit=100):
+        """Select waiting work in SQL, independent of owner history pages."""
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise L1OwnerError('invalid_task_page_limit', field_path='limit')
+        db = self.authority._connect()
+        try:
+            rows = db.execute("SELECT value FROM authority_meta WHERE key LIKE ? AND "
+                "(json_extract(value,'$.phase')='queued' OR (json_extract(value,'$.phase')='prepared' "
+                "AND json_array_length(value,'$.remaining_candidate_ids')>0)) "
+                "ORDER BY CASE json_extract(value,'$.phase') WHEN 'prepared' THEN 0 ELSE 1 END,"
+                "json_extract(value,'$.created_at'),key LIMIT ?", (PREFIX + 'action_source_%', limit)).fetchall()
+            return [json.loads(row['value']) for row in rows]
+        finally: db.close()
+
     def transition(self, task_id, expected_phase, phase, **result):
         if phase not in ('queued', 'generating', 'prepared', 'failed'):
             raise L1OwnerError('invalid_task_phase', field_path='phase')

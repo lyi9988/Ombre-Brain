@@ -12,6 +12,28 @@ from typing import Any
 
 logger = logging.getLogger("ombre_brain.raw_events")
 
+
+def _date_range_predicate(start_at: datetime, end_at: datetime):
+    """SQLite date predicate preserving the existing Python timezone semantics.
+
+    Naive stored timestamps belong to the query timezone. An SQL UTC cast would
+    shift those rows across midnight. Only matching rows leave SQLite, in chunks.
+    """
+    compare_tz = start_at.tzinfo or end_at.tzinfo
+    def local(value):
+        try:
+            parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if compare_tz is None:
+            return parsed.replace(tzinfo=None)
+        return parsed.replace(tzinfo=compare_tz) if parsed.tzinfo is None else parsed.astimezone(compare_tz)
+    start, end = local(start_at), local(end_at)
+    def matches(value):
+        parsed = local(value)
+        return int(parsed is not None and start <= parsed < end)
+    return matches
+
 ALLOWED_RAW_ROLES = {"user", "assistant"}
 RAW_EVENT_DEFAULT_SOURCE = "raw"
 
@@ -252,6 +274,10 @@ class RawEventStore:
         source: str = "",
         conversation_id: str = "",
         session_id: str = "",
+        chronological: bool = False,
+        after_event_id: int = 0,
+        profile_id: str = "",
+        complete_rounds: bool = False,
     ) -> list[dict[str, Any]]:
         try:
             raw_limit = int(limit)
@@ -263,6 +289,49 @@ class RawEventStore:
             conversation_id=conversation_id,
             session_id=session_id,
         )
+        if chronological:
+            # Extraction consumes the oldest still-unprocessed source batch.
+            # Date filtering precedes LIMIT; never sample the whole DB's tail.
+            conn = self._connect()
+            try:
+                conn.create_function("memory_in_date", 1, _date_range_predicate(start_at, end_at))
+                clauses = " AND e.id > ? AND memory_in_date(e.created_at)=1"
+                query_params = [*params, max(0, int(after_event_id))]
+                if profile_id:
+                    clauses += " AND (json_extract(e.metadata_json,'$.profile_id') IS NULL OR json_extract(e.metadata_json,'$.profile_id')=?)"
+                    query_params.append(str(profile_id))
+                base_where = f" WHERE 1=1 {filters}{clauses}"
+                base_params = list(query_params)
+                query = f"SELECT e.* FROM raw_events e{base_where} ORDER BY e.id ASC"
+                batch_limit = max(0, min(10001, raw_limit))
+                if batch_limit:
+                    query += " LIMIT ?"
+                    query_params.append(batch_limit)
+                cursor = conn.execute(query, query_params)
+                result = []
+                while rows := cursor.fetchmany(256):
+                    result.extend(self._row_to_event(row) for row in rows)
+                if complete_rounds and batch_limit:
+                    # Close every included session/round, including interleaved
+                    # rounds, before advancing the global event watermark. A
+                    # single complete round may exceed the source batch target.
+                    while result:
+                        selected_ids = json.dumps([row['id'] for row in result])
+                        end_id = conn.execute(f"SELECT MAX(e.id) FROM raw_events e{base_where} AND EXISTS ("
+                            "SELECT 1 FROM json_each(?) ids JOIN raw_events picked ON picked.id=ids.value "
+                            "WHERE picked.session_id=e.session_id AND json_extract(picked.metadata_json,'$.round_id') IS NOT NULL "
+                            "AND CAST(json_extract(picked.metadata_json,'$.round_id') AS TEXT)=CAST(json_extract(e.metadata_json,'$.round_id') AS TEXT))",
+                            [*base_params, selected_ids]).fetchone()[0]
+                        last_id = result[-1]['id']
+                        if not end_id or end_id <= last_id:
+                            break
+                        extra = conn.execute(f"SELECT e.* FROM raw_events e{base_where} AND e.id>? AND e.id<=? ORDER BY e.id ASC",
+                                             [*base_params, last_id, end_id])
+                        while rows := extra.fetchmany(256):
+                            result.extend(self._row_to_event(row) for row in rows)
+                return result
+            finally:
+                conn.close()
         conn = self._connect()
         if safe_limit > 0:
             rows = conn.execute(

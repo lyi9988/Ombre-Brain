@@ -458,58 +458,63 @@ class MemoryAuthorityStore:
     def put_candidate(self, proposal: MemoryProposal, policy: PolicyDecision) -> dict[str, Any]:
         if not proposal.proposal_id:
             raise ValueError("proposal_id is required")
-        proposal_payload = proposal.payload()
-        proposal_sha = _sha(proposal_payload)
-        status = {"reject": "rejected", "queue_review": "pending", "auto_accept": "accepted"}[policy.action]
-        now = _now()
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT * FROM candidates WHERE candidate_id=?", (proposal.proposal_id,)
-            ).fetchone()
-            if row:
-                current = self._candidate_row(row)
-                if current and current["proposal_sha256"] != proposal_sha:
-                    raise IdempotencyConflict("candidate_id already exists with different proposal")
-                conn.commit()
-                return current or {}
-            conn.execute(
-                "INSERT INTO candidates(candidate_id,revision,status,proposal_sha256,proposal_json,policy_json,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (proposal.proposal_id, 1, status, proposal_sha, _json(proposal_payload), _json(policy.payload()), now, now),
-            )
-            created_result = {
-                "candidate_id": proposal.proposal_id,
-                "revision": 1,
-                "status": status,
-                "proposal_sha256": proposal_sha,
-                "proposal": proposal_payload,
-                "policy": policy.payload(),
-                "created_at": now,
-                "updated_at": now,
-            }
-            self._index_candidate_sources(conn, proposal_payload)
-            conn.execute(
-                "INSERT INTO candidate_revisions(candidate_id,revision,status,proposal_sha256,proposal_json,"
-                "policy_json,actor,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (proposal.proposal_id, 1, status, proposal_sha, _json(proposal_payload),
-                 _json(policy.payload()), "policy", now),
-            )
-            conn.execute(
-                "INSERT INTO candidate_decisions(decision_id,candidate_id,from_status,to_status,candidate_revision,"
-                "request_id,fingerprint,actor,reason_codes_json,result_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), proposal.proposal_id, "generated", status, 1, "", proposal_sha,
-                 "policy", _json(list(policy.reason_codes)), _json(created_result), now),
-            )
+            result = self._put_candidate(conn, proposal, policy)
             conn.commit()
-            row = conn.execute("SELECT * FROM candidates WHERE candidate_id=?", (proposal.proposal_id,)).fetchone()
-            return self._candidate_row(row) or {}
+            return result
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
+
+    def _put_candidate(self, conn, proposal: MemoryProposal, policy: PolicyDecision) -> dict[str, Any]:
+        """Insert inside the caller's Authority transaction."""
+        if not proposal.proposal_id:
+            raise ValueError("proposal_id is required")
+        proposal_payload = proposal.payload()
+        proposal_sha = _sha(proposal_payload)
+        status = {"reject": "rejected", "queue_review": "pending", "auto_accept": "accepted"}[policy.action]
+        now = _now()
+        row = conn.execute(
+            "SELECT * FROM candidates WHERE candidate_id=?", (proposal.proposal_id,)
+        ).fetchone()
+        if row:
+            current = self._candidate_row(row)
+            if current and current["proposal_sha256"] != proposal_sha:
+                raise IdempotencyConflict("candidate_id already exists with different proposal")
+            return current or {}
+        conn.execute(
+            "INSERT INTO candidates(candidate_id,revision,status,proposal_sha256,proposal_json,policy_json,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (proposal.proposal_id, 1, status, proposal_sha, _json(proposal_payload), _json(policy.payload()), now, now),
+        )
+        created_result = {
+            "candidate_id": proposal.proposal_id,
+            "revision": 1,
+            "status": status,
+            "proposal_sha256": proposal_sha,
+            "proposal": proposal_payload,
+            "policy": policy.payload(),
+            "created_at": now,
+            "updated_at": now,
+        }
+        self._index_candidate_sources(conn, proposal_payload)
+        conn.execute(
+            "INSERT INTO candidate_revisions(candidate_id,revision,status,proposal_sha256,proposal_json,"
+            "policy_json,actor,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (proposal.proposal_id, 1, status, proposal_sha, _json(proposal_payload),
+             _json(policy.payload()), "policy", now),
+        )
+        conn.execute(
+            "INSERT INTO candidate_decisions(decision_id,candidate_id,from_status,to_status,candidate_revision,"
+            "request_id,fingerprint,actor,reason_codes_json,result_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), proposal.proposal_id, "generated", status, 1, "", proposal_sha,
+             "policy", _json(list(policy.reason_codes)), _json(created_result), now),
+        )
+        return created_result
 
     def get_candidate(self, candidate_id: str) -> dict[str, Any] | None:
         conn = self._connect()
@@ -559,20 +564,51 @@ class MemoryAuthorityStore:
         finally:
             conn.close()
 
-    def list_candidates(self, *, status: str = "pending", limit: int = 100) -> list[dict[str, Any]]:
+    def list_candidates(self, *, status: str = "pending", limit: int = 100, offset: int = 0,
+                        requested_mode: str | None = None) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
-        if status and status != "all":
+        if status == "review_visible":
+            clauses.append(self._review_visible_candidates_sql())
+        elif status and status != "all":
             clauses.append("status=?")
             params.append(str(status))
+        if requested_mode is not None:
+            clauses.append("COALESCE(json_extract(proposal_json,'$.requested_mode'),'review')=?")
+            params.append(requested_mode)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         conn = self._connect()
         rows = conn.execute(
-            f"SELECT * FROM candidates{where} ORDER BY created_at DESC LIMIT ?",
-            [*params, max(1, min(1000, int(limit)))],
+            f"SELECT * FROM candidates{where} ORDER BY created_at DESC,candidate_id DESC LIMIT ? OFFSET ?",
+            [*params, max(1, min(1000, int(limit))), max(0, int(offset))],
         ).fetchall()
         conn.close()
         return [self._candidate_row(row) or {} for row in rows]
+
+    def count_candidates(self, *, status: str = "all", requested_mode: str | None = None) -> int:
+        clauses, params = [], []
+        if status == "review_visible":
+            clauses.append(self._review_visible_candidates_sql())
+        elif status and status != "all":
+            clauses.append("status=?")
+            params.append(status)
+        if requested_mode is not None:
+            clauses.append("COALESCE(json_extract(proposal_json,'$.requested_mode'),'review')=?")
+            params.append(requested_mode)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        conn = self._connect()
+        try:
+            return int(conn.execute("SELECT count(*) FROM candidates" + where, params).fetchone()[0])
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _review_visible_candidates_sql() -> str:
+        return """(status='pending' OR (status IN ('accepted','commit_failed') AND EXISTS (
+            SELECT 1 FROM authority_meta receipt
+            WHERE receipt.key='memory_candidate_preparation:' || json_extract(candidates.proposal_json,'$.metadata.preparation_key')
+            AND (json_extract(receipt.value,'$.stale')=1 OR NOT EXISTS (
+                SELECT 1 FROM json_each(receipt.value,'$.processed_ids') done WHERE done.value=candidates.candidate_id)))))"""
 
     def revise_candidate(
         self,

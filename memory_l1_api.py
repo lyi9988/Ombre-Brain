@@ -235,3 +235,38 @@ def validate_response(response):
     if error is not None:
         raise L1OwnerError('native_l1_schema_mismatch',
                            field_path='.'.join(map(str, error.absolute_path)) or 'document')
+
+
+def validate_candidate_items(response):
+    """Retain individually valid drafts without claiming the batch was valid.
+
+    The root and every retained Candidate use the unchanged native schema.
+    Invalid items become error markers, never repaired or adopted documents.
+    """
+    import json
+    from memory_l1_service import L1OwnerError
+    schema = getattr(response, 'native_schema', None)
+    try:
+        validate_response(response)
+        schema_issue = None
+    except L1OwnerError as exc:
+        if exc.code != 'native_l1_schema_mismatch': raise
+        schema_issue = {'code': exc.code, 'field_path': exc.field_path}
+    parsed = json.loads(response.choices[0].message.content)
+    candidates = parsed.get('candidates') if isinstance(parsed, dict) else None
+    if not isinstance(candidates, list):
+        raise L1OwnerError('first_pass_candidates_required', field_path='candidates')
+    if schema is None or schema_issue is None: return candidates, schema_issue
+    from jsonschema import Draft202012Validator
+    root = deepcopy(schema)
+    root['properties']['candidates']['items'] = {}
+    error = next(Draft202012Validator(root).iter_errors(parsed), None)
+    if error is not None:
+        raise L1OwnerError('native_l1_schema_mismatch', field_path='.'.join(map(str, error.absolute_path)))
+    validator = Draft202012Validator({'$defs': schema['$defs'], '$ref': '#/$defs/Candidate'})
+    result = []
+    for item in candidates:
+        error = next(validator.iter_errors(item), None)
+        result.append(item if error is None else {'_candidate_validation_issue': {
+            'code': 'native_l1_schema_mismatch', 'field_path': '.'.join(map(str, error.absolute_path))}})
+    return result, schema_issue

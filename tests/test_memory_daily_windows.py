@@ -136,9 +136,12 @@ def raw_day(count):
 def run_day(engine, events, mode="review", buckets=None):
     import asyncio
     from test_daily_chat_memory_quality_review_v4 import FakeBuckets, FakeRawEvents, FakeTurns
-    return asyncio.run(engine.run_daily_chat_memory(buckets or FakeBuckets(),
-        raw_event_store=FakeRawEvents(events), conversation_turn_store=FakeTurns([]),
-        key="2026-08-18", mode=mode))
+    async def batch():
+        result = await engine._run_daily_chat_memory_impl(buckets or FakeBuckets(),
+            raw_event_store=FakeRawEvents(events), conversation_turn_store=FakeTurns([]),
+            key="2026-08-18", mode=mode)
+        return engine._ack_daily_chat_memory_preparation(result)
+    return asyncio.run(batch())
 
 
 def candidate_for(event_id):
