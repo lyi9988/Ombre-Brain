@@ -70,11 +70,11 @@ def test_l2_generation_prompt_is_registered_and_has_gateway_fallback_factory():
     body = factory_body(source_id)
 
     assert spec.scope == "memory.reflection"
-    assert spec.source_revision == "factory-memory-l2-generation-v3-natural-source-faithful"
+    assert spec.source_revision == "factory-memory-l2-generation-v5-scoped-readable-writing"
     assert spec.factory_body() == body
-    assert '"review"' in body
-    assert '"required":false' in body
-    assert "review 是自动稿审阅判断元数据，不是记忆正文" in body
+    assert "review" in body and "required" in body and "reasons" in body
+    assert "仅放审阅元数据" in body
+    assert "不能把理由写进正文" in body
 
 
 def test_internal_recall_preparation_sources_are_scoped_and_provenanced():
