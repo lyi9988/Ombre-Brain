@@ -3042,6 +3042,58 @@
     font-size: 11px;
     color: var(--text-light);
   }
+  .chat-memory-model-io-panel {
+    margin-top: 10px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(255,255,255,0.2);
+    color: var(--text);
+    font-size: 12px;
+    max-height: 72vh;
+    overflow: auto;
+    overflow-wrap: anywhere;
+  }
+  .chat-memory-model-io-head,
+  .chat-memory-model-io-actions,
+  .chat-memory-model-io-message-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .chat-memory-model-io-head { justify-content: space-between; }
+  .chat-memory-model-io-status,
+  .chat-memory-model-io-empty { color: var(--text-light); }
+  .chat-memory-model-io-stage { border-top: 1px solid var(--border); padding-top: 8px; margin-top: 8px; }
+  .chat-memory-model-io-stage h4,
+  .chat-memory-model-io-record-body h5 { margin: 8px 0; color: var(--text); }
+  .chat-memory-model-io-record { border-top: 1px solid var(--border); padding: 7px 0; }
+  .chat-memory-model-io-record > summary,
+  .chat-memory-model-io-json > summary { cursor: pointer; overflow-wrap: anywhere; }
+  .chat-memory-model-io-record-body { padding: 8px 0 4px; min-width: 0; }
+  .chat-memory-model-io-meta {
+    display: grid;
+    grid-template-columns: minmax(115px, 170px) minmax(0, 1fr);
+    gap: 4px 10px;
+    margin: 0 0 8px;
+  }
+  .chat-memory-model-io-meta dt { color: var(--text-light); }
+  .chat-memory-model-io-meta dd { margin: 0; min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .chat-memory-model-io-message { min-width: 0; margin: 8px 0; }
+  .chat-memory-model-io-content,
+  .chat-memory-model-io-json pre {
+    max-height: 30rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    user-select: text;
+    margin: 6px 0;
+  }
+  .chat-memory-model-io-json { margin: 5px 0; }
+  .chat-memory-model-io-copy,
+  .chat-memory-model-io-more { margin: 5px 0; }
 
   @media (max-width: 768px) {
     .chat-memory-card-grid {
@@ -3051,6 +3103,7 @@
       grid-template-columns: 1fr;
     }
     .chat-memory-cognition-grid { grid-template-columns: 1fr; }
+    .chat-memory-model-io-meta { grid-template-columns: 1fr; gap: 2px; }
     .header { padding: 20px; flex-wrap: wrap; }
     .header h1 { font-size: 22px; }
     .darkroom-door {
@@ -9548,7 +9601,7 @@ function loadDashboardModule(path, onload) {
   document.body.appendChild(script);
 }
 
-loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261017-cognition-owner-ui-r1');
+loadDashboardModule('/dashboard-assets/chat-memory.js?v=20261018-model-io-r1');
 loadDashboardModule('/dashboard-assets/memory-task-models.js?v=20261018-memory-l2-schema-p4', function() {
   if (window.renderMemoryTaskModels) window.renderMemoryTaskModels();
 });

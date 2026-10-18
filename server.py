@@ -12505,6 +12505,37 @@ async def _memory_preparation_workers():
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+@mcp.custom_route('/api/memory-authority/memories/{memory_id}/model-io', methods=['GET'])
+async def api_memory_model_io(request):
+    """Owner-only actual model messages and visible output, including pending L1 tasks."""
+    from starlette.responses import JSONResponse
+    from memory_model_io import MemoryModelIO
+    from memory_l1_service import L1OwnerError
+    headers = {'Cache-Control': 'no-store'}
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    if memory_authority_store is None:
+        return JSONResponse({'error': {'code': 'memory_authority_unavailable'}}, status_code=503, headers=headers)
+    try:
+        if set(request.query_params) - {'limit', 'offset'}:
+            raise L1OwnerError('unknown_query_field')
+        paging = {}
+        for key, default in (('limit', '20'), ('offset', '0')):
+            raw = request.query_params.get(key, default)
+            if len(request.query_params.getlist(key)) > 1:
+                raise L1OwnerError('duplicate_query_field', field_path=key)
+            if not raw.isascii() or not raw.isdigit():
+                raise L1OwnerError('invalid_model_io_page', field_path=key)
+            paging[key] = int(raw)
+        result = MemoryModelIO(memory_authority_store).list(str(request.path_params['memory_id']), **paging)
+        return JSONResponse(result, headers=headers)
+    except L1OwnerError as exc:
+        return JSONResponse({'error': {'code': exc.code, 'field_path': exc.field_path}}, status_code=exc.status, headers=headers)
+    except (ValueError, TypeError):
+        return JSONResponse({'error': {'code': 'invalid_model_io_page'}}, status_code=400, headers=headers)
+
+
 @mcp.custom_route('/api/memory-authority/memories/{memory_id}/presentation', methods=['GET'])
 @mcp.custom_route('/api/memory-authority/memories/{memory_id}/presentation/prepare', methods=['POST'])
 @mcp.custom_route('/api/memory-authority/memories/{memory_id}/presentation/revisions', methods=['POST'])

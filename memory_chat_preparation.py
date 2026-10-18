@@ -12,6 +12,7 @@ from memory_authority import IdempotencyConflict
 from memory_l1_contract import canonical_json, semantic_sha256
 from memory_l1_service import L1OwnerError
 from memory_l1_wire_schema import chat_submission_parameters
+from memory_model_io import MemoryModelIO, completion_parameters
 
 PREFIX = 'memory_l1_chat_task:'
 
@@ -245,10 +246,12 @@ async def prepare_chat_tasks(engine, bucket_mgr):
         return {'status': 'not_prepared', 'reason': route['unavailable_reason']}
     engine._chat_preparation_running = True
     tasks = ChatMemoryPreparation(engine.memory_authority_store)
+    model_io = MemoryModelIO(engine.memory_authority_store)
     results = []
     try:
         for pending in tasks.list(limit=options['chat_memory_jobs_per_run'], phase='queued', private=True):
             completion_meta = {}
+            io_id = None
             try:
                 claimed = tasks.claim(pending, lease_seconds=engine.daily_chat_memory_timeout_seconds + 60)
             except L1OwnerError:
@@ -292,10 +295,22 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 input_metrics['completion_parameters'] = {'model': model,
                     **completion_options(route, temperature=engine.temperature)}
                 completion_meta['input_metrics'] = input_metrics
+                generation = {'prompt_revision': prompt_context['prompt_revision'],
+                    'model_route_revision': 'route_sha256:' + semantic_sha256({k: v for k, v in route.items() if k != 'client'}),
+                    'task_id': memory_id + ':' + str(claimed['draft_revision']), 'actor': 'chat_memory_preparation'}
+                messages = [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': serialized_payload}]
+                io_id = model_io.start(memory_id, stage='chat_l1', task_id=memory_id,
+                    attempt=claimed['attempts'], attempt_id=claimed['claim_token'], messages=messages,
+                    parameters=completion_parameters(route, engine.temperature),
+                    draft_revision=claimed['draft_revision'], generation={**generation, 'catalog_revision':catalog_revision},
+                    source_revisions=bindings)
                 response = await engine._daily_chat_memory_create_completion(client, model=model,
-                    messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': serialized_payload}],
+                    messages=messages,
                     max_tokens=engine.daily_chat_memory_candidate_max_tokens, temperature=engine.temperature,
                     use_daily_client=use_daily, task_stage='chat_l1', task_route=route)
+                raw_output = engine._completion_content(response) or ''
+                model_io.returned(io_id, response=response, raw_output=raw_output,
+                                  finish_reason=engine._completion_finish_reason(response))
                 reported_usage = getattr(response, 'usage', None)
                 usage = {name: getattr(reported_usage, name, None) for name in
                          ('prompt_tokens', 'completion_tokens', 'total_tokens')}
@@ -308,10 +323,6 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                     count = getattr(reported_usage, name, None)
                     if type(count) is int:
                         usage[name] = count
-                raw_output = engine._completion_content(response) or ''
-                generation = {'prompt_revision': prompt_context['prompt_revision'],
-                    'model_route_revision': 'route_sha256:' + semantic_sha256({k: v for k, v in route.items() if k != 'client'}),
-                    'task_id': memory_id + ':' + str(claimed['draft_revision']), 'actor': 'chat_memory_preparation'}
                 completion_meta = {'generation': generation, 'usage': usage, 'input_metrics': input_metrics,
                     'duration_ms': int((time.monotonic() - started) * 1000),
                     'preparation_output': {'draft_revision': claimed['draft_revision'],
@@ -373,9 +384,11 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 tasks.finish(claimed, phase='prepared', candidate_ids=[memory_id],
                     generation=generation, catalog_revision=catalog_revision, usage=usage, input_metrics=input_metrics,
                     duration_ms=int((time.monotonic() - started) * 1000),
-                    output_shape=output_shape, preparation_output=None)
+                    output_shape=output_shape, preparation_output=completion_meta['preparation_output'])
+                model_io.finish(io_id)
                 results.append(tasks.receipt(memory_id))
             except Exception as exc:
+                if io_id: model_io.finish(io_id, error=exc)
                 try:
                     tasks.finish(claimed, phase='failed', issue=issue(exc), **completion_meta)
                 except L1OwnerError:

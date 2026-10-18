@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 
 from memory_authority import MemoryNotFound, RevisionConflict
@@ -9,8 +10,64 @@ from memory_l1_contract import L1ContractError, semantic_sha256
 from memory_l1_reads import MemoryL1Reads
 from memory_l1_service import L1OwnerError
 from memory_l2_store import MemoryL2Store, validate_document
+from memory_model_io import MemoryModelIO, completion_parameters
 
 USES = {'current_basis', 'conditional_basis', 'relationship_reference', 'historical_evidence', 'unresolved_evidence'}
+
+
+def semantic_input_projection(material):
+    """Remove custody metadata from model input, retaining all semantic content.
+
+    The full material is still loaded and verified before/after generation.
+    Local evidence/entity/scene IDs and formal statement IDs remain unchanged.
+    """
+    def omit(value, fields):
+        return {key: copy.deepcopy(item) for key, item in value.items() if key not in fields}
+    def anchors(values):
+        return [omit(anchor, {'target_id', 'target_namespace', 'target_revision',
+                              'text_view_id', 'text_sha256', 'quote_sha256'})
+                for anchor in values]
+    def member(value, revision_field):
+        result = omit(value, {'generation', revision_field})
+        if 'anchors' in result:
+            result['anchors'] = anchors(result['anchors'])
+        return result
+    doc = omit(material['l1_document'], {'generation', 'schema_version'})
+    doc['entry'] = omit(doc['entry'], {'parent_ref', 'document_group_id', 'derived_from_revision'})
+    for module, revision_field in (('statements', 'statement_revision_id'), ('scenes', 'scene_revision_id'),
+                                   ('entities', 'entity_revision_id'), ('relations', 'relation_revision_id')):
+        doc[module] = [member(item, revision_field) for item in doc.get(module, [])]
+    # Source identity, revision and hashes are program custody. Evidence refs
+    # retain the exact binding_id and offsets; full source prose stays below.
+    doc['evidence_bindings'] = [{key: (anchors(binding[key]) if key == 'anchors' else copy.deepcopy(binding[key])) for key in
+        ('binding_id', 'author_ref', 'speaker_ref', 'anchors') if key in binding}
+        for binding in material['l1_document'].get('evidence_bindings', [])]
+    sources = []
+    for source in material['sources']:
+        sources.append({'binding_id': source['binding']['binding_id'],
+            **{key: copy.deepcopy(source.get(key)) for key in
+               ('text', 'title', 'author', 'speaker', 'eligible_source', 'state', 'view', 'limitations')},
+            'source_recorded_at': source.get('recorded_at')})
+    result = {'l1_document': doc,
+              'shared_statements': [member(item, 'statement_revision_id') for item in material['shared_statements']],
+              'sources': sources, 'rings': [omit(item, {'memory_id', 'operation_id', 'content_sha256', 'ring_id'})
+                                           for item in material['rings']]}
+    # Keep custom meanings used by this document without resending the whole
+    # generation catalog snapshot and its unused vocabulary.
+    from memory_l1_semantic_wire import semantic_catalog
+    used = set()
+    def strings(value):
+        if isinstance(value, str): used.add(value)
+        elif isinstance(value, list):
+            for item in value: strings(item)
+        elif isinstance(value, dict):
+            for item in value.values(): strings(item)
+    strings(result)
+    catalog = material['l1_document'].get('generation', {}).get('catalog_snapshot')
+    definitions = {axis: {key: meaning for key, meaning in values.items() if key in used and meaning}
+                   for axis, values in semantic_catalog(catalog).items()}
+    result['semantic_definitions'] = {axis: values for axis, values in definitions.items() if values}
+    return result
 
 
 class MemoryL2Service:
@@ -217,19 +274,30 @@ class MemoryL2Service:
                 return
             job = self.store.claim(pending['task_id'], dep)
             if not job: return
+            model_io, io_id = MemoryModelIO(self.revisions.authority), None
             try:
                 if not prompt.strip(): raise L1OwnerError('l2_prompt_disabled')
                 if not route['configured']: raise L1OwnerError('l2_model_unconfigured')
-                material = await self._material(job['memory_id'], dep['first_pass_revision'])
+                full_material = await self._material(job['memory_id'], dep['first_pass_revision'])
+                material = semantic_input_projection(full_material)
                 from memory_l2_schema import output_schema, validate_output
                 schema = output_schema(getattr(self.engine, 'config', {}))
                 material['output_schema'] = schema
+                messages = [{'role':'system','content':prompt},
+                            {'role':'user','content':json.dumps(material, ensure_ascii=False)}]
+                io_id = model_io.start(job['memory_id'], stage='presentation_l2', task_id=job['task_id'],
+                    attempt=job['lease_token'], attempt_id=job['lease_token'], messages=messages,
+                    parameters=completion_parameters(route, self.engine.temperature),
+                    generation={**generation, 'dependencies': dep},
+                    source_revisions=[source['binding'] for source in full_material['sources']])
                 response = await self.engine._daily_chat_memory_create_completion(route['client'], model=route['model'],
-                    messages=[{'role':'system','content':prompt}, {'role':'user','content':json.dumps(material, ensure_ascii=False)}],
+                    messages=messages,
                     max_tokens=route['max_tokens'], temperature=self.engine.temperature, use_daily_client=route['connection']=='daily',
                     task_stage='presentation_l2', task_route=route)
-                if self.engine._completion_finish_reason(response) == 'length': raise L1OwnerError('l2_output_incomplete')
                 raw = self.engine._completion_content(response) or ''
+                model_io.returned(io_id, response=response, raw_output=raw,
+                                  finish_reason=self.engine._completion_finish_reason(response))
+                if self.engine._completion_finish_reason(response) == 'length': raise L1OwnerError('l2_output_incomplete')
                 if raw.strip().startswith('```'): raw = raw.strip().split('\n', 1)[-1].rsplit('```',1)[0]
                 try: document = json.loads(raw)
                 except (ValueError, TypeError): raise L1OwnerError('invalid_l2_json') from None
@@ -244,11 +312,14 @@ class MemoryL2Service:
                 if self.generation_context()[2] != generation: raise L1OwnerError('l2_generation_configuration_changed')
                 result = self.store.save(job['memory_id'], document, dep, request_id=job['task_id'],
                     expected_revision=job['base_presentation_revision'], actor='model', job=job)
+                model_io.finish(io_id)
                 results.append({'task_id': job['task_id'], 'state': 'ready', **result})
             except asyncio.CancelledError:
+                if io_id: model_io.finish(io_id, error=L1OwnerError('worker_interrupted'))
                 self.store.finish(job, 'failed', 'worker_interrupted')
                 raise
             except Exception as exc:
+                if io_id: model_io.finish(io_id, error=exc)
                 reason = getattr(exc, 'code', type(exc).__name__)
                 state = 'stale' if isinstance(exc, RevisionConflict) else 'failed'
                 self.store.finish(job, state, reason)

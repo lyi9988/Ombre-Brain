@@ -13,7 +13,396 @@
   var sourceTaskDetailErrors = new Map();
   var sourceTaskSaving = new Set();
   var sourceTaskTasks = [];
+  var modelIoPanels = new Map();
   var MEMORY_STATE_KEY = 'guyan.ombre.daily-chat-memory-review.v1';
+
+  var MODEL_IO_STAGES = ['chat_l1', 'presentation_l2'];
+  var MODEL_IO_LIMIT = 20;
+
+  function modelIoMemoryId(value) {
+    return typeof value === 'string' ? value.trim() : '';
+  }
+
+  function modelIoViewKey(kind, memoryId) {
+    return String(kind || 'review') + ':' + String(memoryId || '');
+  }
+
+  function modelIoStageLabel(stage) {
+    var labels = { chat_l1: '完整第一遍记忆 L1', presentation_l2: '第二遍可读注入记忆 L2' };
+    return labels[stage] || String(stage || '未提供阶段');
+  }
+
+  function modelIoText(value) {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); }
+  }
+
+  function modelIoValueLabel(value) {
+    if (value == null || value === '') return '未留存';
+    return modelIoText(value);
+  }
+
+  function modelIoTokenSummary(usage) {
+    if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return 'Token 用量未留存';
+    var fields = [
+      ['prompt_tokens', 'prompt'], ['input_tokens', 'input'],
+      ['completion_tokens', 'completion'], ['output_tokens', 'output'],
+      ['reasoning_tokens', 'reasoning'], ['total_tokens', 'total'],
+    ];
+    var parts = fields.filter(function (field) {
+      return Object.prototype.hasOwnProperty.call(usage, field[0]) && usage[field[0]] != null;
+    }).map(function (field) { return field[1] + ' ' + modelIoText(usage[field[0]]); });
+    return parts.length ? 'Token ' + parts.join(' · ') : 'Token 用量已留存';
+  }
+
+  function modelIoValidationSummary(validation) {
+    if (validation == null) return '未留存';
+    if (typeof validation !== 'object' || Array.isArray(validation)) return modelIoText(validation);
+    var parts = [];
+    ['status', 'state', 'ok', 'valid', 'error', 'code'].forEach(function (key) {
+      if (Object.prototype.hasOwnProperty.call(validation, key) && validation[key] != null) {
+        parts.push(key + ': ' + modelIoText(validation[key]));
+      }
+    });
+    return parts.length ? parts.join(' · ') : '结果已留存，展开查看完整结构。';
+  }
+
+  function modelIoAppendText(parent, tagName, className, text) {
+    var element = document.createElement(tagName || 'div');
+    if (className) element.className = className;
+    element.textContent = text == null ? '' : String(text);
+    parent.appendChild(element);
+    return element;
+  }
+
+  function modelIoAppendJsonDetails(parent, label, value) {
+    var details = document.createElement('details');
+    details.className = 'chat-memory-model-io-json';
+    var summary = document.createElement('summary');
+    summary.textContent = label;
+    details.appendChild(summary);
+    var pre = document.createElement('pre');
+    pre.textContent = value == null ? '未留存' : modelIoText(value);
+    details.appendChild(pre);
+    parent.appendChild(details);
+    return details;
+  }
+
+  function modelIoCopy(button, text, status) {
+    var value = String(text == null ? '' : text);
+    var copied = false;
+    var clipboard = window.navigator && window.navigator.clipboard;
+    var write;
+    try {
+      write = clipboard && typeof clipboard.writeText === 'function'
+        ? Promise.resolve(clipboard.writeText(value)).then(function () { copied = true; })
+        : Promise.reject(new Error('clipboard_unavailable'));
+    } catch (error) { write = Promise.reject(error); }
+    return write.catch(function () {
+      var input = document.createElement('textarea');
+      input.value = value;
+      input.readOnly = true;
+      input.setAttribute('aria-hidden', 'true');
+      input.style.position = 'fixed'; input.style.left = '-10000px'; input.style.top = '0';
+      document.body.appendChild(input);
+      input.select();
+      try { copied = Boolean(document.execCommand && document.execCommand('copy')); }
+      catch (_) { copied = false; }
+      input.remove();
+    }).then(function () {
+      if (status) status.textContent = copied ? '已复制到剪贴板。' : '浏览器未开放复制权限；可直接选中正文复制。';
+      if (button) button.disabled = false;
+    });
+  }
+
+  function modelIoCopyButton(parent, label, value, status) {
+    var button = document.createElement('button');
+    button.type = 'button'; button.className = 'chat-memory-model-io-copy'; button.textContent = label;
+    button.addEventListener('click', function () {
+      button.disabled = true;
+      modelIoCopy(button, value, status);
+    });
+    parent.appendChild(button);
+    return button;
+  }
+
+  function modelIoAppendMessage(parent, message, index, status) {
+    var row = document.createElement('div'); row.className = 'chat-memory-model-io-message';
+    var role = message && message.role != null ? String(message.role) : '未提供角色';
+    var content = message && Object.prototype.hasOwnProperty.call(message, 'content')
+      ? modelIoText(message.content) : '消息正文未留存';
+    var head = document.createElement('div'); head.className = 'chat-memory-model-io-message-head';
+    modelIoAppendText(head, 'strong', '', '消息 ' + (index + 1) + ' · ' + role);
+    modelIoCopyButton(head, '复制此条输入', content, status);
+    row.appendChild(head);
+    modelIoAppendText(row, 'pre', 'chat-memory-model-io-content', content);
+    parent.appendChild(row);
+  }
+
+  function modelIoAppendRecord(parent, record, status) {
+    record = record && typeof record === 'object' ? record : {};
+    var stage = String(record.stage || 'unknown');
+    var details = document.createElement('details');
+    details.className = 'chat-memory-model-io-record';
+    details.setAttribute('data-model-io-stage', stage);
+    var summary = document.createElement('summary');
+    var attempt = record.attempt;
+    var numericAttempt = stage === 'chat_l1' && attempt != null && /^\d+$/.test(String(attempt));
+    var attemptText = attempt == null ? '尝试标识未留存'
+      : (numericAttempt ? '第 ' + modelIoText(attempt) + ' 次尝试' : '本轮调用');
+    var stateText = record.status == null ? '状态未留存' : modelIoText(record.status);
+    var finishText = record.finish_reason == null || record.finish_reason === ''
+      ? 'finish_reason 未留存' : 'finish_reason ' + modelIoText(record.finish_reason);
+    var started = record.started_at || record.ended_at || '';
+    summary.textContent = modelIoStageLabel(stage) + ' · ' + attemptText + ' · ' + stateText +
+      ' · ' + finishText + (started ? ' · ' + modelIoText(started) : '') +
+      ' · ' + modelIoTokenSummary(record.usage);
+    details.appendChild(summary);
+
+    var body = document.createElement('div'); body.className = 'chat-memory-model-io-record-body';
+    var metadata = document.createElement('dl'); metadata.className = 'chat-memory-model-io-meta';
+    [
+      ['阶段', record.stage], ['任务 ID', record.task_id], ['调用记录 ID', record.io_id],
+      ['尝试序号或标识', record.attempt], ['任务调用标识', record.attempt_id], ['状态', record.status],
+      ['开始时间', record.started_at], ['结束时间', record.ended_at], ['结束原因', record.finish_reason],
+      ['草稿版本', record.draft_revision],
+    ].forEach(function (field) {
+      modelIoAppendText(metadata, 'dt', '', field[0]);
+      modelIoAppendText(metadata, 'dd', '', modelIoValueLabel(field[1]));
+    });
+    body.appendChild(metadata);
+    modelIoAppendJsonDetails(body, '完整 usage 与 token 计数', record.usage);
+    modelIoAppendJsonDetails(body, '来源版本', record.source_revisions);
+    modelIoAppendJsonDetails(body, '模型与生成信息', record.generation);
+    modelIoAppendJsonDetails(body, 'completion_parameters', record.completion_parameters);
+    var validation = record.validation;
+    var validationSummary = '结构验证结果：' + modelIoValidationSummary(validation);
+    modelIoAppendText(body, 'p', 'chat-memory-model-io-validation', validationSummary);
+    if (validation != null) modelIoAppendJsonDetails(body, '结构验证完整结果', validation);
+
+    var messages = Array.isArray(record.messages) ? record.messages
+      : (Array.isArray(record.input_messages) ? record.input_messages : []);
+    modelIoAppendText(body, 'h5', '', '模型实际输入');
+    if (messages.length) messages.forEach(function (message, index) {
+      modelIoAppendMessage(body, message, index, status);
+    });
+    else modelIoAppendText(body, 'p', 'chat-memory-model-io-empty', '输入消息未留存。');
+
+    var hasRaw = Object.prototype.hasOwnProperty.call(record, 'raw_output') && record.raw_output != null;
+    var hasText = Object.prototype.hasOwnProperty.call(record, 'output_text') && record.output_text != null;
+    var output = hasRaw ? modelIoText(record.raw_output) : (hasText ? modelIoText(record.output_text) : null);
+    modelIoAppendText(body, 'h5', '', '模型可见输出');
+    if (output == null) {
+      modelIoAppendText(body, 'p', 'chat-memory-model-io-empty', '模型可见输出未留存。');
+    } else {
+      var outputHead = document.createElement('div'); outputHead.className = 'chat-memory-model-io-message-head';
+      modelIoCopyButton(outputHead, '复制完整输出', output, status);
+      body.appendChild(outputHead);
+      modelIoAppendText(body, 'pre', 'chat-memory-model-io-content chat-memory-model-io-output', output);
+    }
+    details.appendChild(body);
+    parent.appendChild(details);
+    return details;
+  }
+
+  function modelIoEnsureStage(records, stage) {
+    var section = Array.from(records.querySelectorAll('[data-model-io-stage-section]')).find(function (node) {
+      return node.getAttribute('data-model-io-stage-section') === String(stage || 'unknown');
+    });
+    if (section) return section;
+    section = document.createElement('section'); section.className = 'chat-memory-model-io-stage';
+    section.setAttribute('data-model-io-stage-section', stage || 'unknown');
+    modelIoAppendText(section, 'h4', '', modelIoStageLabel(stage));
+    var items = document.createElement('div'); items.className = 'chat-memory-model-io-stage-items';
+    items.setAttribute('data-model-io-stage-items', stage || 'unknown');
+    section.appendChild(items);
+    records.appendChild(section);
+    return section;
+  }
+
+  function modelIoRenderPage(panel, response, items, append, requestedOffset) {
+    var state = panel._modelIoState;
+    var records = panel.querySelector('[data-model-io-records]');
+    var status = panel.querySelector('[data-model-io-status]');
+    var stages = Array.isArray(response.supported_stages) && response.supported_stages.length
+      ? response.supported_stages : MODEL_IO_STAGES;
+    if (!append) {
+      records.replaceChildren();
+      state.supportedStages = stages.slice();
+      stages.forEach(function (stage) {
+        var section = modelIoEnsureStage(records, stage);
+        var itemsEl = section.querySelector('[data-model-io-stage-items]');
+        modelIoAppendText(itemsEl, 'p', 'chat-memory-model-io-empty',
+          '此阶段尚无已留存的调用记录；旧输出无法补回。');
+      });
+    }
+    items.forEach(function (record) {
+      record = record && typeof record === 'object' ? record : {};
+      var stage = String(record.stage || 'unknown');
+      var section = modelIoEnsureStage(records, stage);
+      var stageItems = section.querySelector('[data-model-io-stage-items]');
+      var empty = stageItems.querySelector('.chat-memory-model-io-empty');
+      if (empty) empty.remove();
+      modelIoAppendRecord(stageItems, record, status);
+    });
+    if (!items.length && !append && response.capture_state === 'missing' && !stages.length) {
+      modelIoAppendText(records, 'p', 'chat-memory-model-io-empty',
+        '此阶段尚无已留存的调用记录；旧输出无法补回。');
+    }
+    state.loaded = true;
+    state.captureState = String(response.capture_state || (items.length ? 'recorded' : 'missing'));
+    state.nextOffset = Number.isInteger(Number(response.next_offset))
+      ? Number(response.next_offset) : requestedOffset + items.length;
+    state.hasMore = Boolean(response.has_more);
+    var totalLoaded = records.querySelectorAll('.chat-memory-model-io-record').length;
+    status.textContent = items.length
+      ? '已读取 ' + totalLoaded + ' 条模型调用记录；按阶段展开后可查看完整输入、输出和校验。'
+      : (state.captureState === 'missing'
+        ? '没有已留存的模型调用记录；旧输出无法补回。'
+        : (totalLoaded ? '本页没有更多记录；已读取 ' + totalLoaded + ' 条。' : '当前没有已留存的模型调用记录。'));
+    var more = panel.querySelector('[data-model-io-more]');
+    if (more) more.hidden = !state.hasMore;
+  }
+
+  async function fetchDailyChatMemoryModelIo(memoryId, panel, offset, refresh) {
+    var state = panel && panel._modelIoState;
+    if (!panel || !state || state.loading) return;
+    state.loading = true;
+    var status = panel.querySelector('[data-model-io-status]');
+    var refreshButton = panel.querySelector('[data-model-io-refresh]');
+    var moreButton = panel.querySelector('[data-model-io-more]');
+    if (refreshButton) refreshButton.disabled = true;
+    if (moreButton) moreButton.disabled = true;
+    if (!state.loaded) status.textContent = '正在读取已留存的模型调用记录…';
+    try {
+      var requestedOffset = refresh ? 0 : Number(offset || 0);
+      var url = dailyChatMemoryApiBase() + '/api/memory-authority/memories/' +
+        encodeURIComponent(memoryId) + '/model-io?limit=' + MODEL_IO_LIMIT + '&offset=' + requestedOffset;
+      var response = await authFetch(url);
+      if (!response) throw new Error('未连接，模型调用记录保留在服务端。');
+      var data = await response.json();
+      if (!response.ok || !data || (data.status && data.status !== 'ok')) {
+        throw new Error(data && data.error ? data.error : ('读取失败 (HTTP ' + response.status + ')'));
+      }
+      var items = Array.isArray(data.items) ? data.items
+        : (Array.isArray(data.records) ? data.records : []);
+      modelIoRenderPage(panel, data, items, !refresh && requestedOffset > 0, requestedOffset);
+    } catch (error) {
+      status.textContent = '模型输入与输出读取失败；已有记录仍保留：' + String(error && error.message || error);
+    } finally {
+      state.loading = false;
+      if (refreshButton) refreshButton.disabled = false;
+      if (moreButton) moreButton.disabled = false;
+    }
+  }
+
+  function createDailyChatMemoryModelIoPanel(memoryId, viewKind) {
+    var panel = document.createElement('section');
+    panel.className = 'chat-memory-model-io-panel'; panel.hidden = true;
+    panel.setAttribute('data-memory-id', memoryId);
+    panel.setAttribute('aria-label', '模型输入与输出');
+    panel._modelIoState = { loaded: false, loading: false, hasMore: false, nextOffset: 0,
+      captureState: '', supportedStages: MODEL_IO_STAGES.slice() };
+    panel._modelIoKind = viewKind;
+    panel._modelIoKey = modelIoViewKey(viewKind, memoryId);
+    var head = document.createElement('div'); head.className = 'chat-memory-model-io-head';
+    modelIoAppendText(head, 'strong', '', '模型输入与输出');
+    var actions = document.createElement('div'); actions.className = 'chat-memory-model-io-actions';
+    var refresh = document.createElement('button'); refresh.type = 'button'; refresh.textContent = '刷新记录';
+    refresh.setAttribute('data-model-io-refresh', '');
+    refresh.addEventListener('click', function () { fetchDailyChatMemoryModelIo(memoryId, panel, 0, true); });
+    actions.appendChild(refresh);
+    var close = document.createElement('button'); close.type = 'button'; close.textContent = '收起';
+    close.addEventListener('click', function () {
+      panel.hidden = true;
+      syncModelIoToggle(panel);
+    });
+    actions.appendChild(close); head.appendChild(actions); panel.appendChild(head);
+    modelIoAppendText(panel, 'p', 'chat-memory-model-io-status',
+      '展开后按需读取；每条调用记录可独立展开查看完整消息。');
+    panel.querySelector('.chat-memory-model-io-status').setAttribute('data-model-io-status', '');
+    var records = document.createElement('div'); records.className = 'chat-memory-model-io-records';
+    records.setAttribute('data-model-io-records', ''); panel.appendChild(records);
+    var more = document.createElement('button'); more.type = 'button'; more.textContent = '继续查看旧记录';
+    more.className = 'chat-memory-model-io-more'; more.hidden = true; more.setAttribute('data-model-io-more', '');
+    more.addEventListener('click', function () {
+      fetchDailyChatMemoryModelIo(memoryId, panel, panel._modelIoState.nextOffset, false);
+    });
+    panel.appendChild(more);
+    return panel;
+  }
+
+  function syncModelIoToggle(panel) {
+    var card = panel && panel.closest ? panel.closest('.chat-memory-card') : null;
+    var viewKey = panel && panel._modelIoKey;
+    var button = card && Array.from(card.querySelectorAll('[data-model-io-toggle]')).find(function (candidate) {
+      return candidate.getAttribute('data-model-io-view-key') === viewKey;
+    });
+    if (!button) return;
+    button.textContent = panel.hidden ? '模型输入与输出' : '收起模型输入与输出';
+    button.setAttribute('aria-expanded', panel.hidden ? 'false' : 'true');
+  }
+
+  function toggleDailyChatMemoryModelIo(button, memoryId, viewKind) {
+    var id = modelIoMemoryId(memoryId);
+    if (!id || !button) return;
+    var card = button.closest ? button.closest('.chat-memory-card') : null;
+    if (!card) return;
+    var key = modelIoViewKey(viewKind, id);
+    var panel = modelIoPanels.get(key);
+    if (!panel) {
+      panel = createDailyChatMemoryModelIoPanel(id, viewKind);
+      modelIoPanels.set(key, panel);
+    }
+    if (panel.parentNode !== card) card.appendChild(panel);
+    panel.hidden = !panel.hidden;
+    syncModelIoToggle(panel);
+    if (!panel.hidden && !panel._modelIoState.loaded) fetchDailyChatMemoryModelIo(id, panel, 0, false);
+  }
+
+  function createDailyChatMemoryModelIoToggle(memoryId, viewKind, label) {
+    var id = modelIoMemoryId(memoryId);
+    if (!id) return null;
+    var button = document.createElement('button');
+    button.type = 'button'; button.textContent = label || '模型输入与输出';
+    button.setAttribute('data-model-io-toggle', '');
+    button.setAttribute('data-model-io-id', id);
+    button.setAttribute('data-model-io-kind', viewKind);
+    button.setAttribute('data-model-io-view-key', modelIoViewKey(viewKind, id));
+    button.setAttribute('aria-expanded', 'false');
+    button.addEventListener('click', function () {
+      toggleDailyChatMemoryModelIo(button, id, viewKind);
+    });
+    return button;
+  }
+
+  function restoreDailyChatMemoryModelIoPanels(target) {
+    if (!target) return;
+    target.querySelectorAll('.chat-memory-card[data-candidate-id]').forEach(function (card) {
+      var id = modelIoMemoryId(card.getAttribute('data-candidate-id'));
+      if (!id) return;
+      var panel = modelIoPanels.get(modelIoViewKey('review', id));
+      var slot = card.querySelector('[data-model-io-slot="review"]');
+      if (panel && slot) {
+        slot.replaceWith(panel);
+        syncModelIoToggle(panel);
+      }
+    });
+    bindDailyChatMemoryModelIoButtons(target);
+  }
+
+  function bindDailyChatMemoryModelIoButtons(target) {
+    if (!target) return;
+    target.querySelectorAll('[data-model-io-toggle][data-model-io-id]').forEach(function (button) {
+      if (button._modelIoBound) return;
+      button._modelIoBound = true;
+      button.addEventListener('click', function () {
+        toggleDailyChatMemoryModelIo(button, button.getAttribute('data-model-io-id'),
+          button.getAttribute('data-model-io-kind') || 'review');
+      });
+    });
+  }
 
   function cloneValue(value) {
     return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -1108,6 +1497,7 @@
         });
         items.forEach(function (item) { memoryItems.set(item.id, item); });
         target.innerHTML = renderDailyChatMemoryPending(items);
+        restoreDailyChatMemoryModelIoPanels(target);
         syncUncertainLocks();
       })
       .catch(function (e) {
@@ -1301,6 +1691,9 @@
     if (task.candidate_ids && task.candidate_ids.length) {
       var refs = document.createElement('p'); refs.textContent = '对应候选：' + task.candidate_ids.join('、') + '；采用状态以候选和正式记忆回执为准。'; row.appendChild(refs);
     }
+    var modelIoIds = Array.isArray(task.candidate_ids)
+      ? Array.from(new Set(task.candidate_ids.map(modelIoMemoryId).filter(Boolean))) : [];
+    var actions = document.createElement('div'); actions.className = 'chat-memory-card-actions';
     if (task.phase === 'failed' || task.phase === 'generating') {
       var retry = document.createElement('button'); retry.type = 'button'; retry.textContent = task.phase === 'failed' ? '重试整理' : '中断后恢复整理';
       retry.addEventListener('click', async function() {
@@ -1312,13 +1705,24 @@
           if (!res || !res.ok) throw new Error('未重新排队，请刷新核对任务状态');
           loadMemorySourceTasks(target);
         } catch (error) { status.textContent = error.message; retry.disabled = false; }
-      }); row.appendChild(retry);
+      }); actions.appendChild(retry);
     }
+    modelIoIds.forEach(function (memoryId) {
+      var label = modelIoIds.length > 1 ? '模型输入与输出 · ' + memoryId : '模型输入与输出';
+      var toggle = createDailyChatMemoryModelIoToggle(memoryId, 'action-candidate', label);
+      if (toggle) actions.appendChild(toggle);
+    });
+    if (actions.childNodes.length) row.appendChild(actions);
+    modelIoIds.forEach(function (memoryId) {
+      var panel = modelIoPanels.get(modelIoViewKey('action-candidate', memoryId));
+      if (panel) { row.appendChild(panel); syncModelIoToggle(panel); }
+    });
     return row;
   }
 
   function renderChatSubmissionTask(task, target) {
     var taskId = String(task.task_id || '');
+    var modelIoId = modelIoMemoryId(taskId);
     var row = document.createElement('div'); row.className = 'chat-memory-card';
     row.style.overflowWrap = 'anywhere';
     row.setAttribute('data-chat-submission-task-id', taskId);
@@ -1363,7 +1767,18 @@
       retry.addEventListener('click', function() { retryChatSubmissionTask(task, retry, target); });
       actions.appendChild(retry);
     }
+    if (modelIoId) {
+      var modelIoToggle = createDailyChatMemoryModelIoToggle(modelIoId, 'task');
+      if (modelIoToggle) actions.appendChild(modelIoToggle);
+    }
     row.appendChild(actions);
+    if (modelIoId) {
+      var existingModelIoPanel = modelIoPanels.get(modelIoViewKey('task', modelIoId));
+      if (existingModelIoPanel) {
+        row.appendChild(existingModelIoPanel);
+        syncModelIoToggle(existingModelIoPanel);
+      }
+    }
     if (sourceTaskOpenIds.has(taskId)) {
       var detailPanel = document.createElement('div'); detailPanel.className = 'chat-memory-edit-panel';
       detailPanel.setAttribute('data-chat-submission-detail', taskId);
@@ -1710,6 +2125,7 @@
   function renderDailyChatMemoryCard(item) {
     var candidate = Object.assign({}, item.candidate || {});
     var id = item.id || '';
+    var modelIoId = modelIoMemoryId(id);
     var draft = memoryDrafts.get(id);
     var revision = draft ? draft.revision : Number(item.authority_revision || candidate.authority_revision || 0);
     var l1Document = itemL1Document(item);
@@ -1754,6 +2170,9 @@
     var confirmDisabled = blocked ? ' disabled title="候选无法核对，不可写入"' : '';
     var sourcePreviewButton = hasSource
       ? '<button type="button" class="chat-memory-source-btn" onclick="toggleDailyChatMemorySource(this, \'' + jsString(id) + '\')">查看完整原文</button>'
+      : '';
+    var modelIoButton = modelIoId
+      ? '<button type="button" data-model-io-toggle data-model-io-id="' + escAttr(modelIoId) + '" data-model-io-kind="review" data-model-io-view-key="' + escAttr(modelIoViewKey('review', modelIoId)) + '" aria-expanded="false">模型输入与输出</button>'
       : '';
     return '' +
       '<div class="chat-memory-card' + (editRequired ? ' chat-memory-card-edit-needed' : '') + '" data-candidate-id="' + escAttr(id) + '" data-revision="' + escAttr(revision) + '" data-editing="' + (draft && draft.expanded ? 'true' : 'false') + '"' + (l1Document ? ' data-l1-editor-mode="' + escAttr(l1Draft && l1Draft.mode || 'body') + '"' : '') + (editRequired ? ' data-needs-edit="true"' : '') + '>' +
@@ -1821,6 +2240,7 @@
           '<button type="button" onclick="saveDailyChatMemoryEdit(this)">保存修改（仍待审核）</button>' +
           '<button type="button" onclick="discardDailyChatMemoryDraft(this)">放弃修改／载入新版</button>' +
           sourcePreviewButton +
+          modelIoButton +
           '<button type="button"' + confirmDisabled + ' onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'confirm\')">采用并入库</button>' +
           '<button type="button" onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'defer\')">暂缓</button>' +
           '<label class="chat-memory-reject-reason">拒绝原因' +
@@ -1835,6 +2255,7 @@
           '<input type="text" class="chat-memory-reject-note-inline" id="reject-note-' + escAttr(id) + '" maxlength="120" placeholder="备注(可选)" />' +
           '<button type="button" class="danger" onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'reject\')">拒绝</button>' +
         '</div>' +
+        (modelIoId ? '<div data-model-io-slot="review"></div>' : '') +
       '</div>';
   }
 
@@ -2238,6 +2659,7 @@
   window.toggleDailyChatMemorySelectAll = toggleDailyChatMemorySelectAll;
   window.refreshDailyChatMemorySelection = refreshDailyChatMemorySelection;
   window.toggleDailyChatMemorySource = toggleDailyChatMemorySource;
+  window.toggleDailyChatMemoryModelIo = toggleDailyChatMemoryModelIo;
   window.loadDailyChatMemorySourceMore = loadDailyChatMemorySourceMore;
   window.loadDailyChatMemoryRuns = loadDailyChatMemoryRuns;
   window.rerunDailyChatMemory = rerunDailyChatMemory;
