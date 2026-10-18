@@ -112,6 +112,8 @@ def test_metadata_pagination_is_scoped_complete_and_legacy_is_missing(tmp_path):
 def test_l2_projection_preserves_complex_semantics_full_sources_and_local_refs():
     body = '我当时没有承诺；只有她明确愿意时才继续，时间不确定。' * 600
     doc = document_template(body, '完整叙事')
+    doc['retrieval'] = {'keywords':['只用于检索的词'], 'tags':['评分标签']}
+    doc['entry']['scene_ref'] = {'scene_id':'scene1', 'scene_revision_id':'machine'}
     stmt = statement_template()
     stmt.update(statement_id='st-real', statement_revision_id='rev-machine', content=body,
         evidence_refs=['source:1'],
@@ -147,6 +149,9 @@ def test_l2_projection_preserves_complex_semantics_full_sources_and_local_refs()
     projected = semantic_input_projection(material)
     assert material == before
     p = projected['l1_document']
+    assert 'retrieval' not in p
+    assert material['l1_document']['retrieval']['keywords'] == ['只用于检索的词']
+    assert p['entry']['scene_ref'] == {'scene_id':'scene1'}
     assert p['narrative']['body'] == body and p['statements'][0]['content'] == body
     for key in ('conditions','property','cognition','attributes','time','evidence_refs'):
         assert p['statements'][0][key] == stmt[key]
@@ -182,3 +187,30 @@ def test_l2_projection_keeps_source_content_restrictions_without_empty_or_techni
     assert projected['sources'][0]['limitations'] == ['原文引用的是过去看法，不表示当下认同。']
     assert 'rings' not in projected
     assert not {'eligible_source', 'state', 'view'} & projected['sources'][0].keys()
+
+
+def test_l2_projection_scopes_sources_to_this_memory_and_shared_claims():
+    doc = document_template('This memory only concerns search.', 'Search')
+    stmt = statement_template()
+    stmt.update(statement_id='search', content='Distinguish original and rendered text.', evidence_refs=['source:16'])
+    doc['statements'] = [stmt]
+    bindings = [{'binding_id':f'source:{i}'} for i in range(1,17)]
+    doc['evidence_bindings'] = bindings
+    material = {'l1_document':doc, 'shared_statements':[], 'rings':[],
+        'sources':[{'binding':b, 'text':'search' if b['binding_id']=='source:16' else 'unrelated'} for b in bindings]}
+    before = copy.deepcopy(material)
+    projected = semantic_input_projection(material)
+    assert [s['binding_id'] for s in projected['sources']] == ['source:16']
+    assert [b['binding_id'] for b in projected['l1_document']['evidence_bindings']] == ['source:16']
+    assert material == before
+    shared = copy.deepcopy(stmt)
+    shared.update(statement_id='shared', evidence_refs=['source:2'])
+    material['shared_statements'] = [shared]
+    assert [s['binding_id'] for s in semantic_input_projection(material)['sources']] == ['source:2','source:16']
+
+
+def test_l2_projection_without_explicit_claim_refs_keeps_legacy_sources():
+    doc = document_template('Complete legacy narrative.', 'Legacy')
+    material = {'l1_document':doc, 'shared_statements':[], 'rings':[],
+        'sources':[{'binding':{'binding_id':'source:1'},'text':'Complete legacy source.'}]}
+    assert semantic_input_projection(material)['sources'][0]['text'] == 'Complete legacy source.'

@@ -70,35 +70,13 @@ def test_l2_generation_prompt_is_composer_editable_and_keeps_its_contract(tmp_pa
     prompt = detail["factory_body"]
 
     assert spec.scope == "memory.reflection"
-    assert detail["source_revision"] == "factory-memory-l2-generation-v3-natural-source-faithful"
+    assert detail["source_revision"] == "factory-memory-l2-generation-v5-scoped-readable-writing"
     for requirement in (
-        '"full_injection_text"',
-        '"coherent_sections"',
-        '"optional_use_variants"',
-        '"review"',
-        '"required"',
-        '"reasons"',
-        '"statement_refs"',
-        '"intended_use"',
-        "每一条分节或用途变体都必须至少有一个可靠的 statement_refs",
-        "current_basis、conditional_basis、relationship_reference、historical_evidence、unresolved_evidence",
-        "完整 L1",
-        "来源原文是事实依据",
-        "年轮或反馈如提供了更正",
-        "自然的第一人称",
-        "否定、条件、范围和不确定性",
-        "不得把历史状态改写成当前状态",
-        "不得把一次性的请求提升成长期偏好",
-        "自审主体、时序、否定、条件和范围",
-        "required=true",
-        "不得自行假定或消解",
-        "required=false 只表示模型完成了自检，不代表任何记忆内容已被证实真实",
-        "review 是自动稿审阅判断元数据，不是记忆正文",
-        "不得把它或 reasons 写入 full_injection_text、分节或用途变体",
-        '"reasons":[]',
-        "2200 token 摘要",
-        "source_refs",
-        "内部版本身份",
+        "full_injection_text", "coherent_sections", "optional_use_variants",
+        "review", "required", "reasons", "statement_refs", "intended_use",
+        "output_schema", "完整、自然、连贯回忆", "sources 中的真实原文",
+        "历史状态仍属于那次经历", "单次请求不改成长期偏好",
+        "禁止杜撰材料中没有发生的事情", "内部来源映射、正式版本和依赖由程序维护",
     ):
         assert requirement in prompt
 

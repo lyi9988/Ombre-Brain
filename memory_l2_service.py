@@ -32,18 +32,46 @@ def semantic_input_projection(material):
         if 'anchors' in result:
             result['anchors'] = anchors(result['anchors'])
         return result
-    doc = omit(material['l1_document'], {'generation', 'schema_version'})
+    # Retrieval features belong to L1 scoring, not to second-pass writing.
+    # Keep the complete semantic modules and source text; never mutate L1.
+    doc = omit(material['l1_document'], {'generation', 'schema_version', 'retrieval'})
     doc['entry'] = omit(doc['entry'], {'parent_ref', 'document_group_id', 'derived_from_revision'})
+    if isinstance(doc['entry'].get('scene_ref'), dict):
+        doc['entry']['scene_ref'] = omit(doc['entry']['scene_ref'], {'scene_revision_id'})
     for module, revision_field in (('statements', 'statement_revision_id'), ('scenes', 'scene_revision_id'),
                                    ('entities', 'entity_revision_id'), ('relations', 'relation_revision_id')):
         doc[module] = [member(item, revision_field) for item in doc.get(module, [])]
+    shared = [member(item, 'statement_revision_id') for item in material['shared_statements']]
+    # Source bindings may cover the whole ingestion window. They are not all
+    # evidence for this one memory. Follow explicit semantic references, not
+    # the binding inventory itself; retain the full window only for older
+    # documents that have no explicit source references at all.
+    referenced_sources = set()
+    def collect_sources(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {'evidence_refs', 'source_refs'} and isinstance(item, list):
+                    referenced_sources.update(ref for ref in item if isinstance(ref, str))
+                elif key != 'evidence_bindings':
+                    collect_sources(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect_sources(item)
+    collect_sources(doc)
+    collect_sources(shared)
+    collect_sources(material['rings'])
+    def relevant(binding_id):
+        return not referenced_sources or binding_id in referenced_sources
     # Source identity, revision and hashes are program custody. Evidence refs
     # retain the exact binding_id and offsets; full source prose stays below.
     doc['evidence_bindings'] = [{key: (anchors(binding[key]) if key == 'anchors' else copy.deepcopy(binding[key])) for key in
         ('binding_id', 'author_ref', 'speaker_ref', 'anchors') if key in binding}
-        for binding in material['l1_document'].get('evidence_bindings', [])]
+        for binding in material['l1_document'].get('evidence_bindings', [])
+        if relevant(binding.get('binding_id'))]
     sources = []
     for source in material['sources']:
+        if not relevant(source['binding']['binding_id']):
+            continue
         projected = {'binding_id': source['binding']['binding_id'],
             **{key: copy.deepcopy(source.get(key)) for key in
                ('text', 'title', 'author', 'speaker')},
@@ -57,7 +85,7 @@ def semantic_input_projection(material):
             projected['limitations'] = limitations
         sources.append(projected)
     result = {'l1_document': doc,
-              'shared_statements': [member(item, 'statement_revision_id') for item in material['shared_statements']],
+              'shared_statements': shared,
               'sources': sources}
     if material['rings']:
         result['rings'] = [omit(item, {'memory_id', 'operation_id', 'content_sha256', 'ring_id', 'state'})

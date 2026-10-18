@@ -170,7 +170,7 @@ class MemoryL2Store:
             state, reason = 'not_prepared', 'l2_missing'
             if product:
                 if product['sync_state'] == 'pending_l1': state, reason = 'pending_sync', 'l1_sync_required'
-                elif product['dependency_versions'] != dependency: state, reason = 'stale', 'dependency_changed'
+                elif not self.dependencies_match(product, dependency): state, reason = 'stale', 'dependency_changed'
                 elif product['publication'] == 'candidate': state, reason = 'pending_review', 'owner_l2_preserved'
                 elif product['actor'] == 'model' and product['document'].get('review', {}).get('required', True):
                     state, reason = 'pending_review', 'l2_semantic_review_required'
@@ -190,6 +190,17 @@ class MemoryL2Store:
                     'revisions': revisions, 'jobs': jobs, 'sync_proposals': proposals,
                     'current_dependencies': dependency}
         finally: conn.close()
+
+    @staticmethod
+    def dependencies_match(product, dependency):
+        saved = product['dependency_versions']
+        if product['actor'] == 'owner' and product['publication'] == 'active':
+            # A writing prompt/model change does not invalidate owner prose.
+            # All fact, source-scope, catalog and schema dependencies still apply.
+            writing = {'prompt_revision', 'model_route_revision'}
+            return ({k:v for k,v in saved.items() if k not in writing}
+                    == {k:v for k,v in dependency.items() if k not in writing})
+        return saved == dependency
 
     def enqueue(self, memory_id, dependency, request_id):
         conn = self.authority._connect()

@@ -405,3 +405,25 @@ def test_runtime_affinity_settings_do_not_regenerate_persistent_l2(tmp_path):
     assert service.detail('m1')['l2']['state'] == 'ready'
     run(service.run_once(1))
     assert len(calls) == 1
+
+
+def test_owner_l2_survives_writing_prompt_change_but_not_l1_change(tmp_path):
+    service, _, calls = setup(tmp_path)
+    run(service.run_once(1))
+    payload = owner_payload(service, request='owner-protected-prompt')
+    payload['document']['full_injection_text'] = 'Owner reviewed wording.'
+    run(service.save('m1', payload))
+    service.engine._memory_l1_prompt = lambda sid: ('new writing prompt', {'prompt_revision':'p2'})
+    service.engine._memory_task_route = lambda stage: {'stage':stage,'client':object(),'configured':True,
+        'model':'new-writing-model','connection':'reflection','max_tokens':16000}
+    current = service.detail('m1')['l2']
+    assert current['state'] == 'ready'
+    assert current['owner_protected']
+    assert current['current_presentation_revision'] == 2
+    assert current['presentation']['document']['full_injection_text'] == 'Owner reviewed wording.'
+    run(service.run_once(10))
+    assert len(calls) == 1
+    update = request_for(service.revisions, 'owner-facts-changed')
+    update['document']['narrative']['body'] += ' Actual L1 change.'
+    run(service.revisions.save('m1', update))
+    assert service.detail('m1')['l2']['state'] == 'stale'
