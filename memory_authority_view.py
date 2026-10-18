@@ -462,7 +462,7 @@ class MemoryAuthorityRecallView:
                 placeholders = ",".join("?" for _ in chunk)
                 rows.extend(conn.execute(
                     "SELECT m.memory_id,COALESCE(NULLIF(m.bucket_id,''),m.memory_id),"
-                    "m.active_revision,COALESCE(r.body_sha256,'') "
+                    "m.active_revision,COALESCE(r.body_sha256,''),json_extract(r.metadata_json,'$.memory_l1.schema_version') "
                     "FROM memories AS m LEFT JOIN memory_revisions AS r "
                     "ON r.memory_id=m.memory_id AND r.revision=m.active_revision "
                     "WHERE m.state='active' AND m.recall_policy='enabled' "
@@ -497,6 +497,9 @@ class MemoryAuthorityRecallView:
                 "revision": int(row[2] or 0),
                 "body_sha256": str(row[3] or ""),
             }
+            if row[4]:
+                from memory_retrieval_text import TEXT_PROJECTION_VERSION
+                result[bucket_id]['text_projection_version'] = TEXT_PROJECTION_VERSION
         return result
 
     def memory_l1_recall_map(self, bucket_ids: Iterable[str]) -> dict[str, dict[str, Any]]:

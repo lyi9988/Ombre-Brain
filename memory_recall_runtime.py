@@ -265,7 +265,11 @@ def render_presentation(service, usage, header, presentation, budget):
         return "", "usage_excluded", [], False
     from utils import count_tokens_approx
 
-    statements = usage_lines(usage)
+    # L1 controls qualification and purpose; its prose must not duplicate the
+    # separately persisted L2 body or consume the L2 narrative's budget.
+    scopes = list(dict.fromkeys(str(item.get('usage') or '') for item in usage.get('items', [])
+                               if item.get('usage') and item['usage'] != 'excluded'))
+    statements = 'Allowed memory uses: ' + ', '.join(scopes)
     presentation_text = str(presentation.get("text") or "")
 
     def wrap(narrative):

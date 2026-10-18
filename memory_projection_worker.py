@@ -14,11 +14,20 @@ from entity_edges import extract_entity_edges_from_bucket
 from identity import identity_names
 from memory_authority import MemoryAuthorityStore
 from memory_moments import parse_bucket_moments
+from memory_l1_contract import semantic_sha256
+from memory_retrieval_text import (TEXT_PROJECTION_VERSION, SemanticUnitTooLarge,
+                                   l1_retrieval_blocks, l1_retrieval_text, pack_source_units)
 from prompt_source_registry import fixed_prompt_source, render_factory_body, resolve_fixed_prompt
 from utils import bucket_text_for_embedding
 
 
 logger = logging.getLogger("ombre_brain.memory_projection")
+
+
+class EmbeddingProjectionPending(RuntimeError):
+    def __init__(self, details):
+        super().__init__(details['reason'])
+        self.details = details
 
 
 def embedding_projection_needs_upgrade(status: str, details: Any, expected_space: dict | None = None) -> bool:
@@ -31,7 +40,7 @@ def embedding_projection_needs_upgrade(status: str, details: Any, expected_space
         return True
     return any(value is not None and value != "" and details.get(key) != value
                for key, value in (expected_space or {}).items()
-               if key in {"model", "provider", "dimension"})
+               if key in {"model", "provider", "dimension", "text_projection_version"})
 
 
 class MemoryProjectionWorker:
@@ -146,7 +155,9 @@ class MemoryProjectionWorker:
                     details = status.get("details") or {}
                     if upgrade_legacy_indexes and name == "embedding":
                         is_pending = embedding_projection_needs_upgrade(
-                            str(status.get("status") or ""), details, expected_embedding_space,
+                            str(status.get("status") or ""), details,
+                            {**expected_embedding_space, **({'text_projection_version': TEXT_PROJECTION_VERSION}
+                                if self._retrieval_document(memory_id, revision) is not None else {})},
                         )
                     if is_pending:
                         pending.append(name)
@@ -191,7 +202,7 @@ class MemoryProjectionWorker:
                             if not self.embedding_engine or not self.embedding_engine.enabled:
                                 result["deferred"] += 1
                                 continue
-                            embedding_units = self._embedding_source_units(bucket, memory_id)
+                            embedding_units = self._embedding_source_units(bucket, memory_id, revision=revision)
                             engine_method = getattr(
                                 self.embedding_engine, "generate_and_store", None
                             )
@@ -221,8 +232,9 @@ class MemoryProjectionWorker:
                             embedding_result = await self._project_embedding_units(
                                 bucket, memory_id, revision, source_sha,
                                 source_units=embedding_units,
-                                progress=progress,
+                                progress=progress, max_units=unit_budget,
                             )
+                            unit_count = embedding_result['source_unit_count']
                             if not await self.embedding_engine.get_embedding(bucket_id):
                                 raise RuntimeError("embedding_not_stored")
                             count = int(embedding_result.get("source_unit_count") or 0)
@@ -269,6 +281,8 @@ class MemoryProjectionWorker:
                             )
                         result["projected"] += 1
                     except Exception as exc:
+                        if isinstance(exc, EmbeddingProjectionPending):
+                            unit_count = max(unit_count, int(exc.details.get('required_units') or 0))
                         if name == "embedding":
                             result["embedding_units_completed"] += int(
                                 progress.get("completed") or 0
@@ -282,6 +296,7 @@ class MemoryProjectionWorker:
                         self._record_status(
                             memory_id, revision, name, "pending_rebuild", source_sha,
                             {"reason": "repair_retry", "error_type": type(exc).__name__,
+                             **(exc.details if isinstance(exc, (SemanticUnitTooLarge, EmbeddingProjectionPending)) else {}),
                              "retry_after_ms": retry_ms},
                         )
                         result["deferred"] += 1
@@ -587,18 +602,56 @@ class MemoryProjectionWorker:
         ))
         return results
 
+    def _retrieval_document(self, memory_id: str, revision: int | None = None):
+        """Read committed semantics, resolving a scene's exact current parent."""
+        if self.authority is None:
+            return None
+        memory = self.authority.get_memory(memory_id)
+        if memory is None:
+            return None
+        revision = revision if revision is not None else memory['active_revision']
+        if memory['active_revision'] != revision:
+            raise RuntimeError('retrieval_l1_revision_changed')
+        record = self.authority.get_memory_revision(memory_id, revision) or {}
+        metadata = record.get('metadata') or {}
+        document = metadata.get('memory_l1')
+        if not document:
+            return None
+        if semantic_sha256(document) != metadata.get('memory_l1_semantic_sha256'):
+            raise RuntimeError('retrieval_l1_semantic_mismatch')
+        parent = (document.get('entry') or {}).get('parent_ref')
+        if parent:
+            root = self.authority.get_memory(parent['memory_id'])
+            if (not root or root['active_revision'] != parent['revision'] or root['state'] != 'active'
+                    or root['recall_policy'] == 'disabled'):
+                raise RuntimeError('retrieval_l1_parent_changed')
+            root_record = self.authority.get_memory_revision(parent['memory_id'], parent['revision']) or {}
+            root_metadata = root_record.get('metadata') or {}
+            root_document = root_metadata.get('memory_l1') or {}
+            if semantic_sha256(root_document) != root_metadata.get('memory_l1_semantic_sha256'):
+                raise RuntimeError('retrieval_l1_parent_semantic_mismatch')
+            refs = set(document['entry'].get('shared_statement_refs') or [])
+            document = {**document, 'statements':[statement for statement in root_document.get('statements', [])
+                                               if statement['statement_id'] in refs],
+                        'entities':root_document.get('entities', []), 'scenes':root_document.get('scenes', [])}
+        return document
+
     def _embedding_source_units(
-        self, bucket: dict, memory_id: str,
-    ) -> list[dict[str, str]]:
+        self, bucket: dict, memory_id: str, *, revision: int | None = None,
+    ) -> list[dict[str, Any]]:
         """Build the provider-bound Bucket seed and committed content units."""
         bucket_id = str(bucket.get("id") or memory_id)
-        units: list[dict[str, str]] = []
-        seed_text = bucket_text_for_embedding(bucket)
+        units: list[dict[str, Any]] = []
+        document = self._retrieval_document(memory_id, revision)
+        seed_text = l1_retrieval_text(document, body=bucket.get('content') or '') if document is not None else bucket_text_for_embedding(bucket)
         if seed_text:
             units.append({
                 "source_unit_id": bucket_id,
                 "source_kind": "bucket_seed",
                 "text": seed_text,
+                "text_projection_version": TEXT_PROJECTION_VERSION if document is not None else None,
+                **({'semantic_blocks':l1_retrieval_blocks(document, body=bucket.get('content') or '')}
+                   if document is not None else {}),
             })
 
         relevance_options = getattr(self.moment_store, "relevance_options", None)
@@ -616,14 +669,17 @@ class MemoryProjectionWorker:
             units.append({
                 "source_unit_id": unit_id,
                 "source_kind": "content_moment",
-                "text": text,
+                "text": l1_retrieval_text(document, body=text) if document is not None else text,
+                "text_projection_version": TEXT_PROJECTION_VERSION if document is not None else None,
+                **({'semantic_blocks':l1_retrieval_blocks(document, body=text)} if document is not None else {}),
             })
         return units
 
     async def _project_embedding_units(
         self, bucket: dict, memory_id: str, revision: int, source_sha: str,
-        *, source_units: list[dict[str, str]] | None = None,
+        *, source_units: list[dict[str, Any]] | None = None,
         progress: dict[str, int] | None = None,
+        max_units: int | None = None,
     ) -> dict[str, Any]:
         """Project a legacy seed plus deterministic committed-body moments.
 
@@ -636,7 +692,7 @@ class MemoryProjectionWorker:
         bucket_id = str(bucket.get("id") or memory_id)
         units = list(
             source_units if source_units is not None
-            else self._embedding_source_units(bucket, memory_id)
+            else self._embedding_source_units(bucket, memory_id, revision=revision)
         )
 
         if not units:
@@ -646,11 +702,34 @@ class MemoryProjectionWorker:
         if engine_method is None:
             raise RuntimeError("embedding_generate_method_missing")
         supports_metadata = self._accepts_revision_metadata(engine_method)
+        try:
+            parameters = inspect.signature(engine_method).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        supports_text_version = ('text_projection_version' in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()))
+        supports_origin = ('source_origin_unit_id' in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()))
         if not supports_metadata:
             # Legacy doubles/engines only understand the original bucket key.
             # Keep that call contract; revision-aware Engines receive every
             # content moment as a separately keyed derived unit.
             units = units[:1]
+
+        # Reserve the actual frozen Composer instruction before packing. A
+        # too-large whole paragraph/statement remains explicitly pending;
+        # no source unit is sent partly, and no provider retry is manufactured.
+        character_limit = (config_snapshot or {}).get('max_chars') or getattr(self.embedding_engine, 'max_chars', None)
+        if character_limit is not None:
+            prefix = self.embedding_engine._prepare_document_snapshot('', config_snapshot) if (
+                config_snapshot is not None and callable(getattr(self.embedding_engine, '_prepare_document_snapshot', None))) else (
+                'Instruct: ' + str(document_instruction) + '\nDocument: ' if document_instruction else '')
+            available = int(character_limit) - len(prefix)
+            units = pack_source_units(units, available)
+        if max_units is not None and len(units) > max_units:
+            raise EmbeddingProjectionPending({'reason':'embedding_unit_budget_exhausted',
+                'required_units':len(units), 'max_embedding_units':max_units,
+                'coverage_status':'incomplete', 'provider_requests':0})
 
         projected_units: list[dict[str, Any]] = []
         actual_dimensions: set[int] = set()
@@ -670,6 +749,8 @@ class MemoryProjectionWorker:
                 document_instruction=document_instruction,
                 config_snapshot=config_snapshot,
                 result_metadata=result_metadata,
+                text_projection_version=unit.get('text_projection_version'),
+                source_origin_unit_id=unit.get('source_origin_unit_id'),
             )
             if result is False:
                 raise RuntimeError("projection_action_returned_false")
@@ -699,6 +780,8 @@ class MemoryProjectionWorker:
         metadata_complete = bool(
             supports_metadata and space.get("provider") and space.get("model")
             and space.get("dimension") and space.get("preparation_sha256")
+            and (supports_text_version or not any(unit.get('text_projection_version') for unit in units))
+            and (supports_origin or not any(unit.get('source_origin_unit_id') for unit in units))
         )
         return {
             "source_memory_id": memory_id,
@@ -711,6 +794,8 @@ class MemoryProjectionWorker:
             "outdated": not metadata_complete,
             "source_unit_count": len(projected_units),
             "source_units": projected_units,
+            **({'text_projection_version': TEXT_PROJECTION_VERSION}
+               if supports_text_version and any(unit.get('text_projection_version') for unit in units) else {}),
             **space,
         }
 
@@ -735,6 +820,8 @@ class MemoryProjectionWorker:
         document_instruction: str | None = None,
         config_snapshot: dict[str, Any] | None = None,
         result_metadata: dict[str, Any] | None = None,
+        text_projection_version: str | None = None,
+        source_origin_unit_id: str | None = None,
     ):
         metadata = {
             "source_revision": source_revision,
@@ -744,6 +831,8 @@ class MemoryProjectionWorker:
             "document_instruction": document_instruction,
             "config_snapshot": config_snapshot,
             "result_metadata": result_metadata,
+            "text_projection_version": text_projection_version,
+            "source_origin_unit_id": source_origin_unit_id,
         }
         try:
             parameters = inspect.signature(method).parameters
@@ -917,6 +1006,9 @@ class MemoryProjectionWorker:
                 memory_id, revision, projector, "projected", source_sha,
                 details,
             )
+        except (SemanticUnitTooLarge, EmbeddingProjectionPending) as exc:
+            return self._record_status(memory_id, revision, projector, 'pending_rebuild', source_sha,
+                {**exc.details, 'retry_after_ms':int(time.time() * 1000) + 3600 * 1000})
         except Exception as exc:
             logger.warning("Memory projection failed: %s %s", projector, exc)
             return self._record_status(

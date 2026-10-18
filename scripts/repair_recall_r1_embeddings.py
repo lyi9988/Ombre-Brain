@@ -37,6 +37,7 @@ from embedding_engine import EmbeddingEngine
 from memory_authority import MemoryAuthorityStore
 from memory_moments import _annotation_options_from_config
 from memory_projection_worker import MemoryProjectionWorker, embedding_projection_needs_upgrade
+from memory_retrieval_text import TEXT_PROJECTION_VERSION, SemanticUnitTooLarge, pack_source_units
 from memory_relevance import memory_relevance_options_from_config
 from prompt_plan_mirror import PromptPlanMirrorStore
 from prompt_source_registry import resolve_fixed_prompt
@@ -80,6 +81,15 @@ class ReadOnlyPromptPlanMirror(PromptPlanMirrorStore):
         connection.execute("PRAGMA query_only=ON")
         connection.execute("PRAGMA busy_timeout=5000")
         return connection
+
+
+class ReadOnlyMemoryAuthority(MemoryAuthorityStore):
+    """Existing authority readers, without initialization or write access."""
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def _connect(self):
+        return _readonly(self.path)
 
 
 class MeasuredEmbeddingEngine(EmbeddingEngine):
@@ -218,7 +228,8 @@ def _active_enabled_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
         "SELECT m.memory_id,COALESCE(NULLIF(m.bucket_id,''),m.memory_id) AS bucket_id,"
         "m.active_revision,COALESCE(r.body_sha256,'') AS body_sha256,"
         "COALESCE(p.status,'missing') AS embedding_status,"
-        "COALESCE(p.details_json,'{}') AS details_json "
+        "COALESCE(p.details_json,'{}') AS details_json,"
+        "json_type(r.metadata_json,'$.memory_l1')='object' AS has_l1 "
         "FROM memories AS m "
         "LEFT JOIN memory_revisions AS r "
         "ON r.memory_id=m.memory_id AND r.revision=m.active_revision "
@@ -248,6 +259,11 @@ def _is_upgrade_candidate(status: str, details_json: str, expected_space: dict |
     except (TypeError, ValueError):
         details = {}
     return embedding_projection_needs_upgrade(status, details, expected_space)
+
+
+def _row_expected_space(row, expected_space):
+    return {**(expected_space or {}), **({'text_projection_version':TEXT_PROJECTION_VERSION}
+        if row['has_l1'] else {})}
 
 
 async def _inventory(config: dict, paths: dict[str, Path]) -> dict[str, Any]:
@@ -299,7 +315,7 @@ async def _inventory(config: dict, paths: dict[str, Path]) -> dict[str, Any]:
         )
         output["legacy_upgrade_candidates"] = sum(
             1 for row in rows if _is_upgrade_candidate(
-                str(row["embedding_status"]), str(row["details_json"]), expected_space,
+                str(row["embedding_status"]), str(row["details_json"]), _row_expected_space(row, expected_space),
             )
         )
         output["active_revision_sha_mismatch"] = int(authority.execute(
@@ -357,7 +373,7 @@ async def _inventory(config: dict, paths: dict[str, Path]) -> dict[str, Any]:
     )
     unit_counter = MemoryProjectionWorker(
         config=config,
-        authority=None,
+        authority=ReadOnlyMemoryAuthority(paths['authority']),
         bucket_manager=bucket_manager,
         moment_store=source_options,
     )
@@ -368,6 +384,16 @@ async def _inventory(config: dict, paths: dict[str, Path]) -> dict[str, Any]:
     live_matches = body_mismatches = unavailable = 0
     source_units = max_units_per_memory = max_unit_chars = 0
     upgrade_source_units = repair_candidate_memories = 0
+    oversized_semantic_memories = 0
+    embedding_cfg = _config_section(config, 'embedding')
+    try:
+        max_chars = max(500, min(32000, int(embedding_cfg.get('max_chars', 6000))))
+    except (TypeError, ValueError):
+        max_chars = 6000
+    document_instruction = str(embedding_cfg.get('document_instruction') or '')
+    if output['prompt_mirror_file_present']:
+        document_instruction, _ = _resolve_prompts(config, ReadOnlyPromptPlanMirror(paths['prompt_mirror']))
+    prefix_size = len(EmbeddingEngine._prepare_document_snapshot('', {'document_instruction':document_instruction}))
     for row in rows:
         bucket_id = str(row["bucket_id"] or row["memory_id"])
         bucket = await bucket_manager.get(bucket_id)
@@ -384,9 +410,13 @@ async def _inventory(config: dict, paths: dict[str, Path]) -> dict[str, Any]:
             continue
         live_matches += 1
         units = unit_counter._embedding_source_units(bucket, str(row["memory_id"]))
+        try:
+            units = pack_source_units(units, max_chars - prefix_size)
+        except SemanticUnitTooLarge:
+            oversized_semantic_memories += 1
         source_units += len(units)
         if _is_upgrade_candidate(
-            str(row["embedding_status"]), str(row["details_json"]), expected_space,
+            str(row["embedding_status"]), str(row["details_json"]), _row_expected_space(row, expected_space),
         ):
             repair_candidate_memories += 1
             upgrade_source_units += len(units)
@@ -407,6 +437,7 @@ async def _inventory(config: dict, paths: dict[str, Path]) -> dict[str, Any]:
         "upgrade_source_units": upgrade_source_units,
         "max_units_per_memory": max_units_per_memory,
         "max_source_unit_chars": max_unit_chars,
+        "oversized_semantic_memories":oversized_semantic_memories,
         "max_segment_chars": max_chars,
         "elapsed_ms": round((time.monotonic() - started) * 1000),
     })
@@ -420,7 +451,7 @@ def _next_candidate(authority_path: Path, *, expected_space: dict | None = None)
         now_ms = int(time.time() * 1000)
         for row in rows:
             status = str(row["embedding_status"])
-            if not _is_upgrade_candidate(status, str(row["details_json"]), expected_space):
+            if not _is_upgrade_candidate(status, str(row["details_json"]), _row_expected_space(row, expected_space)):
                 continue
             try:
                 details = json.loads(row["details_json"] or "{}")
@@ -434,6 +465,7 @@ def _next_candidate(authority_path: Path, *, expected_space: dict | None = None)
                 "bucket_id": str(row["bucket_id"]),
                 "revision": int(row["active_revision"] or 0),
                 "body_sha256": str(row["body_sha256"] or ""),
+                'has_l1':bool(row['has_l1']),
             }
         return None
     finally:
@@ -446,7 +478,7 @@ def _upgrade_candidate_count(authority_path: Path, *, expected_space: dict | Non
         rows = _active_enabled_rows(connection)
         return sum(
             1 for row in rows if _is_upgrade_candidate(
-                str(row["embedding_status"]), str(row["details_json"]), expected_space,
+                str(row["embedding_status"]), str(row["details_json"]), _row_expected_space(row, expected_space),
             )
         )
     finally:
@@ -590,6 +622,8 @@ async def _verify_projection_rows(
     snapshot = embedding._query_config_snapshot(
         document_instruction=document_instruction,
     )
+    prefix_size = len(embedding._prepare_document_snapshot('', snapshot))
+    units = pack_source_units(units, int(snapshot['max_chars']) - prefix_size)
     preparation_sha = str(snapshot.get("document_preparation") or "")
     expected_input_sha = {}
     units_by_id = {}
@@ -601,10 +635,13 @@ async def _verify_projection_rows(
         ).hexdigest()
     connection = _readonly(paths["embeddings"])
     try:
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(embeddings)')}
+        projection_columns = ','.join(name if name in columns else 'NULL AS ' + name
+            for name in ('text_projection_version', 'source_origin_unit_id'))
         rows = connection.execute(
             "SELECT embedding,model,dimension,parent_bucket_id,parent_memory_id,"
             "source_unit_id,source_revision,source_sha256,input_sha256,"
-            "preparation_sha256,provider,input_truncated_chars "
+            "preparation_sha256,provider,input_truncated_chars," + projection_columns + " "
             "FROM embeddings WHERE parent_memory_id=? AND parent_bucket_id=? "
             "AND source_revision=? AND source_sha256=?",
             (memory_id, bucket_id, revision, body_sha),
@@ -626,6 +663,7 @@ async def _verify_projection_rows(
         and details.get("preparation_sha256") == preparation_sha
         and expected_dimension > 0
         and int(details.get("source_unit_count") or 0) == len(units)
+        and (not candidate.get('has_l1') or details.get('text_projection_version') == TEXT_PROJECTION_VERSION)
     )
     for row in rows:
         unit_id = str(row["source_unit_id"] or "")
@@ -654,6 +692,8 @@ async def _verify_projection_rows(
             and row["preparation_sha256"] == preparation_sha
             and row["provider"] == expected_provider
             and int(row["input_truncated_chars"] or 0) == expected_truncated
+            and (not candidate.get('has_l1') or (row['text_projection_version'] == TEXT_PROJECTION_VERSION
+                and (row['source_origin_unit_id'] or unit_id) == units_by_id[unit_id].get('source_origin_unit_id', unit_id)))
         )
         if matches:
             seen_units.add(unit_id)
@@ -704,6 +744,7 @@ async def _verify_new_query(
                     "memory_id": str(candidate["memory_id"]),
                     "revision": int(candidate["revision"]),
                     "body_sha256": str(candidate["body_sha256"]),
+                    **({'text_projection_version':TEXT_PROJECTION_VERSION} if candidate.get('has_l1') else {}),
                 }
             },
             cache_debug=cache_debug,
@@ -838,7 +879,8 @@ async def _apply_controller(
                 paths["authority"], candidate["memory_id"],
             )
             if (not before or not _is_upgrade_candidate(
-                    before["status"], json.dumps(before["details"]), expected_space,
+                    before["status"], json.dumps(before["details"]),
+                    {**(expected_space or {}), **({'text_projection_version':TEXT_PROJECTION_VERSION} if candidate.get('has_l1') else {})},
                     ) or not active_before or active_before["state"] != "active"
                     or active_before["recall_policy"] != "enabled"
                     or int(active_before["active_revision"] or 0) != int(candidate["revision"])

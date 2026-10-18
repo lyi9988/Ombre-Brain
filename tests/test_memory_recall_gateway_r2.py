@@ -609,6 +609,9 @@ def test_ready_l2_is_batch_resolved_and_used_with_per_statement_use_constraints(
     assert "historical_evidence" in sections["direct"]
     assert "L2 coherent presentation sentinel." in sections["direct"]
     assert "L1 raw original sentinel" not in sections["direct"]
+    # Even L1 semantic statement prose is computation-only for ready L2.
+    assert '现住址在白桦街。' not in sections['direct']
+    assert '旧住址在青石路。' not in sections['direct']
     trace = request["presentation_trace"][0]
     assert trace["source"] == "l2"
     assert trace["presentation_revision"] == 7

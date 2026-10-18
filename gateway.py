@@ -60,6 +60,7 @@ from memory_system_config import (
 )
 from canonical_continuation import CanonicalContinuationAdapter, ContinuationBatch
 import memory_recall_runtime as memory_use
+from memory_retrieval_text import l1_retrieval_text
 from dehydrator import Dehydrator
 from dream_engine import DreamEngine
 from embedding_engine import EmbeddingEngine
@@ -14309,6 +14310,9 @@ class GatewayService:
 
     def _moment_rerank_document(self, moment: dict) -> str:
         meta = moment.get("metadata", {}) if isinstance(moment.get("metadata"), dict) else {}
+        document = self._retrieval_document_for_bucket({'id':moment.get('bucket_id')})
+        if document is not None:
+            return l1_retrieval_text(document, body=moment.get('text') or moment.get('content') or '')
         fields = [
             f"title: {meta.get('bucket_name') or moment.get('bucket_id') or ''}",
             f"section: {moment.get('section') or ''}",
@@ -14319,7 +14323,7 @@ class GatewayService:
             f"evidence: {self._format_evidence_spans(meta)}",
             f"text: {moment.get('text') or ''}",
         ]
-        return "\n".join(fields)[:4000]
+        return "\n".join(fields)
 
     @staticmethod
     def _format_annotation_facets(meta: dict) -> str:
@@ -17165,6 +17169,16 @@ class GatewayService:
         pool = await memory_use.verify_sources(self, recall_input, query, pool)
         surviving_ids = {str(item["bucket"]["id"]) for item in pool}
         suppressed.extend(item for item in before_source_check if str(item["bucket"]["id"]) not in surviving_ids)
+        # Use the same current L1 semantic text as the embedding projector.
+        # Moment identity and parent qualification stay attached to the item;
+        # a matched passage does not lose the parent's conditions/negation.
+        for item in pool:
+            bid = str(item['bucket']['id'])
+            record = recall_input.get('_semantic_records', {}).get(bid) or {}
+            if record.get('state') == 'l1' and record.get('document'):
+                moment = item.get('matched_moment') or {}
+                documents[bid] = l1_retrieval_text(record['document'],
+                    body=(moment.get('text') or moment.get('content')) if moment else item['bucket'].get('content') or '')
         rerank_debug = {}
         rerank_started = time.perf_counter()
         rerank_cancelled = False
@@ -22143,7 +22157,18 @@ class GatewayService:
         node["score"] = score
         return recall_rank(query, node, self.relevance_options)
 
+    def _retrieval_document_for_bucket(self, bucket: dict):
+        view = getattr(self, 'memory_authority_view', None)
+        reader = getattr(view, 'memory_l1_recall_map', None)
+        if callable(reader):
+            record = reader([bucket.get('id')]).get(str(bucket.get('id'))) or {}
+            return record.get('document') if record.get('state') == 'l1' else None
+        return None
+
     def _bucket_rerank_document(self, bucket: dict) -> str:
+        document = self._retrieval_document_for_bucket(bucket)
+        if document is not None:
+            return l1_retrieval_text(document, body=bucket.get('content') or '')
         meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
         fields = [
             f"title: {meta.get('name') or bucket.get('id') or ''}",
@@ -22151,7 +22176,7 @@ class GatewayService:
             f"tags: {' '.join(str(item) for item in meta.get('tags', []) or [])}",
             f"content: {bucket_content_for_recall(bucket)}",
         ]
-        return "\n".join(fields)[:4000]
+        return "\n".join(fields)
 
     def _is_high_confidence_match(self, semantic_score: float, keyword_score: float) -> bool:
         return (
