@@ -5289,16 +5289,18 @@ class GatewayService:
 
         stage_started_at = time.perf_counter()
         prompt_composer_debug = {"status": "legacy_default"}
-        if recalled_memory or targeted_memory_detail or related_memory:
+        if recalled_memory or targeted_memory_detail or related_memory or recent_context:
             use_request = natural_input if isinstance(natural_input, dict) else {}
             use_sections = await memory_use.project_sections(self, use_request, recall_query, all_buckets, {
                 "direct": (recalled_memory, [str(m.get("bucket_id") or "") for m in recalled_moments], self.recalled_budget),
                 "targeted": (targeted_memory_detail, targeted_memory_detail_debug.get("accepted_ids", []), self.memory_detail_recall_budget),
                 "diffused": (related_memory, [], self.related_memory_budget),
+                "recent": (recent_context, [], self.recent_budget),
             })
             recalled_memory = use_sections.get("direct", "")
             targeted_memory_detail = use_sections.get("targeted", "")
             related_memory = use_sections.get("diffused", "")
+            recent_context = use_sections.get("recent", "")
         memory_recall_projection = self._build_memory_recall_projection(
             recalled_memory=recalled_memory,
             targeted_memory_detail=targeted_memory_detail,
@@ -5336,7 +5338,8 @@ class GatewayService:
         composed_messages = None
         if prompt_plan is None or prompt_plan.get("fallback_legacy"):
             stable_context, dynamic_context = (
-                self._build_injected_context_messages(**context_args))
+                self._build_injected_context_messages(
+                    **context_args, memory_recall_projection=memory_recall_projection))
             if prompt_plan is not None:
                 prompt_composer_debug = {
                     "status": prompt_plan.get(
@@ -5405,6 +5408,7 @@ class GatewayService:
         if injected_ids is not None:
             actually_injected = set(memory_recall_projection.get("injected_bucket_ids") or [])
             injected_ids = [bid for bid in injected_ids if bid not in selected_for_recall or bid in actually_injected]
+            injected_ids = list(dict.fromkeys(injected_ids + list(memory_recall_projection.get("injected_bucket_ids") or [])))
         self._apply_prompt_cache_hints(forward_payload, session_id)
         forward_payload["stream"] = payload.get("stream") is True
         mark_step("finalize_forward_payload", stage_started_at)
@@ -11507,7 +11511,12 @@ class GatewayService:
             key=lambda bucket: bucket.get("metadata", {}).get("created", ""),
             reverse=True,
         )
-        return await self._summarize_buckets(recent_buckets[:6], self.recent_budget)
+        # An internal carrier: shared projection reads saved L2/qualified prose
+        # and deduplicates it against direct/detail hits. No dehydration call.
+        return "\n\n".join(
+            f"[bucket_id:{bucket['id']}]\n{bucket_content_for_recall(bucket)}"
+            for bucket in recent_buckets[:6]
+        )
 
     def _should_inject_recent_context(
         self,
@@ -14493,7 +14502,6 @@ class GatewayService:
     ) -> str:
         if budget <= 0 or not moments:
             return ""
-        remaining = budget
         parts = []
         bucket_map = {
             str(bucket.get("id") or ""): bucket
@@ -14516,28 +14524,10 @@ class GatewayService:
                 source="direct",
             )
             moment["_reading_note"] = reading_note
-            note_tokens = count_tokens_approx(self._format_reading_note_line(reading_note))
-            block = await self._format_direct_bucket(
-                bucket,
-                moment,
-                grouped_moments,
-                max(1, remaining - note_tokens),
-                query_text=query_text,
-            )
-            block = self._insert_reading_note_after_header(block, reading_note)
-            tokens = count_tokens_approx(block)
-            if tokens <= 0:
-                continue
-            if tokens > remaining:
-                block = self._trim_text(block, remaining)
-                tokens = count_tokens_approx(block)
-            if tokens <= 0:
-                continue
-            parts.append(block)
+            # This is a request-local carrier, not model prose. Packing and
+            # L2/legacy rendering happen once in the shared projection.
+            parts.append(f"[bucket_id:{bucket_id}]")
             seen_buckets.add(bucket_id)
-            remaining -= tokens
-            if remaining <= 0:
-                break
         return "\n".join(parts)
 
     async def _format_direct_bucket(
@@ -23517,7 +23507,13 @@ class GatewayService:
         context_mode: str = "",
         date_persona_trace: str = "",
         date_recall: str = "",
+        memory_recall_projection: dict | None = None,
     ) -> tuple[str, str]:
+        memory_sources = {"Recalled Memory": "ombre.recalled_memory",
+                          "Targeted Memory Detail": "ombre.targeted_memory_detail",
+                          "Diffused Memory": "ombre.diffused_memory",
+                          "Recent Context": "ombre.recent_context"}
+        memory_offsets = []
         has_dynamic_context = any(
             section.strip()
             for section in [
@@ -23572,7 +23568,12 @@ class GatewayService:
 
             def add_section(title: str, content: str) -> None:
                 if content.strip():
-                    dynamic_sections.extend(["", title, content])
+                    if title in {"Recalled Memory", "Targeted Memory Detail", "Diffused Memory", "Recent Context"}:
+                        dynamic_sections.extend(["", content])
+                        start = sum(len(value) + 1 for value in dynamic_sections[:-1])
+                        memory_offsets.append((memory_sources[title], start, start + len(content)))
+                    else:
+                        dynamic_sections.extend(["", title, content])
 
             add_section("Just Now Chat Context", just_now_context)
             add_section("Date Recall", date_recall)
@@ -23608,15 +23609,23 @@ class GatewayService:
             add_section("Dream Context", dream_context)
 
         stable_context = "\n".join(stable_sections).strip()
-        dynamic_context = "\n".join(dynamic_sections).strip()
+        raw_dynamic = "\n".join(dynamic_sections)
+        leading = len(raw_dynamic) - len(raw_dynamic.lstrip())
+        dynamic_context = raw_dynamic.strip()
+        def finish(stable, dynamic):
+            if memory_recall_projection is not None:
+                memory_recall_projection['compiled_memory_blocks'] = [
+                    {'source_id': source, 'content': dynamic[max(0, start-leading):max(0, end-leading)]}
+                    for source, start, end in memory_offsets if start-leading < len(dynamic)]
+            return stable, dynamic
         stable_tokens = count_tokens_approx(stable_context)
         dynamic_tokens = count_tokens_approx(dynamic_context)
         if stable_tokens + dynamic_tokens <= self.inject_total_budget:
-            return stable_context, dynamic_context
+            return finish(stable_context, dynamic_context)
         if stable_tokens >= self.inject_total_budget:
-            return self._trim_text(stable_context, self.inject_total_budget), ""
+            return finish(self._trim_text(stable_context, self.inject_total_budget), "")
         remaining = max(0, self.inject_total_budget - stable_tokens)
-        return stable_context, self._trim_text(dynamic_context, remaining)
+        return finish(stable_context, self._trim_text(dynamic_context, remaining))
 
     def _build_memory_recall_projection(
         self,
@@ -23649,13 +23658,15 @@ class GatewayService:
         def add(title: str, body: str) -> None:
             text = str(body or "").strip()
             if text:
-                sections.extend([title, text])
+                sections.append(text)
 
         add("Recalled Memory", recalled_memory)
         add("Targeted Memory Detail", targeted_memory_detail)
         add("Diffused Memory", related_memory)
         body = "\n\n".join(sections).strip()
-        fact_body = body
+        recent_facts = [span['text'] for span in (natural_input or {}).get('rendered_memory_spans') or []
+                        if span.get('section') == 'recent']
+        fact_body = '\n\n'.join([part for part in [body, *recent_facts] if part])
         selected_bucket_ids = list(dict.fromkeys([
             *[
                 str(moment.get("bucket_id") or "").strip()
@@ -23669,6 +23680,7 @@ class GatewayService:
             ],
             *self._extract_bucket_ids_from_context(related_memory),
             *self._extract_bucket_ids_from_context(recalled_memory),
+            *((natural_input or {}).get("requested_usage_bucket_ids") or []),
         ]))
         ring_ids = list(dict.fromkeys(
             str(
@@ -23697,7 +23709,7 @@ class GatewayService:
                          for bid in selected_bucket_ids if bid in frozen}
             selected_memory_ids = list(revisions) or list(selected_bucket_ids)
             reasons = list(natural_input.get("incomplete_reasons") or [])
-            if natural_input.get("selected_buckets") and not body.strip():
+            if natural_input.get("selected_buckets") and not fact_body.strip():
                 reasons.append("selected_memory_not_rendered")
             semantic = natural_input.get("semantic_debug") or {}
             if semantic.get("coverage_status") == "incomplete":
@@ -23760,6 +23772,7 @@ class GatewayService:
             "selected_memory_revisions": revisions,
             "selected_ring_ids": ring_ids,
             "presentation_trace": list((natural_input or {}).get("presentation_trace") or []),
+            "rendered_memory_spans": (natural_input or {}).get("rendered_memory_spans"),
             "fact_body": fact_body,
             "body": body,
             "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
@@ -23816,7 +23829,20 @@ class GatewayService:
         facts = str(projection.get("fact_body") or "").strip()
         selected = list(projection.get("selected_bucket_ids") or [])
         injected = []
-        if enabled and facts and facts in actual:
+        spans = projection.get("rendered_memory_spans")
+        if enabled and spans is not None:
+            sources = {'direct': {'ombre.recalled_memory', 'ombre.memory_recall'},
+                       'targeted': {'ombre.targeted_memory_detail', 'ombre.memory_recall'},
+                       'diffused': {'ombre.diffused_memory', 'ombre.memory_recall'},
+                       'recent': {'ombre.recent_context'}}
+            blocks = projection.get('compiled_memory_blocks') or []
+            injected = [span["bucket_id"] for span in spans
+                        if span.get("bucket_id") in selected
+                        and str(span.get("text") or "").strip()
+                        and any(block.get('source_id') in sources.get(span.get('section'), set())
+                                and span['text'] in block.get('content', '')
+                                and block.get('content', '') in actual for block in blocks)]
+        elif enabled and facts and facts in actual:
             injected = selected
         elif enabled and facts:
             # Count a budget-trimmed fact only if its ID and an actual fact
@@ -23993,12 +24019,12 @@ class GatewayService:
                 self._memory_reading_policy_context()
                 if has_memory_reading_context else ""),
             "ombre.recalled_memory": (
-                None if recalled.startswith("Date Boundary\n") else "Recalled Memory",
+                None,
                 recalled),
             "ombre.targeted_memory_detail": (
-                "Targeted Memory Detail", targeted_memory_detail),
-            "ombre.diffused_memory": ("Diffused Memory", related_memory),
-            "ombre.recent_context": ("Recent Context", recent_context),
+                None, targeted_memory_detail),
+            "ombre.diffused_memory": (None, related_memory),
+            "ombre.recent_context": (None, recent_context),
             "ombre.date_persona_trace": (
                 "Date Persona Trace", date_persona_trace),
             "ombre.handoff_hint": ("New Window Handoff Hint", handoff_tool_hint),
@@ -24044,6 +24070,7 @@ class GatewayService:
         dynamic_sections: list[str] = []
         resolved = []
         placement_messages = []
+        compiled_memory_blocks = []
         remaining_budget = self.inject_total_budget
         facts = {
             "gateway.scope": scope,
@@ -24092,6 +24119,9 @@ class GatewayService:
             if (isinstance(budget, int) and cost > budget) or cost > remaining_budget:
                 continue
             remaining_budget -= cost
+            if source_id in {'ombre.memory_recall', 'ombre.recalled_memory', 'ombre.targeted_memory_detail',
+                             'ombre.diffused_memory', 'ombre.recent_context'}:
+                compiled_memory_blocks.append({'source_id': source_id, 'content': section})
             placement_messages.append({
                 'block_id':block.get('block_id'), 'source_id':source_id,
                 'role':block.get('role', 'system'), 'anchor':block.get('anchor'),
@@ -24114,6 +24144,8 @@ class GatewayService:
                     body.encode("utf-8")).hexdigest(),
                 "token_count": count_tokens_approx(body),
             })
+        if memory_recall_projection is not None:
+            memory_recall_projection['compiled_memory_blocks'] = compiled_memory_blocks
         # An explicitly applied plan owns inclusion. Missing/off prefaces are
         # not silently reintroduced; the uncomposed legacy path is unchanged.
         stable_context = "\n\n".join(stable_sections).strip()

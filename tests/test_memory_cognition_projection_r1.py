@@ -115,6 +115,8 @@ def _install_revision_source_http(monkeypatch, states=None):
 
     def handler(request):
         payload = json.loads(request.content)
+        if request.url.path.endswith('/presentations/resolve'):
+            return httpx.Response(200, json={'status': 'ok', 'items': []})
         requests.extend(payload["items"])
         rows = []
         for item in payload["items"]:
@@ -212,13 +214,13 @@ def test_historical_cognition_is_injected_as_history_and_trace_counts_it_separat
     body = sections["direct"]
     assert "当前版本的合成认知陈述。" in body
     assert "更早保存的合成认知陈述。" in body
-    assert "[historical_evidence" in body
-    chain_body = body.split("Cognition 1 (earlier saved version)", 1)[1]
+    assert "[historical_evidence" not in body
+    chain_body = body.split("以前记下的想法：", 1)[1]
     assert "稳定且未变化的合成陈述。" not in chain_body
     assert request["cognition_chain"]["provider_requests"] == 0
     assert request["cognition_chain"]["rendered_versions"] == [{
         "memory_id": MEMORY_ID, "revision": 1, "historical": True,
-        "label": "Cognition 1 (earlier saved version)", "partial": False,
+        "label": "以前记下的想法：", "text": "以前记下的想法：\n" + chain_body.strip(), "partial": False,
     }]
     assert view.chain_calls == [([(MEMORY_ID, 2)], 2, 8)]
     assert any(item["revision"] == 1 and item.get("allow_historical") is True
@@ -256,7 +258,9 @@ def test_multiple_statement_paths_render_their_union_without_unrelated_claims(
     assert "第一个关联的合成历史认知。" in body
     assert "第二个关联的合成历史认知。" in body
     assert "未关联陈述不得泄漏到认知链。" not in body
-    assert "Recorded connection: supplements" in body
+    assert "Recorded connection:" not in body
+    assert "a 的早期问题？" in body
+    assert "b 的早期问题？" in body
     assert projection["recall_status"]["cognition_chain_version_count"] == 1
 
 

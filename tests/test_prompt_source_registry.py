@@ -70,7 +70,7 @@ def test_l2_generation_prompt_is_registered_and_has_gateway_fallback_factory():
     body = factory_body(source_id)
 
     assert spec.scope == "memory.reflection"
-    assert spec.source_revision == "factory-memory-l2-generation-v2-review"
+    assert spec.source_revision == "factory-memory-l2-generation-v3-natural-source-faithful"
     assert spec.factory_body() == body
     assert '"review"' in body
     assert '"required":false' in body
@@ -111,10 +111,7 @@ def test_internal_recall_preparation_sources_are_scoped_and_provenanced():
         "Given a memory search query, retrieve relevant long-term memory passages."
     )
     assert document["factory_body"] == ""
-    for state in ("selected", "no_match", "incomplete", "disabled"):
-        assert state in wrapper["factory_body"]
-    assert "does not prove no Memory exists" in wrapper["factory_body"]
-    assert "Status text by itself is not a selected Memory item" in wrapper["factory_body"]
+    assert wrapper["factory_body"] == "{{content}}"
 
 
 def test_internal_recall_preparation_sources_resolve_in_their_own_scope():
@@ -133,8 +130,7 @@ def test_internal_recall_preparation_sources_resolve_in_their_own_scope():
     assert meta["status"] == "internal_default"
     assert store.scope == "memory.recall_status_wrapper"
     assert store.source_id == "ombre.memory_recall_status_wrapper_prompt"
-    assert "Recall status: incomplete." in resolved
-    assert "do not treat it as `no_match`" in resolved
+    assert resolved == ""
 
 
 def test_fixed_detail_has_factory_and_live_body_only():
@@ -150,8 +146,10 @@ def test_fixed_detail_has_factory_and_live_body_only():
             "authority",
         }
         assert detail["body_kind"] == "fixed_prompt"
-        assert detail["factory_body"]
-        assert detail["live_body"]
+        retired = source_id in {'ombre.memory_detail_request_prompt', 'ombre.memory_reading_policy_prompt',
+                                'ombre.date_boundary_prompt'}
+        assert bool(detail["factory_body"]) is not retired
+        assert bool(detail["live_body"]) is not retired
         assert detail["source_revision"]
         assert detail["authority"]
         assert detail["source_sha256"] == hashlib.sha256(
@@ -274,7 +272,7 @@ def test_every_fixed_source_resolves_through_store(tmp_path):
             identity_id="jiajia-main",
             runtime_values=runtime_values,
         )
-        assert resolved
+        assert bool(resolved) == bool(spec.factory_body())
         assert meta["status"] == "legacy_default"
         assert "{max_candidates}" not in resolved
         assert "{{max_ids}}" not in resolved
@@ -286,7 +284,6 @@ def test_every_fixed_source_resolves_through_store(tmp_path):
     [
         ("ombre.dream_wrapper_prompt", "owner_body"),
         ("ombre.active_reminder_prompt", "owner_body"),
-        ("ombre.memory_detail_request_prompt", "owner_body"),
     ],
 )
 def test_fixed_override_must_preserve_runtime_placeholders(

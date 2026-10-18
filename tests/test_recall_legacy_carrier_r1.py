@@ -91,7 +91,7 @@ def _compile(service, plan, context_args, *, status):
     return stable, dynamic, debug, projection
 
 
-def test_legacy_empty_no_match_status_reaches_actual_carrier_without_injecting_facts():
+def test_legacy_empty_no_match_stays_in_inspector_without_injecting_status_dictionary():
     service, context_args = _service_and_context_args()
     plan = _legacy_plan()
     status = {"status": "no_match", "selected_count": 0}
@@ -101,14 +101,9 @@ def test_legacy_empty_no_match_status_reaches_actual_carrier_without_injecting_f
     )
 
     actual_context = "\n\n".join(part for part in (stable, dynamic) if part)
-    recalled_block = next(
-        row for row in debug["resolved_blocks"]
-        if row["source_id"] == "ombre.recalled_memory"
-    )
-    assert "Recall status: no_match." in actual_context
-    assert "Status text by itself is not a selected Memory item." in actual_context
-    assert recalled_block["role"] == "user"
-    assert recalled_block["order"] == 100
+    assert not actual_context
+    assert not debug["resolved_blocks"]
+    assert projection["recall_status"]["status"] == "no_match"
     assert projection["injected_bucket_ids"] == []
     assert projection["recall_status"]["injected_count"] == 0
     assert projection["recall_status"]["status_only"] is True
@@ -127,9 +122,11 @@ def test_legacy_empty_incomplete_status_is_not_rendered_as_no_match():
     )
 
     actual_context = "\n\n".join(part for part in (stable, dynamic) if part)
-    assert "Recall status: incomplete." in actual_context
-    assert "do not treat it as `no_match`" in actual_context
+    assert "Recall status: incomplete." not in actual_context
+    assert "do not treat it as `no_match`" not in actual_context
     assert "Recall status: no_match." not in actual_context
+    assert projection["recall_status"]["status"] == "incomplete"
+    assert projection["recall_status"]["incomplete_reasons"] == ["synthetic_index_unavailable"]
     assert projection["recall_status"]["injected_count"] == 0
     assert projection["recall_status"]["status_only"] is True
 
@@ -181,12 +178,12 @@ def test_configured_canonical_source_is_used_once_without_legacy_wrapper():
 
     assert context_args == context_before_projection
     assert "legacy_compatibility_projection" not in status
-    assert actual_context.count("Recall status: no_match.") == 1
+    assert "Recall status:" not in actual_context
     assert "legacy-direct-marker" not in actual_context
     assert "legacy-diffused-marker" not in actual_context
     assert "legacy-targeted-marker" not in actual_context
     resolved_sources = [row["source_id"] for row in debug["resolved_blocks"]]
-    assert resolved_sources.count("ombre.memory_recall") == 1
+    assert resolved_sources.count("ombre.memory_recall") == 0
     assert not set(LEGACY_MEMORY_SOURCES) & set(resolved_sources)
 
 

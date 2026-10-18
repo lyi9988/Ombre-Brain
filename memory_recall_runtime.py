@@ -252,11 +252,12 @@ def render(service, usage, header, original, budget):
         return ""
     # Factory/body/owner_override/off are resolved through the normal Composer
     # component registry. Turning it off must not resurrect the old raw body.
-    text = service._resolve_gateway_fixed_prompt("ombre.memory_usage_card_prompt", runtime_values={
-        "header": header, "statements": usage_lines(usage),
-        "narrative": original if usage.get("narrative_allowed") else "",
-    })
-    return service._trim_text(text, budget) if text else ""
+    from memory_readable_projection import qualified_units, fit_units
+    def wrap(narrative):
+        return service._resolve_gateway_fixed_prompt("ombre.memory_usage_card_prompt", runtime_values={
+            "header": "", "statements": "", "narrative": narrative,
+        })
+    return fit_units(qualified_units(usage, original), budget, wrap=wrap)
 
 
 def render_presentation(service, usage, header, presentation, budget):
@@ -267,14 +268,11 @@ def render_presentation(service, usage, header, presentation, budget):
 
     # L1 controls qualification and purpose; its prose must not duplicate the
     # separately persisted L2 body or consume the L2 narrative's budget.
-    scopes = list(dict.fromkeys(str(item.get('usage') or '') for item in usage.get('items', [])
-                               if item.get('usage') and item['usage'] != 'excluded'))
-    statements = 'Allowed memory uses: ' + ', '.join(scopes)
     presentation_text = str(presentation.get("text") or "")
 
     def wrap(narrative):
         return service._resolve_gateway_fixed_prompt("ombre.memory_usage_card_prompt", runtime_values={
-            "header": header, "statements": statements,
+            "header": "", "statements": "",
             # Brain has already applied source, dependency, and per-statement
             # use checks to the complete L2 or to each returned unit.
             "narrative": narrative,
@@ -508,18 +506,26 @@ async def cognition_context(service, request, query, permitted, budget):
             uses = [use for use in uses if use["statement_id"] in refs]
         if not uses:
             continue
-        label = f'Cognition {len(spans) + 1} ({"earlier saved version" if row["historical"] else "related recorded view/evidence"})'
-        text = label + "\n" + usage_lines({**usage, "items": uses})
-        if paths:
-            text += "\nRecorded connection: " + ", ".join(dict.fromkeys(path["kind"] for path in paths))
+        from memory_readable_projection import qualified_prose, fit_units
+        label = '以前记下的想法：' if row['historical'] else '相关的想法：'
+        text = label + "\n" + qualified_prose({**usage, 'items': uses, 'narrative_allowed': False}, '')
+        for use in uses:
+            cognition = use.get('cognition') or {}
+            status = known(cognition.get('epistemic_status'))
+            if status in {'tentative', 'contested', 'revised'}:
+                text += '\n' + {'tentative': '这段想法当时尚未确定。', 'contested': '这段想法仍有争议。',
+                                 'revised': '这段想法后来有过修订。'}[status]
+            for question in cognition.get('open_questions') or []:
+                if question and question not in text:
+                    text += '\n' + str(question)
         if any(path.get("confirmation_state") in {"proposed", "unresolved"} for path in paths):
-            text += "\nRelationship remains unconfirmed."
-        clipped = service._trim_text(text, max(0, remaining))
+            text += "\n它与前述想法的关系还未确认。"
+        clipped = fit_units([text], max(0, remaining))
         if not clipped:
             break
         parts.append(clipped)
         spans.append({"memory_id": row["memory_id"], "revision": row["revision"], "historical": row["historical"],
-                      "label": label, "partial": clipped != text})
+                      "label": label, "text": clipped, "partial": clipped != text})
         remaining -= count_tokens_approx(clipped)
         if remaining <= 0:
             break
@@ -527,7 +533,7 @@ async def cognition_context(service, request, query, permitted, budget):
     text = (service._resolve_gateway_fixed_prompt("ombre.memory_cognition_chain_prompt", runtime_values={"content": content})
             if content else "")
     text = service._trim_text(text, budget) if text else ""
-    emitted = [row for row in spans if row["label"] in text]
+    emitted = [row for row in spans if row["text"] in text]
     request["cognition_chain"] = {"depth": depth, "limit": limit, "budget": budget,
         "eligible_versions": len(allowed), "rendered_versions": emitted,
         "truncated": bool(graph["truncated"] or len(emitted) < len(allowed) or any(s["partial"] for s in emitted)),
@@ -568,7 +574,7 @@ async def project_sections(service, request, query, buckets, sections):
         uses[bid] = {"state": "excluded", "items": [], "narrative_allowed": False}
     bucket_map = {str(bucket["id"]): bucket for bucket in valid}
     render_ids_by_section, planned_section, seen = {}, {}, set()
-    for key in ("targeted", "direct", "diffused"):
+    for key in ("targeted", "direct", "diffused", "recent"):
         body, _refs, budget = sections.get(key, ("", [], 0))
         ids = [bid for bid in ids_by_section.get(key, []) if bid in allowed and bid not in seen]
         seen.update(ids)
@@ -625,36 +631,25 @@ async def project_sections(service, request, query, buckets, sections):
         }
 
     rendered = {}
+    spans = []
     # Explicit original detail wins over a brief of the same record.
-    for key in ("targeted", "direct", "diffused"):
+    for key in ("targeted", "direct", "diffused", "recent"):
         body, _refs, budget = sections.get(key, ("", [], 0))
         ids = render_ids_by_section.get(key, [])
         if not body or not ids or budget <= 0:
             rendered[key] = ""
             continue
-        has_l2 = any(bid in presentations for bid in ids)
-        if (not has_l2 and len(ids) == len(ids_by_section[key])
-                and all(uses[bid]["narrative_allowed"] for bid in ids)):
-            notes = "\n".join(f'[bucket_id:{bid}] {usage_lines(uses[bid])}' for bid in ids)
-            text = service._resolve_gateway_fixed_prompt("ombre.memory_usage_card_prompt", runtime_values={
-                "header": "", "statements": notes, "narrative": body})
-            rendered[key] = service._trim_text(text, budget) if text else ""
-            included_ids = set(service._extract_bucket_ids_from_context(rendered[key]))
-            for bid in ids:
-                row = trace_by_bucket.setdefault(bid, {"bucket_id": bid, "source": "none"})
-                if bid not in included_ids:
-                    row["source"] = "none"
-                    row["fallback_reason"] = (
-                        "usage_card_prompt_unavailable" if not rendered[key]
-                        else "section_budget_exhausted")
-                elif row.get("source") not in {"l1_targeted_original", "legacy"}:
-                    row["source"] = "l1"
-        else:
+        if ids:
             parts, remaining = [], budget
             for bid in ids:
                 bucket = bucket_map[bid]
-                header = service._direct_bucket_header(bucket, {"bucket_id": bid})
+                header = ""
                 row = trace_by_bucket.setdefault(bid, {"bucket_id": bid, "source": "none"})
+                row["section"] = key
+                original = str(bucket.get('content') or '')
+                comments_reader = getattr(service, '_bucket_text_with_comments', None)
+                if uses[bid]['state'] == 'legacy' and callable(comments_reader):
+                    original = comments_reader(bucket)
                 presentation = presentations.get(bid)
                 if presentation:
                     text, render_reason, selected_unit_ids, partial_presentation = render_presentation(
@@ -674,7 +669,7 @@ async def project_sections(service, request, query, buckets, sections):
                         }:
                             text = render(
                                 service, uses[bid], header,
-                                str(bucket.get("content") or ""), remaining,
+                                original, remaining,
                             )
                             if text:
                                 row["source"] = "l1"
@@ -686,7 +681,7 @@ async def project_sections(service, request, query, buckets, sections):
                             row["render_reason"] = render_reason
                 else:
                     text = render(service, uses[bid], header,
-                                  str(bucket.get("content") or ""), remaining)
+                                  original, remaining)
                     if text:
                         if row.get("source") not in {"l1_targeted_original", "legacy"}:
                             row["source"] = "legacy" if uses[bid]["state"] == "legacy" else "l1"
@@ -695,16 +690,17 @@ async def project_sections(service, request, query, buckets, sections):
                         row.setdefault("render_reason", "usage_card_prompt_unavailable")
                 if text:
                     parts.append(text)
+                    spans.append({"bucket_id": bid, "section": key, "text": text})
                     # The existing Gateway owns token accounting and budgets.
                     from utils import count_tokens_approx
                     remaining -= count_tokens_approx(text)
                 elif remaining > 0:
+                    row['source'] = 'none'
                     row.setdefault("fallback_reason", "not_rendered")
                 if remaining <= 0:
                     break
             if remaining <= 0:
-                included_ids = set(bid for part in parts
-                                   for bid in service._extract_bucket_ids_from_context(part))
+                included_ids = {span["bucket_id"] for span in spans if span["section"] == key}
                 for bid in ids:
                     if bid not in included_ids:
                         row = trace_by_bucket.setdefault(bid, {"bucket_id": bid, "source": "none"})
@@ -723,8 +719,8 @@ async def project_sections(service, request, query, buckets, sections):
     # A dependency supplements an actually shown memory; it cannot reserve
     # tokens first and clip the selected memory's decisive claim away.
     from utils import count_tokens_approx
-    target = next((key for key in ("targeted", "direct", "diffused") if rendered.get(key)), None)
-    rendered_ids = {bid for body in rendered.values() for bid in service._extract_bucket_ids_from_context(body)}
+    target = next((key for key in ("targeted", "direct", "diffused", "recent") if rendered.get(key)), None)
+    rendered_ids = {span["bucket_id"] for span in spans}
     chain_seeds = [item for item in permitted if str(item["bucket"]["id"]) in rendered_ids
                    and any(use.get("cognition") for use in uses.get(str(item["bucket"]["id"]), {}).get("items", []))]
     remaining = max(0, sections[target][2] - count_tokens_approx(rendered[target] + "\n\n")) if target else 0
@@ -735,7 +731,9 @@ async def project_sections(service, request, query, buckets, sections):
     elif chain_seeds and remaining <= 0:
         request["cognition_chain"] = {"rendered_versions": [], "budget": 0, "provider_requests": 0,
                                       "issues": [{"reason": "no_budget_after_main_memory"}], "truncated": True}
+    request["rendered_memory_spans"] = spans
+    request["requested_usage_bucket_ids"] = list(dict.fromkeys(
+        bid for ids in ids_by_section.values() for bid in ids))
     request["injected_usage_bucket_ids"] = list(dict.fromkeys(
-        bid for body in rendered.values() for bid in service._extract_bucket_ids_from_context(body)
-        if bid in allowed))
+        span["bucket_id"] for span in spans if span["bucket_id"] in allowed))
     return rendered

@@ -278,13 +278,14 @@ def test_l1_legacy_source_record_and_repeated_sections_reach_one_ordered_compose
 
     # The real source-record direct formatter fed the shared generator. Targeted
     # wins; the same L1 bucket in direct/diffused is projected only once.
-    assert "Synthetic source-record capsule." in sections["targeted"]
-    assert "current_basis" in sections["targeted"]
-    assert "historical_evidence" in sections["targeted"]
-    assert "historical_evidence" in sections["direct"]
+    assert "current synthetic address evidence" in sections["targeted"]
+    assert "旧住址在青石路。" in sections["targeted"]
+    assert "现住址在白桦街。" in sections["targeted"]
+    assert "current_basis" not in sections["targeted"]
+    assert "historical_evidence" not in sections["direct"]
     assert sections["diffused"] == ""
-    assert sections["targeted"].count("Historical narrative (record date is not event date):") == 1
-    assert sections["direct"].count("Historical narrative (record date is not event date):") == 1
+    assert "Historical narrative" not in sections["targeted"]
+    assert "[bucket_id:" not in sections["direct"]
     assert "Legacy archive narrative" in sections["direct"]
     assert request["injected_usage_bucket_ids"] == ["bucket-l1", "bucket-legacy"]
     trace_by_bucket = {
@@ -304,10 +305,10 @@ def test_l1_legacy_source_record_and_repeated_sections_reach_one_ordered_compose
 
     messages, stable, dynamic, debug = _compose(service, plan, projection, sections)
     user = _user_content(messages)
-    assert user.index("ORDER-A") < user.index("Recall status: selected.") < user.index("ORDER-C")
+    assert user.index("ORDER-A") < user.index("current synthetic address evidence") < user.index("ORDER-C")
     assert user.count("CANONICAL-MEMORY-BEGIN") == 1
     assert user.count("CANONICAL-MEMORY-END") == 1
-    assert user.count("Recall status: selected.") == 1
+    assert "Recall status:" not in user
     assert user.count("Legacy archive narrative") == 1
     assert "CORE-BYPASS" in "\n".join(message["content"] for message in messages)
     assert projection["recall_status"]["injection_measured_after_compile"] is True
@@ -316,7 +317,7 @@ def test_l1_legacy_source_record_and_repeated_sections_reach_one_ordered_compose
     assert resolved_sources.count("ombre.memory_recall") == 1
     assert not ({"ombre.recalled_memory", "ombre.targeted_memory_detail",
                  "ombre.diffused_memory"} & set(resolved_sources))
-    assert "ORDER-A" in dynamic and "ORDER-C" in dynamic and "Recall status: selected." in dynamic
+    assert "ORDER-A" in dynamic and "ORDER-C" in dynamic and "current synthetic address evidence" in dynamic
     assert stable and "CORE-BYPASS" in stable
 
 
@@ -335,7 +336,8 @@ def test_section_and_composer_budgets_control_actual_injection_and_counts(
          "targeted": ("", [], 0), "diffused": ("", [], 0)},
     ))
     assert 0 < count_tokens_approx(sections["direct"]) <= 180
-    assert "预算边界合成记忆。" in sections["direct"]
+    assert "现住址在白桦街。" in sections["direct"]
+    assert "预算边界合成记忆。" not in sections["direct"]  # Do not clip an oversized paragraph.
     assert request["injected_usage_bucket_ids"] == ["bucket-l1"]
 
     projection = service._build_memory_recall_projection(
