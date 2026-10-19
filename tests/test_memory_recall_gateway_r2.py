@@ -347,9 +347,11 @@ def test_fast_local_uses_configured_formula_and_threshold_in_real_selection_and_
         {"direct": (raw, ["bucket-high-keyword"], 4000),
          "targeted": ("", [], 0), "diffused": ("", [], 0)},
     ))["direct"]
-    assert "current_basis" in projected
-    assert "historical_evidence" in projected
-    assert "原始故事仍保留作叙述背景" in projected
+    uses = request["usage_by_bucket"]["bucket-high-keyword"]["items"]
+    assert {"current_basis", "historical_evidence"} <= {item["usage"] for item in uses}
+    assert "current_basis" not in projected and "historical_evidence" not in projected
+    assert "高词法命中的合成记忆" in projected
+    assert "现住址在白桦街" in projected and "旧住址在青石路" in projected
     assert request["injected_usage_bucket_ids"] == ["bucket-high-keyword"]
     final = service._build_memory_recall_projection(
         recalled_memory=projected, targeted_memory_detail="", related_memory="",
@@ -358,8 +360,9 @@ def test_fast_local_uses_configured_formula_and_threshold_in_real_selection_and_
     )
     assert final["recall_status"]["status"] == "selected"
     assert final["selected_bucket_ids"] == ["bucket-high-keyword"]
-    assert "historical_evidence" in final["fact_body"]
-    assert "current_basis" in final["fact_body"]
+    assert "historical_evidence" not in final["fact_body"]
+    assert "current_basis" not in final["fact_body"]
+    assert "现住址在白桦街" in final["fact_body"]
 
     stricter_config = _base_config(local_threshold=0.9)
     stricter, stricter_calls = _gateway_service(
@@ -605,8 +608,10 @@ def test_ready_l2_is_batch_resolved_and_used_with_per_statement_use_constraints(
     assert item["statement_uses"] == expected_statement_uses
     assert set(item["allowed_uses"]) == set(expected_statement_uses.values())
     assert item["narrative_allowed"] is True
-    assert "current_basis" in sections["direct"]
-    assert "historical_evidence" in sections["direct"]
+    assert "current_basis" in item["statement_uses"].values()
+    assert "current_basis" not in sections["direct"]
+    assert "historical_evidence" in item["statement_uses"].values()
+    assert "historical_evidence" not in sections["direct"]
     assert "L2 coherent presentation sentinel." in sections["direct"]
     assert "L1 raw original sentinel" not in sections["direct"]
     # Even L1 semantic statement prose is computation-only for ready L2.

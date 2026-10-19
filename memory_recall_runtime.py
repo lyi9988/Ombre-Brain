@@ -12,6 +12,7 @@ from memory_recall_semantics import (apply_relations, known, lexical_features, r
                                      score_document, temporal_features)
 from memory_system_config import REQUEST_CONFIGURATION, values_from_config
 from memory_affinity import resolve_signals
+from memory_query_evidence import query_purpose, match_statements, correction_matches, semantic_source_refs
 
 
 def values(service):
@@ -35,9 +36,10 @@ def context(service, request, query):
         plan = planner(query) if callable(planner) else None
         target = (datetime.fromisoformat(date_hint["date"]).replace(tzinfo=now.tzinfo)
                   if date_hint and date_hint.get("date") else None)
+        temporal_intent = query_purpose(query, target_time=target, now=now)
         request["_use_context"] = {
             "now": now, "target_time": target, "query": query,
-            "purpose": "history" if target is not None or getattr(plan, "explicit_old_memory", False) else "current",
+            **temporal_intent,
             "overview": bool(date_hint and getattr(plan, "auto_too_vague", False)),
             "facts": {"hour": {"state": "known", "value": now.hour},
                       "weekday": {"state": "known", "value": now.weekday()}},
@@ -112,16 +114,23 @@ def score_pool(service, request, query, pool, *, after_rerank=False):
             "importance": metadata.get("importance", item["bucket"].get("importance")),
             "confidence": metadata.get("confidence", item["bucket"].get("confidence")),
             "canonical_domain": domain or None,
+            "statement_selection": item.get("_statement_selection"),
+            "eligible_statement_ids": ([use["statement_id"] for use in
+                request.get("usage_by_bucket", {}).get(bid, {}).get("items", [])]
+                if bid in request.get("usage_by_bucket", {}) else None),
         })
         policy_formula = calculation.get("formula_id") or "final"
         formula = next((f for f in settings["formulas"] if f["id"] == policy_formula), {})
         custom_formula = (formula.get("expression", "relevance").strip() != "relevance"
                           or bool(settings.get("recall", {}).get("formula_id"))
-                          or any(row.get("scoring_profile") for row in calculation["statements"]))
-        time_applied = any(row["features"].get("freshness") is not None
+                          or any(row.get("participates_in_aggregation") and row.get("scoring_profile")
+                                 for row in calculation["statements"]))
+        time_applied = any(row.get("participates_in_aggregation") and row["features"].get("freshness") is not None
                            and row["features"].get("time_weight") is not None
                            for row in calculation["statements"])
-        calculation["window_score"] = (calculation["score"] if not calculation["reason_codes"]
+        formula_failed = any(reason in {"formula_unknown_retained_base", "formula_error_retained_base"}
+                             for reason in calculation["reason_codes"])
+        calculation["window_score"] = (calculation["score"] if not formula_failed
             and (custom_formula or time_applied or item.get("l1_local_match")) else None)
         item["_configured_score"] = calculation
         if calculation["score"] is not None:
@@ -140,7 +149,9 @@ async def verify_sources(service, request, query, items):
         record = records.get(bid) or {}
         document = record.get("document")
         if record.get("state") == "l1" and document:
-            bindings = [binding["binding_id"] for binding in document.get("evidence_bindings", [])]
+            referenced = semantic_source_refs(document)
+            bindings = [binding["binding_id"] for binding in document.get("evidence_bindings", [])
+                        if not referenced or binding["binding_id"] in referenced]
             bindings_by_bucket[bid] = bindings
             if bindings:
                 wanted.append({"memory_id": record["memory_id"], "revision": record["revision"],
@@ -203,9 +214,29 @@ async def verify_sources(service, request, query, items):
             continue
         usage_by_bucket[bid] = {"state": "l1", "items": allowed,
                                "narrative_allowed": narrative_allowed, "record": record,
-                               "source_states": source_states}
+                               "source_states": source_states, "query_purpose": use_context["purpose"]}
         result.append(item)
     apply_relations(records, usage_by_bucket, use_context)
+    for item in result:
+        bid = str(item["bucket"]["id"])
+        usage = usage_by_bucket[bid]
+        record = records.get(bid) or {}
+        if usage["state"] != "l1":
+            continue
+        selection = match_statements(record["document"], {**use_context,
+            "memory_id": record.get("memory_id"), "revision": record.get("revision")})
+        eligible_ids = {use["statement_id"] for use in usage["items"] if use["usage"] != "excluded"}
+        for key in ("direct_ids", "support_ids"):
+            selection[key] = [sid for sid in selection[key] if sid in eligible_ids]
+        item["_statement_selection"] = selection
+        usage["statement_selection"] = selection
+        explicit = {use["statement_id"] for use in usage["items"]
+                    if use.get("source_state") == "available"
+                    and known((use.get("classification") or {}).get("basis")) in {"direct_expression", "record"}}
+        corrections = [sid for sid in correction_matches(record["document"], use_context, selection) if sid in explicit]
+        usage["correction_statement_ids"] = corrections
+        item["correction_statement_ids"] = corrections
+        item["matched_correction_background"] = bool(corrections and settings["recall"].get("include_correction_background", True))
     return result
 
 
@@ -246,18 +277,38 @@ def usage_lines(usage):
     return "\n".join(rows)
 
 
-def render(service, usage, header, original, budget):
+def render(service, usage, header, original, budget, *, trace=None):
     """A source-faithful interim L1 view, not the future persisted L2."""
     if usage["state"] == "excluded":
         return ""
     # Factory/body/owner_override/off are resolved through the normal Composer
     # component registry. Turning it off must not resurrect the old raw body.
-    from memory_readable_projection import qualified_units, fit_units
+    from memory_readable_projection import qualified_units, qualified_prose, fit_units
+    selection = usage.get("statement_selection") or {}
+    if selection.get("direct_ids") and usage.get("scope_to_query", True):
+        refs = set(selection["direct_ids"]) | set(selection.get("support_ids") or [])
+        usage = {**usage, "items": [item for item in usage.get("items", []) if item["statement_id"] in refs]}
+    required = set(usage.get("correction_statement_ids") or [])
+    required.update(selection.get("support_ids") or [])
+    if required:
+        usage = {**usage, "items": sorted(usage.get("items", []), key=lambda item: item["statement_id"] not in required)}
+        by_id = {item["statement_id"]: item for item in usage["items"]}
+        missing = [sid for sid in required if sid not in by_id or not qualified_units(
+            {**usage, "items": [by_id[sid]], "narrative_allowed": False}, "")]
+        if missing:
+            if trace is not None:
+                trace.update(render_reason="required_context_not_readable", unrenderable_required_statement_ids=sorted(missing))
+            return ""
     def wrap(narrative):
         return service._resolve_gateway_fixed_prompt("ombre.memory_usage_card_prompt", runtime_values={
             "header": "", "statements": "", "narrative": narrative,
         })
-    return fit_units(qualified_units(usage, original), budget, wrap=wrap)
+    units = qualified_units(usage, original)
+    if required:
+        # A fallback must not retain a positive claim but drop its required
+        # correction/condition merely because another paragraph fits first.
+        units = [qualified_prose(usage, original)] if units else []
+    return fit_units(units, budget, wrap=wrap)
 
 
 def render_presentation(service, usage, header, presentation, budget):
@@ -293,8 +344,14 @@ def render_presentation(service, usage, header, presentation, budget):
                 or not isinstance(unit_text, str) or not unit_text.strip()):
             continue
         seen_unit_ids.add(unit_id)
-        units.append({"unit_id": unit_id, "text": unit_text})
+        units.append({"unit_id": unit_id, "text": unit_text,
+                      "statement_refs": list(unit.get("statement_refs") or [])})
     unit_ids = [unit["unit_id"] for unit in units]
+    required = set(usage.get("correction_statement_ids") or [])
+    required.update((usage.get("statement_selection") or {}).get("support_ids") or [])
+    coverage = presentation.get("coverage")
+    if coverage is not None and not required <= set(coverage.get("used_statement_ids") or []):
+        return "", "required_l2_context_missing", [], False
 
     # Keep the complete preferred L2 whenever it fits the remaining owner
     # budget. Otherwise choose complete resolver-approved units, never slices.
@@ -306,13 +363,21 @@ def render_presentation(service, usage, header, presentation, budget):
     wrapper_cost = max(0, count_tokens_approx(text) - count_tokens_approx(presentation_text))
     available_narrative_budget = max(0, budget - wrapper_cost)
     selected = []
-    for unit in units:
+    matched = set((usage.get("statement_selection") or {}).get("direct_ids") or [])
+    ordered = sorted(enumerate(units), key=lambda pair: (
+        -len(set(pair[1]["statement_refs"]) & required),
+        -len(set(pair[1]["statement_refs"]) & matched), pair[0]))
+    for _position, unit in ordered:
         candidate = selected + [unit]
         narrative = "\n\n".join(item["text"] for item in candidate)
         if count_tokens_approx(narrative) <= available_narrative_budget:
             selected = candidate
     if not selected:
         return "", "no_complete_unit_fits_remaining_budget", [], False
+    if required and not required <= {ref for unit in selected for ref in unit["statement_refs"]}:
+        return "", "no_complete_correction_unit_fits_remaining_budget", [], False
+    selected_ids = {unit["unit_id"] for unit in selected}
+    selected = [unit for unit in units if unit["unit_id"] in selected_ids]
 
     # The final result receives one shared usage card wrapper around all units.
     # Recheck its exact estimate and drop whole trailing units if wrapper
@@ -320,6 +385,8 @@ def render_presentation(service, usage, header, presentation, budget):
     while selected:
         narrative = "\n\n".join(item["text"] for item in selected)
         selected_text = wrap(narrative)
+        if required and not required <= {ref for unit in selected for ref in unit["statement_refs"]}:
+            return "", "no_complete_correction_unit_fits_remaining_budget", [], False
         if selected_text and count_tokens_approx(selected_text) <= max(0, budget):
             selected_ids = [item["unit_id"] for item in selected]
             return selected_text, None, selected_ids, len(selected_ids) < len(unit_ids)
@@ -356,6 +423,9 @@ async def resolve_presentations(service, candidates):
             "allowed_uses": allowed_uses,
             "statement_uses": statement_uses,
             "narrative_allowed": bool(usage.get("narrative_allowed")),
+            **({"matched_statement_ids": usage["statement_selection"]["direct_ids"],
+                "support_statement_ids": usage["statement_selection"]["support_ids"]}
+               if (usage.get("statement_selection") or {}).get("direct_ids") else {}),
         })
 
     base = os.environ.get("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://ombre-brain:8000").rstrip("/")
@@ -394,6 +464,7 @@ async def resolve_presentations(service, candidates):
     for candidate in candidates:
         bid = candidate["bucket_id"]
         memory_id = candidate["memory_id"]
+        usage = candidate["usage"]
         common = {
             "bucket_id": bid,
             "memory_id": memory_id,
@@ -405,6 +476,8 @@ async def resolve_presentations(service, candidates):
             "resolver_state": None,
             "source": "l1",
             "fallback_reason": failure or "resolver_missing_item",
+            "query_purpose": usage.get("query_purpose"),
+            "statement_selection": usage.get("statement_selection"),
         }
         row = rows_by_memory.get(memory_id) if not failure else None
         if row is not None:
@@ -430,7 +503,9 @@ async def resolve_presentations(service, candidates):
                         "units": row.get("units") if isinstance(row.get("units"), list) else [],
                         "presentation_revision": revision,
                         "resolver_state": state,
+                        "coverage": row.get("coverage"),
                     }
+                    common["l2_coverage"] = row.get("coverage")
         trace[bid] = common
     return presentations, trace
 
@@ -661,27 +736,38 @@ async def project_sections(service, request, query, buckets, sections):
                         row["selected_unit_ids"] = selected_unit_ids
                         row["partial_presentation"] = partial_presentation
                         row["fallback_reason"] = None
+                        coverage = presentation.get("coverage") or {}
+                        selected_set = set(selected_unit_ids)
+                        actual_refs = (coverage.get("used_statement_ids") if not partial_presentation else
+                            list(dict.fromkeys(ref for unit in presentation.get("units") or []
+                                if unit.get("unit_id") in selected_set for ref in unit.get("statement_refs") or [])))
+                        row["injected_statement_ids"] = actual_refs
+                        if actual_refs is not None:
+                            row["uncovered_matched_statement_ids"] = sorted(set(
+                                (uses[bid].get("statement_selection") or {}).get("direct_ids") or []) - set(actual_refs))
                     else:
                         row["fallback_reason"] = render_reason
                         if render_reason in {
                             "presentation_exceeds_remaining_budget",
                             "no_complete_unit_fits_remaining_budget",
+                            "no_complete_correction_unit_fits_remaining_budget",
+                            "required_l2_context_missing",
                         }:
                             text = render(
                                 service, uses[bid], header,
-                                original, remaining,
+                                original, remaining, trace=row,
                             )
                             if text:
                                 row["source"] = "l1"
                             else:
                                 row["source"] = "none"
-                                row["render_reason"] = "usage_card_prompt_unavailable"
+                                row.setdefault("render_reason", "usage_card_prompt_unavailable")
                         else:
                             row["source"] = "none"
                             row["render_reason"] = render_reason
                 else:
-                    text = render(service, uses[bid], header,
-                                  original, remaining)
+                    text = render(service, {**uses[bid], "scope_to_query": key != "targeted"}, header,
+                                  original, remaining, trace=row)
                     if text:
                         if row.get("source") not in {"l1_targeted_original", "legacy"}:
                             row["source"] = "legacy" if uses[bid]["state"] == "legacy" else "l1"
@@ -715,6 +801,9 @@ async def project_sections(service, request, query, buckets, sections):
     for row in presentation_trace:
         row.setdefault("selected_unit_ids", [])
         row.setdefault("partial_presentation", False)
+        if row.get("source") in {"l1", "l1_targeted_original"}:
+            selection = (uses.get(row["bucket_id"]) or {}).get("statement_selection") or {}
+            row.setdefault("statement_selection", selection)
     request["presentation_trace"] = presentation_trace
     # A dependency supplements an actually shown memory; it cannot reserve
     # tokens first and clip the selected memory's decisive claim away.

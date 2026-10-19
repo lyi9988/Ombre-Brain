@@ -17154,9 +17154,9 @@ class GatewayService:
             elif checkpoint:
                 debug["candidate_checkpoint"] = {"status": "invalidated"}
         pool = memory_use.add_local_candidates(self, recall_input, query, pool)
-        pool = memory_use.score_pool(self, recall_input, query, pool)
         before_source_check = pool
         pool = await memory_use.verify_sources(self, recall_input, query, pool)
+        pool = memory_use.score_pool(self, recall_input, query, pool)
         surviving_ids = {str(item["bucket"]["id"]) for item in pool}
         suppressed.extend(item for item in before_source_check if str(item["bucket"]["id"]) not in surviving_ids)
         # Use the same current L1 semantic text as the embedding projector.
@@ -17217,9 +17217,10 @@ class GatewayService:
             local_signal = bool(self._safe_float(item.get("keyword_score"), 0) > 0
                                 or any((item.get("l1_local_match") or {}).values()))
             local_admit = local_threshold is not None and local_signal and item["score"] >= local_threshold
-            admit = bool(hard or local_admit or (rerank is not None and self._safe_float(rerank, 0) >= rerank_threshold)
+            correction = bool(item.get("matched_correction_background"))
+            admit = bool(hard or local_admit or correction or (rerank is not None and self._safe_float(rerank, 0) >= rerank_threshold)
                          or (rerank is None and semantic_verified and semantic >= semantic_threshold))
-            item["admission_reason"] = "verified_local_evidence" if hard else "configured_local_score" if local_admit else "strong_rerank" if admit and rerank is not None else "strong_semantic" if admit else "insufficient_contextual_relevance"
+            item["admission_reason"] = "verified_local_evidence" if hard else "configured_local_score" if local_admit else "matched_correction_background" if correction else "strong_rerank" if admit and rerank is not None else "strong_semantic" if admit else "insufficient_contextual_relevance"
             item["evidence_labels"] = labels
             item["hard_evidence_labels"] = self._hard_bucket_evidence_labels(labels)
             item["identity_evidence_status"] = (
@@ -17245,11 +17246,17 @@ class GatewayService:
         )
         debug["final_bucket_ids"] = [str(item["bucket"]["id"]) for item in selected]
         debug["configured_computation"] = {
+            "query_use": {key: value for key, value in (recall_input.get("_use_context") or {}).items()
+                          if key in {"purpose", "purpose_reason", "temporal_reference"}},
             "recall": dict(memory_use.values(self).get("recall") or {}),
             "signal_sources": (recall_input.get("_use_context") or {}).get("signals", {}),
             "hierarchy_suppressed": list(recall_input.get("hierarchy_suppressed") or []),
             "scores": [{"bucket_id": str(item["bucket"]["id"]), "computation": item.get("_configured_score")}
                        for item in selected],
+            "candidate_scores": [{"bucket_id": str(item["bucket"]["id"]), "computation": item.get("_configured_score"),
+                        "selected": item in selected, "admission_reason": item.get("admission_reason"),
+                        "correction_statement_ids": item.get("correction_statement_ids", [])}
+                       for item in pool],
             "usage_by_bucket": {bid: {"state": row["state"],
                 "claims": [{"statement_id": use.get("statement_id"), "usage": use["usage"], "reason_codes": use["reason_codes"]}
                            for use in row.get("items", [])]}
@@ -23307,6 +23314,12 @@ class GatewayService:
         return bool(keys and text and all(key in text for key in keys))
 
     def _dynamic_bucket_item_has_reliable_recall_signal(self, query: str, item: dict) -> bool:
+        if item.get("matched_correction_background") and item.get("correction_statement_ids"):
+            return True  # Source-qualified correction background, not a score boost.
+        if (item.get("_configured_score") or {}).get("window_score") is not None:
+            # Raw channel flags, including lexical/anchor flags, cannot undo
+            # the owner's applied claim/time formula at final selection.
+            return False
         if (
             self._planner_lexical_direct_signal(item)
             or item.get("exact_anchor_match")
