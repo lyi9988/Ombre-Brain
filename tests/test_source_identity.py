@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import gc
 from contextlib import closing
 import json
 import os
@@ -119,6 +120,7 @@ class Tests(unittest.TestCase):
             mapped=mapped_config(sources[1],subject='self:guyan',name='顾衍');mapped['state_dir']=tmp
             actual=asyncio.run(LocalMemorySourceReader(mapped,'raw_event').read(bindings[1]))
             self.assertEqual(actual['participant']['subject_id'],'self:guyan')
+            gc.collect()  # SQLite context managers can leave unreferenced cycles on Windows.
     def test_real_sqlite_retention_and_live_conversation_reader(self):
         with tempfile.TemporaryDirectory() as tmp:
             config={**copy.deepcopy(CONFIG),'buckets_dir':tmp}
@@ -140,6 +142,7 @@ class Tests(unittest.TestCase):
             with closing(sqlite3.connect(db)) as conn, conn:conn.execute('UPDATE conversation_turns SET user_text=?',('已改写',))
             changed=asyncio.run(retained.locate(bindings[0]))
             self.assertFalse(changed['eligible_source'])
+            gc.collect()
     def test_actor_revision_changes_but_legacy_binding_stays_unknown(self):
         from memory_l1_source_readers import attributed_snapshot
         source=canonical(conversation='peer-room');config=mapped_config(source)
