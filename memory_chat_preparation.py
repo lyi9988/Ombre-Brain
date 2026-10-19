@@ -33,7 +33,7 @@ def validate_submission(envelope):
     if errors:
         raise L1OwnerError('invalid_chat_submission', field_path='arguments')
     context = envelope['context']
-    if not isinstance(context, dict) or set(context) != {'conversation_id', 'request_id', 'turn_id', 'sources'}:
+    if not isinstance(context, dict) or (set(context) - {'attachment_sources'}) != {'conversation_id', 'request_id', 'turn_id', 'sources'}:
         raise L1OwnerError('invalid_source_context', field_path='context')
     if any(not isinstance(context.get(k), str) or not context[k] or len(context[k]) > 200
            for k in ('conversation_id', 'request_id', 'turn_id')):
@@ -59,6 +59,13 @@ def validate_submission(envelope):
     if (sources[-1]['event_id'] != context['turn_id'] or sources[-1]['role'] != 'user'
             or sum(len(s['text']) for s in sources) > 60000):
         raise L1OwnerError('source_coverage_invalid', field_path='context.sources')
+    # Validate the optional transport field independently of model arguments.
+    # The worker later rechecks its exact source through the live reader.
+    from chat_memory_tool import chat_evidence_sources
+    try:
+        chat_evidence_sources(context, profile_id='submission-validation')
+    except (ValueError, TypeError, KeyError) as exc:
+        raise L1OwnerError('invalid_attachment_sources', field_path='context.attachment_sources') from exc
     from memory_l1_wire_schema import MEMORY_WRITE_MAX_REQUEST_BYTES
     if len(canonical_json(envelope).encode('utf-8')) > MEMORY_WRITE_MAX_REQUEST_BYTES:
         raise L1OwnerError('memory_request_too_large', status=413, field_path='submission')
@@ -267,8 +274,8 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                     results.append(tasks.receipt(memory_id))
                     continue
                 envelope = claimed['envelope']
-                sources = [canonical_source(s, conversation_id=envelope['context']['conversation_id'],
-                    profile_id=engine.memory_semantic_profile_id) for s in envelope['context']['sources']]
+                from chat_memory_tool import chat_evidence_sources
+                sources = chat_evidence_sources(envelope['context'], profile_id=engine.memory_semantic_profile_id)
                 snapshots, bindings = bind_sources(sources, config=engine.config)
                 for source, snapshot in zip(sources, snapshots):
                     source['_participant_revision'] = snapshot['source_revision']

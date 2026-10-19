@@ -93,6 +93,7 @@ def semantic_sources(snapshots, bindings, *, chat_view=False, source_timezone=No
         raise L1OwnerError('source_binding_count_mismatch', field_path='sources')
     result = [{'binding_id': binding['binding_id'], 'text': source['text'],
              'author': source.get('author'), 'participant': deepcopy(source.get('participant')),
+             'uploader': deepcopy(source.get('uploader')),
              'source_group_id': (source.get('source_group') or {}).get('source_group_id'),
              'author_ref': binding.get('author_ref'), 'speaker_ref': binding.get('speaker_ref'),
              'source_recorded_at': source.get('recorded_at')}

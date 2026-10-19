@@ -202,6 +202,35 @@ class AizActionSourceReader(CanonicalMemorySourceReader):
             'version_id': version, 'recorded_at': source.get('recorded_at')})
 
 
+class AizAttachmentTextSourceReader(CanonicalMemorySourceReader):
+    namespace = 'snapshot.aiz.attachment_text'
+
+    async def read(self, binding):
+        from memory_attachment_source import normalize, snapshot, canonical, digest
+        locator = json.loads(binding['source_id'])
+        raw_revision = 'attachment_sha256:' + digest(canonical(locator))
+        conversation = self.options.get('conversation_id', 'conv-jiajia-main')
+        if locator.get('conversation_id') != conversation:
+            return {'state': 'unavailable', 'reason': 'source_outside_bound_conversation'}
+        token = os.environ.get('OMBRE_CANONICAL_BRIDGE_TOKEN', '')
+        if not self.options.get('enabled') or not token or not self.options.get('base_url'):
+            return {'state': 'unavailable', 'reason': 'attachment_source_reader_unconfigured'}
+        async with httpx.AsyncClient(timeout=15, trust_env=False, follow_redirects=False) as client:
+            response = await client.get(str(self.options['base_url']).rstrip('/') + '/bridge/v1/memory-source',
+                params={'kind': 'attachment_text', 'source_id': binding['source_id'], 'version': raw_revision},
+                headers={'Authorization': 'Bearer ' + token,
+                         'X-Guyan-Device-ID': str(self.options.get('device_id') or 'ombre-gateway-operit')})
+            response.raise_for_status()
+            result = response.json().get('source', {})
+        if result.get('state') != 'available' or result.get('eligible_source') is not True:
+            return {'state': result.get('state', 'unavailable'), 'reason': result.get('reason', 'attachment_not_eligible')}
+        if result.get('source_id') != binding['source_id'] or result.get('source_revision') != raw_revision:
+            return {'state': 'changed', 'reason': 'attachment_source_changed'}
+        source = normalize(result, profile_id=str((self.config.get('persona') or {}).get('profile_id') or 'haven_xiaoyu'),
+                           conversation_id=conversation)
+        return snapshot(source)
+
+
 def configured_source_readers(config, authority=None):
     readers = [LocalMemorySourceReader(config, 'raw_event'), LocalMemorySourceReader(config, 'conversation_turn')]
     canonical = CanonicalMemorySourceReader(config)
@@ -214,6 +243,7 @@ def configured_source_readers(config, authority=None):
         canonical.upstream_version = version
         action.upstream_version = version
     readers.append(canonical)
+    readers.append(AizAttachmentTextSourceReader(config))
     readers.extend(AizDiarySourceReader(config, kind) for kind in ('private', 'digest'))
     readers.extend([AizSharedDiarySourceReader(config), action])
     return readers

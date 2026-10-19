@@ -24,6 +24,9 @@ def source_snapshot(source, *, config=None):
     """Only callers holding actual authenticated reader results call this."""
     if not isinstance(source, dict) or not isinstance(source.get('text'), str) or not source['text']:
         raise L1OwnerError('source_text_required', field_path='sources')
+    if source.get('namespace') == 'attachment_text':
+        from memory_attachment_source import snapshot
+        return snapshot(source)
     namespace = {'canonical_event': 'snapshot.aiz.canonical_event', 'raw_event': 'snapshot.ombre.raw_event',
                  'conversation_turn': 'snapshot.ombre.conversation_turn',
                  'action_receipt': 'snapshot.aiz.action_receipt'}.get(source.get('namespace'))

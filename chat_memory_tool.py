@@ -71,6 +71,33 @@ def receipt(store, memory_id):
             "semantics": owner_semantic_summary(metadata, proposal.get("proposed_body") or "")}
 
 
+def chat_evidence_sources(context, *, profile_id):
+    """Program-owned attachment snapshots are separate from canonical turns.
+
+    Normalization proves descriptor consistency, not permission: callers must
+    still live-locate the resulting bindings before retaining a candidate.
+    """
+    from memory_attachment_source import normalize
+    canonical = [canonical_source(s, conversation_id=context["conversation_id"],
+                                  profile_id=profile_id) for s in context["sources"]]
+    attachments = context.get("attachment_sources", [])
+    if not isinstance(attachments, list):
+        raise ValueError("invalid_attachment_sources")
+    normalized, seen = [], set()
+    for result in attachments:
+        if not isinstance(result, dict):
+            raise ValueError("invalid_attachment_source")
+        source = normalize(result, profile_id=profile_id, conversation_id=context["conversation_id"])
+        if source["source_key"] in seen:
+            raise ValueError("duplicate_attachment_source")
+        seen.add(source["source_key"])
+        normalized.append(source)
+    if normalized and (not canonical or context["sources"][-1]["role"] != "user"
+            or context["sources"][-1]["event_id"] != context["turn_id"]):
+        raise ValueError("current_user_source_must_be_last")
+    return canonical[:-1] + normalized + canonical[-1:]
+
+
 class ChatMemoryTool:
     def __init__(self, engine, bucket_mgr):
         self.engine, self.bucket_mgr = engine, bucket_mgr
@@ -121,8 +148,13 @@ class ChatMemoryTool:
             confidence = args.get("confidence", 0.7)
             if type(confidence) not in (float, int) or not 0 <= confidence <= 1 or type(args.get("sensitive", False)) is not bool:
                 raise ValueError("invalid_policy_fields")
-        if not isinstance(context, dict) or set(context) != {"conversation_id", "request_id", "turn_id", "sources"}:
+        if not isinstance(context, dict) or (set(context) - {"attachment_sources"}) != {"conversation_id", "request_id", "turn_id", "sources"}:
             raise ValueError("invalid_source_context")
+        if context.get("attachment_sources"):
+            from memory_l1_wire_schema import MEMORY_WRITE_MAX_REQUEST_BYTES
+            from memory_l1_contract import canonical_json
+            if len(canonical_json(envelope).encode("utf-8")) > MEMORY_WRITE_MAX_REQUEST_BYTES:
+                raise ValueError("memory_request_too_large")
         if any(not isinstance(context.get(key), str) or not context[key] or len(context[key]) > 200
                for key in ("conversation_id", "request_id", "turn_id")):
             raise ValueError("invalid_source_identity")
@@ -158,9 +190,13 @@ class ChatMemoryTool:
         if document_input is None and len(matches) == 1:
             time_candidate["event_time"] = {**temporal, "source_turn_id": matches[0]["event_id"], "source_role": matches[0]["role"]}
         from memory_source_identity import source_participant
-        evidence_sources = [canonical_source(s, conversation_id=context["conversation_id"],
-                            profile_id=self.engine.memory_semantic_profile_id) for s in sources]
-        participants = {s['event_id']: source_participant(s, self.engine.config) for s in evidence_sources}
+        evidence_sources = chat_evidence_sources(context, profile_id=self.engine.memory_semantic_profile_id)
+        if context.get("attachment_sources") and document_input is None:
+            raise ValueError("attachment_sources_require_l1_document")
+        # A file can share its upload event ID with the owner turn. Never let
+        # its unknown author overwrite the canonical speaker in the narrative.
+        participants = {s['event_id']: source_participant(s, self.engine.config)
+                        for s in evidence_sources if s.get('namespace') != 'attachment_text'}
         narrative = build_chat_narrative(time_candidate, turns, self.engine.identity, self.engine.tz, "")
         for item in narrative['sources']:
             participant = participants[item['source_ref'].split(':', 1)[1]]
@@ -181,7 +217,12 @@ class ChatMemoryTool:
         l1_semantic = None
         semantic = None
         if document_input is not None:
-            source_text = {f"source:{index + 1}": source["text"] for index, source in enumerate(sources)}
+            from memory_attachment_source import semantic_text
+            # Scene offsets refer to exactly the memory projection shown to
+            # the model, not the retained file's original code/body bytes.
+            source_text = {f"source:{index + 1}":
+                           semantic_text(source) if source.get("namespace") == "attachment_text" else source["text"]
+                           for index, source in enumerate(evidence_sources)}
             source_text["source:current"] = sources[-1]["text"]
             for scene in document_input.get("scenes") or []:
                 if not isinstance(scene, dict):
@@ -254,6 +295,13 @@ class ChatMemoryTool:
             # Replaying submission is read-only, including failed/accepted:
             # only explicit authority recovery may resume an interrupted write.
             return receipt(self.store, proposal.proposal_id)
+        if envelope["context"].get("attachment_sources"):
+            # Authenticated snapshots and valid hashes alone are insufficient:
+            # withdrawal, resource changes and event supersession revoke use.
+            readers = self.engine._memory_l1_sources()
+            for binding in proposal.metadata["memory_l1"]["evidence_bindings"]:
+                if not (await readers.locate(binding))["eligible_source"]:
+                    raise ChatMemoryValidationError("source_not_currently_readable", "sources")
         policy = self.engine.memory_ingestion_policy.evaluate(proposal)
         row = self.store.put_candidate(proposal, policy)
         if row["status"] == "accepted":

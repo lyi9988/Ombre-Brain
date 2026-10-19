@@ -12,6 +12,8 @@ _KINDS = {'human', 'ai', 'unknown'}
 
 
 def source_participant(source, config=None):
+    if source.get("system") == "aizizhu" and source.get("namespace") == "attachment_text":
+        return {"subject_id": None, "kind": "unknown", "display_name": "文档作者未知", "resolution": "external_document"}
     config = config or {}
     coordinates = {k: source.get(k) for k in _COORDINATES}
     bindings = (config.get('identity') or {}).get('source_participants', [])
