@@ -47,6 +47,7 @@ RECALL_DEFAULTS = {
     "second_card_relative_score": None,
     "window_formula_weight": 1.0, "rrf_constant": 60.0,
     "include_correction_background": True,
+    "local_first_enabled": False,
     "scoring_profiles": [],
     "signal_bindings": [], "affinity_mappings": [], "affinity_aggregation": "max",
     "cognition_chain_depth": 2, "cognition_chain_nodes": 8, "cognition_chain_budget": 300,
@@ -419,7 +420,7 @@ def validate_values(values):
     if recall["formula_id"] is not None:
         _id(recall["formula_id"], "recall.formula_id")
     for name, value in recall.items():
-        if name == "include_correction_background":
+        if name in {"include_correction_background", "local_first_enabled"}:
             if type(value) is not bool:
                 _fail("boolean_required", "recall." + name)
             continue

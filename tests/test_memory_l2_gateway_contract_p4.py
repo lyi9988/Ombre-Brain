@@ -37,7 +37,7 @@ def _gateway_runtime(monkeypatch):
     # The runtime is imported under a private alias. Its small pure dependencies
     # are loaded by path from the Gateway checkout so Brain's modules do not
     # shadow the implementation under test.
-    for name in ("memory_recall_semantics", "memory_system_config", "utils", "memory_readable_projection"):
+    for name in ("memory_query_evidence", "memory_recall_semantics", "memory_system_config", "utils", "memory_readable_projection"):
         path = gateway_root / f"{name}.py"
         spec = importlib.util.spec_from_file_location(name, path)
         assert spec and spec.loader
