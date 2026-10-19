@@ -122,7 +122,7 @@ from entity_edges import EntityEdgeStore
 from memory_moments import MemoryMomentStore, parse_bucket_moments, preview_bucket_moment_chunks
 from memory_authority_view import MemoryAuthorityRecallView
 from memory_narrative import memory_context_labels
-from recall_rerank_window import admission_evidence, select_natural_window
+from recall_rerank_window import admission_evidence, explicit_query_parts, select_natural_window
 from memory_relevance import (
     active_facets,
     content_terms_for_query,
@@ -17085,8 +17085,18 @@ class GatewayService:
         # current view remains a local channel and is available for optional
         # expansion without paying for two vectors on every ordinary turn.
         query = recall_input.get("q_context") or recall_input.get("q_current") or ""
-        for view in recall_input.get("metadata", {}).get("query_views", []):
-            view["semantic_used"] = view.get("sha256") == hashlib.sha256(query.encode()).hexdigest()
+        parts = recall_input.get("_query_parts") or [query]
+        semantic_queries = parts if query == recall_input.get("q_current") and len(parts) > 1 else [query]
+        recall_input["_semantic_query_parts"] = len(semantic_queries) > 1
+        semantic_hashes = {hashlib.sha256(text.encode()).hexdigest() for text in semantic_queries}
+        views = recall_input.setdefault("metadata", {}).setdefault("query_views", [])
+        for view in views:
+            view["semantic_used"] = view.get("sha256") in semantic_hashes
+        if len(semantic_queries) > 1:
+            existing = {view.get("sha256") for view in views}
+            views.extend({"kind": "question_part", "chars": len(part),
+                "sha256": hashlib.sha256(part.encode()).hexdigest(), "semantic_used": True}
+                for part in semantic_queries if hashlib.sha256(part.encode()).hexdigest() not in existing)
         search = getattr(self.embedding_engine, "search_similar_queries", None)
         if not callable(search):
             diagnostics.update(status="legacy_provider_adapter", coverage_status="incomplete")
@@ -17103,7 +17113,7 @@ class GatewayService:
                         getattr(self.embedding_engine, "document_instruction", "")),
                 }
             hits = await search(
-                [query], top_k=self.semantic_candidate_top_k, eligible_ids=eligible_ids,
+                semantic_queries, top_k=self.semantic_candidate_top_k, eligible_ids=eligible_ids,
                 index_metadata=recall_input.get("index_metadata"), cache_debug=diagnostics,
                 deadline=recall_input.get("_deadline"), **preparation,
             )
@@ -17168,6 +17178,8 @@ class GatewayService:
         # Request-local only. The wrapper snapshots numeric stages on timeout;
         # it must not persist this whole debug object (which may contain queries).
         recall_input["_selection_debug"] = debug
+        query_parts = explicit_query_parts(recall_input.get("q_current") or query)
+        recall_input["_query_parts"] = query_parts
         validation_started = time.perf_counter()
         view = getattr(self, "memory_authority_view", None)
         authority_stamp = getattr(view, "_file_stamp", None)
@@ -17394,9 +17406,25 @@ class GatewayService:
         rerank_cancelled = False
         try:
             if not recall_input.get("local_only") and recall_input.get("allow_rerank", True):
+                part_options = {"query_parts": query_parts,
+                    "current_query": recall_input.get("q_current") or query} if len(query_parts) > 1 else {}
+                if part_options:
+                    keyword_views = recall_input.get("_query_part_keywords") or []
+                    for item in pool:
+                        bid = str(item["bucket"]["id"])
+                        scores = {}
+                        for index, keywords in enumerate(keyword_views):
+                            rank = keywords.get(bid)
+                            if rank:
+                                scores[index] = 1.0 / (60.0 + rank)
+                        if recall_input.get("_semantic_query_parts"):
+                            for index, rank in (item.get("natural_semantic", {}).get("view_ranks") or {}).items():
+                                part = int(index)
+                                scores[part] = scores.get(part, 0.0) + 1.0 / (60.0 + rank)
+                        item["_query_view_scores"] = scores
                 pool = await self._rerank_scored_bucket_candidates(
                     recall_input.get("q_context") or query, pool, diagnostics=rerank_debug,
-                    documents_override=documents, natural_window=True,
+                    documents_override=documents, natural_window=True, **part_options,
                 )
         except asyncio.CancelledError:
             rerank_cancelled = True
@@ -17415,6 +17443,7 @@ class GatewayService:
                 provider_latency_ms=rerank_debug.get("provider_latency_ms"),
                 provider_model=rerank_debug.get("provider_model"),
                 window=rerank_debug.get("window"),
+                query_parts=rerank_debug.get("query_parts"),
                 cancelled=rerank_cancelled, cache=rerank_debug.get("cache", {}),
             )
         if rerank_debug.get("provider_failed"):
@@ -17484,6 +17513,16 @@ class GatewayService:
         }
         recall_input["configured_computation"] = debug["configured_computation"]
         recall_input["selected_buckets"] = debug["final_bucket_ids"]
+        if len(query_parts) > 1:
+            debug["query_part_coverage"] = [{
+                "part": index, "query_sha256": hashlib.sha256(part.encode()).hexdigest(),
+                "selected_bucket_ids": [str(item["bucket"]["id"]) for item in selected
+                    if (item.get("_rerank_window") or {}).get("query_part") == index],
+                "state": "selected_candidate_evidence",
+            } for index, part in enumerate(query_parts)]
+            # Candidate coverage does not prove that every question has been
+            # answered, nor that Composer actually adopted these candidates.
+            recall_input["query_part_coverage"] = debug["query_part_coverage"]
         buckets = [self._bucket_with_recall_signal(item) for item in selected]
         if grouped_moments is None:
             return buckets, suppressed, debug
@@ -20861,6 +20900,16 @@ class GatewayService:
             normalized_query = self._normalized_recall_query(raw_query)
         stage_started_at = time.perf_counter()
         keyword_scores = self._get_keyword_candidates(normalized_query, eligible) if normalized_query else {}
+        parts = (natural_input or {}).get("_query_parts") or []
+        if len(parts) > 1:
+            keyword_views = []
+            for part in parts:
+                scores = self._get_keyword_candidates(part, eligible)
+                ranked = sorted(scores, key=lambda bid: (-scores[bid], bid))
+                keyword_views.append({bid: rank for rank, bid in enumerate(ranked, 1)})
+                for bid, score in scores.items():
+                    keyword_scores[bid] = max(keyword_scores.get(bid, 0), score)
+            natural_input["_query_part_keywords"] = keyword_views
         mark("keyword_candidates", stage_started_at)
         record(
             "keyword_candidates",
@@ -22287,6 +22336,8 @@ class GatewayService:
         diagnostics: dict[str, Any] | None = None,
         documents_override: dict[str, str] | None = None,
         natural_window: bool = False,
+        query_parts: list[str] | None = None,
+        current_query: str = "",
     ) -> list[dict]:
         enabled = bool(getattr(self.reranker_engine, "enabled", False))
         if not scored_candidates or not enabled:
@@ -22309,6 +22360,8 @@ class GatewayService:
                 configured_scores=[item.get("_configured_score", {}).get("window_score") for item in scored_candidates],
                 configured_weight=memory_use.option(self, "window_formula_weight", 1.0),
                 rrf_constant=memory_use.option(self, "rrf_constant", 60.0),
+                query_view_scores=([item.get("_query_view_scores") or {} for item in scored_candidates]
+                                   if query_parts else None),
             )
             scored_candidates = [dict(item, _rerank_window=note)
                                  for item, note in zip(scored_candidates, notes)]
@@ -22329,13 +22382,53 @@ class GatewayService:
         documents = [(documents_override or {}).get(str(item["bucket"].get("id")))
                      or self._bucket_rerank_document(item["bucket"]) for item in head]
         cache_debug: dict[str, Any] = {}
-        results = await self._rerank_cached(
-            namespace="bucket",
-            query=query,
-            documents=documents,
-            top_n=len(head),
-            cache_debug=cache_debug,
-        )
+        if query_parts:
+            groups = {}
+            for index, item in enumerate(head):
+                part = item["_rerank_window"].get("query_part")
+                groups.setdefault(part, []).append(index)
+
+            async def rerank_part(part, indices):
+                part_debug = {}
+                part_query = query_parts[part] if part is not None else query
+                current = current_query or query
+                if part is not None and query != current:
+                    # Retain the same dialogue/time/condition context as the
+                    # original query; only focus the independently asked part.
+                    part_query = (part_query + query[len(current):] if query.startswith(current)
+                        else query + "\n\nQuestion being matched:\n" + part_query)
+                rows = await self._rerank_cached(namespace="bucket", query=part_query,
+                    documents=[documents[i] for i in indices], top_n=len(indices),
+                    cache_debug=part_debug)
+                return indices, rows, part_debug
+
+            tasks = [asyncio.create_task(rerank_part(part, indices)) for part, indices in groups.items()]
+            try:
+                outputs = await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            results = [RerankResult(index=indices[row.index], score=row.score)
+                       for indices, rows, _detail in outputs for row in rows]
+            for indices, _rows, detail in outputs:
+                if detail.get("provider_failed"):
+                    for index in indices:
+                        head[index]["_query_part_provider_failed"] = True
+            failed = any(detail.get("provider_failed") for _indices, _rows, detail in outputs)
+            cache_debug.update(provider_status="partial_failure" if failed else "ok", provider_failed=failed,
+                provider_requests=sum(detail.get("provider_requests", 0) for _, _, detail in outputs),
+                part_results=[{"part": part, "provider_input_count": len(indices),
+                    "provider_output_count": len(rows), **detail}
+                    for (part, _), (indices, rows, detail) in zip(groups.items(), outputs)])
+            if isinstance(diagnostics, dict):
+                diagnostics["query_parts"] = cache_debug["part_results"]
+        else:
+            results = await self._rerank_cached(
+                namespace="bucket", query=query, documents=documents,
+                top_n=len(head), cache_debug=cache_debug,
+            )
         if isinstance(diagnostics, dict):
             diagnostics.update({key: cache_debug.get(key) for key in (
                 "provider_status", "provider_failed", "provider_http_status",
@@ -22370,7 +22463,8 @@ class GatewayService:
             rerank_score = by_index.get(index)
             if natural_window:
                 new_item["_rerank_window"] = dict(
-                    item["_rerank_window"], status="scored" if rerank_score is not None else "no_score",
+                    item["_rerank_window"], status=("scored" if rerank_score is not None else
+                        "provider_failed" if item.get("_query_part_provider_failed") else "no_score"),
                 )
             if rerank_score is None:
                 new_item["rerank_score"] = None
@@ -23624,6 +23718,26 @@ class GatewayService:
                     values.append(value)
 
     def _pick_dynamic_cards(self, scored_candidates: list[dict], *, query: str = "") -> list[dict]:
+        ordinary = self._pick_dynamic_cards_by_score(scored_candidates, query=query)
+        if len(explicit_query_parts(query)) < 2 or self.inject_max_cards < 2:
+            return ordinary
+        groups = {}
+        for item in scored_candidates:
+            part = (item.get("_rerank_window") or {}).get("query_part")
+            if part is not None and (item["score"] >= self.first_card_min_score
+                    or self._dynamic_bucket_item_has_reliable_recall_signal(query, item)):
+                groups.setdefault(part, item)
+        if len(groups) < 2:
+            return ordinary
+        chosen = list(groups.values())[:self.inject_max_cards]
+        for item in ordinary:
+            if len(chosen) >= self.inject_max_cards:
+                break
+            if item not in chosen:
+                chosen.append(item)
+        return chosen
+
+    def _pick_dynamic_cards_by_score(self, scored_candidates: list[dict], *, query: str = "") -> list[dict]:
         if self.inject_max_cards <= 0 or not scored_candidates:
             return []
 

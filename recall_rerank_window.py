@@ -16,6 +16,27 @@ POLICY = "natural_channel_rrf_v1"
 EVIDENCE_LIMIT = 128
 
 
+def explicit_query_parts(query):
+    """Split independent, explicitly punctuated questions, never arbitrary prose.
+
+    A short follow-up or shared conditional context stays on the original path.
+    The original query is retained by the caller for scope/source decisions.
+    """
+    text = str(query or "").strip()
+    if len(re.findall(r"[?？]", text)) < 2:
+        return [text]
+    parts = [part.strip() for part in re.split(r"(?<=[?？])\s*", text) if part.strip()]
+    parts = [re.sub(r"^(?:另外|还有|再问(?:一下)?|以及|顺便问(?:一下)?|also\b)[，,：:\s]*", "", part,
+                    flags=re.IGNORECASE).strip() for part in parts]
+    # Pronoun-only follow-ups and conditions depend on the surrounding question.
+    if (any(not part.endswith(("?", "？")) for part in parts)
+            or any(re.search(r"如果|假如|除非|只要|\b(?:if|unless)\b", part, re.I) for part in parts)
+            or any(re.match(r"^(?:他|她|它|这个|那个|这样|那时候)", part) for part in parts)
+            or any(len(re.sub(r"[?？\W]", "", part)) < 4 for part in parts)):
+        return [text]
+    return list(dict.fromkeys(parts))
+
+
 def finite_score(value):
     if isinstance(value, bool):
         return None
@@ -27,7 +48,8 @@ def finite_score(value):
 
 
 def select_natural_window(items, limit, priorities, *, configured_scores=None,
-                          configured_weight=1.0, rrf_constant=60.0):
+                          configured_weight=1.0, rrf_constant=60.0,
+                          query_view_scores=None):
     """Return pool indices and request-local evidence, without modifying items.
 
 The four special-evidence flags retain the old priority. Within a tier, reciprocal
@@ -82,10 +104,38 @@ Types, narrator and text length are deliberately not eligibility conditions.
                 "keyword" not in ranks, tuple(priorities[index][4:]), identity(index))
 
     ordered = sorted(range(len(items)), key=rank_key)
-    selected = set(ordered[:limit])
+    selected, part_for_index = set(), {}
+    if query_view_scores:
+        if len(query_view_scores) != len(items):
+            raise ValueError("window_query_view_count_mismatch")
+        parts = sorted({key for scores in query_view_scores for key in scores})
+        queues = {part: sorted(
+            (i for i in ordered if (finite_score(query_view_scores[i].get(part)) or 0) > 0),
+            key=lambda i: (tuple(priorities[i][:4]),
+                           -query_view_scores[i][part], rank_key(i))) for part in parts}
+        # Each explicit question gets an opportunity within the existing total
+        # window. This supplies evidence to the reranker, never admission.
+        while len(selected) < limit:
+            added = False
+            for part in parts:
+                index = next((i for i in queues[part] if i not in selected), None)
+                if index is not None:
+                    selected.add(index)
+                    part_for_index[index] = part
+                    added = True
+                    if len(selected) == limit:
+                        break
+            if not added:
+                break
+    for index in ordered:
+        if len(selected) >= limit:
+            break
+        selected.add(index)
     for rank, index in enumerate(ordered, 1):
         notes[index].update(rank=rank, selected=index in selected,
                             status="pending" if index in selected else "outside_window")
+        if index in part_for_index:
+            notes[index]["query_part"] = part_for_index[index]
         notes[index]["fusion_score"] = round(notes[index]["fusion_score"], 8)
     selected_counts = Counter(name for index in selected for name in notes[index]["channel_ranks"])
     summary = {
@@ -96,6 +146,8 @@ Types, narrator and text length are deliberately not eligibility conditions.
         "configured_candidates": len(configured), "configured_weight": configured_weight,
         "rrf_constant": rrf_constant,
     }
+    if query_view_scores:
+        summary["query_part_selected"] = dict(Counter(part_for_index.values()))
     return selected, notes, summary
 
 
