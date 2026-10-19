@@ -382,8 +382,18 @@ adjustment. Formula errors retain the base with reasons, never a guessed input.
     base = inputs.get("relevance")
     if type(base) not in (int, float) or not math.isfinite(base):
         return {"score": None, "state": "unknown", "reason_codes": ["base_score_unknown"], "statements": []}
-    common = {**inputs, **lexical_features(context.get("query", ""), document, values["catalog"]),
+    common = {**{key: value for key, value in inputs.items()
+                 if key not in {"statement_selection", "eligible_statement_ids"}},
+              **lexical_features(context.get("query", ""), document, values["catalog"]),
               "base_relevance": base, "query_purpose": context.get("purpose", "current")}
+    from memory_query_evidence import match_statements
+    selection = inputs.get("statement_selection") or match_statements(document, context)
+    direct = set(selection["direct_ids"])
+    support = set(selection["support_ids"])
+    eligible = inputs.get("eligible_statement_ids")
+    if eligible is not None:
+        direct.intersection_update(eligible)
+        support.intersection_update(eligible)
     reserved = {row[0] for row in [*RUNTIME_INPUTS, *PENDING_RUNTIME_INPUTS]}
     reserved.update(TARGETS)
     reserved.update("signal_" + row["id"] for row in values.get("recall", {}).get("signal_bindings", []))
@@ -403,7 +413,19 @@ adjustment. Formula errors retain the base with reasons, never a guessed input.
     rows = []
     # An unannotated record still participates in the original retrieval path.
     for statement in document.get("statements") or [{}]:
-        features = {**common, **temporal_features(statement, context, profiles)}
+        sid = statement.get("statement_id")
+        # Document-wide keywords/types cannot make an unrelated stable claim
+        # rank an old transient claim. Declared terms are attributed only where
+        # they occur; the embedding/rerank base remains explicitly bucket-level.
+        content = str(statement.get("content") or "").casefold()
+        retrieval = document.get("retrieval") or {}
+        local_document = {**document, "statements": [statement], "retrieval": {
+            key: [term for term in retrieval.get(key) or [] if str(term).casefold() in content]
+            for key in ("keywords", "tags")}}
+        features = {**common, **lexical_features(context.get("query", ""), local_document, values["catalog"]),
+                    **temporal_features(statement, context, profiles)}
+        features["statement_match"] = (selection.get("matches", {}).get(sid) or {}).get("score")
+        features["statement_match_kind"] = "direct" if sid in direct else "support" if sid in support else "unmatched"
         classification = statement.get("classification") or {}
         for name in ("kind", "stability", "modality", "basis"):
             features[name] = known(classification.get(name))
@@ -447,14 +469,41 @@ adjustment. Formula errors retain the base with reasons, never a guessed input.
         except ConfigurationError as exc:
             value, calculation = base, {"error": exc.payload()["error"]}
             reasons.append("formula_error_retained_base")
-        rows.append({"statement_id": statement.get("statement_id"), "score": value,
+        rows.append({"statement_id": sid, "score": value,
+                     "participates_in_aggregation": sid in direct or not document.get("statements"),
+                     "match_kind": features["statement_match_kind"],
+                     "match_evidence": selection.get("matches", {}).get(sid),
                      "formula_id": formula, "scoring_profile": profile.get("id") if profile else None,
                      "time_profile": features["time_profile"], "features": features,
                      "calculation": calculation, "reason_codes": reasons,
                      "affinity": affinity_trace})
-    best = max(rows, key=lambda row: row["score"])
+    participants = [row for row in rows if row["participates_in_aggregation"]]
+    if not participants:
+        # A bucket-only semantic match cannot identify a particular claim.
+        # Keep it available as qualified background, with no fictitious typed
+        # decay or category bonus from an arbitrary member of the document.
+        # Global formulas still apply when a semantic synonym has no lexical
+        # claim attribution. Only claim-specific type/time values stay unknown.
+        formula = policy.get("formula_id") or ("final" if any(row["id"] == "final" for row in values["formulas"]) else None)
+        features = {**common, "relevance": base}
+        reasons = ["no_attributable_statement_match"]
+        try:
+            calculation = evaluate_scores(values, features)
+            value = calculation["formulas"].get(formula, {}).get("value") if formula else base
+            if value is None:
+                value = base
+                reasons.append("formula_unknown_retained_base")
+        except ConfigurationError as exc:
+            value, calculation = base, {"error": exc.payload()["error"]}
+            reasons.append("formula_error_retained_base")
+        return {"score": value, "state": "unassigned_semantic_evidence", "formula_id": formula,
+                "reason_codes": reasons, "statements": rows, "calculation": calculation,
+                "statement_selection": selection, "aggregation_statement_ids": []}
+    best = max(participants, key=lambda row: row["score"])
     return {"score": best["score"], "state": "computed", "formula_id": best["formula_id"],
-            "reason_codes": best["reason_codes"], "statements": rows}
+            "reason_codes": best["reason_codes"], "statements": rows,
+            "statement_selection": selection, "aggregation_statement_ids": [row["statement_id"] for row in participants],
+            "winning_statement_id": best["statement_id"]}
 
 
 def preview_pipeline(values, inputs, scenario, *, tz=timezone.utc):
@@ -488,7 +537,7 @@ is explicitly simulated so that this preview can never authorize a real claim.
     now, target = date("now", True), date("target_time")
     date("event_time")
     purpose = scenario.get("purpose", "current")
-    if purpose not in {"current", "history", "relationship", "autonomous"}:
+    if purpose not in {"current", "history", "relationship", "mixed", "autonomous"}:
         fail("purpose")
     statement = statement_template()
     statement["content"] = "Synthetic preview claim"

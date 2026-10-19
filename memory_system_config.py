@@ -46,6 +46,7 @@ RECALL_DEFAULTS = {
     "first_card_min_score": None, "second_card_min_score": None,
     "second_card_relative_score": None,
     "window_formula_weight": 1.0, "rrf_constant": 60.0,
+    "include_correction_background": True,
     "scoring_profiles": [],
     "signal_bindings": [], "affinity_mappings": [], "affinity_aggregation": "max",
     "cognition_chain_depth": 2, "cognition_chain_nodes": 8, "cognition_chain_budget": 300,
@@ -56,6 +57,8 @@ COGNITION_LIMITS = {"cognition_chain_depth": 32, "cognition_chain_nodes": 200,
 RUNTIME_INPUTS = [
     ("relevance", "number", "时间策略处理后的相关性"),
     ("base_relevance", "number", "时间策略前的融合分数"),
+    ("statement_match", "number", "本条陈述的本地内容命中比例；不等于语义概率"),
+    ("statement_match_kind", "string", "direct命中/support必要上下文/unmatched；只有direct参与桶聚合"),
     ("keyword_score", "number", "原词法通道分数"),
     ("semantic_score", "number", "原向量通道分数"),
     ("rerank_score", "number", "外部重排分数；未调用时未知"),
@@ -79,7 +82,7 @@ RUNTIME_INPUTS = [
     ("stability", "string", "本条陈述稳定性"),
     ("modality", "string", "表达方式"),
     ("basis", "string", "证据性质"),
-    ("query_purpose", "string", "current或history"),
+    ("query_purpose", "string", "current/history/relationship/mixed；与旧记忆准入分离"),
     ("role_hint", "string", "core或detail；未标注时未知"),
     ("cognition_role", "string", "陈述的认知角色；未标注时未知"),
     ("cognition_status", "string", "陈述的认识状态；不等于世界事实的真假"),
@@ -416,6 +419,10 @@ def validate_values(values):
     if recall["formula_id"] is not None:
         _id(recall["formula_id"], "recall.formula_id")
     for name, value in recall.items():
+        if name == "include_correction_background":
+            if type(value) is not bool:
+                _fail("boolean_required", "recall." + name)
+            continue
         if name in {"mode", "formula_id", "hierarchy_mode", "scoring_profiles", "local_match_weights",
                     "signal_bindings", "affinity_mappings", "affinity_aggregation"} or value is None:
             continue

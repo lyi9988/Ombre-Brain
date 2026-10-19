@@ -15,6 +15,34 @@ from memory_model_io import MemoryModelIO, completion_parameters
 USES = {'current_basis', 'conditional_basis', 'relationship_reference', 'historical_evidence', 'unresolved_evidence'}
 
 
+def source_dependency_ids(document, *, shared_statements=(), rings=(), statement_ids=None):
+    """The inventory is provenance; explicit semantic references are dependencies.
+
+    No-ref older documents retain the previous whole-inventory qualification.
+    Selected L2 units depend on their complete supporting claims, including
+    shared statements and active rings, not on unrelated ingestion messages.
+    """
+    from memory_query_evidence import semantic_source_refs
+    scope = copy.deepcopy(document)
+    shared = list(shared_statements)
+    all_refs = semantic_source_refs([document, shared, list(rings)])
+    if not all_refs:
+        return {binding['binding_id'] for binding in document.get('evidence_bindings', [])}
+    if statement_ids is not None:
+        selected = set(statement_ids)
+        scope['statements'] = [s for s in document.get('statements', []) if s['statement_id'] in selected]
+        shared = [s for s in shared if s['statement_id'] in selected]
+        subjects = {s.get('subject_ref', {}).get('value') for s in [*scope['statements'], *shared]
+                    if isinstance(s.get('subject_ref'), dict)}
+        subjects.update(ref for s in [*scope['statements'], *shared]
+                        for ref in (s.get('cognition') or {}).get('about_refs', []))
+        scope['entities'] = [e for e in document.get('entities', []) if e['entity_id'] in subjects]
+        scope['scenes'] = [scene for scene in document.get('scenes', []) if set(scene.get('statement_refs', [])) & selected]
+        scope['relations'] = [relation for relation in document.get('relations', []) if any(
+            (relation.get(end) or {}).get('object_id') in selected for end in ('from', 'to'))]
+    return semantic_source_refs([scope, shared, list(rings)])
+
+
 def semantic_input_projection(material):
     """Remove custody metadata from model input, retaining all semantic content.
 
@@ -204,13 +232,6 @@ class MemoryL2Service:
             raise L1OwnerError('l1_dependency_changed', status=409)
         document = base['l1']['document']
         reads = MemoryL1Reads(self.revisions, self.engine._memory_l1_sources())
-        bindings = reads.source_list(memory_id, expected)['sources']
-        sources = []
-        for binding in bindings:
-            source = await reads.sources.locate(binding)
-            if not source.get('eligible_source'):
-                raise L1OwnerError('l2_source_not_available', status=409)
-            sources.append(source)
         parent = document['entry'].get('parent_ref')
         shared = []
         if parent:
@@ -220,15 +241,29 @@ class MemoryL2Service:
             refs = document['entry'].get('shared_statement_refs', [])
             shared = [reads.index.member(parent['memory_id'], parent['revision'], 'statements', ref) for ref in refs]
             if any(s is None for s in shared): raise L1OwnerError('scene_dependency_mismatch', status=409)
+        rings = [r for r in base['rings'] if r['state'] == 'active']
+        dependencies = source_dependency_ids(document, shared_statements=shared, rings=rings)
+        bindings = reads.source_list(memory_id, expected)['sources']
+        if dependencies - {binding['binding_id'] for binding in bindings}:
+            raise L1OwnerError('l2_source_dependency_missing', status=409)
+        sources = []
+        for binding in bindings:
+            if binding['binding_id'] not in dependencies:
+                continue
+            source = await reads.sources.locate(binding)
+            if not source.get('eligible_source'):
+                raise L1OwnerError('l2_source_not_available', status=409)
+            sources.append(source)
         return {'l1_document': document, 'shared_statements': shared, 'sources': sources,
-                'rings': [r for r in base['rings'] if r['state'] == 'active']}
+                'rings': rings}
 
     async def resolve(self, payload):
         self.request(payload, {'items'})
         if not isinstance(payload['items'], list): raise L1OwnerError('array_required', field_path='items')
         results = []
         for item in payload['items']:
-            self.request(item, {'memory_id', 'revision', 'statement_ids', 'allowed_uses', 'narrative_allowed'}, {'statement_uses'})
+            self.request(item, {'memory_id', 'revision', 'statement_ids', 'allowed_uses', 'narrative_allowed'},
+                         {'statement_uses', 'matched_statement_ids', 'support_statement_ids'})
             if (not isinstance(item['memory_id'], str) or type(item['revision']) is not int or item['revision'] < 1
                     or type(item['narrative_allowed']) is not bool or not isinstance(item['statement_ids'], list)
                     or any(not isinstance(s, str) for s in item['statement_ids'])
@@ -236,44 +271,79 @@ class MemoryL2Service:
                     or not isinstance(item.get('statement_uses', {}), dict)
                     or any(not isinstance(k, str) or not isinstance(v, str) or v not in USES for k,v in item.get('statement_uses', {}).items())):
                 raise L1OwnerError('invalid_l2_resolve_item', field_path='items')
+            for name in ('matched_statement_ids', 'support_statement_ids'):
+                if name in item and (not isinstance(item[name], list)
+                        or any(not isinstance(ref, str) or ref not in item['statement_ids'] for ref in item[name])):
+                    raise L1OwnerError('invalid_l2_statement_scope', field_path='items.' + name)
             result = {'memory_id': item['memory_id'], 'state': 'not_prepared', 'text': '', 'units': [], 'presentation_revision': None, 'reason': 'l2_missing'}
             try:
                 status = self.detail(item['memory_id'])['l2']
                 result.update(state=status['state'], reason=status['reason'])
                 product = status['presentation']
                 if status['state'] == 'ready' and product['first_pass_revision'] == item['revision']:
-                    # The Gateway has already applied this query's source/use
-                    # eligibility. Check the source again only before use, not
-                    # by calling a generation model or loading all L0 prose.
                     reads = MemoryL1Reads(self.revisions, self.engine._memory_l1_sources())
+                    doc = product['document']
+                    statement_uses = item.get('statement_uses', {})
+                    allowed = {ref for ref in item['statement_ids'] if statement_uses.get(ref) in item['allowed_uses']}
+                    matched = set(item.get('matched_statement_ids', item['statement_ids'])) & allowed
+                    support = set(item.get('support_statement_ids', [])) & allowed
+                    # Each stored section is a complete, model-authored semantic
+                    # unit. Its other refs are supporting context, not new hits
+                    # and never a reason to raise the Gateway's ranking score.
+                    scoped = 'matched_statement_ids' in item
+                    variants = [v for v in doc['optional_use_variants']
+                                if v['intended_use'] in item['allowed_uses'] and set(v['statement_refs']) <= allowed
+                                and all(statement_uses.get(ref) == v['intended_use'] for ref in v['statement_refs'])
+                                and (not scoped or set(v['statement_refs']) & (matched | support))]
+                    sections = [v for v in doc['coherent_sections'] if set(v['statement_refs']) <= allowed
+                                and (not scoped or set(v['statement_refs']) & (matched | support))]
+                    # A variant for one claim must not hide another matched
+                    # correction or a complete section covering an uncovered hit.
+                    units = list(variants)
+                    covered = {ref for v in units for ref in v['statement_refs']}
+                    for section in sections:
+                        if not variants or (set(section['statement_refs']) & (matched | support)) - covered:
+                            units.append(section)
+                            covered.update(section['statement_refs'])
+                    if product['units_state'] != 'current': units = []
+                    unit_refs = {ref for v in units for ref in v['statement_refs']}
+                    base = await self.revisions.detail(item['memory_id'])
+                    l1 = base['l1']['document']
+                    parent = l1['entry'].get('parent_ref')
+                    shared = [reads.index.member(parent['memory_id'], parent['revision'], 'statements', ref)
+                              for ref in l1['entry'].get('shared_statement_refs', [])] if parent else []
+                    if any(s is None for s in shared):
+                        raise L1OwnerError('scene_dependency_mismatch', status=409)
+                    refs = {s['statement_id'] for s in [*l1['statements'], *shared]}
+                    if not set(item['statement_ids']) <= refs:
+                        raise L1OwnerError('invalid_l2_statement_scope', field_path='items.statement_ids')
+                    full = item['narrative_allowed'] and refs <= allowed and (not scoped or refs <= (matched | support | unit_refs))
+                    used_refs = refs if full else unit_refs
                     bindings = reads.source_list(item['memory_id'], item['revision'])['sources']
+                    dependencies = source_dependency_ids(l1, shared_statements=shared,
+                        rings=[r for r in base['rings'] if r['state'] == 'active'],
+                        statement_ids=None if full else used_refs)
+                    if dependencies - {b['binding_id'] for b in bindings}:
+                        raise L1OwnerError('l2_source_dependency_missing', status=409)
                     source_status = await reads.recall_source_status([{'memory_id': item['memory_id'], 'revision': item['revision'],
-                        'binding_ids': [b['binding_id'] for b in bindings]}])
+                        'binding_ids': [b['binding_id'] for b in bindings if b['binding_id'] in dependencies]}])
                     checked = source_status['items'][0]
                     if checked['state'] != 'ok' or any(not s.get('eligible_source') for s in checked['sources'].values()):
                         result.update(state='stale', reason='source_dependency_changed')
                     else:
-                        doc = product['document']
-                        identity = reads.index.identity(item['memory_id'], item['revision'])
-                        refs = set(identity['entry'].get('shared_statement_refs', [])) if identity else set()
-                        conn = self.revisions.authority._connect()
-                        try:
-                            refs.update(r[0] for r in conn.execute("SELECT object_id FROM memory_l1_members WHERE memory_id=? AND revision=? AND module='statements'", (item['memory_id'], item['revision'])))
-                        finally: conn.close()
-                        statement_uses = item.get('statement_uses', {})
-                        allowed = {ref for ref in item['statement_ids'] if statement_uses.get(ref) in item['allowed_uses']}
-                        variants = [v for v in doc['optional_use_variants']
-                                    if v['intended_use'] in item['allowed_uses'] and set(v['statement_refs']) <= allowed
-                                    and all(item.get('statement_uses', {}).get(ref) == v['intended_use'] for ref in v['statement_refs'])]
-                        units = variants or [v for v in doc['coherent_sections'] if set(v['statement_refs']) <= allowed]
-                        if product['units_state'] != 'current': units = []
                         result['units'] = [{'unit_id':v.get('variant_id', v.get('section_id')), 'text':v['text'],
                                             'statement_refs':v['statement_refs']} for v in units]
-                        if item['narrative_allowed'] and refs <= allowed:
+                        if full:
                             text = doc['full_injection_text']
                         else:
                             text = '\n\n'.join(dict.fromkeys(v['text'] for v in units))
                         result.update(text=text, presentation_revision=product['presentation_revision'], reason='' if text else 'no_compatible_l2_unit')
+                        result['coverage'] = {'matched_statement_ids': sorted(matched),
+                            'support_statement_ids': sorted(used_refs - matched),
+                            'used_statement_ids': sorted(used_refs),
+                            'uncovered_matched_statement_ids': sorted(matched - used_refs),
+                            'uncovered_support_statement_ids': sorted(support - used_refs),
+                            'source_binding_ids': sorted(dependencies), 'full_narrative': full}
                         # Dependency may change while source IO is in flight.
                         latest = self.detail(item['memory_id'])['l2']
                         if latest['state'] != 'ready' or latest['current_presentation_revision'] != product['presentation_revision']:
