@@ -546,6 +546,18 @@ def test_recovery_selects_and_projects_second_source_backed_l2_only(tmp_path, mo
         assert request["usage_by_bucket"]["b3"]["source_states"]["source:later-trip"] == "available"
         assert _path_count(env, RESOLVE_PATH) == 1
         assert all(call["path"].endswith((SOURCE_PATH, RESOLVE_PATH)) for call in env[5].calls)
+        projection = env[0]._build_memory_recall_projection(
+            recalled_memory=rendered["direct"], targeted_memory_detail="", related_memory="",
+            recalled_moments=[{"bucket_id": "b2"}], targeted_memory_detail_debug={},
+            memory_sentinel_debug={"route": "ordinary"}, natural_input=request)
+        stable, dynamic = env[0]._build_injected_context_messages(
+            persona_block="", core_memory="", portrait_memory="",
+            recalled_memory=rendered["direct"], memory_recall_projection=projection)
+        env[0]._reconcile_memory_recall_injection(projection, stable, dynamic)
+        assert projection["selected_bucket_ids"] == ["b3"]
+        assert projection["injected_bucket_ids"] == ["b3"]
+        assert env[0]._actual_recall_ids(["b2", "auxiliary-source"], projection,
+            retired_ids=recovery["rejected_bucket_ids"]) == ["auxiliary-source", "b3"]
 
     run(scenario())
 
