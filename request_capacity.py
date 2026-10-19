@@ -152,6 +152,11 @@ def assess_capacity(payload: dict, contract: dict | None = None, *,
     if _opaque(messages) or any(isinstance(tool, dict) and tool.get("type") is not None
                                 and tool.get("type") != "function" for tool in tools):
         unknown = unknown or "opaque_input_token_cost_unknown"
+        # Serialized media bytes are wire-size observations, not a visual or
+        # audio token estimate. Preserve them in *_utf8 components, but never
+        # label base64 length as a model input/combined token upper bound.
+        report.update(opaque_input_present=True, input_tokens_upper_bound=None,
+                      required_tokens_upper_bound=None)
     if capacity is None:
         unknown = unknown or "model_context_capacity_unknown"
     if reserve is None or any(n is None for n in actual_reserves):

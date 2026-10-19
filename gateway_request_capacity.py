@@ -1,6 +1,7 @@
 """Resolve explicit capacity metadata for the actual Gateway route, without bodies."""
 from __future__ import annotations
 
+import hashlib
 import json
 
 
@@ -52,14 +53,17 @@ def route_limits(config, route):
 
 
 def has_full_attachment(payload, trace):
-    if trace.get("attachment_adoption"):
-        return True
+    manifest = trace.get("attachment_adoption") or {}
+    image_descriptors = set()
     # Legacy callers may omit the transport manifest. Inspect the actual source
     # wrapper rather than mistaking a filename or attachment mention for a body.
     for message in payload.get("messages", []):
         if not isinstance(message, dict):
             continue
         content = message.get("content")
+        image_present = isinstance(content, list) and any(
+            isinstance(part, dict) and part.get("type") in {"image_url", "image"}
+            for part in content)
         blocks = [content] if isinstance(content, str) else (
             [part.get("text") for part in content if isinstance(part, dict)]
             if isinstance(content, list) else [])
@@ -83,4 +87,20 @@ def has_full_attachment(payload, trace):
             if (isinstance(value, dict) and isinstance(value.get("attachment_source"), dict)
                     and isinstance(value.get("content"), str)):
                 return True
+            if (image_present and isinstance(value, dict)
+                    and isinstance(value.get("attachment_source"), dict)
+                    and value["attachment_source"].get("source_kind") == "image"
+                    and value.get("adoption") == "native_image"
+                    and value.get("media_available") is True
+                    and value.get("content_available") is False
+                    and value.get("content") is None):
+                image_descriptors.add(hashlib.sha256(text.encode("utf-8")).hexdigest())
+    # Owner policy: original native images may dispatch with explicitly unknown
+    # capacity. Full text and unaccounted manifest entries retain the prior gate.
+    # This classifies input only; adoption still verifies the actual image bytes.
+    if manifest:
+        wanted = manifest.get("body_sha256s")
+        return not (isinstance(wanted, list) and wanted
+                    and all(isinstance(item, str) for item in wanted)
+                    and set(wanted) <= image_descriptors)
     return False

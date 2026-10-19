@@ -15,6 +15,9 @@ from copy import deepcopy
 HEADER = 'X-Guyan-Attachment-Adoption'
 SCOPE = ('request_id', 'turn_id', 'conversation_id', 'profile_id')
 LOCATOR = {'owner_id','conversation_id','event_id','event_version_id','resource_id','raw_sha256','text_sha256','text_view_id'}
+IMAGE_LOCATOR = {'owner_id','conversation_id','event_id','event_version_id','resource_id','raw_sha256','media_view_id'}
+IMAGE_NAMESPACE = 'snapshot.aiz.attachment_image'
+IMAGE_VIEW = 'attachment.image.original-v1'
 
 def sha(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
@@ -53,8 +56,87 @@ def text_blocks(payload):
                 if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str):
                     yield block['text']
 
+def _inline_image_hashes(message):
+    """Original inline bytes in the final provider message; never fetch URLs."""
+    result = set()
+    content = message.get('content')
+    if not isinstance(content, list):
+        return result
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        mime, encoded = None, None
+        if block.get('type') == 'image_url':
+            image = block.get('image_url')
+            url = image.get('url') if isinstance(image, dict) else image
+            if isinstance(url, str) and url.startswith('data:') and ';base64,' in url:
+                mime, encoded = url[5:].split(';base64,', 1)
+        elif block.get('type') == 'image':
+            source = block.get('source')
+            if isinstance(source, dict) and source.get('type') == 'base64':
+                mime, encoded = source.get('media_type'), source.get('data')
+        if mime not in {'image/png', 'image/jpeg'} or not isinstance(encoded, str):
+            continue
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, UnicodeError):
+            continue
+        signature_matches = (raw.startswith(b'\x89PNG\r\n\x1a\n') if mime == 'image/png'
+                             else raw.startswith(b'\xff\xd8\xff'))
+        if raw and signature_matches:
+            result.add((mime, hashlib.sha256(raw).hexdigest(), len(raw)))
+    return result
+
+def _verified_image_refs(payload, wanted, conversation_id):
+    found = []
+    for message in payload.get('messages') or []:
+        if not isinstance(message, dict) or message.get('role') != 'user':
+            continue
+        images = _inline_image_hashes(message)
+        if not images:
+            continue
+        for text in text_blocks({'messages': [message]}):
+            block_hash = sha(text)
+            if block_hash not in wanted:
+                continue
+            try:
+                wrapper = json.loads(text)
+                desc = wrapper['attachment_source']
+                locator = json.loads(desc['source_id'])
+                if not isinstance(locator, dict) or set(locator) != IMAGE_LOCATOR:
+                    continue
+                if any(not isinstance(v, str) or not v or len(v) > 200 for v in locator.values()):
+                    continue
+                if (canonical(locator) != desc['source_id'] or desc['locator'] != locator
+                        or locator['conversation_id'] != conversation_id
+                        or locator['media_view_id'] != IMAGE_VIEW
+                        or desc.get('source_namespace') != IMAGE_NAMESPACE
+                        or desc.get('source_kind') != 'image'):
+                    continue
+                raw_hash = locator['raw_sha256']
+                if (len(raw_hash) != 64 or any(c not in '0123456789abcdef' for c in raw_hash)
+                        or desc.get('sha256') != raw_hash
+                        or desc['source_revision'] != 'attachment_sha256:' + sha(desc['source_id'])):
+                    continue
+                if (wrapper.get('adoption') != 'native_image' or wrapper.get('media_available') is not True
+                        or wrapper.get('content_available') is not False or wrapper.get('content') is not None):
+                    continue
+                size = wrapper.get('adopted_bytes')
+                if (type(size) is not int or wrapper.get('total_bytes') != size
+                        or (desc.get('mime'), raw_hash, size) not in images):
+                    continue
+                if any(desc.get(k) != locator[k] for k in ('event_id', 'event_version_id', 'resource_id')):
+                    continue
+                ref = {'source_id': desc['source_id'], 'source_revision': desc['source_revision'],
+                       'body_sha256': block_hash, 'source_kind': 'image'}
+                if ref not in found:
+                    found.append(ref)
+            except (ValueError, TypeError, KeyError, AttributeError, UnicodeError):
+                continue
+    return found
+
 def verified_refs(payload, manifest, conversation_id):
-    """Match a complete final wire text block, not a substring or claimed flag."""
+    """Match complete text or same-message original image bytes on final wire."""
     wanted = set(manifest.get('body_sha256s') or [])
     found = []
     for text in text_blocks(payload):
@@ -85,6 +167,7 @@ def verified_refs(payload, manifest, conversation_id):
                 found.append(ref)
         except (ValueError, TypeError, KeyError):
             continue
+    found.extend(_verified_image_refs(payload, wanted, conversation_id))
     return found
 
 class AdoptionReceipts:
