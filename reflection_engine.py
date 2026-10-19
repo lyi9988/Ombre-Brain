@@ -2851,7 +2851,7 @@ class ReflectionEngine(MemoryL1Runtime):
         effective_mode = self._normalize_daily_chat_memory_mode(mode or self.daily_chat_memory_mode)
         if effective_mode == "off" or self._daily_chat_memory_candidate_limit(effective_mode) <= 0:
             return {"status": "disabled", "reason": "daily_chat_memory_off", "mode": effective_mode}
-        if not conversation_turn_store:
+        if not conversation_turn_store and not (self.memory_authority_enabled and self.memory_authority_store):
             return {"status": "skipped", "reason": "no_conversation_turn_store", "mode": effective_mode}
         if not self._daily_chat_memory_run_lock_acquire():
             return {
@@ -2929,6 +2929,14 @@ class ReflectionEngine(MemoryL1Runtime):
                     result["status"] = "pending" if effective_mode == "review" else "created"
             if self.memory_authority_enabled and self.memory_authority_store:
                 result['action_memory_preparation'] = await self._memory_l1_action_tasks(bucket_mgr, mode=effective_mode)
+                if not getattr(self, '_daily_chat_memory_cancel_requested', False):
+                    try:
+                        result['attachment_memory_preparation'] = await self._memory_l1_attachment_tasks(
+                            bucket_mgr, day=key or (now or datetime.now(timezone.utc)).astimezone(self.tz).date().isoformat(),
+                            mode=effective_mode)
+                    except Exception as exc:
+                        result['attachment_memory_preparation'] = {'status': 'blocked',
+                            'reason': getattr(exc, 'code', type(exc).__name__)}
             return result
         finally:
             self._daily_chat_memory_run_lock_release()
@@ -4408,6 +4416,7 @@ class ReflectionEngine(MemoryL1Runtime):
         max_candidates: int | None = None,
         window_index: int = 1,
         window_total: int = 1,
+        attachment_sources=(),
     ) -> tuple[list[dict], dict]:
         route = self._memory_task_route("auto_l1")
         client, model, use_daily_client = route["client"], route["model"], route["connection"] == "daily"
@@ -4426,7 +4435,7 @@ class ReflectionEngine(MemoryL1Runtime):
         l1_sources = None
         prompt_context = None
         if self.memory_authority_enabled and self.memory_authority_store:
-            l1_payload, l1_sources, l1_catalog_context = self._memory_l1_daily_context(window)
+            l1_payload, l1_sources, l1_catalog_context = self._memory_l1_daily_context(window, attachment_sources=attachment_sources)
             payload['identity'] = l1_payload['identity']
             payload.pop('conversation_turns', None)
             payload["l1_contract"] = l1_payload

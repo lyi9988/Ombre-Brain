@@ -241,11 +241,15 @@ class MemoryL1Runtime:
         return body, {'prompt_revision': 'prompt_sha256:' + hashlib.sha256(body.encode()).hexdigest(),
                       'binding': meta.get('binding'), 'selected_blocks': meta.get('selected_blocks')}
 
-    def _memory_l1_daily_context(self, window):
+    async def _memory_l1_attachment_tasks(self, bucket_mgr, *, day, mode):
+        from memory_daily_attachment_jobs import run_attachment_jobs
+        return await run_attachment_jobs(self, bucket_mgr, day=day, mode=mode, options=task_options(self.config))
+
+    def _memory_l1_daily_context(self, window, *, attachment_sources=()):
         from memory_source_identity import source_model_identity
         service = self._memory_l1_revisions()
         catalog, catalog_revision = service.catalog_provider()
-        sources = daily_sources(window, profile_id=self.memory_semantic_profile_id)
+        sources = daily_sources(window, profile_id=self.memory_semantic_profile_id) + list(attachment_sources)
         snapshots, bindings = bind_sources(sources, config=self.config)
         for source, snapshot in zip(sources, snapshots):
             source['_participant_revision'] = snapshot['source_revision']

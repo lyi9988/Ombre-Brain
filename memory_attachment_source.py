@@ -34,6 +34,9 @@ def normalize(result, *, profile_id, conversation_id):
         'source_key':digest(canonical({'namespace':NAMESPACE,'locator':locator,'profile_id':profile_id}))}
 
 def snapshot(source):
+    if source.get("adoption_dependency") is not None:
+        from memory_daily_attachments import adopted_snapshot
+        return adopted_snapshot(source)
     locator=source['attachment_locator']
     result={'state':'available','eligible_source':True,'source_namespace':NAMESPACE,
         'source_id':canonical(locator),'source_revision':source['version_id'],'text_view_id':VIEW,'text':source['text']}

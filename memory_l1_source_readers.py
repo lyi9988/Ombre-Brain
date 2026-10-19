@@ -205,7 +205,7 @@ class AizActionSourceReader(CanonicalMemorySourceReader):
 class AizAttachmentTextSourceReader(CanonicalMemorySourceReader):
     namespace = 'snapshot.aiz.attachment_text'
 
-    async def read(self, binding):
+    async def capture_source(self, binding):
         from memory_attachment_source import normalize, snapshot, canonical, digest
         locator = json.loads(binding['source_id'])
         raw_revision = 'attachment_sha256:' + digest(canonical(locator))
@@ -228,7 +228,12 @@ class AizAttachmentTextSourceReader(CanonicalMemorySourceReader):
             return {'state': 'changed', 'reason': 'attachment_source_changed'}
         source = normalize(result, profile_id=str((self.config.get('persona') or {}).get('profile_id') or 'haven_xiaoyu'),
                            conversation_id=conversation)
-        return snapshot(source)
+        return source
+
+    async def read(self, binding):
+        from memory_attachment_source import snapshot
+        source = await self.capture_source(binding)
+        return snapshot(source) if source.get('namespace') == 'attachment_text' else source
 
 
 def configured_source_readers(config, authority=None):
@@ -244,6 +249,8 @@ def configured_source_readers(config, authority=None):
         action.upstream_version = version
     readers.append(canonical)
     readers.append(AizAttachmentTextSourceReader(config))
+    from memory_daily_attachments import AdoptedAttachmentReader
+    readers.append(AdoptedAttachmentReader(config))
     readers.extend(AizDiarySourceReader(config, kind) for kind in ('private', 'digest'))
     readers.extend([AizSharedDiarySourceReader(config), action])
     return readers
