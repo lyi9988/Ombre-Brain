@@ -87,6 +87,22 @@ def _noun_fragment(term):
     return any(part.word == term and part.flag.startswith('n') for part in pseg.cut(term))
 
 
+def _identity_terms(document):
+    """Person names are identity cues; named objects remain content anchors."""
+    result = set()
+    for entity in document.get("entities") or []:
+        kind = entity.get("entity_type")
+        if isinstance(kind, dict):
+            kind = kind.get("value") if kind.get("state") == "known" else None
+        if kind == "object":
+            continue
+        # Preserve the prior treatment of untyped/unknown entities: their
+        # occurrence alone does not establish which personal claim was recalled.
+        for name in [entity.get("name"), *(entity.get("aliases") or [])]:
+            result.update(terms(str(name or "")))
+    return result
+
+
 def match_statements(document, context):
     """Return direct and explicit supporting refs; never copy a bucket hit to all.
 
@@ -100,8 +116,7 @@ def match_statements(document, context):
         return {"state": "explicit_claim_scope", "direct_ids": list(by_id), "support_ids": [],
                 "matches": {sid: {"score": 1.0, "terms": [], "reason": "explicit_claim_scope"} for sid in by_id}}
     # Mere shared identity is not a content hit on every claim about that person.
-    identity = {term for entity in document.get("entities") or []
-                for value in [entity.get("name"), *(entity.get("aliases") or [])] for term in terms(str(value or ""))}
+    identity = _identity_terms(document)
     query_terms = set(terms(query)) - identity
     texts = {sid: _text(row).casefold() for sid, row in by_id.items()}
     statement_terms = {sid: set(terms(text)) - identity for sid, text in texts.items()}
