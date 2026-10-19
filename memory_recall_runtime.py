@@ -846,7 +846,16 @@ async def _project_sections(service, request, query, buckets, sections):
         if callable(reader):
             request["_semantic_records"].update(reader([b["id"] for b in valid]))
     candidates = [{"bucket": bucket, "score": 0.0} for bucket in valid]
-    permitted = await verify_sources(service, request, query, candidates, refresh=True)
+    final_check = request.setdefault("recall_io", {}).setdefault(
+        "final_source_recheck", {"passes": 0, "calls": 0, "duration_ms": 0})
+    final_check["passes"] += 1
+    source_calls_before = request["recall_io"].get("sources", {}).get("calls", 0)
+    final_check_started = time.perf_counter()
+    try:
+        permitted = await verify_sources(service, request, query, candidates, refresh=True)
+    finally:
+        final_check["duration_ms"] += max(0, int((time.perf_counter() - final_check_started) * 1000))
+        final_check["calls"] += max(0, request["recall_io"].get("sources", {}).get("calls", 0) - source_calls_before)
     allowed = {str(item["bucket"]["id"]) for item in permitted}
     uses = request.get("usage_by_bucket", {})
     for bid in requested - allowed:
