@@ -4841,6 +4841,7 @@ class GatewayService:
         date_recall_bucket_ids: list[str] = []
         recent_context = ""
         recent_context_reason = ""
+        recent_context_selection = {"stage": "candidate_selection", "state": "not_requested"}
         recalled_moments: list[dict] = []
         moment_candidates: list[dict] = []
         suppressed_moments: list[dict] = []
@@ -5256,6 +5257,7 @@ class GatewayService:
                     all_buckets,
                     current_user_query,
                     allow_vague=explicit_recent_query,
+                    selection_debug=recent_context_selection,
                 )
                 mark_step("recent_context", stage_started_at)
                 if recent_context.strip():
@@ -5587,6 +5589,7 @@ class GatewayService:
             prepare_timing_debug["total_ms"] = max(0, int((time.perf_counter() - prepare_started_at) * 1000))
             prepare_timing_debug["steps_ms"] = dict(prepare_steps_ms)
             debug_payload["prepare_timing_debug"] = prepare_timing_debug
+            debug_payload["recent_context_selection"] = recent_context_selection
             debug_payload["effective_config"] = effective_config
             debug_payload["candidate_stages"] = candidate_stages
             debug_payload["prompt_composer"] = prompt_composer_debug
@@ -11674,8 +11677,19 @@ class GatewayService:
         query_text: str = "",
         *,
         allow_vague: bool = False,
+        selection_debug: dict | None = None,
     ) -> str:
-        if self._auto_query_too_vague(query_text) and not allow_vague:
+        mode = memory_use.option(self, "recent_context_mode", "auto")
+        max_items = memory_use.option(self, "recent_context_max_items", 6)
+        debug = selection_debug if selection_debug is not None else {}
+        debug.update(stage="candidate_selection", mode=mode, max_items=max_items,
+                     selected_bucket_ids=[], unrelated_bucket_ids=[])
+        if max_items == 0:
+            debug["state"] = "disabled_by_count"
+            return ""
+        vague = self._auto_query_too_vague(query_text)
+        if vague and not allow_vague:
+            debug["state"] = "vague_query"
             return ""
         cutoff = datetime.now() - timedelta(hours=self.head_recent_hours)
         enforce_topic = (
@@ -11684,16 +11698,29 @@ class GatewayService:
         )
         recent_buckets = []
         explicit_recent_query = self._query_requests_recent_context(query_text)
+        if mode != "chronological":
+            specific = bool(self._specific_query_terms(query_text))
+            broad_recent = explicit_recent_query and (vague or not specific)
+            # Existing query intent and locatable anchors distinguish a lookup
+            # from open conversation; grammatical fragments in "let's chat"
+            # are not a new reason to suppress session continuity.
+            if not broad_recent:
+                enforce_topic = enforce_topic or mode == "relevant" or bool(
+                    self._locatable_query_terms(query_text)
+                    or self._query_has_explicit_recall_marker(query_text)
+                    or memory_use.query_purpose(query_text)["purpose"] in {"history", "mixed"})
+        debug["topic_filter_applied"] = enforce_topic
         for bucket in all_buckets:
             if self._is_self_anchor_recall_excluded_bucket(bucket):
                 continue
             meta = bucket.get("metadata", {})
             if not can_bucket_be_recent_context(bucket, explicit_lookup=explicit_recent_query):
                 continue
-            if enforce_topic and not self._bucket_has_query_topic_evidence(query_text, bucket):
-                continue
             created = self._parse_iso(meta.get("created") or meta.get("last_active"))
             if created and created >= cutoff:
+                if enforce_topic and not self._bucket_has_query_topic_evidence(query_text, bucket):
+                    debug["unrelated_bucket_ids"].append(bucket["id"])
+                    continue
                 recent_buckets.append(bucket)
 
         recent_buckets.sort(
@@ -11702,9 +11729,13 @@ class GatewayService:
         )
         # An internal carrier: shared projection reads saved L2/qualified prose
         # and deduplicates it against direct/detail hits. No dehydration call.
+        selected = recent_buckets[:max_items]
+        debug.update(state="selected" if selected else "no_qualified_recent_content",
+                     selected_bucket_ids=[bucket["id"] for bucket in selected],
+                     qualified_count=len(recent_buckets))
         return "\n\n".join(
             f"[bucket_id:{bucket['id']}]\n{bucket_content_for_recall(bucket)}"
-            for bucket in recent_buckets[:6]
+            for bucket in selected
         )
 
     def _should_inject_recent_context(

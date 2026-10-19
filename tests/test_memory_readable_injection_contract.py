@@ -81,6 +81,7 @@ def _recent_carrier(service, bucket: dict, monkeypatch) -> str:
     service.head_recent_hours = 48
     service._auto_query_too_vague = lambda _query: False
     service._recent_context_requires_topic_evidence = lambda _query: False
+    service._specific_query_terms = lambda _query: []  # An explicit, unqualified recent overview.
     service._query_wants_body_chain = lambda _query: False
     service._query_requests_recent_context = lambda _query: True
     service._is_self_anchor_recall_excluded_bucket = lambda _bucket: False
@@ -98,7 +99,7 @@ def _recent_carrier(service, bucket: dict, monkeypatch) -> str:
         lambda *_args, **_kwargs: True,
     )
     return asyncio.run(service._build_recent_context_block(
-        [bucket], "recent memory query", allow_vague=True,
+        [bucket], "最近有什么？", allow_vague=True,
     ))
 
 
