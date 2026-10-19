@@ -30,6 +30,9 @@ from embedding_vector_cache import VectorDecodeCache
 
 logger = logging.getLogger("ombre_brain.embedding")
 
+# Cooperative scheduling quantum only; this does not cap candidate validation.
+SEARCH_COOPERATIVE_YIELD_EVERY = 64
+
 
 class EmbeddingEngine:
     """
@@ -902,107 +905,148 @@ class EmbeddingEngine:
         valid, rejected = [], {}
         decode_debug = {"hits": 0, "misses": 0, "invalid": 0,
                         "bypassed": 0, "evictions": 0}
-        for row in rows:
-            row_id, payload, model, dimension, parent, memory_id, unit, revision, body_sha, prep, provider, truncated, text_version, origin = row
-            parent = str(parent or row_id)
-            if parent not in eligible_ids:
-                continue
-            reason = ""
-            expected = (index_metadata or {}).get(parent)
-            if index_metadata is not None and expected is None:
-                reason = "active_index_metadata_missing"
-            if expected is not None:
-                if revision is None or not body_sha or not provider or not prep:
-                    reason = "legacy_index_metadata_unavailable"
-                elif (int(revision) != int(expected.get("revision") or 0)
-                      or body_sha != expected.get("body_sha256")
-                      or (memory_id and memory_id != expected.get("memory_id"))):
-                    reason = "stale_memory_revision"
-                elif (expected.get('text_projection_version')
-                      and text_version != expected['text_projection_version']):
-                    reason = 'embedding_text_projection_mismatch'
-            if not reason and provider and provider.rstrip("/") != snapshot["base_url"].rstrip("/"):
-                reason = "embedding_provider_mismatch"
-            if not reason and prep and prep != snapshot["document_preparation"]:
-                reason = "embedding_preparation_mismatch"
-            try:
-                vector, vector_valid = self._vector_decode_cache.decode(
-                    payload, diagnostics=decode_debug)
-                if (model != snapshot["model"] or not vector_valid
-                        or dimension != len(vector)
-                        or (snapshot.get("dimension") is not None and dimension != snapshot["dimension"])):
-                    reason = reason or "embedding_space_mismatch"
-            except (ValueError, TypeError):
-                reason = reason or "invalid_stored_vector"
-                vector = []
-            if reason:
-                rejected[reason] = rejected.get(reason, 0) + 1
-                continue
-            valid.append((parent, str(origin or unit or row_id), vector, int(truncated or 0)))
-        index_filter_ms = round((time.monotonic() - filter_started) * 1000)
-        if cache_debug is not None:
-            cache_debug["vector_decode_cache"] = {
-                **decode_debug, **self._vector_decode_cache.snapshot()}
         query_debug = {}
-        if valid and chunks:
-            try:
-                vectors = await self.query_embeddings(chunks, deadline=deadline, cache_debug=query_debug,
-                                                      config_snapshot=snapshot)
-            except BaseException as exc:
-                if cache_debug is not None:
-                    cache_debug.update(query_debug)
-                    cache_debug.update(status="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
-                                       error_type=type(exc).__name__, coverage_status="incomplete",
-                                       index_rejections=rejected,
-                                       total_ms=round((time.monotonic() - started) * 1000))
-                raise
-            query_dimensions = {len(vector) for vector in vectors if vector}
-            dimension_matched = []
-            for item in valid:
-                if len(item[2]) not in query_dimensions:
-                    rejected["query_document_dimension_mismatch"] = rejected.get("query_document_dimension_mismatch", 0) + 1
+        query_task = None
+        index_filter_ms = None
+        similarity_started = None
+        try:
+            # Start one batched query request as soon as a compatible stored
+            # vector exists. Continue validating every row while it is in flight.
+            for row_number, row in enumerate(rows, 1):
+                row_id, payload, model, dimension, parent, memory_id, unit, revision, body_sha, prep, provider, truncated, text_version, origin = row
+                parent = str(parent or row_id)
+                if parent not in eligible_ids:
+                    if row_number % SEARCH_COOPERATIVE_YIELD_EVERY == 0:
+                        await asyncio.sleep(0)
+                    continue
+                reason = ""
+                expected = (index_metadata or {}).get(parent)
+                if index_metadata is not None and expected is None:
+                    reason = "active_index_metadata_missing"
+                if expected is not None:
+                    if revision is None or not body_sha or not provider or not prep:
+                        reason = "legacy_index_metadata_unavailable"
+                    elif (int(revision) != int(expected.get("revision") or 0)
+                          or body_sha != expected.get("body_sha256")
+                          or (memory_id and memory_id != expected.get("memory_id"))):
+                        reason = "stale_memory_revision"
+                    elif (expected.get('text_projection_version')
+                          and text_version != expected['text_projection_version']):
+                        reason = 'embedding_text_projection_mismatch'
+                if not reason and provider and provider.rstrip("/") != snapshot["base_url"].rstrip("/"):
+                    reason = "embedding_provider_mismatch"
+                if not reason and prep and prep != snapshot["document_preparation"]:
+                    reason = "embedding_preparation_mismatch"
+                try:
+                    vector, vector_valid = self._vector_decode_cache.decode(
+                        payload, diagnostics=decode_debug)
+                    if (model != snapshot["model"] or not vector_valid
+                            or dimension != len(vector)
+                            or (snapshot.get("dimension") is not None and dimension != snapshot["dimension"])):
+                        reason = reason or "embedding_space_mismatch"
+                except (ValueError, TypeError):
+                    reason = reason or "invalid_stored_vector"
+                    vector = []
+                if reason:
+                    rejected[reason] = rejected.get(reason, 0) + 1
                 else:
-                    dimension_matched.append(item)
-            valid = dimension_matched
-        else:
-            vectors = []
-            query_debug.update(status="no_compatible_index", provider_requests=0)
-        similarity_started = time.monotonic()
-        combined = {}
-        for view in range(len(queries)):
-            matches = {}
-            view_vectors = [vector for vector, owner in zip(vectors, owners) if owner == view and vector]
-            for parent, unit, vector, truncated in valid:
-                score = max((self._cosine_similarity(q, vector) for q in view_vectors), default=0.0)
-                if parent not in matches or score > matches[parent][0]:
-                    matches[parent] = (score, unit, truncated)
-            ranked = sorted(matches.items(), key=lambda pair: pair[1][0], reverse=True)[:top_k]
-            for rank, (parent, (score, unit, truncated)) in enumerate(ranked, 1):
-                item = combined.setdefault(parent, {
-                    "bucket_id": parent, "score": score, "unit_id": unit,
-                    "view_ranks": {}, "index_status": "verified", "fusion_rank_score": 0.0,
-                })
-                item["view_ranks"][str(view)] = rank
-                item["fusion_rank_score"] += 1.0 / (60 + rank)
-                if score > item["score"]:
-                    item.update(score=score, unit_id=unit)
-                if truncated:
-                    item["index_status"] = "partial"
-        result = sorted(combined.values(), key=lambda item: item["fusion_rank_score"], reverse=True)
-        if cache_debug is not None:
-            covered = {parent for parent, *_ in valid}
-            cache_debug.update(
-                **query_debug,
-                query_view_count=len(queries), query_chunk_count=len(chunks),
-                index_rows_read=len(rows), index_read_ms=index_read_ms,
-                index_filter_ms=index_filter_ms,
-                similarity_ms=round((time.monotonic() - similarity_started) * 1000),
-                valid_unit_count=len(valid), indexed_bucket_count=len(covered),
-                eligible_bucket_count=len(eligible_ids), missing_bucket_count=len(eligible_ids - covered),
-                index_rejections=rejected, total_ms=round((time.monotonic() - started) * 1000),
-                coverage_status="complete" if eligible_ids <= covered else "incomplete",
-            )
-        return result
+                    valid.append((parent, str(origin or unit or row_id), vector, int(truncated or 0)))
+                    if query_task is None and chunks:
+                        query_task = asyncio.create_task(
+                            self.query_embeddings(chunks, deadline=deadline, cache_debug=query_debug,
+                                                  config_snapshot=snapshot)
+                        )
+                        # Let query_embeddings reach its provider/cache await before
+                        # spending more time on local index validation.
+                        await asyncio.sleep(0)
+                if row_number % SEARCH_COOPERATIVE_YIELD_EVERY == 0:
+                    await asyncio.sleep(0)
+
+            index_filter_ms = round((time.monotonic() - filter_started) * 1000)
+            if cache_debug is not None:
+                cache_debug["vector_decode_cache"] = {
+                    **decode_debug, **self._vector_decode_cache.snapshot()}
+            if query_task is not None:
+                if deadline is None or query_task.done():
+                    vectors = await query_task
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        query_task.cancel()
+                        await asyncio.gather(query_task, return_exceptions=True)
+                        raise asyncio.TimeoutError("embedding_request_budget_exhausted")
+                    vectors = await asyncio.wait_for(query_task, timeout=remaining)
+                query_dimensions = {len(vector) for vector in vectors if vector}
+                dimension_matched = []
+                for item_number, item in enumerate(valid, 1):
+                    if len(item[2]) not in query_dimensions:
+                        rejected["query_document_dimension_mismatch"] = rejected.get("query_document_dimension_mismatch", 0) + 1
+                    else:
+                        dimension_matched.append(item)
+                    if item_number % SEARCH_COOPERATIVE_YIELD_EVERY == 0:
+                        await asyncio.sleep(0)
+                valid = dimension_matched
+            else:
+                vectors = []
+                query_debug.update(status="no_compatible_index", provider_requests=0)
+
+            similarity_started = time.monotonic()
+            combined = {}
+            comparisons = 0
+            for view in range(len(queries)):
+                matches = {}
+                view_vectors = [vector for vector, owner in zip(vectors, owners) if owner == view and vector]
+                for parent, unit, vector, truncated in valid:
+                    score = max((self._cosine_similarity(q, vector) for q in view_vectors), default=0.0)
+                    if parent not in matches or score > matches[parent][0]:
+                        matches[parent] = (score, unit, truncated)
+                    comparisons += 1
+                    if comparisons % SEARCH_COOPERATIVE_YIELD_EVERY == 0:
+                        await asyncio.sleep(0)
+                ranked = sorted(matches.items(), key=lambda pair: pair[1][0], reverse=True)[:top_k]
+                for rank, (parent, (score, unit, truncated)) in enumerate(ranked, 1):
+                    item = combined.setdefault(parent, {
+                        "bucket_id": parent, "score": score, "unit_id": unit,
+                        "view_ranks": {}, "index_status": "verified", "fusion_rank_score": 0.0,
+                    })
+                    item["view_ranks"][str(view)] = rank
+                    item["fusion_rank_score"] += 1.0 / (60 + rank)
+                    if score > item["score"]:
+                        item.update(score=score, unit_id=unit)
+                    if truncated:
+                        item["index_status"] = "partial"
+            result = sorted(combined.values(), key=lambda item: item["fusion_rank_score"], reverse=True)
+            if cache_debug is not None:
+                covered = {parent for parent, *_ in valid}
+                cache_debug.update(
+                    **query_debug,
+                    query_view_count=len(queries), query_chunk_count=len(chunks),
+                    index_rows_read=len(rows), index_read_ms=index_read_ms,
+                    index_filter_ms=index_filter_ms,
+                    similarity_ms=round((time.monotonic() - similarity_started) * 1000),
+                    valid_unit_count=len(valid), indexed_bucket_count=len(covered),
+                    eligible_bucket_count=len(eligible_ids), missing_bucket_count=len(eligible_ids - covered),
+                    index_rejections=rejected, total_ms=round((time.monotonic() - started) * 1000),
+                    coverage_status="complete" if eligible_ids <= covered else "incomplete",
+                )
+            return result
+        except BaseException as exc:
+            if cache_debug is not None:
+                cache_debug.update(query_debug)
+                cache_debug.update(
+                    status="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                    error_type=type(exc).__name__, coverage_status="incomplete",
+                    index_rejections=rejected,
+                    total_ms=round((time.monotonic() - started) * 1000),
+                )
+                if index_filter_ms is None:
+                    cache_debug["index_filter_ms"] = round((time.monotonic() - filter_started) * 1000)
+            raise
+        finally:
+            if query_task is not None:
+                if not query_task.done():
+                    query_task.cancel()
+                await asyncio.gather(query_task, return_exceptions=True)
 
     def _prepare_embedding_input(self, text: str, *, kind: str) -> str:
         raw = str(text or "")
