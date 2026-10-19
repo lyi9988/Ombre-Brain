@@ -156,7 +156,15 @@ def assess_capacity(payload: dict, contract: dict | None = None, *,
         unknown = unknown or "model_context_capacity_unknown"
     if reserve is None or any(n is None for n in actual_reserves):
         unknown = unknown or "output_reservation_unknown"
-    if unknown:
+    # Unknown input cost does not erase a separately proven output-only
+    # overflow. Do not use a malformed or different-model contract as proof.
+    trusted_window = (capacity is not None and not contract.get("contract_error")
+                      and (not contract.get("model") or contract["model"] == model))
+    if trusted_window and reserve is not None and reserve > capacity:
+        report.update(state="exceeded", code="context_capacity_exceeded",
+                      reason="output_reservation_exceeds_context_window",
+                      dispatch_allowed=False)
+    elif unknown:
         report.update(state="capacity_unverified", code="context_capacity_unknown",
                       reason=unknown, dispatch_allowed=not attachments)
     elif report["required_tokens_upper_bound"] > capacity:

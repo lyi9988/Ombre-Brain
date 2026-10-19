@@ -46,6 +46,10 @@ PROMPT_BINDING_REVISION_HEADER = "X-Guyan-Prompt-Binding-Revision"
 PROMPT_SCOPE_HEADER = "X-Guyan-Prompt-Scope"
 
 
+class AnthropicOutputBudgetError(ValueError):
+    """An explicit output budget cannot be preserved on the Anthropic wire."""
+
+
 def _usage_from_httpx_response(response: httpx.Response) -> dict | None:
     try:
         body = response.json()
@@ -6876,7 +6880,10 @@ class GatewayService:
     ) -> httpx.Response:
         upstream = route["upstream"]
         model = route["public_model"]
-        upstream_payload = self._anthropic_payload_for_upstream(payload, route)
+        try:
+            upstream_payload = self._anthropic_payload_for_upstream(payload, route)
+        except AnthropicOutputBudgetError as exc:
+            return self._anthropic_output_budget_error_response(exc)
         url = f"{upstream['base_url']}/messages"
         key_entries = self._available_upstream_api_keys(upstream)
         last_error: Exception | None = None
@@ -7085,7 +7092,10 @@ class GatewayService:
     ) -> httpx.Response:
         upstream = route["upstream"]
         model = route["public_model"]
-        upstream_payload = self._anthropic_payload_for_upstream(payload, route)
+        try:
+            upstream_payload = self._anthropic_payload_for_upstream(payload, route)
+        except AnthropicOutputBudgetError as exc:
+            return self._anthropic_output_budget_error_response(exc)
         upstream_payload["stream"] = True
         url = f"{upstream['base_url']}/messages"
         key_entries = self._available_upstream_api_keys(upstream)
@@ -8923,6 +8933,9 @@ class GatewayService:
         category: str | None = None,
         timeout_category: str = "",
     ) -> JSONResponse:
+        if upstream_response.extensions.get("guyan_output_budget_rejected"):
+            return JSONResponse(upstream_response.json(), status_code=upstream_response.status_code,
+                                headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
         valid_categories = {
             "auth",
             "rate_limit",
@@ -8985,6 +8998,10 @@ class GatewayService:
             )
 
     def _anthropic_request_to_openai(self, payload: dict) -> dict:
+        if "max_completion_tokens" in payload:
+            raise ValueError("max_completion_tokens is not supported by /v1/messages; use max_tokens")
+        if "max_tokens" in payload:
+            self._anthropic_max_tokens({"max_tokens": payload["max_tokens"]})
         messages = payload.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages must be a non-empty list")
@@ -9467,10 +9484,39 @@ class GatewayService:
         return upstream_payload
 
     def _anthropic_max_tokens(self, payload: dict[str, Any]) -> int:
-        try:
-            return max(1, int(payload.get("max_tokens") or self.gateway_cfg.get("anthropic_max_tokens") or 1024))
-        except (TypeError, ValueError):
+        budgets = {}
+        for field in ("max_tokens", "max_completion_tokens"):
+            if field not in payload:
+                continue
+            value = payload[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise AnthropicOutputBudgetError(f"{field} must be a positive integer for Anthropic")
+            budgets[field] = value
+        if len(set(budgets.values())) > 1:
+            raise AnthropicOutputBudgetError("max_tokens and max_completion_tokens conflict for Anthropic")
+        if budgets:
+            return next(iter(budgets.values()))
+        # Only an absent configuration uses the default. Preserve previously
+        # supported integer strings, but never truncate or clamp invalid values.
+        if "anthropic_max_tokens" not in self.gateway_cfg:
             return 1024
+        configured = self.gateway_cfg["anthropic_max_tokens"]
+        if isinstance(configured, str):
+            try:
+                configured = int(configured)
+            except ValueError:
+                raise AnthropicOutputBudgetError("gateway.anthropic_max_tokens must be a positive integer") from None
+        if isinstance(configured, bool) or not isinstance(configured, int) or configured <= 0:
+            raise AnthropicOutputBudgetError("gateway.anthropic_max_tokens must be a positive integer")
+        return configured
+
+    def _anthropic_output_budget_error_response(self, exc: AnthropicOutputBudgetError) -> httpx.Response:
+        response = httpx.Response(400, json={
+            "type": "error",
+            "error": {"type": "invalid_request_error", "code": "invalid_output_budget", "message": str(exc)},
+        }, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+        response.extensions["guyan_output_budget_rejected"] = True
+        return response
 
     def _apply_anthropic_prompt_cache(
         self,
@@ -10924,7 +10970,8 @@ class GatewayService:
         return mapping.get(str(stop_reason or ""), "stop")
 
     def _proxy_anthropic_error_response(self, upstream_response: httpx.Response) -> JSONResponse:
-        if upstream_response.extensions.get("guyan_context_capacity_blocked"):
+        if (upstream_response.extensions.get("guyan_context_capacity_blocked")
+                or upstream_response.extensions.get("guyan_output_budget_rejected")):
             return JSONResponse(upstream_response.json(), status_code=upstream_response.status_code,
                                 headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
         valid_categories = {

@@ -18,6 +18,28 @@ from starlette.requests import Request
 PATHS = ["openai", "anthropic", "openai_stream", "anthropic_stream"]
 
 
+@pytest.mark.parametrize("path", PATHS)
+def test_output_only_overflow_blocks_unknown_image_cost_on_every_wire_path(tmp_path, path):
+    service, route, sent = _harness(tmp_path, window=5000, output=1000)
+    body = {"model": "public-model", "max_tokens": 6000,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "offline image"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}}]}],
+        "_ombre_trace_context": {"trace_id": "trace-1"}}
+    original = copy.deepcopy(body)
+    async def run():
+        response = await _send(service, route, body, path)
+        assert response.status_code == 413
+        report = response.json()["context_capacity"]
+        assert report["reason"] == "output_reservation_exceeds_context_window"
+        assert report["reserved_output_tokens"] == 6000
+        assert not sent and not service.attachment_adoption.rows
+        assert service.model_request_trace.get("trace-1")["attempts"] == []
+        assert body["messages"] == original["messages"] and body["max_tokens"] == 6000
+        await service.http_client.aclose()
+    asyncio.run(run())
+
+
 async def _send(service, route, payload, path):
     if path == "openai":
         return await service._forward_upstream(payload)
