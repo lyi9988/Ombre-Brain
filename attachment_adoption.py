@@ -107,7 +107,11 @@ class AdoptionReceipts:
         if not all(isinstance(v, str) and 0 < len(v) <= 200 for v in scope.values()):
             return None
         refs = verified_refs(payload, manifest, scope['conversation_id'])
-        return {'attempt_id': 'adopt-' + uuid.uuid4().hex, **scope, 'attachments': refs}
+        attempt = {'attempt_id': 'adopt-' + uuid.uuid4().hex, **scope, 'attachments': refs}
+        logical = trace.get('logical_request_id')
+        if isinstance(logical, str) and 0 < len(logical) <= 200:
+            attempt['logical_request_id'] = logical
+        return attempt
 
     def complete(self, attempt, ids):
         if not attempt:
@@ -124,8 +128,29 @@ class AdoptionReceipts:
             self.rows[key] = (self.clock() + self.ttl, row)
         self._prune()
 
+    def complete_response(self, attempt):
+        """Only a unique successfully terminated physical attempt is eligible."""
+        if not attempt or not attempt.get('logical_request_id'):
+            return
+        self._prune()
+        key = ('response',) + tuple(attempt[k] for k in SCOPE) + (attempt['logical_request_id'],)
+        row = {**attempt, 'lookup_type': 'response', 'state': 'available'}
+        prior = self.rows.get(key)
+        if prior and prior[1].get('attempt_id') != attempt['attempt_id']:
+            row = {k: attempt[k] for k in (*SCOPE, 'logical_request_id')}
+            row.update(lookup_type='response', state='unknown', reason='ambiguous_physical_attempt')
+        self.rows[key] = (self.clock() + self.ttl, row)
+        self._prune()
+
     def lookup(self, query):
         self._prune()
+        if isinstance(query, dict) and query.get('lookup_type') == 'response':
+            if not all(isinstance(query.get(k), str) and 0 < len(query[k]) <= 200 for k in (*SCOPE, 'logical_request_id')):
+                return {'state': 'unavailable', 'reason': 'invalid_scope'}
+            key = ('response',) + tuple(query[k] for k in SCOPE) + (query['logical_request_id'],)
+            row = self.rows.get(key)
+            absent = {k: query[k] for k in (*SCOPE, 'logical_request_id')}
+            return deepcopy(row[1]) if row else {**absent, 'lookup_type': 'response', 'state': 'unavailable', 'reason': 'no_completed_attempt_receipt'}
         if not isinstance(query, dict) or not all(isinstance(query.get(k), str) and query[k] for k in (*SCOPE, 'tool_call_id')):
             return {'state': 'unavailable', 'reason': 'invalid_scope'}
         row = self.rows.get(tuple(query[k] for k in SCOPE) + (query['tool_call_id'],))
@@ -142,6 +167,9 @@ class AdoptionReceipts:
                 choices = obj.get('choices') or []
                 first = next((c for c in choices if c.get('index', 0) == 0), {})
                 ids = [b['id'] for b in first.get('message', {}).get('tool_calls', [])] if first.get('finish_reason') == 'tool_calls' else []
+            terminal = obj.get('stop_reason') in {'end_turn', 'tool_use', 'stop_sequence'} if protocol == 'anthropic' else first.get('finish_reason') in {'stop', 'tool_calls'}
+            if terminal:
+                self.complete_response(attempt)
             self.complete(attempt, ids)
         except (ValueError, TypeError, KeyError, AttributeError):
             return
@@ -157,6 +185,7 @@ class ReceiptObserver:
         self.store, self.attempt, self.protocol = store, attempt, protocol
         self.decoder = codecs.getincrementaldecoder('utf-8')()
         self.buffer, self.ids, self.finished, self.done, self.invalid = '', {}, False, False, False
+        self.response_finished = False
 
     def consume(self, chunk):
         if self.invalid or self.done:
@@ -171,6 +200,8 @@ class ReceiptObserver:
                     continue
                 if self.protocol == 'openai' and data == '[DONE]':
                     self.done = True
+                    if self.response_finished:
+                        self.store.complete_response(self.attempt)
                     if self.finished:
                         self.store.complete(self.attempt, self.ids.values())
                     return
@@ -183,9 +214,13 @@ class ReceiptObserver:
                     if kind == 'content_block_start' and obj.get('content_block', {}).get('type') == 'tool_use':
                         self.ids[obj['index']] = obj['content_block']['id']
                     elif kind == 'message_delta':
-                        self.finished = obj.get('delta', {}).get('stop_reason') == 'tool_use'
+                        reason = obj.get('delta', {}).get('stop_reason')
+                        self.finished = reason == 'tool_use'
+                        self.response_finished = reason in {'end_turn', 'tool_use', 'stop_sequence'}
                     elif kind == 'message_stop':
                         self.done = True
+                        if self.response_finished:
+                            self.store.complete_response(self.attempt)
                         if self.finished:
                             self.store.complete(self.attempt, self.ids.values())
                 else:
@@ -198,6 +233,7 @@ class ReceiptObserver:
                                 self.ids[index] = self.ids.get(index, '') + call['id']
                         if choice.get('finish_reason') is not None:
                             self.finished = choice['finish_reason'] == 'tool_calls'
+                            self.response_finished = choice['finish_reason'] in {'stop', 'tool_calls'}
                 if len(self.ids) > 128:
                     self.invalid = True
                     return
