@@ -1,4 +1,5 @@
 import logging
+from attachment_adoption import AdoptionReceipts, parse_header as parse_adoption_header
 import hashlib
 import os
 import re
@@ -656,6 +657,7 @@ class GatewayService:
         self.state_store = state_store or GatewayStateStore(
             os.path.join(config["buckets_dir"], "gateway_state.db")
         )
+        self.attachment_adoption = AdoptionReceipts()
         self.model_request_trace = ModelRequestTraceStore(
             self.gateway_cfg.get("model_request_trace_path")
             or os.path.join(config["buckets_dir"], "model_request_trace.sqlite3")
@@ -5868,6 +5870,7 @@ class GatewayService:
             "client_id": marker, "session_id": session_id[:160],
             "coverage": coverage, "worldbook": worldbook[:64],
             "recall_signals": recall_signals,
+            "attachment_adoption": parse_adoption_header(request.headers.get("X-Guyan-Attachment-Adoption", "")),
             "runtime_scope": self._runtime_scope_for_request(request),
             "prompt_plan_identity": {
                 "preset_id": str(request.headers.get(
@@ -6656,6 +6659,18 @@ class GatewayService:
             payload = {"settings": settings}
         return JSONResponse(payload, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
+    async def handle_attachment_adoption_lookup(self, request: Request) -> JSONResponse:
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        try:
+            query = await request.json()
+        except Exception:
+            return JSONResponse({"state": "unavailable", "reason": "invalid_json"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        return JSONResponse(self.attachment_adoption.lookup(query),
+                            headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
     async def handle_model_request_trace_clear(self, request: Request) -> JSONResponse:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
@@ -6712,6 +6727,7 @@ class GatewayService:
                 or ("provider_retry" if attempt > 1 else ""),
                 payload=upstream_payload,
             )
+            adoption_attempt = self.attachment_adoption.begin(trace, upstream_payload)
             try:
                 response = await self.http_client.post(
                     url,
@@ -6772,6 +6788,7 @@ class GatewayService:
             )
             if 200 <= response.status_code < 300:
                 self._clear_upstream_key_cooldown(upstream, key_entry)
+                self.attachment_adoption.response(adoption_attempt, response, "openai")
                 return response
             if not self._should_retry_upstream_status(response.status_code):
                 return response
@@ -6810,6 +6827,7 @@ class GatewayService:
                 or ("provider_retry" if attempt > 1 else ""),
                 payload=upstream_payload,
             )
+            adoption_attempt = self.attachment_adoption.begin(trace, upstream_payload)
             try:
                 response = await self.http_client.post(
                     url,
@@ -6867,6 +6885,7 @@ class GatewayService:
             )
             if 200 <= response.status_code < 300:
                 self._clear_upstream_key_cooldown(upstream, key_entry)
+                self.attachment_adoption.response(adoption_attempt, response, "anthropic")
                 return response
             if not self._should_retry_upstream_status(response.status_code):
                 return response
@@ -6912,6 +6931,7 @@ class GatewayService:
                 or ("provider_retry" if attempt > 1 else ""),
                 payload=upstream_payload,
             )
+            adoption_attempt = self.attachment_adoption.begin(trace, upstream_payload)
             try:
                 upstream_response = await self.http_client.send(request, stream=True)
             except httpx.RequestError as exc:
@@ -6965,6 +6985,7 @@ class GatewayService:
                     outcome=("final_answer" if 200 <= upstream_response.status_code < 300 else "error"))
             if 200 <= upstream_response.status_code < 300:
                 self._clear_upstream_key_cooldown(upstream, key_entry)
+                self.attachment_adoption.wrap(adoption_attempt, upstream_response, "openai")
                 return upstream_response
 
             await upstream_response.aclose()
@@ -7014,6 +7035,7 @@ class GatewayService:
                 or ("provider_retry" if attempt > 1 else ""),
                 payload=upstream_payload,
             )
+            adoption_attempt = self.attachment_adoption.begin(trace, upstream_payload)
             try:
                 upstream_response = await self.http_client.send(request, stream=True)
             except httpx.RequestError as exc:
@@ -7067,6 +7089,7 @@ class GatewayService:
                     outcome=("final_answer" if 200 <= upstream_response.status_code < 300 else "error"))
             if 200 <= upstream_response.status_code < 300:
                 self._clear_upstream_key_cooldown(upstream, key_entry)
+                self.attachment_adoption.wrap(adoption_attempt, upstream_response, "anthropic")
                 return upstream_response
 
             await upstream_response.aclose()
@@ -26865,6 +26888,11 @@ class GatewayService:
     ):
         try:
             async for chunk in upstream_response.aiter_bytes():
+                observer = (getattr(upstream_response, "extensions", None) or {}).get(
+                    "attachment_adoption_observer"
+                )
+                if observer is not None:
+                    observer.consume(chunk)
                 if chunk:
                     now = time.perf_counter()
                     if timing.get("first_byte_ms") is None:
@@ -27686,6 +27714,9 @@ def create_gateway_app(
     async def upstream_usage_debug(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_upstream_usage_debug(request)
 
+    async def attachment_adoption_lookup(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_attachment_adoption_lookup(request)
+
     async def model_request_trace(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_model_request_trace(request)
 
@@ -27747,6 +27778,7 @@ def create_gateway_app(
             Route("/api/hook/recall", hook_recall, methods=["POST"]),
             Route("/api/debug/recall-eval", recall_eval_debug, methods=["GET"]),
             Route("/api/debug/upstream-usage", upstream_usage_debug, methods=["GET"]),
+            Route("/internal/attachment-adoption/lookup", attachment_adoption_lookup, methods=["POST"]),
             Route("/api/debug/model-requests", model_request_trace_list, methods=["GET"]),
             Route("/api/debug/model-requests/events", model_request_trace_events, methods=["GET"]),
             Route("/api/debug/model-requests/settings", model_request_trace_settings, methods=["GET", "PUT"]),
