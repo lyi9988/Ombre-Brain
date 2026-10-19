@@ -156,6 +156,31 @@ class AdoptionReceipts:
         row = self.rows.get(tuple(query[k] for k in SCOPE) + (query['tool_call_id'],))
         return deepcopy(row[1]) if row else {'state': 'unavailable', 'reason': 'no_completed_attempt_receipt'}
 
+    def block_dispatch(self, trace, reason):
+        """Keep prior physical evidence, revoke adoption for this failed logical.
+
+        Never broaden a missing/malformed profile, turn or logical scope into
+        revocation of another request. This only affects ephemeral receipts.
+        """
+        manifest = trace.get('attachment_adoption') or {}
+        scope = {k: trace.get(k) for k in SCOPE[:3]}
+        scope['profile_id'] = manifest.get('profile_id')
+        logical = trace.get('logical_request_id')
+        if (not all(isinstance(v, str) and 0 < len(v) <= 200 for v in scope.values())
+                or not isinstance(logical, str) or not 0 < len(logical) <= 200):
+            return
+        self._prune()
+        for key, (expires, row) in list(self.rows.items()):
+            if row.get('logical_request_id') != logical or any(row.get(k) != v for k, v in scope.items()):
+                continue
+            self.rows[key] = (expires, {
+                **{k: row[k] for k in (*SCOPE, 'logical_request_id', 'lookup_type', 'tool_call_id') if k in row},
+                'state': 'unavailable', 'reason': 'logical_dispatch_blocked',
+                'capacity_error_code': reason,
+                'prior_physical_attempt_id': row.get('attempt_id') or row.get('prior_physical_attempt_id'),
+                'prior_physical_state': row.get('prior_physical_state') or row.get('state'),
+            })
+
     def response(self, attempt, response, protocol):
         if not attempt or not 200 <= response.status_code < 300:
             return

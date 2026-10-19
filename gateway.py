@@ -1,5 +1,8 @@
 import logging
 from attachment_adoption import AdoptionReceipts, parse_header as parse_adoption_header
+from gateway_request_capacity import explicit_limits, has_full_attachment, route_limits
+from request_capacity import (HEADER as CAPACITY_HEADER, assess_capacity, blocked as capacity_blocked,
+                              error_body as capacity_error_body, read_header as read_capacity_header)
 import hashlib
 import os
 import re
@@ -1976,13 +1979,21 @@ class GatewayService:
     def _safe_upstream_models_payload(self, upstream: dict[str, Any]) -> list[Any]:
         models: list[Any] = []
         model_map = upstream.get("model_map", {}) if isinstance(upstream.get("model_map"), dict) else {}
+        raw_upstreams = getattr(self, "gateway_cfg", {}).get("upstreams", [])
+        raw = next((item for index, item in enumerate(raw_upstreams, 1)
+                    if isinstance(item, dict) and str(item.get("name") or f"upstream-{index}").strip()
+                    == upstream.get("name")), {}) if isinstance(raw_upstreams, list) else {}
+        raw_models = self._sanitize_upstream_model_entries(raw.get("models", []))
+        capacity_by_model = {item["id"]: explicit_limits(item)
+                             for item in raw_models if isinstance(item, dict)}
         for model in upstream.get("models", []) or []:
             public_model = str(model or "").strip()
             if not public_model:
                 continue
             upstream_model = str(model_map.get(public_model) or public_model).strip()
-            if upstream_model and upstream_model != public_model:
-                models.append({"id": public_model, "upstream_model": upstream_model})
+            capacity = capacity_by_model.get(public_model, {})
+            if capacity or (upstream_model and upstream_model != public_model):
+                models.append({"id": public_model, "upstream_model": upstream_model, **capacity})
             else:
                 models.append(public_model)
         return models
@@ -2024,6 +2035,7 @@ class GatewayService:
                     "anthropic_version": upstream.get("anthropic_version", ""),
                     "anthropic_beta": upstream.get("anthropic_beta", ""),
                     "models": self._safe_upstream_models_payload(upstream),
+                    **explicit_limits(raw),
                 }
             )
         return payload
@@ -2078,8 +2090,9 @@ class GatewayService:
             if not public_model or public_model in seen:
                 continue
             seen.add(public_model)
-            if upstream_model and upstream_model != public_model:
-                models.append({"id": public_model, "upstream_model": upstream_model})
+            capacity = explicit_limits(raw_model)
+            if capacity or (upstream_model and upstream_model != public_model):
+                models.append({"id": public_model, "upstream_model": upstream_model, **capacity})
             else:
                 models.append(public_model)
         return models
@@ -2107,6 +2120,7 @@ class GatewayService:
                     raw.get("protocol") or raw.get("api_format") or raw.get("type")
                 ),
                 "base_url": str(raw.get("base_url") or "").strip().rstrip("/"),
+                **explicit_limits(raw),
             }
             env_names = self._sanitize_env_names(raw.get("api_key_envs", raw.get("api_key_env", [])))
             if env_names:
@@ -5871,6 +5885,7 @@ class GatewayService:
             "coverage": coverage, "worldbook": worldbook[:64],
             "recall_signals": recall_signals,
             "attachment_adoption": parse_adoption_header(request.headers.get("X-Guyan-Attachment-Adoption", "")),
+            "context_capacity_contract": read_capacity_header(request.headers.get(CAPACITY_HEADER)),
             "runtime_scope": self._runtime_scope_for_request(request),
             "prompt_plan_identity": {
                 "preset_id": str(request.headers.get(
@@ -6706,6 +6721,53 @@ class GatewayService:
 
         return None
 
+    def _capacity_response(self, payload: dict, upstream_payload: dict,
+                           route: dict, *, protocol: str, stream: bool) -> httpx.Response | None:
+        """Reassess the complete final wire payload before any physical dispatch."""
+        trace = self._trace_from_payload(payload)
+        header = trace.get("context_capacity_contract")
+        contract = dict(header) if isinstance(header, dict) else {}
+        alias = str(route.get("public_model") or payload.get("model") or "")
+        # Only a validated public alias can be translated to the provider id.
+        if not contract.get("model") or contract["model"] == alias:
+            contract["model"] = str(route["upstream_model"])
+        limits = route_limits(getattr(self, "gateway_cfg", {}), route)
+        windows = [value for value in (contract.get("context_window"), limits["context_window"])
+                   if isinstance(value, int) and not isinstance(value, bool) and value > 0]
+        reserves = [value for value in (contract.get("reserved_output_tokens"), limits["reserved_output_tokens"])
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0]
+        contract["context_window"] = min(windows) if windows else None
+        contract["reserved_output_tokens"] = max(reserves) if reserves else None
+        if limits["sources"]:
+            contract["capacity_source"] = ("registry_header_and_gateway_upstream_config"
+                if header else "gateway_upstream_config")
+        report = assess_capacity(upstream_payload, contract, stage="gateway.final_provider_payload",
+                                 has_attachments=has_full_attachment(upstream_payload, trace))
+        report["route"] = {"upstream": str(route["upstream"].get("name") or ""),
+                           "public_model": alias, "upstream_model": str(route["upstream_model"]),
+                           "protocol": protocol, "stream": stream}
+        report["gateway_config_sources"] = limits["sources"]
+        trace["context_capacity"] = report
+        trace_id = str(trace.get("trace_id") or "")
+        store = getattr(self, "model_request_trace", None)
+        if trace_id and store is not None:
+            if hasattr(store, "update_metadata"):
+                store.update_metadata(trace_id, {"context_capacity": report})
+            if hasattr(store, "record_event"):
+                store.record_event(trace_id, "capacity.assessed", report)
+        if not capacity_blocked(report):
+            return None
+        receipts = getattr(self, "attachment_adoption", None)
+        if receipts is not None:
+            receipts.block_dispatch(trace, report["code"])
+        if trace_id and hasattr(store, "set_outcome"):
+            store.set_outcome(trace_id, report["code"])
+        response = httpx.Response(400 if report["code"] == "context_capacity_unknown" else 413,
+                                 json=capacity_error_body(report),
+                                 headers={"Cache-Control": "no-store"})
+        response.extensions["guyan_context_capacity_blocked"] = True
+        return response
+
     async def _forward_upstream(self, payload: dict) -> httpx.Response:
         model = str(payload.get("model") or "").strip()
         route = self._resolve_upstream_for_model(model)
@@ -6717,6 +6779,10 @@ class GatewayService:
         last_response: httpx.Response | None = None
 
         for attempt, key_entry in enumerate(key_entries, start=1):
+            capacity_response = self._capacity_response(payload, upstream_payload, route,
+                protocol="openai", stream=False)
+            if capacity_response is not None:
+                return capacity_response
             started_at = time.perf_counter()
             trace = self._trace_from_payload(payload)
             attempt_id = self.model_request_trace.record_attempt(
@@ -6817,6 +6883,10 @@ class GatewayService:
         last_response: httpx.Response | None = None
 
         for attempt, key_entry in enumerate(key_entries, start=1):
+            capacity_response = self._capacity_response(payload, upstream_payload, route,
+                protocol="anthropic", stream=False)
+            if capacity_response is not None:
+                return capacity_response
             started_at = time.perf_counter()
             trace = self._trace_from_payload(payload)
             attempt_id = self.model_request_trace.record_attempt(
@@ -6912,6 +6982,10 @@ class GatewayService:
         last_response: httpx.Response | None = None
 
         for attempt, key_entry in enumerate(key_entries, start=1):
+            capacity_response = self._capacity_response(payload, upstream_payload, route,
+                protocol="openai", stream=True)
+            if capacity_response is not None:
+                return capacity_response
             request = self.http_client.build_request(
                 "POST",
                 url,
@@ -7019,6 +7093,10 @@ class GatewayService:
         last_response: httpx.Response | None = None
 
         for attempt, key_entry in enumerate(key_entries, start=1):
+            capacity_response = self._capacity_response(payload, upstream_payload, route,
+                protocol="anthropic", stream=True)
+            if capacity_response is not None:
+                return capacity_response
             request = self.http_client.build_request(
                 "POST",
                 url,
@@ -7803,6 +7881,10 @@ class GatewayService:
         if 200 <= retry_response.status_code < 300:
             debug["retried"] = True
             return finish(self._strip_memory_detail_marker_from_response(retry_response))
+
+        if retry_response.extensions.get("guyan_context_capacity_blocked"):
+            debug["skip_reason"] = retry_response.json()["error"]["code"]
+            return finish(retry_response)
 
         debug["skip_reason"] = "retry_failed"
         return finish(stripped_response)
@@ -10842,6 +10924,9 @@ class GatewayService:
         return mapping.get(str(stop_reason or ""), "stop")
 
     def _proxy_anthropic_error_response(self, upstream_response: httpx.Response) -> JSONResponse:
+        if upstream_response.extensions.get("guyan_context_capacity_blocked"):
+            return JSONResponse(upstream_response.json(), status_code=upstream_response.status_code,
+                                headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
         valid_categories = {
             "auth",
             "rate_limit",

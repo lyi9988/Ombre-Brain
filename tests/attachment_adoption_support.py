@@ -77,6 +77,10 @@ def gateway_service(handler):
     }
     service = GatewayService.__new__(GatewayService)
     service.gateway_token = "gateway-test-token"
+    # Receipt tests model a configured, known-capacity upstream. Unknown full
+    # attachment requests intentionally stop before receipt creation.
+    service.gateway_cfg = {"upstreams": [{"name": upstream["name"],
+        "context_window": 1000000, "max_output_tokens": 1024}]}
     service.attachment_adoption = AdoptionReceipts()
     service.model_request_trace = _NoTraceStore()
     service.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
