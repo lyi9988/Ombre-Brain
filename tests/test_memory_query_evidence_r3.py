@@ -122,6 +122,34 @@ def test_matching_keeps_only_necessary_scene_and_relation_context_as_support():
     assert scored["score"] == pytest.approx(rows["st-date"]["score"])
 
 
+@pytest.mark.parametrize("entity_type", ["object", _known("object")])
+def test_named_product_and_topic_remain_direct_statement_anchors(entity_type):
+    document = _document(
+        _claim("search-wish", "主人希望未来 Reality 的聊天搜索区分原文和渲染后的文本。"),
+        _claim("coffee", "主人仍然喜欢咖啡的味道。", kind="preference", stability="stable"),
+    )
+    document["entities"] = [
+        {"name": "主人", "entity_type": _known("user"), "aliases": ["润润"]},
+        {"name": "Reality", "entity_type": entity_type, "aliases": ["聊天"]},
+    ]
+    selection = match_statements(document, _context("我之前对Reality聊天搜索提过什么要求？"))
+    assert selection["direct_ids"] == ["search-wish"]
+    assert "reality" in selection["matches"]["search-wish"]["terms"]
+    assert selection["matches"]["coffee"]["terms"] == []
+
+
+@pytest.mark.parametrize("entity_type", ["user", _known("assistant"),
+    _known("third_party"), unknown("not_stated"), None])
+def test_shared_person_name_alone_does_not_match_every_statement(entity_type):
+    document = _document(
+        _claim("coffee", "润润喜欢咖啡。"),
+        _claim("trip", "润润计划去深圳。"),
+    )
+    document["entities"] = [{"name": "润润", "entity_type": entity_type, "aliases": []}]
+    selection = match_statements(document, _context("润润？"))
+    assert selection["direct_ids"] == []
+
+
 def test_unverified_or_excluded_claims_cannot_enter_the_scoring_pool():
     claim = _claim("st-source", "苏州日期改到11月3日。", evidence_refs=["source:trip"])
     document = _document(claim)
