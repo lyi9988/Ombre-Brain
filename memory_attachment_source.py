@@ -71,5 +71,14 @@ def semantic_text(source):
         return '（代码块）'
     # Keep the raw source immutable; this separately versioned view is the
     # only attachment body exposed to memory semantic extraction/anchors.
-    pattern=r'(?ms)^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]{0,3}\1[ \t]*$|\Z)'
-    return re.sub(pattern,'（代码块）',source['text'])
+    # Markdown permits a closing fence longer than its opener. Preserve the
+    # prose after it, including CRLF, rather than consuming the rest as code.
+    text=source['text']; result=[]; consumed=0
+    for opener in re.finditer(r'(?m)^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n',text):
+        if opener.start()<consumed:continue
+        fence=opener.group(1)
+        closing=re.search(r'(?m)^[ \t]{0,3}'+re.escape(fence[0])+r'{'+str(len(fence))+r',}[ \t]*(?=\r?$)',text[opener.end():])
+        result.append(text[consumed:opener.start()]+'（代码块）')
+        consumed=opener.end()+closing.end() if closing else len(text)
+    result.append(text[consumed:])
+    return ''.join(result)

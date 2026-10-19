@@ -187,6 +187,17 @@ def test_no_new_raw_daily_actual_engine_commits_and_generates_ready_l2(tmp_path,
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('opening,closing,newline', [
+    ('```','```','\n'), ('```','````','\n'), ('~~~~','~~~~~','\n'), ('```','````','\r\n'),
+])
+def test_code_view_keeps_prose_after_valid_closing_fence(opening,closing,newline):
+    from memory_attachment_source import semantic_text
+    text=newline.join(['作者有一项偏好。',opening+'python','secret_code()',closing,'后来作者改变了想法。'])
+    source={'namespace':'attachment_text','text':text,'attachment_format':{'name':'note.md','mime':'text/markdown'}}
+    assert semantic_text(source)==newline.join(['作者有一项偏好。','（代码块）','后来作者改变了想法。'])
+    assert source['text']==text
+
+
 def test_review_adoption_blocked_after_success_event_withdrawal(tmp_path, monkeypatch):
     monkeypatch.setenv('OMBRE_CANONICAL_BRIDGE_TOKEN', 'test-only')
     async def run():
