@@ -48,6 +48,7 @@ RECALL_DEFAULTS = {
     "window_formula_weight": 1.0, "rrf_constant": 60.0,
     "include_correction_background": True,
     "local_first_enabled": False,
+    "recent_context_mode": "auto", "recent_context_max_items": 6,
     "scoring_profiles": [],
     "signal_bindings": [], "affinity_mappings": [], "affinity_aggregation": "max",
     "cognition_chain_depth": 2, "cognition_chain_nodes": 8, "cognition_chain_budget": 300,
@@ -417,6 +418,12 @@ def validate_values(values):
         _fail("unknown_recall_mode", "recall.mode")
     if recall["hierarchy_mode"] not in {"auto", "scene", "overview", "mixed"}:
         _fail("unknown_hierarchy_mode", "recall.hierarchy_mode")
+    if (not isinstance(recall["recent_context_mode"], str)
+            or recall["recent_context_mode"] not in {"auto", "relevant", "chronological"}):
+        _fail("unknown_recent_context_mode", "recall.recent_context_mode")
+    if (type(recall["recent_context_max_items"]) is not int
+            or not 0 <= recall["recent_context_max_items"] <= 200):
+        _fail("recent_context_limit_out_of_range", "recall.recent_context_max_items", minimum=0, maximum=200)
     if recall["formula_id"] is not None:
         _id(recall["formula_id"], "recall.formula_id")
     for name, value in recall.items():
@@ -424,7 +431,7 @@ def validate_values(values):
             if type(value) is not bool:
                 _fail("boolean_required", "recall." + name)
             continue
-        if name in {"mode", "formula_id", "hierarchy_mode", "scoring_profiles", "local_match_weights",
+        if name in {"mode", "formula_id", "hierarchy_mode", "recent_context_mode", "scoring_profiles", "local_match_weights",
                     "signal_bindings", "affinity_mappings", "affinity_aggregation"} or value is None:
             continue
         _number(value, "recall." + name)
@@ -891,6 +898,8 @@ def configuration(config, *, last_request=None):
                          "conditional_inputs": conditional_inputs},
             "formulas": {"state": "active", "consumer": "natural_recall", "revision": rev},
             "time_profiles": {"state": "active", "consumer": "natural_recall_statement_usage", "revision": rev},
+            "recent_context": {"state": "active", "consumer": "recent_context_selection", "revision": rev,
+                "budget_binding": "gateway.recent_context_budget", "composer_source": "ombre.recent_context"},
             "affinity_config": {"revision": rev},
             "last_request": last_request,
         }, "validation": validation,
