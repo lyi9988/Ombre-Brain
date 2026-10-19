@@ -13,6 +13,18 @@ from memory_l1_ingestion import source_snapshot
 from memory_l1_service import L1OwnerError
 
 
+def attributed_snapshot(actual, binding, config):
+    snapshot = source_snapshot(actual, config=config)
+    # Old bindings did not carry participant identity. Keep their exact old
+    # source revision readable, but do not retroactively promote unknown
+    # authorship to today's configured actor. New bindings hash actor id/kind.
+    if snapshot['source_revision'] != binding.get('source_revision') and not binding.get('author_ref') and not binding.get('speaker_ref'):
+        legacy = source_snapshot(actual)
+        if legacy['source_revision'] == binding.get('source_revision'):
+            return legacy
+    return snapshot
+
+
 def canonical_recorded_at(source):
     """Keep the authority's record time; never substitute event or local time."""
     recorded = source.get('recorded_at')
@@ -62,7 +74,7 @@ class LocalMemorySourceReader:
                 actual = {'namespace': 'conversation_turn', 'system': 'ombre', 'event_id': str(row['id']),
                     'profile_id': row['profile_id'], 'conversation_id': row['session_id'], 'version_id': '',
                     'role': locator['role'], 'text': row[locator['role'] + '_text'], 'recorded_at': row['created_at']}
-        snapshot = source_snapshot(actual)
+        snapshot = attributed_snapshot(actual, binding, self.config)
         if snapshot['source_id'] != binding['source_id']:
             return {'state': 'unavailable', 'reason': 'source_identity_mismatch'}
         return snapshot
@@ -72,6 +84,7 @@ class CanonicalMemorySourceReader:
     namespace = 'snapshot.aiz.canonical_event'
 
     def __init__(self, config):
+        self.config = config
         self.options = (config.get('gateway') or {}).get('canonical_continuation') or {}
 
     async def read(self, binding):
@@ -100,7 +113,7 @@ class CanonicalMemorySourceReader:
             return {'state': 'unavailable', 'reason': 'source_identity_mismatch'}
         actual = {**locator, 'namespace': 'canonical_event', 'text': result['text'], 'version_id': version,
                   'recorded_at': canonical_recorded_at(result)}
-        return source_snapshot(actual)
+        return attributed_snapshot(actual, binding, self.config)
 
 
 class AizDiarySourceReader(CanonicalMemorySourceReader):

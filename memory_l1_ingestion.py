@@ -20,7 +20,7 @@ def model_template(*, catalog=None, catalog_revision=None):
     return {key: ({'form': 'episode'} if key == 'entry' else copy.deepcopy(doc[key])) for key in MODEL_FIELDS}
 
 
-def source_snapshot(source):
+def source_snapshot(source, *, config=None):
     """Only callers holding actual authenticated reader results call this."""
     if not isinstance(source, dict) or not isinstance(source.get('text'), str) or not source['text']:
         raise L1OwnerError('source_text_required', field_path='sources')
@@ -31,26 +31,33 @@ def source_snapshot(source):
     locator = {key: source.get(key) for key in ('system', 'profile_id', 'conversation_id', 'event_id', 'role')}
     if not locator['event_id'] or locator['role'] not in ('user', 'assistant', 'tool'):
         raise L1OwnerError('source_identity_required', field_path='sources')
+    from memory_source_identity import source_participant, source_group
+    participant = source_participant(source, config)
     revision = {'version_id': source.get('version_id'), 'text_sha256': hashlib.sha256(source['text'].encode()).hexdigest()}
+    if config is not None:
+        revision['participant'] = {key: participant[key] for key in ('subject_id', 'kind')}
     return {'state': 'available', 'source_namespace': namespace, 'source_id': canonical_json(locator),
         'source_revision': 'source_sha256:' + hashlib.sha256(canonical_json(revision).encode()).hexdigest(),
         'text_view_id': 'memory.source.exact-v1', 'text': source['text'], 'author': source.get('role'),
-        'speaker': source.get('role'), 'upstream_revision': source.get('version_id') or None,
+        'speaker': source.get('role'), 'participant': participant, 'source_group': source_group(source), 'upstream_revision': source.get('version_id') or None,
         'recorded_at': source.get('recorded_at'), 'source_key': source.get('source_key'),
         'archive_ref': source.get('archive_ref'),
         'limitations': ['来源记录时间不代表事件发生时间；源快照不是主人确认事实。']}
 
 
-def bind_sources(sources):
+def bind_sources(sources, *, config=None):
     if not isinstance(sources, list) or not sources:
         raise L1OwnerError('sources_required', field_path='sources')
     snapshots, bindings = [], []
     for index, source in enumerate(sources):
-        snapshot = source_snapshot(source)
+        snapshot = source_snapshot(source, config=config)
+        expected = source.get('_participant_revision')
+        if expected is not None and expected != snapshot['source_revision']:
+            raise L1OwnerError('source_participant_changed', status=409, field_path='sources')
         snapshots.append(snapshot)
         bindings.append({'binding_id': f'source:{index + 1}',
             'source_namespace': snapshot['source_namespace'], 'source_id': snapshot['source_id'],
-            'source_revision': snapshot['source_revision'], 'author_ref': None, 'speaker_ref': None,
+            'source_revision': snapshot['source_revision'], 'author_ref': snapshot['participant']['subject_id'], 'speaker_ref': snapshot['participant']['subject_id'],
             'anchors': [make_text_anchor(snapshot['text'], target_namespace='l0', target_id=snapshot['source_id'],
                 target_revision=snapshot['source_revision'], text_view_id=snapshot['text_view_id'], start=0, end=len(snapshot['text']))]})
     return snapshots, bindings
@@ -132,7 +139,7 @@ def expand_model_document(document, base, source_texts=None):
     return doc
 
 
-def prepare_model_document(revisions, *, memory_id, document, sources, generation, request_id, previous=None, catalog_context=None):
+def prepare_model_document(revisions, *, memory_id, document, sources, generation, request_id, previous=None, catalog_context=None, config=None):
     if not isinstance(document, dict) or set(document) != MODEL_FIELDS:
         raise L1OwnerError('model_document_fields_required', field_path='document')
     if (not isinstance(generation, dict) or set(generation) != {'prompt_revision', 'model_route_revision', 'task_id', 'actor'}
@@ -141,7 +148,7 @@ def prepare_model_document(revisions, *, memory_id, document, sources, generatio
                    for k in ('prompt_revision', 'model_route_revision'))):
         raise L1OwnerError('generation_context_required', field_path='generation')
     catalog, catalog_revision = catalog_context if catalog_context is not None else revisions.catalog_provider()
-    snapshots, bindings = bind_sources(sources)
+    snapshots, bindings = bind_sources(sources, config=config)
     base = copy.deepcopy(previous) if previous else document_template(catalog=catalog, catalog_revision=catalog_revision)
     base['evidence_bindings'] = bindings
     doc = expand_model_document(document, base, {b['binding_id']: s['text'] for b, s in zip(bindings, snapshots)})

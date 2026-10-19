@@ -242,13 +242,15 @@ class MemoryL1Runtime:
                       'binding': meta.get('binding'), 'selected_blocks': meta.get('selected_blocks')}
 
     def _memory_l1_daily_context(self, window):
-        from identity import model_identity
+        from memory_source_identity import source_model_identity
         service = self._memory_l1_revisions()
         catalog, catalog_revision = service.catalog_provider()
         sources = daily_sources(window, profile_id=self.memory_semantic_profile_id)
-        snapshots, bindings = bind_sources(sources)
+        snapshots, bindings = bind_sources(sources, config=self.config)
+        for source, snapshot in zip(sources, snapshots):
+            source['_participant_revision'] = snapshot['source_revision']
         contract = semantic_contract([b['binding_id'] for b in bindings], catalog=catalog,
-            initial_chat=True, require_keywords=True, identity=model_identity(self.config))
+            initial_chat=True, require_keywords=True, identity=source_model_identity(self.config, sources))
         contract['document']['required'].append('narrative')
         contract['document']['narrative'] = contract['document']['optional'].pop('narrative')
         from memory_l1_api import AUTO_KINDS
@@ -259,7 +261,8 @@ class MemoryL1Runtime:
                           'reason': 'string', 'document': 'Document (document/types above)'},
             'rules': '只输出上述JSON对象。catalog中key为输出值，中文为释义。Candidate.kind是入库类别；Statement.classification.kind只用catalog.kinds。subject_ref/about_refs只引用本稿实体ID，例如e1，不能用user/assistant代替。保留主体、改口、否定、条件和未知；不同日期的状态分别表达，计划目标日不自动作为截止日。每份document独立填写完整narrative与非空retrieval.keywords，关键词按内容提取。',
         }
-        return {'source_texts': semantic_sources(snapshots, bindings, chat_view=True,
+        return {'identity': source_model_identity(self.config, sources),
+                'source_texts': semantic_sources(snapshots, bindings, chat_view=True,
                     source_timezone=getattr(self, 'tz', None)),
                 'catalog_revision': catalog_revision, 'semantic_contract': contract}, sources, (copy.deepcopy(catalog), catalog_revision)
 
@@ -270,7 +273,7 @@ class MemoryL1Runtime:
             raise L1OwnerError('generated_task_context_missing', field_path='document')
         return prepare_model_document(self._memory_l1_revisions(), memory_id=memory_id,
             document=candidate['document'], sources=sources, generation=generation, request_id=generation['task_id'],
-            catalog_context=candidate.get('_l1_catalog_context'))
+            catalog_context=candidate.get('_l1_catalog_context'), config=self.config)
 
     def _memory_l1_sources(self):
         from memory_l0_sources import MemoryL0Sources, McpDiarySourceAdapter

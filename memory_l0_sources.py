@@ -144,7 +144,7 @@ class MemoryL0Sources:
                   "eligible_source": eligible, "reason": current.get("reason"), "view": "source" if eligible else "source_copy",
                   "text": None, "limitations": []}
         if snapshot:
-            result.update({key: snapshot.get(key) for key in ("text", "title", "author", "speaker", "upstream_revision", "recorded_at", "limitations")})
+            result.update({key: snapshot.get(key) for key in ("text", "title", "author", "speaker", "participant", "source_group", "upstream_revision", "recorded_at", "limitations")})
             if not eligible: result["limitations"] = [*(result.get("limitations") or []), "历史原文副本；当前来源未核验通过，不作当前资格依据。"]
             if start is not None:
                 if type(start) is not int or type(end) is not int or not 0 <= start < end <= len(snapshot["text"]):

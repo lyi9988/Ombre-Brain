@@ -157,7 +157,14 @@ class ChatMemoryTool:
         time_candidate = {}
         if document_input is None and len(matches) == 1:
             time_candidate["event_time"] = {**temporal, "source_turn_id": matches[0]["event_id"], "source_role": matches[0]["role"]}
+        from memory_source_identity import source_participant
+        evidence_sources = [canonical_source(s, conversation_id=context["conversation_id"],
+                            profile_id=self.engine.memory_semantic_profile_id) for s in sources]
+        participants = {s['event_id']: source_participant(s, self.engine.config) for s in evidence_sources}
         narrative = build_chat_narrative(time_candidate, turns, self.engine.identity, self.engine.tz, "")
+        for item in narrative['sources']:
+            participant = participants[item['source_ref'].split(':', 1)[1]]
+            item.update(speaker=participant['display_name'], participant=participant)
         narrative.update(generation_kind=("chat_authored_l1" if document_input is not None else "chat_authored"),
                          source_kind="chat_tool", provenance_only=True)
         versions = {s["event_id"]: s["version_id"] for s in sources}
@@ -168,10 +175,9 @@ class ChatMemoryTool:
             narrative["event_time"]["source_ref"] = narrative["event_time"]["source_ref"].replace("conversation_turn:", "canonical_event:", 1)
         # This excerpt is a display aid; the private immutable snapshot remains
         # in the same candidate metadata for attribution and owner review.
-        excerpt = "\n".join(f"{s['role']}: {s['text']}" for s in sources)[-3000:]
-        excerpt = self.engine._daily_chat_memory_owner_text(excerpt).replace("<", "‹").replace(">", "›")
-        evidence_sources = [canonical_source(s, conversation_id=context["conversation_id"],
-                            profile_id=self.engine.memory_semantic_profile_id) for s in sources]
+        excerpt = "\n".join(f"{participants[s['event_id']]['display_name']}: {s['text']}" for s in sources)[-3000:]
+        excerpt = excerpt.replace("<", "‹").replace(">", "›")
+
         l1_semantic = None
         semantic = None
         if document_input is not None:
@@ -199,7 +205,7 @@ class ChatMemoryTool:
                 revisions, memory_id=memory_id, document=document_input, sources=evidence_sources,
                 generation=generation or {"prompt_revision": None, "model_route_revision": None,
                             "task_id": envelope["operation_id"], "actor": "chat_model"},
-                request_id=envelope["operation_id"], previous=None, catalog_context=catalog_context)
+                request_id=envelope["operation_id"], previous=None, catalog_context=catalog_context, config=self.engine.config)
             content, l1_semantic = split_document(prepared_document)
             title = str(prepared_document["narrative"]["title"])
         else:

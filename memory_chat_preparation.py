@@ -269,7 +269,9 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 envelope = claimed['envelope']
                 sources = [canonical_source(s, conversation_id=envelope['context']['conversation_id'],
                     profile_id=engine.memory_semantic_profile_id) for s in envelope['context']['sources']]
-                snapshots, bindings = bind_sources(sources)
+                snapshots, bindings = bind_sources(sources, config=engine.config)
+                for source, snapshot in zip(sources, snapshots):
+                    source['_participant_revision'] = snapshot['source_revision']
                 readers = engine._memory_l1_sources()
                 # Preserve the authenticated program snapshots first: the
                 # canonical reader resolves their exact upstream revisions
@@ -282,8 +284,8 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                         raise L1OwnerError('source_not_currently_readable', status=409, field_path='sources')
                 service = engine._memory_l1_revisions(bucket_mgr)
                 catalog, catalog_revision = service.catalog_provider()
-                from identity import model_identity
-                identity = model_identity(engine.config)
+                from memory_source_identity import source_model_identity
+                identity = source_model_identity(engine.config, sources)
                 payload = {'input_kind': 'chat_authored_draft', 'draft': envelope['arguments'], 'identity': identity,
                     'narrative_from_draft': True, 'catalog_revision': catalog_revision,
                     'sources': semantic_sources(snapshots, bindings, chat_view=True,
@@ -371,6 +373,9 @@ async def prepare_chat_tasks(engine, bucket_mgr):
                 # invalidate this task before it can create a proposal.
                 if tasks.get(memory_id)['revision'] != claimed['revision']:
                     raise L1OwnerError('submission_revision_conflict', status=409, field_path='revision')
+                # Rebinding after generation must not assign the old model
+                # interpretation to a newly configured participant.
+                bind_sources(sources, config=engine.config)
                 prepared_envelope = copy.deepcopy(envelope)
                 prepared_envelope['arguments'] = {**parsed, 'document': document}
                 proposal = ChatMemoryTool(engine, bucket_mgr)._proposal(prepared_envelope, generation=generation,

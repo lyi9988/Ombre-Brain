@@ -4427,8 +4427,7 @@ class ReflectionEngine(MemoryL1Runtime):
         prompt_context = None
         if self.memory_authority_enabled and self.memory_authority_store:
             l1_payload, l1_sources, l1_catalog_context = self._memory_l1_daily_context(window)
-            from identity import model_identity
-            payload['identity'] = model_identity(self.config)
+            payload['identity'] = l1_payload['identity']
             payload.pop('conversation_turns', None)
             payload["l1_contract"] = l1_payload
             prompt, prompt_context = self._memory_l1_prompt("ombre.daily_chat_memory_prompt",
