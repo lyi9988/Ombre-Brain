@@ -17351,6 +17351,37 @@ class GatewayService:
             selection_started = time.perf_counter()
             attempts: list[dict[str, Any]] = []
             result = None
+            # Opt-in scheduling only: do not reinterpret the owner's modes or
+            # turn every semantic query into two serial retrieval passes.
+            local_threshold = memory_use.option(self, "local_threshold")
+            local_first = bool(
+                memory_use.option(self, "local_first_enabled", False)
+                and sentinel_debug.get("hint_route") == "fast"
+                and memory_use.option(self, "mode", "inherit") != "fast_local"
+                and local_threshold is not None
+                and not natural_input.get("local_only")
+            )
+            local_first_debug = {"attempted": False, "selection_sufficient": False}
+            natural_input["local_first"] = local_first_debug
+
+            def local_selection_sufficient(completed):
+                # The ordinary selector already applied source checks, the
+                # owner's formula, and final admission. Require direct claims,
+                # not an alias alone or correction-background-only admission.
+                ids = natural_input.get("selected_buckets") or []
+                uses = natural_input.get("usage_by_bucket") or {}
+                scores = {row["bucket_id"]: (row.get("computation") or {}).get("score")
+                          for row in completed[-1].get("configured_computation", {}).get("candidate_scores", [])}
+                return bool(completed[0] and ids and all(
+                    isinstance(scores.get(bid), (int, float))
+                    and not isinstance(scores[bid], bool)
+                    and scores[bid] >= local_threshold
+                    and
+                    uses.get(bid, {}).get("state") == "l1"
+                    and (uses[bid].get("statement_selection") or {}).get("direct_ids")
+                    and not uses[bid].get("correction_statement_ids")
+                    for bid in ids
+                ))
 
             def capture_attempt(phase: str, status: str, started: float, completed=None) -> None:
                 attempt_debug = completed[-1] if completed is not None else natural_input.get("_selection_debug", {})
@@ -17376,10 +17407,48 @@ class GatewayService:
             try:
                 initial_started = time.perf_counter()
                 try:
-                    result = await asyncio.wait_for(selector(query, *args, **kwargs),
-                                                    timeout=getattr(self, "recall_timeout_seconds", 15.0))
+                    active_phase = "local" if local_first else "initial"
+                    if local_first:
+                        local_first_debug["attempted"] = True
+                        previous_local_only = natural_input.get("local_only")
+                        had_local_only = "local_only" in natural_input
+                        local_options = dict(kwargs)
+                        local_options.update(allow_semantic=False, allow_query_planner=False, allow_rerank=False)
+                        natural_input["local_only"] = True
+                        try:
+                            local_result = await asyncio.wait_for(
+                                selector(query, *args, **local_options),
+                                timeout=max(0, natural_input["_deadline"] - time.monotonic()),
+                            )
+                        finally:
+                            if had_local_only:
+                                natural_input["local_only"] = previous_local_only
+                            else:
+                                natural_input.pop("local_only", None)
+                        capture_attempt("local", "completed", initial_started, local_result)
+                        if local_selection_sufficient(local_result):
+                            result = local_result
+                            local_first_debug.update(selection_sufficient=True, reason="qualified_local_selection")
+                        else:
+                            local_first_debug["reason"] = "local_selection_insufficient"
+                            # prepare/selector may have copied execution flags into
+                            # this same request. Restore explicit caller choices.
+                            for key in ("allow_semantic", "allow_query_planner", "allow_rerank"):
+                                if key in kwargs:
+                                    natural_input[key] = kwargs[key]
+                                else:
+                                    natural_input.pop(key, None)
+                            initial_started = time.perf_counter()
+                            active_phase = "initial"
+                            result = await asyncio.wait_for(
+                                selector(query, *args, **kwargs),
+                                timeout=max(0, natural_input["_deadline"] - time.monotonic()),
+                            )
+                    else:
+                        result = await asyncio.wait_for(selector(query, *args, **kwargs),
+                                                        timeout=getattr(self, "recall_timeout_seconds", 15.0))
                 except asyncio.TimeoutError:
-                    capture_attempt("initial", "timeout", initial_started)
+                    capture_attempt(active_phase, "timeout", initial_started)
                     natural_input.setdefault("incomplete_reasons", []).append("recall_total_timeout")
                     options = dict(kwargs)
                     options.update(allow_semantic=False, allow_query_planner=False, allow_rerank=False)
@@ -17388,12 +17457,14 @@ class GatewayService:
                     result = await selector(query, *args, **options)
                     capture_attempt("timeout_fallback", "completed", fallback_started, result)
                 else:
-                    capture_attempt("initial", "completed", initial_started, result)
+                    if not local_first_debug["selection_sufficient"]:
+                        capture_attempt("initial", "completed", initial_started, result)
                 debug = result[-1]
+                debug["local_first"] = dict(local_first_debug)
                 debug["selection_attempts"] = attempts
                 debug["candidate_stages"] = []
                 for attempt in attempts:
-                    prefix = "initial." if len(attempts) > 1 and attempt["phase"] == "initial" else ""
+                    prefix = attempt["phase"] + "." if len(attempts) > 1 and attempt is not attempts[-1] else ""
                     debug.setdefault("timing_ms", {}).update({
                         prefix + name: elapsed for name, elapsed in attempt["timing_ms"].items()
                     })

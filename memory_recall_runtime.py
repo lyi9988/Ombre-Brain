@@ -140,7 +140,7 @@ def score_pool(service, request, query, pool, *, after_rerank=False):
     return pool
 
 
-async def verify_sources(service, request, query, items):
+async def verify_sources(service, request, query, items, *, refresh=False):
     """No provider model calls; exact current L0 readers remain on Brain."""
     records = request.get("_semantic_records", {})
     wanted, bindings_by_bucket = [], {}
@@ -161,6 +161,11 @@ async def verify_sources(service, request, query, items):
     validation = (frozen.setdefault("source_validation", {})
                   if frozen and frozen.get("service") == id(service) else request)
     checked = validation.setdefault("_checked_sources", {})
+    if refresh:
+        # Selection may have awaited semantic/rerank work since this cache was
+        # filled. Revalidate the final batch, including when L2 is not ready.
+        for item in wanted:
+            checked.pop((item["memory_id"], item["revision"]), None)
     wanted = [item for item in wanted if (item["memory_id"], item["revision"]) not in checked]
     if wanted and not validation.get("_source_check_cancelled"):
         base = os.environ.get("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://ombre-brain:8000").rstrip("/")
@@ -226,10 +231,18 @@ async def verify_sources(service, request, query, items):
         selection = match_statements(record["document"], {**use_context,
             "memory_id": record.get("memory_id"), "revision": record.get("revision")})
         eligible_ids = {use["statement_id"] for use in usage["items"] if use["usage"] != "excluded"}
+        # Keep the declared dependency before eligibility filtering: losing a
+        # necessary condition is not permission to present the positive claim.
+        selection["required_support_ids"] = list(selection["support_ids"])
+        selection["missing_support_ids"] = [sid for sid in selection["support_ids"] if sid not in eligible_ids]
         for key in ("direct_ids", "support_ids"):
             selection[key] = [sid for sid in selection[key] if sid in eligible_ids]
         item["_statement_selection"] = selection
         usage["statement_selection"] = selection
+        if selection["missing_support_ids"]:
+            item["admission_reason"] = "required_statement_support_not_eligible"
+            usage.update(state="excluded", narrative_allowed=False)
+            continue
         explicit = {use["statement_id"] for use in usage["items"]
                     if use.get("source_state") == "available"
                     and known((use.get("classification") or {}).get("basis")) in {"direct_expression", "record"}}
@@ -237,7 +250,7 @@ async def verify_sources(service, request, query, items):
         usage["correction_statement_ids"] = corrections
         item["correction_statement_ids"] = corrections
         item["matched_correction_background"] = bool(corrections and settings["recall"].get("include_correction_background", True))
-    return result
+    return [item for item in result if usage_by_bucket[str(item["bucket"]["id"])]["state"] != "excluded"]
 
 
 def usage_lines(usage):
@@ -290,6 +303,8 @@ def render(service, usage, header, original, budget, *, trace=None):
         usage = {**usage, "items": [item for item in usage.get("items", []) if item["statement_id"] in refs]}
     required = set(usage.get("correction_statement_ids") or [])
     required.update(selection.get("support_ids") or [])
+    if usage.get("scope_to_query", True):
+        required.update(selection.get("direct_ids") or [])
     if required:
         usage = {**usage, "items": sorted(usage.get("items", []), key=lambda item: item["statement_id"] not in required)}
         by_id = {item["statement_id"]: item for item in usage["items"]}
@@ -349,6 +364,7 @@ def render_presentation(service, usage, header, presentation, budget):
     unit_ids = [unit["unit_id"] for unit in units]
     required = set(usage.get("correction_statement_ids") or [])
     required.update((usage.get("statement_selection") or {}).get("support_ids") or [])
+    required.update((usage.get("statement_selection") or {}).get("direct_ids") or [])
     coverage = presentation.get("coverage")
     if coverage is not None and not required <= set(coverage.get("used_statement_ids") or []):
         return "", "required_l2_context_missing", [], False
@@ -642,7 +658,7 @@ async def project_sections(service, request, query, buckets, sections):
         if callable(reader):
             request["_semantic_records"].update(reader([b["id"] for b in valid]))
     candidates = [{"bucket": bucket, "score": 0.0} for bucket in valid]
-    permitted = await verify_sources(service, request, query, candidates)
+    permitted = await verify_sources(service, request, query, candidates, refresh=True)
     allowed = {str(item["bucket"]["id"]) for item in permitted}
     uses = request.get("usage_by_bucket", {})
     for bid in requested - allowed:
@@ -765,6 +781,12 @@ async def project_sections(service, request, query, buckets, sections):
                         else:
                             row["source"] = "none"
                             row["render_reason"] = render_reason
+                elif row.get("fallback_reason") == "source_dependency_changed":
+                    # Brain has fresher source evidence than the request-local
+                    # selection cache. Never revive the rejected source via L1.
+                    text = ""
+                    row["source"] = "none"
+                    row["render_reason"] = "source_dependency_changed"
                 else:
                     text = render(service, {**uses[bid], "scope_to_query": key != "targeted"}, header,
                                   original, remaining, trace=row)

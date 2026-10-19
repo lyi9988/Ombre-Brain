@@ -297,11 +297,11 @@ def _recall_input(query="现在住在哪里？"):
     }
 
 
-def _authority_fixture(tmp_path, rows):
+def _authority_fixture(tmp_path, rows, **l1_options):
     authority = MemoryAuthorityStore({"state_dir": str(tmp_path)})
     records, buckets = {}, []
     for bucket_id, body in rows:
-        record = _commit_l1(authority, bucket_id, body)
+        record = _commit_l1(authority, bucket_id, body, **l1_options)
         records[bucket_id] = record
         buckets.append({"id": bucket_id, "content": body, "metadata": {"name": bucket_id}})
     view = MemoryAuthorityRecallView({
@@ -696,6 +696,9 @@ def test_l2_is_kept_as_a_whole_unit_when_it_exceeds_the_remaining_budget(tmp_pat
 def test_large_l2_selects_complete_units_that_fit_the_existing_budget(tmp_path, monkeypatch):
     _authority, view, _records, buckets = _authority_fixture(
         tmp_path, [("bucket-l2-units", "L1 fallback must not replace a fitting L2 unit.")],
+        # The omitted historical unit is unrelated. Old/current addresses both
+        # match this query and cannot demonstrate an optional, droppable unit.
+        old="那时我喜欢咖啡的味道。",
     )
     current_unit = (
         "Complete current unit: the arrangement applies only under its stated condition, "
