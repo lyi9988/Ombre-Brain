@@ -116,6 +116,7 @@ def assess_capacity(payload: dict, contract: dict | None = None, *,
         "version": 1, "stage": stage, "model": model,
         "context_window": capacity, "reserved_output_tokens": reserve,
         "calculation_method": "json_utf8_upper_estimate_v1",
+        "measurement": "conservative_estimate", "provider_usage_verified": False,
         "capacity_source": contract.get("capacity_source") or "unavailable",
         "registry_revision": contract.get("registry_revision"),
         "has_attachment_text": bool(attachments),
@@ -178,7 +179,7 @@ def error_body(report: dict) -> dict:
             "type": "context_capacity_error", "code": report.get("code"),
             "message": ("附件全文请求的容量尚无法核实，未发送模型。原文件与正文保持完整。"
                         if unknown else
-                        "最终请求加输出预留超过已配置的上下文容量，未发送模型，正文未裁剪、预算未降低。"),
+                        "完整请求加输出预留的保守估算超过已配置容量，未发送模型，正文未裁剪、预算未降低。"),
         },
         "context_capacity": report,
         "available_actions": (["核实实际路由的上下文容量与输出预留", "取消本轮附件全文采用后继续纯聊天"]
