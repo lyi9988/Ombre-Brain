@@ -260,7 +260,8 @@ class MemoryL2Service:
     async def resolve(self, payload):
         self.request(payload, {'items'})
         if not isinstance(payload['items'], list): raise L1OwnerError('array_required', field_path='items')
-        results = []
+        results, pending = [], []
+        reads = None
         for item in payload['items']:
             self.request(item, {'memory_id', 'revision', 'statement_ids', 'allowed_uses', 'narrative_allowed'},
                          {'statement_uses', 'matched_statement_ids', 'support_statement_ids'})
@@ -281,7 +282,8 @@ class MemoryL2Service:
                 result.update(state=status['state'], reason=status['reason'])
                 product = status['presentation']
                 if status['state'] == 'ready' and product['first_pass_revision'] == item['revision']:
-                    reads = MemoryL1Reads(self.revisions, self.engine._memory_l1_sources())
+                    if reads is None:
+                        reads = MemoryL1Reads(self.revisions, self.engine._memory_l1_sources())
                     doc = product['document']
                     statement_uses = item.get('statement_uses', {})
                     allowed = {ref for ref in item['statement_ids'] if statement_uses.get(ref) in item['allowed_uses']}
@@ -325,29 +327,22 @@ class MemoryL2Service:
                         statement_ids=None if full else used_refs)
                     if dependencies - {b['binding_id'] for b in bindings}:
                         raise L1OwnerError('l2_source_dependency_missing', status=409)
-                    source_status = await reads.recall_source_status([{'memory_id': item['memory_id'], 'revision': item['revision'],
-                        'binding_ids': [b['binding_id'] for b in bindings if b['binding_id'] in dependencies]}])
-                    checked = source_status['items'][0]
-                    if checked['state'] != 'ok' or any(not s.get('eligible_source') for s in checked['sources'].values()):
-                        result.update(state='stale', reason='source_dependency_changed')
-                    else:
-                        result['units'] = [{'unit_id':v.get('variant_id', v.get('section_id')), 'text':v['text'],
-                                            'statement_refs':v['statement_refs']} for v in units]
-                        if full:
-                            text = doc['full_injection_text']
-                        else:
-                            text = '\n\n'.join(dict.fromkeys(v['text'] for v in units))
-                        result.update(text=text, presentation_revision=product['presentation_revision'], reason='' if text else 'no_compatible_l2_unit')
-                        result['coverage'] = {'matched_statement_ids': sorted(matched),
+                    text = doc['full_injection_text'] if full else '\n\n'.join(dict.fromkeys(v['text'] for v in units))
+                    pending.append({
+                        'result': result, 'memory_id': item['memory_id'],
+                        'presentation_revision': product['presentation_revision'],
+                        'source_request': {'memory_id': item['memory_id'], 'revision': item['revision'],
+                            'binding_ids': [b['binding_id'] for b in bindings if b['binding_id'] in dependencies]},
+                        'text': text,
+                        'units': [{'unit_id':v.get('variant_id', v.get('section_id')), 'text':v['text'],
+                                   'statement_refs':v['statement_refs']} for v in units],
+                        'coverage': {'matched_statement_ids': sorted(matched),
                             'support_statement_ids': sorted(used_refs - matched),
                             'used_statement_ids': sorted(used_refs),
                             'uncovered_matched_statement_ids': sorted(matched - used_refs),
                             'uncovered_support_statement_ids': sorted(support - used_refs),
-                            'source_binding_ids': sorted(dependencies), 'full_narrative': full}
-                        # Dependency may change while source IO is in flight.
-                        latest = self.detail(item['memory_id'])['l2']
-                        if latest['state'] != 'ready' or latest['current_presentation_revision'] != product['presentation_revision']:
-                            result.update(state='stale', text='', units=[], reason='dependency_changed')
+                            'source_binding_ids': sorted(dependencies), 'full_narrative': full},
+                    })
                 elif status['state'] == 'ready':
                     result.update(state='stale', reason='l1_revision_mismatch')
             except MemoryNotFound:
@@ -355,6 +350,36 @@ class MemoryL2Service:
             except (L1OwnerError, L1ContractError) as exc:
                 result.update(state='stale', text='', units=[], reason=exc.code)
             results.append(result)
+        if pending:
+            # One request-scoped batch shares the source reader's existing
+            # bounded concurrency and binding deduplication across memories.
+            try:
+                source_status = await reads.recall_source_status([row['source_request'] for row in pending])
+            except MemoryNotFound:
+                for row in pending:
+                    row['result'].update(state='not_prepared', reason='memory_not_found')
+            except (L1OwnerError, L1ContractError) as exc:
+                for row in pending:
+                    row['result'].update(state='stale', text='', units=[], reason=exc.code)
+            else:
+                for index, row in enumerate(pending):
+                    checked = source_status['items'][index]
+                    result = row['result']
+                    if checked['state'] != 'ok' or any(not s.get('eligible_source') for s in checked['sources'].values()):
+                        result.update(state='stale', reason='source_dependency_changed')
+                        continue
+                    try:
+                        result.update(text=row['text'], units=row['units'], coverage=row['coverage'],
+                            presentation_revision=row['presentation_revision'],
+                            reason='' if row['text'] else 'no_compatible_l2_unit')
+                        # Dependency may change while source IO is in flight.
+                        latest = self.detail(row['memory_id'])['l2']
+                        if latest['state'] != 'ready' or latest['current_presentation_revision'] != row['presentation_revision']:
+                            result.update(state='stale', text='', units=[], reason='dependency_changed')
+                    except MemoryNotFound:
+                        result.update(state='not_prepared', text='', units=[], reason='memory_not_found')
+                    except (L1OwnerError, L1ContractError) as exc:
+                        result.update(state='stale', text='', units=[], reason=exc.code)
         return {'status': 'ok', 'items': results}
 
     async def run_once(self, limit):
