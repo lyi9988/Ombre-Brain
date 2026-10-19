@@ -83,6 +83,9 @@ def test_real_selector_source_and_l2_chain_records_timing_and_http_counts(tmp_pa
         assert stats["sources"]["calls"] == source_http
         assert stats["l2_resolve"]["calls"] == resolver_http == 1
         assert stats["sources"]["duration_ms"] >= 0
+        assert stats["final_source_recheck"]["passes"] == 1
+        assert 0 <= stats["final_source_recheck"]["calls"] <= source_http
+        assert stats["final_source_recheck"]["duration_ms"] >= 0
         assert stats["l2_resolve"]["duration_ms"] >= 0
         assert stats["projection_ms"] >= 0
         assert stats["remaining_ms"] >= 0
