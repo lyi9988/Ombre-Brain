@@ -5426,15 +5426,12 @@ class GatewayService:
         recall_status = memory_recall_projection.get("recall_status", {})
         # Only refs that survive actual compilation/budgets are injection
         # evidence. Do not mark discarded selected cards as recently shown.
-        selected_for_recall = set(memory_recall_projection.get("selected_bucket_ids") or [])
         natural_input.setdefault("projection_status", {}).update(
             actual_injected_count=recall_status.get("injected_count", 0),
             measured_after_compile=True,
         )
-        if injected_ids is not None:
-            actually_injected = set(memory_recall_projection.get("injected_bucket_ids") or [])
-            injected_ids = [bid for bid in injected_ids if bid not in selected_for_recall or bid in actually_injected]
-            injected_ids = list(dict.fromkeys(injected_ids + list(memory_recall_projection.get("injected_bucket_ids") or [])))
+        injected_ids = self._actual_recall_ids(injected_ids, memory_recall_projection,
+            retired_ids=(natural_input.get("projection_recovery") or {}).get("rejected_bucket_ids") or [])
         self._apply_prompt_cache_hints(forward_payload, session_id)
         forward_payload["stream"] = payload.get("stream") is True
         mark_step("finalize_forward_payload", stage_started_at)
@@ -17372,6 +17369,15 @@ class GatewayService:
             return combined, debug
         debug["reason"] = "no_recent_user_context"
         return query, debug
+
+    @staticmethod
+    def _actual_recall_ids(injected_ids, projection, *, retired_ids=()):
+        """Only compiled recall may be marked shown, including replaced cards."""
+        if injected_ids is None:
+            return None
+        shown = list(projection.get("injected_bucket_ids") or [])
+        candidates = set(projection.get("selected_bucket_ids") or []) | set(retired_ids)
+        return list(dict.fromkeys([bid for bid in injected_ids if bid not in candidates or bid in shown] + shown))
 
     async def _project_recall_with_recovery(self, request, query, buckets, sections):
         """Only a lost local shortcut can justify one remaining-budget search.
