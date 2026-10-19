@@ -4339,6 +4339,7 @@ class GatewayService:
             "effective_config_revision": effective_config.get("revision"),
             "effective_config_sha256": effective_config.get("sha256"),
             "memory_configuration_revision": (REQUEST_CONFIGURATION.get() or {}).get("revision"),
+            "memory_authority_stamp": memory_use.authority_stamp(self),
             "recall_signal_transport": trace_context.get("recall_signals"),
             "prompt_preset_id": prompt_preset_id,
             "prompt_preset_revision": prompt_preset_revision,
@@ -4402,6 +4403,7 @@ class GatewayService:
         injected_ids: list[str] | None,
         debug_payload: dict[str, Any] | None,
         composed_messages: list[dict] | None = None,
+        memory_guard: dict | None = None,
     ) -> None:
         ttl = max(
             0.0,
@@ -4443,6 +4445,7 @@ class GatewayService:
             "composed_messages": deepcopy(composed_messages),
             "injected_ids": list(injected_ids or []),
             "debug_payload": deepcopy(debug_payload) if debug_payload is not None else None,
+            "memory_guard": deepcopy(memory_guard),
         }
         max_entries = max(
             8,
@@ -4686,6 +4689,7 @@ class GatewayService:
                                        "injected_count": 0, "incomplete_reasons": []}}
             return (dict(payload), None, debug) if include_debug else (dict(payload), None)
 
+        recall_budget_request = {}
         snapshot_meta = self._prepare_snapshot_identity(
             payload,
             session_id,
@@ -4699,8 +4703,9 @@ class GatewayService:
         if snapshot_meta is not None:
             snapshot_key = str(snapshot_meta.get("key_hash") or "")
             snapshot_entry = self._prepare_snapshot_get(snapshot_key)
-            if snapshot_entry is not None:
-                replay_started_at = time.perf_counter()
+            replay_started_at = time.perf_counter()
+            if snapshot_entry is not None and await memory_use.snapshot_sources_current(
+                    self, snapshot_entry, recall_budget_request):
                 replay = self._prepare_snapshot_replay(
                     snapshot_entry,
                     snapshot_meta,
@@ -4711,6 +4716,8 @@ class GatewayService:
                 )
                 if replay is not None:
                     replay_debug = replay[2] if len(replay) > 2 else {}
+                    if isinstance(replay_debug.get("prepare_timing_debug"), dict):
+                        replay_debug["prepare_timing_debug"]["recall_io"] = recall_budget_request.get("recall_io", {})
                     logger.info(
                         "Gateway prepare snapshot hit | session=%s model=%s "
                         "continuation=%s key_hash=%s duration_ms=%s",
@@ -4742,6 +4749,10 @@ class GatewayService:
             recent_turns=getattr(self, "recall_recent_turns", 4),
             trace_context=payload.get("_ombre_trace_context") or {},
         )
+        if "_deadline" in recall_budget_request:
+            natural_input["_deadline"] = recall_budget_request["_deadline"]
+        natural_input["recall_io"] = recall_budget_request.get("recall_io", {})
+        natural_input.setdefault("incomplete_reasons", []).extend(recall_budget_request.get("incomplete_reasons") or [])
         state_transport = (payload.get("_ombre_trace_context") or {}).get("recall_signals") or {}
         natural_input["_signal_snapshots"] = deepcopy(state_transport.get("snapshots") or [])
         natural_input["_signal_transport"] = {key: state_transport[key] for key in ("state", "reason") if key in state_transport}
@@ -5291,7 +5302,7 @@ class GatewayService:
         prompt_composer_debug = {"status": "legacy_default"}
         if recalled_memory or targeted_memory_detail or related_memory or recent_context:
             use_request = natural_input if isinstance(natural_input, dict) else {}
-            use_sections = await memory_use.project_sections(self, use_request, recall_query, all_buckets, {
+            use_sections = await self._project_recall_with_recovery(use_request, recall_query, all_buckets, {
                 "direct": (recalled_memory, [str(m.get("bucket_id") or "") for m in recalled_moments], self.recalled_budget),
                 "targeted": (targeted_memory_detail, targeted_memory_detail_debug.get("accepted_ids", []), self.memory_detail_recall_budget),
                 "diffused": (related_memory, [], self.related_memory_budget),
@@ -5301,6 +5312,17 @@ class GatewayService:
             targeted_memory_detail = use_sections.get("targeted", "")
             related_memory = use_sections.get("diffused", "")
             recent_context = use_sections.get("recent", "")
+            recovery = natural_input.get("projection_recovery") or {}
+            if recovery.get("attempted"):
+                for name, elapsed in recovery.get("selection_timing_ms", {}).items():
+                    query_planner_debug.setdefault("timing_ms", {})["projection_recovery." + name] = elapsed
+                for original_stage in recovery.get("candidate_stages", []):
+                    stage = deepcopy(original_stage)
+                    stage["attempt_phase"] = "projection_recovery"
+                    if stage.get("timing_key"):
+                        stage["timing_key"] = "projection_recovery." + stage["timing_key"]
+                    query_planner_debug.setdefault("candidate_stages", []).append(stage)
+                query_planner_debug["final_bucket_ids"] = list(natural_input.get("selected_buckets") or [])
         memory_recall_projection = self._build_memory_recall_projection(
             recalled_memory=recalled_memory,
             targeted_memory_detail=targeted_memory_detail,
@@ -5405,6 +5427,10 @@ class GatewayService:
         # Only refs that survive actual compilation/budgets are injection
         # evidence. Do not mark discarded selected cards as recently shown.
         selected_for_recall = set(memory_recall_projection.get("selected_bucket_ids") or [])
+        natural_input.setdefault("projection_status", {}).update(
+            actual_injected_count=recall_status.get("injected_count", 0),
+            measured_after_compile=True,
+        )
         if injected_ids is not None:
             actually_injected = set(memory_recall_projection.get("injected_bucket_ids") or [])
             injected_ids = [bid for bid in injected_ids if bid not in selected_for_recall or bid in actually_injected]
@@ -5435,6 +5461,9 @@ class GatewayService:
             "recall_selection_attempts": query_planner_debug.get("selection_attempts", []),
             "recall_selection_total_ms": query_planner_debug.get("selection_total_ms"),
             "recall_selection_cleanup_ms": query_planner_debug.get("selection_cleanup_ms"),
+            "recall_io": natural_input.get("recall_io", {}),
+            "memory_projection": natural_input.get("projection_status", {}),
+            "projection_recovery": natural_input.get("projection_recovery", {}),
             "query_chars": len(current_user_query),
             "message_count": len(messages),
             "bucket_count": len(all_buckets),
@@ -5584,6 +5613,10 @@ class GatewayService:
                     injected_ids=injected_ids,
                     debug_payload=debug_payload,
                     composed_messages=composed_messages,
+                    memory_guard=memory_use.snapshot_guard(self, natural_input, complete=not (
+                        core_memory or portrait_memory or relationship_weather or favorite_memory or date_recall
+                        or date_persona_trace or dream_context
+                        or (natural_input.get("cognition_chain") or {}).get("rendered_versions"))),
                 )
             log_prepare_timing()
             return forward_payload, injected_ids, debug_payload
@@ -5598,6 +5631,10 @@ class GatewayService:
                 injected_ids=injected_ids,
                 debug_payload=None,
                 composed_messages=composed_messages,
+                memory_guard=memory_use.snapshot_guard(self, natural_input, complete=not (
+                    core_memory or portrait_memory or relationship_weather or favorite_memory or date_recall
+                    or date_persona_trace or dream_context
+                    or (natural_input.get("cognition_chain") or {}).get("rendered_versions"))),
             )
         return forward_payload, injected_ids
 
@@ -17336,6 +17373,108 @@ class GatewayService:
         debug["reason"] = "no_recent_user_context"
         return query, debug
 
+    async def _project_recall_with_recovery(self, request, query, buckets, sections):
+        """Only a lost local shortcut can justify one remaining-budget search.
+
+        Owner-disabled output and budgets never trigger deeper retrieval. A
+        completed semantic search is not repeated just because its results are
+        empty, and a candidate score is never an answer-completeness verdict.
+        """
+        rendered = await memory_use.project_sections(self, request, query, buckets, sections)
+        status = request.get("projection_status") or {}
+        recovery = request.setdefault("projection_recovery", {"attempted": False})
+        if any(rendered.values()):
+            recovery["reason"] = "content_adopted"
+            return rendered
+        if status.get("reason"):
+            recovery["reason"] = status["reason"]
+            return rendered
+        if {"l0_source_verification_unavailable", "final_source_deadline", "source_deadline"} & set(
+                request.get("incomplete_reasons") or []):
+            recovery["reason"] = "source_verification_unavailable"
+            return rendered
+        local = request.get("local_first") or {}
+        spec = request.get("_selection_spec")
+        if not local.get("selection_sufficient") or not spec:
+            recovery["reason"] = "no_unsearched_semantic_phase"
+            return rendered
+        reasons = {str(row.get("fallback_reason") or row.get("render_reason") or "")
+                   for row in request.get("presentation_trace") or []}
+        unavailable = any(reason.startswith(("l0_", "l1_", "source_", "dependency_", "required_statement_support"))
+                          for reason in reasons)
+        if not unavailable:
+            recovery["reason"] = "projection_budget_or_readability"
+            return rendered
+        if memory_use.remaining(self, request) <= 0:
+            recovery["reason"] = "deadline_exhausted"
+            return rendered
+        selector, args, options = spec
+        if (request.get("composer_recall_enabled") is False
+                or memory_use.option(self, "mode", "inherit") == "fast_local"
+                or options.get("allow_semantic") is False):
+            recovery["reason"] = "execution_policy_disabled"
+            return rendered
+        recovery.update(attempted=True, reason="local_candidates_became_unavailable",
+                        rejected_bucket_ids=[row["bucket_id"] for row in request.get("presentation_trace") or []],
+                        initial_selected_bucket_ids=list(request.get("selected_buckets") or []))
+        started = time.perf_counter()
+        had_local = "local_only" in request
+        previous_local = request.get("local_only")
+        request["local_only"] = False
+        for key in ("allow_semantic", "allow_query_planner", "allow_rerank"):
+            if key in options:
+                request[key] = options[key]
+            else:
+                request.pop(key, None)
+        try:
+            result = await asyncio.wait_for(selector(query, *args, **options),
+                                            timeout=memory_use.remaining(self, request))
+            recovery["selection_timing_ms"] = dict(result[-1].get("timing_ms") or {})
+            recovery["candidate_stages"] = deepcopy(result[-1].get("candidate_stages") or [])
+            recovery["candidate_scores"] = [
+                {"bucket_id": row["bucket_id"], "score": (row.get("computation") or {}).get("score"),
+                 "selected": row.get("selected"), "admission_reason": row.get("admission_reason")}
+                for row in (result[-1].get("configured_computation") or {}).get("candidate_scores", [])]
+            ids = list(dict.fromkeys(str(item.get("bucket_id") or item.get("id") or "")
+                                     for item in result[0]))
+            ids = [bid for bid in ids if bid]
+            recovery["selected_bucket_ids"] = ids
+            if not ids:
+                recovery["reason"] = "no_qualified_replacement"
+                return rendered
+            # Projection reads current canonical bodies; this carrier supplies
+            # references only and cannot resurrect the previous raw prose.
+            target = next((key for key in ("direct", "diffused")
+                           if sections.get(key, ("", [], 0))[2] > 0), None)
+            if target is None:
+                recovery["reason"] = "section_budget_zero"
+                return rendered
+            replacement = {key: ("", [], budget) for key, (_body, _refs, budget) in sections.items()}
+            replacement[target] = ("\n".join(f"[bucket_id:{bid}]" for bid in ids), ids, sections[target][2])
+            rendered = await memory_use.project_sections(self, request, query, buckets, replacement)
+            recovery["projected_bucket_ids"] = list(request.get("injected_usage_bucket_ids") or [])
+            recovery["reason"] = "replacement_projected" if any(rendered.values()) else "replacement_projection_empty"
+            return rendered
+        except asyncio.TimeoutError:
+            request.setdefault("incomplete_reasons", []).append("projection_recovery_deadline")
+            request["selected_buckets"] = []
+            recovery["selected_bucket_ids"] = []
+            recovery["reason"] = "deadline_exhausted"
+            return rendered
+        finally:
+            if had_local:
+                request["local_only"] = previous_local
+            else:
+                request.pop("local_only", None)
+            for task in request.get("_tasks", []):
+                if not task.done():
+                    task.cancel()
+            if request.get("_tasks"):
+                await asyncio.gather(*request["_tasks"], return_exceptions=True)
+            request.pop("_selection_debug", None)
+            request.pop("_completed_candidate_pool", None)
+            recovery["duration_ms"] = max(0, int((time.perf_counter() - started) * 1000))
+
     async def _select_recall_with_fallback(
         self, selector, query: str, *args,
         sentinel_debug: dict[str, Any], **kwargs,
@@ -17348,6 +17487,7 @@ class GatewayService:
         """
         natural_input = kwargs.get("natural_input")
         if natural_input is not None:
+            natural_input["_selection_spec"] = (selector, args, dict(kwargs))
             selection_started = time.perf_counter()
             attempts: list[dict[str, Any]] = []
             result = None
@@ -17368,6 +17508,16 @@ class GatewayService:
                 # The ordinary selector already applied source checks, the
                 # owner's formula, and final admission. Require direct claims,
                 # not an alias alone or correction-background-only admission.
+                current = str(natural_input.get("q_current") or query)
+                questions = re.findall(r"什么|哪|几时|多久|怎么|为何|为什么|是否|[多几]少|几[点天号月]|\b(?:what|when|why|where|which|how|whether)\b",
+                                       current, re.IGNORECASE)
+                multi_part = (len(re.findall(r"[?？]", current)) > 1
+                              or (len(questions) > 1 and bool(re.search(r"[,，;；。]", current)))
+                              or bool(re.search(r"分别|以及|另外|还有.{0,40}[?？]", current))
+                              or len([line for line in current.splitlines() if line.strip()]) > 1)
+                local_first_debug["query_coverage"] = "multiple_parts_unverified" if multi_part else "candidate_evidence_only"
+                if multi_part:
+                    return False
                 ids = natural_input.get("selected_buckets") or []
                 uses = natural_input.get("usage_by_bucket") or {}
                 scores = {row["bucket_id"]: (row.get("computation") or {}).get("score")
@@ -17403,7 +17553,7 @@ class GatewayService:
 
             natural_input.pop("_selection_debug", None)
             natural_input.pop("_completed_candidate_pool", None)
-            natural_input["_deadline"] = time.monotonic() + getattr(self, "recall_timeout_seconds", 15.0)
+            memory_use.deadline(self, natural_input)
             try:
                 initial_started = time.perf_counter()
                 try:
@@ -17446,7 +17596,7 @@ class GatewayService:
                             )
                     else:
                         result = await asyncio.wait_for(selector(query, *args, **kwargs),
-                                                        timeout=getattr(self, "recall_timeout_seconds", 15.0))
+                                                        timeout=memory_use.remaining(self, natural_input))
                 except asyncio.TimeoutError:
                     capture_attempt(active_phase, "timeout", initial_started)
                     natural_input.setdefault("incomplete_reasons", []).append("recall_total_timeout")
@@ -17454,8 +17604,23 @@ class GatewayService:
                     options.update(allow_semantic=False, allow_query_planner=False, allow_rerank=False)
                     natural_input["local_only"] = True
                     fallback_started = time.perf_counter()
-                    result = await selector(query, *args, **options)
-                    capture_attempt("timeout_fallback", "completed", fallback_started, result)
+                    # Never give a fallback a second full budget. If the
+                    # shared deadline is exhausted, final qualification cannot
+                    # safely adopt a cached source observation either.
+                    if memory_use.remaining(self, natural_input) > 0:
+                        try:
+                            result = await asyncio.wait_for(selector(query, *args, **options),
+                                timeout=memory_use.remaining(self, natural_input))
+                        except asyncio.TimeoutError:
+                            result = None
+                    if result is None:
+                        empty_debug = {"triggered": False, "final_bucket_ids": [], "candidate_stages": []}
+                        result = (([], [], [], [], empty_debug) if "all_moments" in kwargs
+                                  else ([], [], empty_debug))
+                        natural_input["selected_buckets"] = []
+                        capture_attempt("timeout_fallback", "deadline_exhausted", fallback_started, result)
+                    else:
+                        capture_attempt("timeout_fallback", "completed", fallback_started, result)
                 else:
                     if not local_first_debug["selection_sufficient"]:
                         capture_attempt("initial", "completed", initial_started, result)
@@ -23766,6 +23931,9 @@ class GatewayService:
             *self._extract_bucket_ids_from_context(recalled_memory),
             *((natural_input or {}).get("requested_usage_bucket_ids") or []),
         ]))
+        if ((natural_input or {}).get("projection_recovery") or {}).get("attempted"):
+            selected_bucket_ids = list(dict.fromkeys(
+                (natural_input or {}).get("selected_buckets") or []))
         ring_ids = list(dict.fromkeys(
             str(
                 moment.get("ring_id")

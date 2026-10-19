@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
+import time
 
 import httpx
 
@@ -13,6 +15,141 @@ from memory_recall_semantics import (apply_relations, known, lexical_features, r
 from memory_system_config import REQUEST_CONFIGURATION, values_from_config
 from memory_affinity import resolve_signals
 from memory_query_evidence import query_purpose, match_statements, correction_matches, semantic_source_refs
+
+
+def deadline(service, request):
+    """One owner-configured recall budget, including final source/L2 IO."""
+    if "_deadline" not in request:
+        request["_deadline"] = time.monotonic() + getattr(service, "recall_timeout_seconds", 15.0)
+    return request["_deadline"]
+
+
+def remaining(service, request):
+    return max(0.0, deadline(service, request) - time.monotonic())
+
+
+def authority_stamp(service):
+    reader = getattr(getattr(service, "memory_authority_view", None), "_file_stamp", None)
+    try:
+        return reader() if callable(reader) else None
+    except OSError:
+        return None
+
+
+async def snapshot_sources_current(service, entry, request):
+    """Cached prose cannot outlive the source qualification that produced it."""
+    guard = entry.get("memory_guard")
+    view = getattr(service, "memory_authority_view", None)
+    if not guard:
+        return not getattr(view, "enabled", False)
+    if not guard["complete"]:
+        return False
+    stamp = authority_stamp(service)
+    if getattr(view, "enabled", False) and (stamp is None or stamp != guard["authority_stamp"]):
+        return False
+    ids = list(guard["records"])
+    if not ids:
+        return True
+    metadata = view.memory_index_metadata_map(ids)
+    records = view.memory_l1_recall_map(ids)
+    if any(not metadata.get(bid) or metadata[bid].get("revision") != old["revision"]
+           or metadata[bid].get("memory_id") != old["memory_id"]
+           or metadata[bid].get("body_sha256") != old["body_sha256"]
+           for bid, old in guard["records"].items()):
+        return False
+    sub = {"_semantic_records": records, "_deadline": deadline(service, request),
+           "recall_io": request.setdefault("recall_io", {}), "_chain_projection": True}
+    permitted = await verify_sources(service, sub, guard["query"],
+        [{"bucket": {"id": bid}, "score": 0.0} for bid in ids], refresh=True)
+    request.setdefault("incomplete_reasons", []).extend(sub.get("incomplete_reasons") or [])
+    if {item["bucket"]["id"] for item in permitted} != set(ids):
+        return False
+    for bid, old in guard["records"].items():
+        usage = sub["usage_by_bucket"][bid]
+        # Replaying an old whole narrative after losing only one source is
+        # unsafe even if another claim keeps the same bucket eligible.
+        if usage["state"] == "l1":
+            if not usage.get("narrative_allowed"):
+                return False
+            current = {use["statement_id"]: use["usage"] for use in usage["items"]}
+            if any(current.get(sid) != use for sid, use in old["statement_uses"].items()):
+                return False
+    return stamp == authority_stamp(service)
+
+
+def snapshot_guard(service, request, *, complete):
+    view = getattr(service, "memory_authority_view", None)
+    ids = request.get("injected_usage_bucket_ids") or []
+    reader = getattr(view, "memory_index_metadata_map", None)
+    metadata = reader(ids) if callable(reader) else {}
+    records = {}
+    for bid in ids:
+        row = metadata.get(bid)
+        if not row:
+            complete = False
+            continue
+        records[bid] = {key: row.get(key) for key in ("memory_id", "revision", "body_sha256")}
+        records[bid]["statement_uses"] = {use["statement_id"]: use["usage"] for use in
+            request.get("usage_by_bucket", {}).get(bid, {}).get("items", [])}
+    return {"complete": complete, "authority_stamp": authority_stamp(service),
+            "query": request.get("q_current", ""), "records": records}
+
+
+async def read_batch(service, request, stage, path, payload):
+    """Coalesce identical in-flight reads inside this request, never across owners.
+
+    Completed source qualifications are cached separately with their exact
+    binding scope. A final refresh still makes a new observation of L0.
+    """
+    budget = remaining(service, request)
+    stats = request.setdefault("recall_io", {}).setdefault(stage, {
+        "calls": 0, "singleflight_hits": 0, "duration_ms": 0, "timeouts": 0,
+    })
+    if budget <= 0:
+        stats["timeouts"] += 1
+        raise asyncio.TimeoutError
+    base = os.environ.get("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://ombre-brain:8000").rstrip("/")
+    token = os.environ.get("OMBRE_MEMORY_WRITE_TOKEN") or getattr(service, "gateway_token", "")
+    key = (base, hashlib.sha256(token.encode()).hexdigest(), path,
+           json.dumps(payload, sort_keys=True, ensure_ascii=False))
+    pending = request.setdefault("_recall_reads", {})
+    task = pending.get(key)
+    owner = task is None
+    if owner:
+        async def fetch():
+            stats["calls"] += 1
+            started = time.perf_counter()
+            try:
+                # HTTPX's per-operation cap is not a new stage allowance. The
+                # surrounding absolute deadline covers connect/read/cleanup.
+                async with httpx.AsyncClient(timeout=min(20.0, budget), trust_env=False) as client:
+                    response = await client.post(base + path,
+                        headers={"Authorization": "Bearer " + token}, json=payload)
+                    response.raise_for_status()
+                    return response.json()
+            finally:
+                stats["duration_ms"] += max(0, int((time.perf_counter() - started) * 1000))
+        task = asyncio.create_task(fetch())
+        pending[key] = task
+    else:
+        stats["singleflight_hits"] += 1
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=remaining(service, request))
+    except asyncio.TimeoutError:
+        stats["timeouts"] += 1
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+    except asyncio.CancelledError:
+        if owner:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            if stage == "sources":
+                request["_source_owner_cancelled"] = True
+        raise
+    finally:
+        if pending.get(key) is task and task.done():
+            pending.pop(key, None)
 
 
 def values(service):
@@ -143,7 +280,12 @@ def score_pool(service, request, query, pool, *, after_rerank=False):
 async def verify_sources(service, request, query, items, *, refresh=False):
     """No provider model calls; exact current L0 readers remain on Brain."""
     records = request.get("_semantic_records", {})
-    wanted, bindings_by_bucket = [], {}
+    view = getattr(service, "memory_authority_view", None)
+    authority_generation = authority_stamp(service)
+    endpoint = os.environ.get("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://ombre-brain:8000").rstrip("/")
+    credential = os.environ.get("OMBRE_MEMORY_WRITE_TOKEN") or getattr(service, "gateway_token", "")
+    authority_scope = (id(service), endpoint, hashlib.sha256(credential.encode()).hexdigest())
+    wanted, bindings_by_bucket, cache_keys = [], {}, {}
     for item in items:
         bid = str(item["bucket"]["id"])
         record = records.get(bid) or {}
@@ -157,6 +299,13 @@ async def verify_sources(service, request, query, items, *, refresh=False):
                 wanted.append({"memory_id": record["memory_id"], "revision": record["revision"],
                                "binding_ids": bindings,
                                **({"allow_historical": True} if record.get("historical") else {})})
+                # Binding identities alone do not prove unchanged provenance.
+                cache_keys[(record["memory_id"], record["revision"])] = (
+                    authority_scope,
+                    record["memory_id"], record["revision"], bool(record.get("historical")),
+                    authority_generation,
+                    json.dumps([b for b in document.get("evidence_bindings", [])
+                                if b["binding_id"] in bindings], sort_keys=True, ensure_ascii=False))
     frozen = REQUEST_CONFIGURATION.get()
     validation = (frozen.setdefault("source_validation", {})
                   if frozen and frozen.get("service") == id(service) else request)
@@ -165,22 +314,28 @@ async def verify_sources(service, request, query, items, *, refresh=False):
         # Selection may have awaited semantic/rerank work since this cache was
         # filled. Revalidate the final batch, including when L2 is not ready.
         for item in wanted:
-            checked.pop((item["memory_id"], item["revision"]), None)
-    wanted = [item for item in wanted if (item["memory_id"], item["revision"]) not in checked]
+            checked.pop(cache_keys[(item["memory_id"], item["revision"])], None)
+    stats = request.setdefault("recall_io", {}).setdefault("sources", {
+        "calls": 0, "singleflight_hits": 0, "duration_ms": 0, "timeouts": 0,
+    })
+    stats["cache_hits"] = stats.get("cache_hits", 0) + sum(
+        cache_keys[(item["memory_id"], item["revision"])] in checked for item in wanted)
+    wanted = list({cache_keys[(item["memory_id"], item["revision"])]: item for item in wanted
+                   if cache_keys[(item["memory_id"], item["revision"])] not in checked}.values())
     if wanted and not validation.get("_source_check_cancelled"):
-        base = os.environ.get("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://ombre-brain:8000").rstrip("/")
-        token = os.environ.get("OMBRE_MEMORY_WRITE_TOKEN") or getattr(service, "gateway_token", "")
         try:
-            async with httpx.AsyncClient(timeout=20.0, trust_env=False) as client:
-                response = await client.post(base + "/api/memory-authority/recall-sources",
-                    headers={"Authorization": "Bearer " + token}, json={"items": wanted})
-                response.raise_for_status()
-                response_items = response.json()["items"]
-            for row in response_items:
-                checked[(row["memory_id"], row["revision"])] = row
+            response = await read_batch(service, request, "sources",
+                "/api/memory-authority/recall-sources", {"items": wanted})
+            for row in response["items"]:
+                identity = (row["memory_id"], row["revision"])
+                if identity in cache_keys:
+                    checked[cache_keys[identity]] = row
         except asyncio.CancelledError:
-            validation["_source_check_cancelled"] = True
+            if request.get("_source_owner_cancelled"):
+                validation["_source_check_cancelled"] = True
             raise
+        except asyncio.TimeoutError:
+            request.setdefault("incomplete_reasons", []).append("final_source_deadline" if refresh else "source_deadline")
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             request.setdefault("incomplete_reasons", []).append("l0_source_verification_unavailable")
     result = []
@@ -201,7 +356,7 @@ async def verify_sources(service, request, query, items, *, refresh=False):
             usage_by_bucket[bid] = {"state": "legacy", "items": [], "narrative_allowed": True}
             result.append(item)
             continue
-        check = checked.get((record["memory_id"], record["revision"]))
+        check = checked.get(cache_keys.get((record["memory_id"], record["revision"])))
         if bindings_by_bucket.get(bid) and (not check or check.get("state") != "ok"):
             item["admission_reason"] = "l0_source_not_current_or_eligible"
             request.setdefault("incomplete_reasons", []).append(item["admission_reason"])
@@ -410,10 +565,11 @@ def render_presentation(service, usage, header, presentation, budget):
     return "", "no_complete_unit_fits_remaining_budget", [], False
 
 
-async def resolve_presentations(service, candidates):
+async def resolve_presentations(service, candidates, *, request=None):
     """Resolve only source-qualified, non-targeted L1 memories in one Brain call."""
     if not candidates:
         return {}, {}
+    request = request if request is not None else {}
     items = []
     for candidate in candidates:
         usage = candidate["usage"]
@@ -451,14 +607,8 @@ async def resolve_presentations(service, candidates):
     try:
         if failure:
             raise RuntimeError(failure)
-        async with httpx.AsyncClient(timeout=20.0, trust_env=False) as client:
-            response = await client.post(
-                base + "/api/memory-authority/presentations/resolve",
-                headers={"Authorization": "Bearer " + token},
-                json={"items": items},
-            )
-            response.raise_for_status()
-            payload = response.json()
+        payload = await read_batch(service, request, "l2_resolve",
+            "/api/memory-authority/presentations/resolve", {"items": items})
         if not isinstance(payload, dict) or payload.get("status") != "ok" \
                 or not isinstance(payload.get("items"), list):
             raise ValueError("invalid_presentation_response")
@@ -467,6 +617,9 @@ async def resolve_presentations(service, candidates):
                 rows_by_memory[str(row["memory_id"])] = row
     except asyncio.CancelledError:
         raise
+    except asyncio.TimeoutError:
+        failure = "resolver_deadline"
+        request.setdefault("incomplete_reasons", []).append(failure)
     except RuntimeError:
         pass
     except httpx.HTTPStatusError as exc:
@@ -567,9 +720,13 @@ async def cognition_context(service, request, query, permitted, budget):
     initial = set(seeds)
     rows = [row for row in graph["nodes"] if (row["memory_id"], row["revision"]) not in initial]
     sub = {"_semantic_records": {str(index): {**row, "state": "l1"} for index, row in enumerate(rows)},
-           "_use_context": context(service, request, query), "_chain_projection": True}
+           "_use_context": context(service, request, query), "_chain_projection": True,
+           "_deadline": deadline(service, request),
+           "_recall_reads": request.setdefault("_recall_reads", {}),
+           "recall_io": request.setdefault("recall_io", {})}
     candidates = [{"bucket": {"id": str(index)}, "score": 0.0} for index in range(len(rows))]
     allowed = await verify_sources(service, sub, query, candidates)
+    request.setdefault("incomplete_reasons", []).extend(sub.get("incomplete_reasons") or [])
     parts, spans, remaining = [], [], budget
     for item in allowed:
         key = item["bucket"]["id"]
@@ -628,14 +785,45 @@ async def cognition_context(service, request, query, permitted, budget):
     request["cognition_chain"] = {"depth": depth, "limit": limit, "budget": budget,
         "eligible_versions": len(allowed), "rendered_versions": emitted,
         "truncated": bool(graph["truncated"] or len(emitted) < len(allowed) or any(s["partial"] for s in emitted)),
-        "issues": graph["issues"], "provider_requests": 0}
+        "issues": [*graph["issues"], *({"reason": reason} for reason in sub.get("incomplete_reasons") or [])],
+        "provider_requests": 0}
     return text
 
 
 async def project_sections(service, request, query, buckets, sections):
+    started = time.perf_counter()
+    try:
+        rendered = await _project_sections(service, request, query, buckets, sections)
+        request["projection_status"] = {
+            "state": "projected" if any(rendered.values()) else "empty",
+            "projected_count": len(request.get("injected_usage_bucket_ids") or []),
+            "reason": request.pop("_projection_skip_reason", None),
+        }
+        return rendered
+    finally:
+        request.setdefault("recall_io", {})["projection_ms"] = max(0, int((time.perf_counter() - started) * 1000))
+        request["recall_io"]["remaining_ms"] = max(0, int(remaining(service, request) * 1000))
+
+
+async def _project_sections(service, request, query, buckets, sections):
     """Apply the same use/source gates to direct, detail and diffused sections."""
+    request.update(presentation_trace=[], rendered_memory_spans=[], injected_usage_bucket_ids=[])
     ids_by_section = {key: list(dict.fromkeys(service._extract_bucket_ids_from_context(body) or refs))
                      for key, (body, refs, _budget) in sections.items() if body}
+    active = {key for key, (body, _refs, budget) in sections.items() if body and budget > 0}
+    reason = ("composer_live_recall_disabled" if request.get("composer_recall_enabled") is False
+              else "section_budget_zero" if not active
+              else "usage_card_prompt_unavailable" if not service._resolve_gateway_fixed_prompt(
+                  "ombre.memory_usage_card_prompt", runtime_values={"header": "", "statements": "", "narrative": "memory"})
+              else None)
+    if reason:
+        request["_projection_skip_reason"] = reason
+        request["presentation_trace"] = [{"bucket_id": bid, "source": "none", "render_reason": reason,
+            "presentation_revision": None, "fallback_reason": reason}
+            for bid in dict.fromkeys(bid for ids in ids_by_section.values() for bid in ids)]
+        request.update(rendered_memory_spans=[], injected_usage_bucket_ids=[])
+        return {key: "" for key in sections}
+    ids_by_section = {key: ids for key, ids in ids_by_section.items() if key in active}
     requested = set(value for ids in ids_by_section.values() for value in ids)
     if not requested:
         return {key: body for key, (body, _refs, _budget) in sections.items()}
@@ -708,8 +896,18 @@ async def project_sections(service, request, query, buckets, sections):
                 "fallback_reason": "l1_revision_unavailable",
             }
 
-    presentations, resolved_trace = await resolve_presentations(service, l2_candidates)
+    presentations, resolved_trace = await resolve_presentations(service, l2_candidates, request=request)
     trace_by_bucket.update(resolved_trace)
+    # Authority/permission may change while either batch is in flight. This
+    # local metadata read is not another L0/provider round trip.
+    if getattr(view, "enabled", False) and callable(metadata_reader):
+        latest = metadata_reader(list(planned_section))
+        for bid in list(allowed):
+            if latest.get(bid) != metadata.get(bid):
+                allowed.discard(bid)
+                uses[bid] = {"state": "excluded", "items": [], "narrative_allowed": False}
+        render_ids_by_section = {key: [bid for bid in ids if bid in allowed]
+                                 for key, ids in render_ids_by_section.items()}
     candidate_by_bucket = {str(item["bucket"]["id"]): item for item in candidates}
     for bid in requested - allowed:
         item = candidate_by_bucket.get(bid)
@@ -781,12 +979,14 @@ async def project_sections(service, request, query, buckets, sections):
                         else:
                             row["source"] = "none"
                             row["render_reason"] = render_reason
-                elif row.get("fallback_reason") == "source_dependency_changed":
+                elif row.get("fallback_reason") in {"source_dependency_changed", "memory_not_found",
+                        "memory_not_eligible", "l1_revision_mismatch", "l1_dependency_changed",
+                        "l1_parent_dependency_changed", "scene_dependency_mismatch"}:
                     # Brain has fresher source evidence than the request-local
                     # selection cache. Never revive the rejected source via L1.
                     text = ""
                     row["source"] = "none"
-                    row["render_reason"] = "source_dependency_changed"
+                    row["render_reason"] = row["fallback_reason"]
                 else:
                     text = render(service, {**uses[bid], "scope_to_query": key != "targeted"}, header,
                                   original, remaining, trace=row)

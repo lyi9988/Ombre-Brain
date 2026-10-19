@@ -437,7 +437,7 @@ def test_task_context_and_disabled_planner_do_not_turn_off_ordinary_semantics():
     ]
 
 
-def test_natural_total_timeout_retries_local_only_with_all_provider_steps_disabled():
+def test_natural_total_timeout_does_not_restart_local_io_after_budget_exhausted():
     service = GatewayService.__new__(GatewayService)
     service.recall_timeout_seconds = 0.01
     calls = []
@@ -472,21 +472,15 @@ def test_natural_total_timeout_retries_local_only_with_all_provider_steps_disabl
             "allow_query_planner": True,
             "allow_rerank": True,
         },
-        {
-            "local_only": True,
-            "allow_semantic": False,
-            "allow_query_planner": False,
-            "allow_rerank": False,
-        },
     ]
     assert "recall_total_timeout" in natural_input["incomplete_reasons"]
     assert result[:2] == ([], [])
     assert [(item["phase"], item["status"]) for item in result[2]["selection_attempts"]] == [
-        ("initial", "timeout"), ("timeout_fallback", "completed"),
+        ("initial", "timeout"), ("timeout_fallback", "deadline_exhausted"),
     ]
 
 
-def test_natural_timeout_retains_completed_verified_semantic_without_second_embedding_or_rerank():
+def test_natural_timeout_keeps_semantic_checkpoint_without_unbounded_source_adoption():
     query = "An ordinary paraphrase about a shared evening experience."
     bucket = _natural_bucket("memory-timeout-semantic", "A committed source-backed evening fact.")
     service, calls, _metadata = _natural_finish_service(None, [bucket], {})
@@ -539,11 +533,10 @@ def test_natural_timeout_retains_completed_verified_semantic_without_second_embe
 
     assert rerank_started.is_set() and rerank_cancelled.is_set()
     assert provider_calls == [[query]]
-    assert [item["id"] for item in selected] == [bucket["id"]]
+    assert selected == []
     assert suppressed == []
-    assert debug["final_bucket_ids"] == [bucket["id"]]
-    assert calls["selected"][0]["admission_reason"] == "strong_semantic"
-    assert calls["selected"][0].get("rerank_score") is None
+    assert natural_input["_completed_semantic"]["hits"][bucket["id"]]["index_status"] == "verified"
+    assert debug["selection_attempts"][-1]["status"] == "deadline_exhausted"
     assert natural_input["semantic_debug"]["provider_requests"] == 1
     assert "recall_total_timeout" in natural_input["incomplete_reasons"]
 
@@ -591,24 +584,21 @@ def test_natural_timeout_preserves_initial_and_local_fallback_selection_telemetr
 
     assert phases == ["initial"]  # Completed candidate work is not scanned twice.
     assert rerank_cancelled.is_set()
-    assert [item["id"] for item in selected] == [bucket["id"]] and suppressed == []
+    assert selected == [] and suppressed == []
     assert "recall_total_timeout" in natural_input["incomplete_reasons"]
     initial, fallback = debug["selection_attempts"]
     assert (initial["phase"], initial["status"]) == ("initial", "timeout")
-    assert (fallback["phase"], fallback["status"]) == ("timeout_fallback", "completed")
+    assert (fallback["phase"], fallback["status"]) == ("timeout_fallback", "deadline_exhausted")
     assert all(isinstance(attempt["duration_ms"], int) and attempt["duration_ms"] >= 0
                for attempt in (initial, fallback))
     assert initial["timing_ms"]["direct.synthetic_lookup"] == 7
     assert "direct.synthetic_lookup" not in fallback["timing_ms"]
-    assert fallback["timing_ms"]["natural.checkpoint_restore"] >= 0
     assert debug["timing_ms"]["initial.direct.synthetic_lookup"] == 7
     assert "direct.synthetic_lookup" not in debug["timing_ms"]
     assert [item["attempt_phase"] for item in debug["candidate_stages"]
             if item["stage"] == "synthetic.lookup"] == ["initial"]
     assert initial["candidate_stages"][0]["stage"] == "synthetic.lookup"
-    assert fallback["candidate_stages"][0]["stage"] == "natural.candidate_checkpoint"
-    assert fallback["candidate_stages"][0]["reused"] is True
-    assert debug["candidate_checkpoint"]["status"] == "reused"
+    assert fallback["candidate_stages"] == []
     cancelled_rerank = next(item for item in initial["candidate_stages"]
                             if item["stage"] == "natural.final_rerank")
     assert cancelled_rerank["cancelled"] is True
@@ -725,7 +715,7 @@ def test_continuation_snapshot_reuses_the_same_memory_recall_projection():
     service.prepare_snapshot_ttl_seconds = 300
     service._restore_cached_reasoning_content = lambda *_args, **_kwargs: None
     service._apply_prompt_cache_hints = lambda *_args, **_kwargs: None
-    service._inject_context_messages = lambda messages, stable, dynamic: [
+    service._inject_context_messages = lambda messages, stable, dynamic, **_kwargs: [
         *messages,
         {"role": "system", "content": "\n".join(part for part in (stable, dynamic) if part)},
     ]

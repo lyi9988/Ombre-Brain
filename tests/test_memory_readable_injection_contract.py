@@ -42,7 +42,7 @@ def _request_with_records(view, bucket_ids: list[str]) -> dict:
 def _resolved_l2_stub(monkeypatch, text: str = L2_BODY):
     calls = []
 
-    async def resolve(_service, candidates):
+    async def resolve(_service, candidates, *, request=None):
         calls.append([
             {
                 "bucket_id": item["bucket_id"],
@@ -481,7 +481,7 @@ def test_legacy_natural_prose_survives_but_json_metadata_is_not_projected(
     legacy_bucket = buckets[1]
     request = _request_with_records(view, ["bucket-legacy"])
 
-    async def no_l2_for_legacy(_service, candidates):
+    async def no_l2_for_legacy(_service, candidates, *, request=None):
         assert candidates == []
         return {}, {}
 

@@ -558,7 +558,7 @@ def test_usage_card_off_source_does_not_fall_back_to_l1_or_ready_l2(tmp_path, mo
          "targeted": ("", [], 0), "diffused": ("", [], 0)},
     ))
     assert sections["direct"] == ""
-    assert len(source_requests.presentation_requests) == 1
+    assert len(source_requests.presentation_requests) == 0
     assert request["injected_usage_bucket_ids"] == []
     trace = request["presentation_trace"][0]
     assert trace["source"] == "none"
