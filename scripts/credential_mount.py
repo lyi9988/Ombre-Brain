@@ -8,6 +8,7 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -153,16 +154,47 @@ def prepare(args):
     return state
 
 
-def render_model(original, name, state, operation_dir, image):
+def canonical_credentials(decisions, name, state, operation_dir):
+    """Only explicitly reconciled historical credential literals may change source.
+
+    The executor traces declaring files without logging values, then supplies this
+    operation/service-scoped decision. This is never a blanket environment reset.
+    """
+    if decisions is None:
+        return set()
+    require(isinstance(decisions, dict) and set(decisions) == {"operation", "service", "credentials"} and
+            decisions["operation"] == state["operation"] and decisions["service"] == name,
+            "credential source decision belongs to another operation or service")
+    approved = decisions["credentials"]
+    require(isinstance(approved, dict) and approved, "empty credential source decision")
+    require(set(state["services"]) == set(SERVICES), "both prepared service snapshots required")
+    values = read_values(operation_dir / "host-current.env")[0]
+    snapshots = [read_values(operation_dir / (service + ".env"))[0] for service in state["services"]]
+    for key, evidence in approved.items():
+        require(re.fullmatch(r"OMBRE_(?:[A-Z0-9_]+_)?API_KEY", key) and key in values,
+                "source decision is not a prepared Ombre credential")
+        require(isinstance(evidence, dict) and set(evidence) == {"kind", "declared_in", "authority"} and
+                evidence["kind"] == "stale_literal" and evidence["authority"] == "prepared_file_consensus" and
+                evidence["declared_in"] in state["services"][name]["compose_files"],
+                "historical literal source has not been explicitly reconciled")
+        require(all(key in snapshot and snapshot[key] == values[key] for snapshot in snapshots),
+                "credential source snapshots do not agree")
+    return set(approved)
+
+
+def render_model(original, name, state, operation_dir, image, source_decisions=None):
     model = deepcopy(original)
     service = model["services"][name]
     values = read_values(operation_dir / "host-current.env")[0]
+    approved = canonical_credentials(source_decisions, name, state, operation_dir)
     environment = service.setdefault("environment", {})
     # Values resolved into Compose environment from the old env_file must not
-    # become an immutable startup snapshot. A deliberate override is a conflict.
+    # become an immutable startup snapshot. Conflicting explicit overrides stay
+    # blocked unless that exact historical credential literal was reconciled.
     for key, value in values.items():
         if key in environment:
-            require(str(environment[key]) == value, "startup override conflicts with persistent source")
+            require(str(environment[key]) == value or key in approved,
+                    "startup override conflicts with persistent source")
             del environment[key]
     environment["OMBRE_ENV_PATH"] = CONTAINER_DIR + "/.env"
     service.pop("env_file", None)
@@ -288,6 +320,7 @@ def main():
     parser.add_argument("--writers-quiesced", action="store_true")
     parser.add_argument("--service", choices=SERVICES)
     parser.add_argument("--image", help="immutable image ID/tag frozen by the release controller")
+    parser.add_argument("--source-decisions", help="nonsecret operation/service-scoped historical credential decisions")
     args = parser.parse_args()
     require(sys.platform == "linux", "run on the Linux Docker host")
     directory = Path(args.operation_dir).absolute()
@@ -307,11 +340,22 @@ def main():
                 image = (args.image or state["services"][args.service]["image"]) if args.action == "rollback" else args.image
                 require(image, "explicit release image required")
                 original = json.loads((directory / (args.service + ".original.json")).read_text())
-                model = render_model(original, args.service, state, directory, image)
+                cached = directory / (args.service + ".credential-sources.json")
+                decisions = json.loads(cached.read_text()) if cached.exists() else None
+                if args.source_decisions:
+                    requested = json.loads(Path(args.source_decisions).read_text(encoding="utf-8-sig"))
+                    require(decisions is None or decisions == requested, "recorded credential source decision differs")
+                    require(cached.exists() or state["phase"] == "prepared", "new source decisions require prepared operation")
+                    decisions = requested
+                model = render_model(original, args.service, state, directory, image, decisions)
+                if decisions is not None and not cached.exists():
+                    private_write(cached, (json.dumps(decisions, indent=2) + "\n").encode())
+                    sync_directory(directory)
                 name = args.service + (".rollback.json" if args.action == "rollback" else ".directory.json")
                 private_write(directory / name, (json.dumps(model, indent=2) + "\n").encode())
                 return {"phase": "rendered", "compose_file": str(directory / name),
                         "service": args.service, "project": state["services"][args.service]["project"],
+                        "canonical_credential_names": sorted(decisions["credentials"]) if decisions else [],
                         "rollback_keeps_current_credentials": True}
     return {"operation": state["operation"], "phase": state["phase"]}
 

@@ -71,6 +71,93 @@ class MigrationTests(unittest.TestCase):
         with self.assertRaises(mount.Refused):
             mount.render_model(self.model, self.service, self.state, self.operation, "new")
 
+    def source_decisions(self):
+        self.state.update(operation=uuid.uuid4().hex, phase="prepared", services={
+            name: {"compose_files": ["/release/historical.yml"], "image": "sha256:old", "project": "test"}
+            for name in mount.SERVICES})
+        for name in mount.SERVICES:
+            shutil.copyfile(self.operation / "host-current.env", self.operation / (name + ".env"))
+        self.model["services"][self.service]["environment"]["OMBRE_EMBEDDING_API_KEY"] = "fake-historical-literal"
+        return {"operation": self.state["operation"], "service": self.service, "credentials": {
+            "OMBRE_EMBEDDING_API_KEY": {"kind": "stale_literal", "declared_in": "/release/historical.yml",
+                                         "authority": "prepared_file_consensus"}}}
+
+    def test_source_decision_reconciles_only_named_historical_credentials(self):
+        decisions = self.source_decisions()
+        before = deepcopy(self.model)
+        rendered = mount.render_model(self.model, self.service, self.state, self.operation, "new", decisions)
+        self.assertNotIn("OMBRE_EMBEDDING_API_KEY", rendered["services"][self.service]["environment"])
+        self.assertEqual(self.model, before)
+        self.model["services"][self.service]["environment"]["BACKUP_KEY"] = "fake-independent-override"
+        with self.assertRaises(mount.Refused):
+            mount.render_model(self.model, self.service, self.state, self.operation, "new", decisions)
+
+    def test_source_decision_rejects_other_operation_service_file_or_kind(self):
+        decisions = self.source_decisions()
+        variants = []
+        for field, value in (("operation", "other-operation"), ("service", "ombre-gateway")):
+            changed = deepcopy(decisions)
+            changed[field] = value
+            variants.append(changed)
+        for field, value in (("declared_in", "/other/not-in-chain.yml"), ("kind", "unresolved_override"),
+                             ("authority", "creation_env")):
+            changed = deepcopy(decisions)
+            changed["credentials"]["OMBRE_EMBEDDING_API_KEY"][field] = value
+            variants.append(changed)
+        for changed in variants:
+            with self.subTest(decision=changed), self.assertRaises(mount.Refused):
+                mount.render_model(self.model, self.service, self.state, self.operation, "new", changed)
+
+    def test_source_decision_requires_snapshot_consensus_and_credential_name(self):
+        decisions = self.source_decisions()
+        (self.operation / "ombre-gateway.env").write_text("OMBRE_EMBEDDING_API_KEY=fake-different\n")
+        with self.assertRaises(mount.Refused):
+            mount.render_model(self.model, self.service, self.state, self.operation, "new", decisions)
+        decisions["credentials"] = {"BACKUP_KEY": next(iter(decisions["credentials"].values()))}
+        with self.assertRaises(mount.Refused):
+            mount.render_model(self.model, self.service, self.state, self.operation, "new", decisions)
+
+    @unittest.skipUnless(os.name == "posix", "migration CLI requires Linux directory fsync")
+    def test_source_decision_cli_resumes_prepared_operation_and_rollback_uses_record(self):
+        decisions = self.source_decisions()
+        (self.operation / "state.json").write_text(json.dumps(self.state))
+        (self.operation / (self.service + ".original.json")).write_text(json.dumps(self.model))
+        gateway = self.operation / "ombre-gateway.directory.json"
+        gateway.write_text('{"already_rendered":true}')
+        before = {p.name: p.read_bytes() for p in self.operation.iterdir() if p.is_file()}
+        source = self.root / "approved-sources.json"
+        source.write_text(json.dumps(decisions), encoding="utf-8-sig")
+        with patch.object(sys, "platform", "linux"), patch.object(sys, "argv", [
+                "credential_mount.py", "render", "--operation-dir", str(self.operation),
+                "--service", self.service, "--image", "sha256:new", "--source-decisions", str(source)]):
+            receipt = mount.main()
+        self.assertEqual(receipt["canonical_credential_names"], ["OMBRE_EMBEDDING_API_KEY"])
+        for name, raw in before.items():
+            self.assertEqual((self.operation / name).read_bytes(), raw)
+        cached = self.operation / (self.service + ".credential-sources.json")
+        self.assertEqual(json.loads(cached.read_text()), decisions)
+        if os.name == "posix":
+            self.assertEqual(cached.stat().st_mode & 0o777, 0o600)
+        # A later rollback reuses the exact recorded source choice, not the old literal.
+        with patch.object(sys, "platform", "linux"), patch.object(sys, "argv", [
+                "credential_mount.py", "rollback", "--operation-dir", str(self.operation), "--service", self.service]):
+            mount.main()
+        rollback = json.loads((self.operation / (self.service + ".rollback.json")).read_text())
+        self.assertNotIn("OMBRE_EMBEDDING_API_KEY", rollback["services"][self.service]["environment"])
+
+    def test_source_decision_covers_four_confirmed_names_and_keeps_independent_inline_backup(self):
+        names = ("OMBRE_EMBEDDING_API_KEY", "OMBRE_PERSONA_API_KEY", "OMBRE_DREAM_API_KEY", "OMBRE_GATEWAY_JIYUAN_API_KEY")
+        write_values(self.operation / "host-current.env", {name: "fake-current-" + str(i) for i, name in enumerate(names)})
+        decisions = self.source_decisions()
+        evidence = decisions["credentials"][names[0]]
+        decisions["credentials"] = {name: dict(evidence) for name in names}
+        self.model["services"][self.service]["environment"].update({name: "fake-stale" for name in names})
+        self.model["services"][self.service]["environment"]["INDEPENDENT_INLINE_BACKUP"] = "fake-kept"
+        rendered = mount.render_model(self.model, self.service, self.state, self.operation, "new", decisions)
+        environment = rendered["services"][self.service]["environment"]
+        self.assertTrue(all(name not in environment for name in names))
+        self.assertEqual(environment["INDEPENDENT_INLINE_BACKUP"], "fake-kept")
+
     def test_original_model_unchanged_and_missing_mount_refused(self):
         original = deepcopy(self.model)
         mount.render_model(self.model, self.service, self.state, self.operation, "new")
