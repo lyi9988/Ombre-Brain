@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import time
 
 from memory_authority import MemoryNotFound
 from memory_l1_contract import L1ContractError
@@ -53,7 +54,34 @@ class MemoryL1Reads:
         """Verify requested bindings without returning text or retaining copies."""
         if not isinstance(items, list):
             raise L1OwnerError("array_required", field_path="items")
+        started = time.perf_counter()
         requests, dependencies, epochs = [], {}, {}
+        # Fixed-revision members are immutable. Share their reads only during
+        # this batch; live memory/root eligibility is checked again after IO.
+        bases, members = {}, {}
+        member_batches, member_hits = 0, 0
+
+        def base(memory_id, revision):
+            key = (memory_id, revision)
+            if key not in bases:
+                bases[key] = self.base(memory_id, revision)
+            return bases[key]
+
+        def batch_members(memory_id, revision, module, ids):
+            nonlocal member_batches, member_hits
+            ids = list(dict.fromkeys(ids))
+            missing = [key for key in ids if (memory_id, revision, module, key) not in members]
+            member_hits += len(ids) - len(missing)
+            if missing:
+                found = self.index.members(memory_id, revision, module, missing)
+                member_batches += 1
+                for key in missing:
+                    members[(memory_id, revision, module, key)] = found.get(key)
+            return {key: members[(memory_id, revision, module, key)] for key in ids}
+
+        def member(memory_id, revision, module, key):
+            return batch_members(memory_id, revision, module, [key])[key]
+
         for item in items:
             required = {"memory_id", "revision", "binding_ids"}
             if (not isinstance(item, dict) or not required <= set(item) or set(item) - required - {"allow_historical"}
@@ -69,22 +97,23 @@ class MemoryL1Reads:
                 continue
             epochs[(item["memory_id"], item["revision"])] = memory["active_revision"]
             try:
-                result, identity = self.base(item["memory_id"], item["revision"])
+                result, identity = base(item["memory_id"], item["revision"])
             except MemoryNotFound:
                 requests.append((item, {}, "revision_unavailable"))
                 continue
             if not identity:
                 requests.append((item, {}, "legacy"))
                 continue
-            root_id, root_revision, _ = self._shared_root(item["memory_id"], item["revision"], identity)
+            root_id, root_revision, _ = self._shared_root(
+                item["memory_id"], item["revision"], identity,
+                base_reader=base, member_reader=member)
             root = self.authority.get_memory(root_id)
             if (not root or root["state"] != "active" or root["recall_policy"] != "enabled"
                     or (not item.get("allow_historical") and root["active_revision"] != root_revision)):
                 requests.append((item, {}, "dependency_changed"))
                 continue
             dependencies[(item["memory_id"], item["revision"])] = (root_id, root["active_revision"])
-            bindings = {key: self.index.member(root_id, root_revision, "evidence_bindings", key)
-                        for key in set(item["binding_ids"])}
+            bindings = batch_members(root_id, root_revision, "evidence_bindings", item["binding_ids"])
             requests.append((item, bindings, "ok"))
         semaphore = asyncio.Semaphore(8)
         tasks = {}
@@ -97,9 +126,13 @@ class MemoryL1Reads:
                     key = json.dumps(binding, sort_keys=True, ensure_ascii=False)
                     if key not in tasks:
                         tasks[key] = asyncio.create_task(check(binding))
+        preparation_ms = max(0, int((time.perf_counter() - started) * 1000))
+        source_started = time.perf_counter()
         try:
             if tasks:
                 await asyncio.gather(*tasks.values())
+            source_ms = max(0, int((time.perf_counter() - source_started) * 1000))
+            final_started = time.perf_counter()
             results = []
             for item, bindings, state in requests:
                 latest = self.authority.get_memory(item["memory_id"])
@@ -122,7 +155,12 @@ class MemoryL1Reads:
                 results.append({"memory_id": item["memory_id"], "revision": item["revision"],
                                 "state": state, "sources": statuses,
                                 "historical": bool(latest and latest["active_revision"] != item["revision"])})
-            return {"items": results}
+            return {"items": results, "diagnostics": {
+                "timing_ms": {"prepare": preparation_ms, "source_reads": source_ms,
+                              "final_authority": max(0, int((time.perf_counter() - final_started) * 1000))},
+                "member_batches": member_batches, "member_cache_hits": member_hits,
+                "unique_binding_reads": len(tasks),
+            }}
         finally:
             for task in tasks.values():
                 if not task.done():
@@ -154,14 +192,14 @@ class MemoryL1Reads:
             if result["coverage"]["state"] != "complete": result["restrictions"].append("此版本第一遍输入覆盖不完整；原文全文仍独立保留。")
         return result, identity
 
-    def _shared_root(self, memory_id, revision, identity):
+    def _shared_root(self, memory_id, revision, identity, *, base_reader=None, member_reader=None):
         entry = identity["entry"]
         parent, scene_ref = entry.get("parent_ref"), entry.get("scene_ref")
         if not parent or not scene_ref:
             return memory_id, revision, None
         root_id, root_revision = parent["memory_id"], parent["revision"]
-        self.base(root_id, root_revision)
-        scene = self.index.member(root_id, root_revision, "scenes", scene_ref["scene_id"])
+        (base_reader or self.base)(root_id, root_revision)
+        scene = (member_reader or self.index.member)(root_id, root_revision, "scenes", scene_ref["scene_id"])
         if (not scene or scene["scene_revision_id"] != scene_ref["scene_revision_id"]
                 or scene["statement_refs"] != entry.get("shared_statement_refs", [])):
             raise L1OwnerError("scene_dependency_mismatch", status=409, field_path="entry.scene_ref")

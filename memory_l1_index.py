@@ -144,6 +144,26 @@ class MemoryL1Index:
         finally:
             conn.close()
 
+    def members(self, memory_id, revision, module, object_ids):
+        """Read requested fixed-revision members with one index identity check."""
+        ids = list(dict.fromkeys(object_ids))
+        if not ids or not self.ensure(memory_id, revision):
+            return {}
+        conn = self.authority._connect()
+        try:
+            result = {}
+            for offset in range(0, len(ids), 400):
+                chunk = ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    "SELECT object_id,content_json FROM memory_l1_members "
+                    "WHERE memory_id=? AND revision=? AND module=? "
+                    f"AND object_id IN ({placeholders})", (memory_id, revision, module, *chunk))
+                result.update((row[0], json.loads(row[1])) for row in rows)
+            return result
+        finally:
+            conn.close()
+
     def page(self, memory_id, revision, module, *, offset=0, limit=20, scene_id=None):
         if not self.ensure(memory_id, revision):
             return [], 0
