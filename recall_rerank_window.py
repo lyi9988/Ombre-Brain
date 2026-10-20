@@ -197,6 +197,9 @@ def admission_evidence(items, accepted, selected, *, semantic_threshold, rerank_
             "raw_base_score": finite_score(item.get("_raw_base_score")),
             "raw_fused_score": finite_score(item.get("_raw_fused_score")),
             "final_score": finite_score(item.get("score")),
+            "recent_repeat": ({key: value for key, value in (item.get("_recent_repeat") or {}).items()
+                if key in {"decision", "reason", "previous_admission_reason"}
+                and isinstance(value, str) and re.fullmatch(r"[a-z0-9_]{1,80}", value)} or None),
             "configured_window_score": finite_score((item.get("_configured_score") or {}).get("window_score")),
             "query_part": window.get("query_part") if type(window.get("query_part")) is int else None,
             "window_fusion_score": finite_score(window.get("fusion_score")),

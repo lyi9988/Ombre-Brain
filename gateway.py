@@ -173,7 +173,8 @@ from query_terms import (
     identity_address_terms,
 )
 from recall_eval import RECALL_EVAL_BLOCKED_SECTIONS, RECALL_EVAL_DEFAULT_CASES
-from recall_policy import QueryAnchorPlan, RecallPolicy, diffusion_seed_topic_term_has_specific_residue
+from recall_policy import (ANCHOR_OPTIONAL_WEAK_TERMS, QueryAnchorPlan, RecallPolicy,
+                           diffusion_seed_topic_term_has_specific_residue)
 from memory_nodes import MemoryNodeStore
 from persona_engine import PersonaStateEngine
 from persona_event_selection import (
@@ -13638,6 +13639,102 @@ class GatewayService:
             kept.append(item)
         return kept, suppressed
 
+    def _filter_natural_recent_repeats(
+        self, query: str, session_id: str, items: list[dict], recall_input: dict,
+    ) -> tuple[list[dict], list[dict], dict]:
+        """Suppress only a recent card carried by background after a topic change.
+
+        Contextual rerank/semantic scores cannot establish current-turn need.
+        Source qualification and ordinary admission have already run; the
+        exceptions below never admit an otherwise ineligible Memory.
+        """
+        summary = {"status": "disabled", "recent_count": 0, "suppressed_count": 0,
+                   "bypass_reasons": {}}
+        store = getattr(self, "state_store", None)
+        if not store or not session_id or getattr(self, "skip_recent_rounds", 0) <= 0:
+            return items, [], summary
+        try:
+            recent = set(store.get_recent_bucket_ids(session_id, self.skip_recent_rounds))
+            recent.update(self._session_hard_exclude_bucket_ids(session_id))
+        except Exception as exc:
+            summary.update(status="unavailable", error_type=type(exc).__name__)
+            return items, [], summary
+        summary["status"] = "checked"
+        if not recent or not items:
+            return items, [], summary
+        current = str(recall_input.get("q_current") or "").strip()
+        contextual = str(recall_input.get("q_context") or query or "").strip()
+        current_terms = self.recall_policy._topic_evidence_terms(current) if current else []
+        specific_terms = [term for term in current_terms
+                          if term not in ANCHOR_OPTIONAL_WEAK_TERMS
+                          and not self._dynamic_anchor_term_is_category(term)]
+        plan = self._recall_query_plan(current) if current else None
+        intent = memory_use.query_purpose(current)
+        # Reuse the existing nearest-user follow-up resolver. Assistant text
+        # cannot supply an antecedent or bypass a later user topic change.
+        messages = [{"role": row["role"], "content": row["text"]}
+                    for row in [*(recall_input.get("recent_messages") or []),
+                                *(recall_input.get("current_messages") or [])]]
+        followup, followup_debug = (self._contextual_recall_query(current, messages)
+                                   if messages and current else (current, {"used": False}))
+        kept, suppressed = [], []
+        for item in items:
+            bucket = item["bucket"]
+            if str(bucket["id"]) not in recent:
+                kept.append(item)
+                continue
+            summary["recent_count"] += 1
+            reason = None
+            record = (recall_input.get("_semantic_records") or {}).get(str(bucket["id"])) or {}
+            usage = (recall_input.get("usage_by_bucket") or {}).get(str(bucket["id"])) or {}
+            current_claims, current_corrections = set(), set()
+            if record.get("state") == "l1" and usage.get("state") == "l1":
+                document = record["document"]
+                current_context = {"query": current, "memory_id": record.get("memory_id"),
+                                   "revision": record.get("revision")}
+                selection = memory_use.match_statements(document, current_context)
+                eligible = {row["statement_id"] for row in usage.get("items", [])
+                            if row.get("source_state") == "available" and row.get("usage") != "excluded"}
+                current_claims = set(selection["direct_ids"]) & eligible
+                current_corrections = set(memory_use.correction_matches(
+                    document, current_context, selection)) & eligible
+            # Only explicit ID/detail requests are retained from this legacy
+            # bypass here; do not feed it scores/anchors inherited from history.
+            explicit_probe = {"bucket": bucket, "semantic_score": 0, "keyword_score": 0}
+            if not current or current == contextual:
+                reason = "current_query_view"
+            elif self._session_hard_exclude_bucket_bypass(current, explicit_probe):
+                reason = "explicit_current_request"
+            elif (getattr(plan, "explicit_old_memory", False)
+                  or intent["purpose_reason"] == "explicit_recollection_query"):
+                reason = "explicit_recollection_request"
+            elif current_corrections:
+                reason = "qualified_correction_background"
+            elif current_claims:
+                reason = "current_qualified_statements"
+            elif self.recall_policy.bucket_has_topic_evidence(current, bucket):
+                reason = "current_topic_evidence"
+            elif (followup_debug.get("used")
+                  and self.recall_policy.bucket_has_topic_evidence(followup, bucket)):
+                reason = "nearest_user_followup"
+            elif not specific_terms and not followup_debug.get("used"):
+                # Bare continuations and broad preference overviews provide no
+                # evidence of a topic change. Do not turn recency into a ban.
+                reason = "no_current_topic_change_evidence"
+            item["_recent_repeat"] = {"recent": True,
+                "decision": "bypassed" if reason else "suppressed",
+                "reason": reason or "recent_context_only",
+                "previous_admission_reason": item.get("admission_reason")}
+            if reason:
+                counts = summary["bypass_reasons"]
+                counts[reason] = counts.get(reason, 0) + 1
+                kept.append(item)
+            else:
+                item["admission_reason"] = "recent_context_only"
+                suppressed.append(item)
+        summary["suppressed_count"] = len(suppressed)
+        return kept, suppressed, summary
+
     def _session_semantic_dedupe_source_bucket_ids(self, session_id: str) -> list[str]:
         if (
             not self.semantic_session_dedupe_enabled
@@ -17531,6 +17628,18 @@ class GatewayService:
                 accepted.append(item)
             else:
                 suppressed.append(item)
+        repeat_started = time.perf_counter()
+        before_repeat = len(accepted)
+        accepted, repeat_suppressed, repeat_debug = self._filter_natural_recent_repeats(
+            query, session_id, accepted, recall_input,
+        )
+        suppressed.extend(repeat_suppressed)
+        debug["recent_repeat"] = recall_input["recent_repeat"] = repeat_debug
+        self._add_timing_ms(timings, "natural.recent_repeat", repeat_started)
+        self._record_candidate_stage(
+            stages, "natural.recent_repeat", before_repeat, len(accepted),
+            timing_key="natural.recent_repeat", **repeat_debug,
+        )
         admitted_before_hierarchy = {str(item["bucket"]["id"]) for item in accepted}
         accepted = memory_use.hierarchy_pool(self, recall_input, accepted)
         if any(item.get("_configured_score", {}).get("window_score") is not None for item in accepted):
