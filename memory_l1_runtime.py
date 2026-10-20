@@ -5,6 +5,7 @@ existing scheduling and Auto/Review control; source and task clocks are distinct
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -277,7 +278,8 @@ class MemoryL1Runtime:
             raise L1OwnerError('generated_task_context_missing', field_path='document')
         return prepare_model_document(self._memory_l1_revisions(), memory_id=memory_id,
             document=candidate['document'], sources=sources, generation=generation, request_id=generation['task_id'],
-            catalog_context=candidate.get('_l1_catalog_context'), config=self.config)
+            catalog_context=candidate.get('_l1_catalog_context'), config=self.config,
+            candidate_refs=candidate.get('source_refs', []))
 
     def _memory_l1_sources(self):
         from memory_l0_sources import MemoryL0Sources, McpDiarySourceAdapter
@@ -375,6 +377,18 @@ class MemoryL1Runtime:
         return {'id': candidate_id, 'status': 'created', 'revision': committed['revision']}
 
     async def _memory_l1_diary_task(self, key, bucket_mgr):
+        # Suppress duplicate invocations on this engine, without holding a DB
+        # transaction across model IO. Cross-process writes still use CAS.
+        locks = getattr(self, '_diary_l1_task_locks', None)
+        if locks is None:
+            locks = self._diary_l1_task_locks = {}
+        lock = locks.setdefault(key, asyncio.Lock())
+        if lock.locked():
+            return {'status': 'in_progress', 'reason': 'diary_task_already_running'}
+        async with lock:
+            return await self._memory_l1_diary_task_locked(key, bucket_mgr)
+
+    async def _memory_l1_diary_task_locked(self, key, bucket_mgr):
         from memory_diary_l1 import DiaryL1Service
         options = task_options(self.config)
         prompt, prompt_context = self._memory_l1_prompt('ombre.diary_memory_prompt')
@@ -401,18 +415,49 @@ class MemoryL1Runtime:
         model_route = 'route_sha256:' + semantic_sha256({k: v for k, v in route.items() if k != 'client'})
         memory_id = 'diary_full_' + hashlib.sha256(source['source_id'].encode()).hexdigest()[:32]
         candidate_id = 'diary-l1:' + memory_id + ':' + task_id
+        from memory_diary_progress import DiaryProgress
+        progress_store = DiaryProgress(self.memory_authority_store)
+        progress_record = progress_store.get(candidate_id)
         original_candidate = self.memory_authority_store.get_candidate(candidate_id)
+        checkpoint = None
         if original_candidate:
-            organizer = DiaryL1Service(service, sources, self.memory_ingestion_policy)
-            replay = await organizer.adopt(candidate_id) if original_candidate['status'] in ('accepted', 'committed') else {'status': original_candidate['status']}
-            return {'status': replay['status'], 'candidate_id': candidate_id, 'task_id': task_id, 'replayed': True, 'result': replay}
+            metadata = original_candidate['proposal']['metadata']
+            checkpoint = metadata.get('diary_l1_checkpoint')
+            coverage = metadata.get('diary_l1_bundle', {}).get('coverage', {})
+            if original_candidate['status'] != 'pending' or coverage.get('state') == 'complete':
+                organizer = DiaryL1Service(service, sources, self.memory_ingestion_policy)
+                replay = await organizer.adopt(candidate_id) if original_candidate['status'] in ('accepted', 'committed') else {'status': original_candidate['status']}
+                return {'status': replay['status'], 'candidate_id': candidate_id, 'task_id': task_id, 'replayed': True, 'result': replay}
+            if not checkpoint or not progress_record:
+                return {'status': 'not_prepared', 'reason': 'legacy_partial_requires_rebuild_decision', 'candidate_id': candidate_id}
+            if checkpoint.get('candidate_revision') != original_candidate['revision']:
+                return {'status': 'not_prepared', 'reason': 'candidate_changed_after_checkpoint', 'candidate_id': candidate_id}
+        checkpoint = progress_record['progress'] if progress_record else None
+        if checkpoint and checkpoint.get('uncertain_window') is not None:
+            return {'status': 'not_prepared', 'reason': 'model_outcome_unknown_requires_retry_decision',
+                'candidate_id': candidate_id, 'task_id': task_id, 'window': checkpoint['uncertain_window']}
         previous_memory = self.memory_authority_store.get_memory(memory_id)
+        previous_revision = previous_memory['active_revision'] if previous_memory else 0
+        if checkpoint and checkpoint['previous_revision'] != previous_revision:
+            return {'status': 'not_prepared', 'reason': 'diary_root_changed_after_checkpoint', 'candidate_id': candidate_id}
         previous = (await service.detail(memory_id))['l1']['document'] if previous_memory else None
+        if checkpoint:
+            combined = copy.deepcopy(checkpoint['combined'])
+            prose = copy.deepcopy(checkpoint['prose'])
+            scene_bodies = copy.deepcopy(checkpoint['scene_bodies'])
+            input_ranges = copy.deepcopy(checkpoint['input_ranges'])
+            confidence = copy.deepcopy(checkpoint['confidence'])
+        organizer = DiaryL1Service(service, sources, self.memory_ingestion_policy)
+        row = original_candidate
         known_ids = {item[key] for module, key in (('entities', 'entity_id'), ('scenes', 'scene_id'),
             ('statements', 'statement_id'), ('relations', 'relation_id')) for item in (previous or {}).get(module, [])}
         failures = []
+        attempted = 0
+        completed_starts = {r['start'] for r in input_ranges}
         for index, start in enumerate(range(0, len(text), width)):
-            if index >= max_windows: break
+            if start in completed_starts: continue
+            if attempted >= max_windows: break
+            attempted += 1
             end = min(start + width, len(text))
             anchor = make_text_anchor(text, target_namespace='l0', target_id=source['source_id'],
                 target_revision=source['source_revision'], text_view_id=source['text_view_id'], start=start, end=end)
@@ -424,11 +469,22 @@ class MemoryL1Runtime:
                 'catalog_revision': catalog_revision, 'options': options,
                 'existing_members': {module: (previous or {}).get(module, []) for module in ('entities', 'scenes', 'statements', 'relations')},
                 'window_index': index, 'source_length': len(text)}
+            attempt_checkpoint = {'previous_revision': previous_revision, 'combined': copy.deepcopy(combined),
+                'prose': list(prose), 'scene_bodies': dict(scene_bodies),
+                'input_ranges': copy.deepcopy(input_ranges), 'confidence': list(confidence), 'uncertain_window': index}
+            try:
+                progress_record = progress_store.save(candidate_id, attempt_checkpoint,
+                    expected_revision=progress_record['revision'] if progress_record else 0)
+            except Exception as exc:
+                return {'status': 'not_prepared', 'reason': 'progress_changed_before_model_call',
+                    'task_id': task_id, 'code': type(exc).__name__}
+            response_received = False
             try:
                 response = await self._daily_chat_memory_create_completion(route['client'], model=route['model'],
                     messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}],
                     max_tokens=options['diary_l1_max_tokens'], temperature=self.temperature,
                     use_daily_client=route['connection'] == 'daily', task_stage='diary_l1', task_route=route)
+                response_received = True
                 if self._completion_finish_reason(response) == 'length': raise ValueError('first_pass_output_incomplete')
                 from memory_l1_api import validate_response
                 validate_response(response)
@@ -473,23 +529,64 @@ class MemoryL1Runtime:
                     combined['retrieval'][field] = list(dict.fromkeys(combined['retrieval'].get(field, []) + draft['retrieval'].get(field, [])))
                 if not combined['narrative']['title']: combined['narrative']['title'] = draft['narrative']['title']
                 input_ranges.append({'start': start, 'end': end})
+                combined['narrative']['body'] = '\n\n'.join(prose)
+                base = copy.deepcopy(previous) if previous else document_template(catalog=catalog, catalog_revision=catalog_revision)
+                base['evidence_bindings'] = [binding]
+                full = expand_model_document(combined, base, {binding['binding_id']: text})
+                checkpoint = {'previous_revision': previous_revision, 'combined': copy.deepcopy(combined),
+                    'prose': list(prose), 'scene_bodies': dict(scene_bodies),
+                    'input_ranges': copy.deepcopy(input_ranges), 'confidence': list(confidence)}
+                progress_record = progress_store.save(candidate_id, checkpoint,
+                    expected_revision=progress_record['revision'] if progress_record else 0)
             except Exception as exc:
                 failures.append({'window': index, 'reason': type(exc).__name__, 'code': getattr(exc, 'code', None)})
+                if response_received:
+                    # A received but invalid result is known, not an unknown
+                    # provider outcome. Keep the pre-attempt successful state.
+                    known = copy.deepcopy(attempt_checkpoint)
+                    known.pop('uncertain_window', None)
+                    try:
+                        progress_record = progress_store.save(candidate_id, known,
+                            expected_revision=progress_record['revision'])
+                    except Exception:
+                        return {'status': 'not_prepared', 'reason': 'progress_changed_after_model_call',
+                            'task_id': task_id, 'failures': failures}
                 break
-        if not prose:
+        if progress_record is None or not progress_record['progress']['prose']:
             self.memory_authority_store.set_projection_status(memory_id='diary_task_' + key, memory_revision=0,
                 projector='memory_l1_first_pass', status='degraded', details={'state': 'failed', 'task_id': task_id,
                     'failures': failures, 'prompt_revision': prompt_context['prompt_revision']})
             return {'status': 'failed', 'reason': 'no_complete_first_pass_window', 'failures': failures, 'task_id': task_id}
-        combined['narrative']['body'] = '\n\n'.join(prose)
+        # Only the durable checkpoint is eligible for proposal construction.
+        # A failed CAS never lets this invocation publish its losing draft.
+        saved = progress_record['progress']
         base = copy.deepcopy(previous) if previous else document_template(catalog=catalog, catalog_revision=catalog_revision)
         base['evidence_bindings'] = [binding]
-        full = expand_model_document(combined, base, {binding['binding_id']: text})
-        organizer = DiaryL1Service(service, sources, self.memory_ingestion_policy)
-        row = await organizer.prepare(day=key, document=full, scene_bodies=scene_bodies,
-            generation={'prompt_revision': prompt_context['prompt_revision'], 'model_route_revision': model_route,
-                'task_id': task_id, 'source_revision': source['source_revision']}, input_ranges=input_ranges,
-            request_id=task_id, confidence=min(confidence), requested_mode=self.daily_chat_memory_mode)
+        full = expand_model_document(saved['combined'], base, {binding['binding_id']: text})
+        try:
+            row = await organizer.prepare(day=key, document=full, scene_bodies=saved['scene_bodies'],
+                generation={'prompt_revision': prompt_context['prompt_revision'], 'model_route_revision': model_route,
+                    'task_id': task_id, 'source_revision': source['source_revision']}, input_ranges=saved['input_ranges'],
+                request_id=task_id, confidence=min(saved['confidence']), requested_mode=self.daily_chat_memory_mode,
+                checkpoint={'candidate_revision': row['revision'] + 1 if row else 1,
+                    'progress_revision': progress_record['revision']},
+                expected_candidate_revision=row['revision'] if row else None,
+                expected_root_revision=previous_revision)
+        except Exception as exc:
+            return {'status': 'not_prepared', 'reason': 'checkpoint_saved_candidate_not_updated',
+                'task_id': task_id, 'candidate_id': candidate_id, 'code': getattr(exc, 'code', type(exc).__name__),
+                'failures': failures}
+        checkpoint_compaction_pending = False
+        if row['proposal']['metadata']['diary_l1_bundle']['coverage']['state'] == 'complete':
+            try:
+                progress_store.save(candidate_id,
+                    {'completed_candidate_id': candidate_id, 'candidate_revision': row['revision']},
+                    expected_revision=progress_record['revision'])
+            except Exception:
+                # The canonical candidate is already saved; compaction failure
+                # must not relabel it failed or cause another model call.
+                checkpoint_compaction_pending = True
         result = await organizer.adopt(row['candidate_id']) if row['status'] == 'accepted' else {'status': row['status']}
         return {'status': result['status'], 'candidate_id': row['candidate_id'], 'task_id': task_id,
-            'coverage': row['proposal']['metadata']['diary_l1_bundle']['coverage'], 'failures': failures, 'result': result}
+            'coverage': row['proposal']['metadata']['diary_l1_bundle']['coverage'], 'failures': failures, 'result': result,
+            'checkpoint_compaction_pending': checkpoint_compaction_pending}

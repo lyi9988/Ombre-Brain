@@ -4519,19 +4519,9 @@ class ReflectionEngine(MemoryL1Runtime):
                     item["title"] = draft.get("narrative", {}).get("title", "")
                     # The model selects binding labels; only the program maps them
                     # to archive/event/turn identities used by the existing policy.
-                    refs = set(item.get('source_refs') or [])
-                    def collect_refs(node):
-                        if isinstance(node, list):
-                            for child in node: collect_refs(child)
-                        elif isinstance(node, dict):
-                            refs.update(v for v in node.get('evidence_refs', []) if isinstance(v, str))
-                            refs.update(v for v in node.get('source_refs', []) if isinstance(v, str))
-                            for child in node.values(): collect_refs(child)
-                    collect_refs(draft)
+                    from memory_l1_ingestion import candidate_source_refs
+                    refs = candidate_source_refs(draft, item.get('source_refs', []), len(l1_sources))
                     available = {'source:' + str(i + 1): source for i, source in enumerate(l1_sources)}
-                    if refs - set(available):
-                        from memory_l1_service import L1OwnerError
-                        raise L1OwnerError('unknown_source_binding', field_path='candidate.source_refs')
                     if refs:
                         selected_keys = {available[ref]['source_key'] for ref in refs}
                         selected_turns = [turn for turn in window if selected_keys.intersection(

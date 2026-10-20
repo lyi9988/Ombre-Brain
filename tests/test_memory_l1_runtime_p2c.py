@@ -34,8 +34,10 @@ def runtime(tmp_path, text, *, fail_window=None, limit=32, compact=False):
         draft['statements'] = [statement]
         draft['scenes'] = [{'scene_id': 'new:scene', 'title': '一次连贯经历',
             'source_refs': ['diary-source'], 'statement_refs': ['new:statement'], 'attributes': []}]
+        assert kwargs['response_format']['type'] == 'json_schema'
         assert 'semantic_contract' in payload
         assert not {'model_document_schema', 'catalog', 'document_template'}.intersection(payload)
+        draft['format'] = 'semantic-v1'
         if compact:
             draft = {'format': 'semantic-v1', 'narrative': draft['narrative'], 'entities': [],
                 'statements': [{'content': statement['content'], 'subject_ref': None,
@@ -47,7 +49,8 @@ def runtime(tmp_path, text, *, fail_window=None, limit=32, compact=False):
             '场景独立完整正文：' + payload['source_text']}, 'confidence': 0.9}
         return NS(choices=[NS(message=NS(content=json.dumps(result, ensure_ascii=False)), finish_reason='stop')])
     engine.model = 'synthetic-model'
-    engine.client = NS(chat=NS(completions=NS(create=create)))
+    engine.client = NS(base_url='https://fixture.invalid/v1',
+        with_options=lambda **_: engine.client, chat=NS(completions=NS(create=create)))
     return env, engine, calls
 
 
@@ -114,13 +117,15 @@ def test_diary_window_failure_keeps_completed_input_and_queues_partial_review(tm
     assert len(row['proposal']['metadata']['diary_l1_bundle']['scene_bodies']) == 1
 
 
-def test_configured_window_budget_is_visible_partial_and_replay_does_not_call_model_again(tmp_path):
+def test_configured_window_budget_resumes_only_next_missing_window(tmp_path):
     env, engine, calls = runtime(tmp_path, '合成材料。' * 160, limit=1)
     result = run(engine._memory_l1_diary_task(DAY, env['buckets']))
     assert result['coverage']['state'] == 'partial'
-    replay = run(engine._memory_l1_diary_task(DAY, env['buckets']))
-    assert replay['candidate_id'] == result['candidate_id'] and replay['replayed']
-    assert len(calls) == 1
+    resumed = run(engine._memory_l1_diary_task(DAY, env['buckets']))
+    assert resumed['candidate_id'] == result['candidate_id']
+    assert resumed['coverage']['input_ranges'] == [{'start': 0, 'end': 512}]
+    assert resumed['coverage']['state'] == 'partial'
+    assert [call['window_index'] for call in calls] == [0, 1]
 
 
 def test_first_window_failure_is_failed_task_not_fake_empty_memory(tmp_path):

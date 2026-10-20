@@ -12,6 +12,8 @@ from memory_l1_contract import canonical_json, make_text_anchor, verify_text_anc
 from memory_l1_schema import document_template, generation_template, validate_l1_document
 from memory_l1_service import L1OwnerError
 
+_UNSCOPED_CANDIDATE = object()
+
 MODEL_FIELDS = {'entry', 'narrative', 'entities', 'scenes', 'statements', 'retrieval', 'relations', 'attributes'}
 
 
@@ -64,6 +66,44 @@ def bind_sources(sources, *, config=None):
             'anchors': [make_text_anchor(snapshot['text'], target_namespace='l0', target_id=snapshot['source_id'],
                 target_revision=snapshot['source_revision'], text_view_id=snapshot['text_view_id'], start=0, end=len(snapshot['text']))]})
     return snapshots, bindings
+
+
+
+def candidate_source_refs(document, source_refs, source_count):
+    """Resolve one candidate's explicit support, not its broad scan window.
+
+    Source labels keep their original window positions. Entity evidence and
+    scene ranges are support too; never reinterpret them as local entity IDs.
+    This validates references, not the truth/relevance of a model's citations.
+    """
+    refs = set()
+    def add(values):
+        if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
+            raise L1OwnerError('candidate_source_refs_required', field_path='candidate.source_refs')
+        refs.update(values)
+    add(source_refs)
+    def visit(node):
+        if isinstance(node, list):
+            for child in node: visit(child)
+        elif isinstance(node, dict):
+            for key in ('evidence_refs', 'source_refs'):
+                if key in node: add(node[key])
+            if 'source_ranges' in node:
+                ranges = node['source_ranges']
+                if not isinstance(ranges, list):
+                    raise L1OwnerError('invalid_scene_source_range', field_path='document.scenes.source_ranges')
+                for extent in ranges:
+                    if not isinstance(extent, dict) or not isinstance(extent.get('source_ref'), str):
+                        raise L1OwnerError('invalid_scene_source_range', field_path='document.scenes.source_ranges')
+                    refs.add(extent['source_ref'])
+            for child in node.values(): visit(child)
+    visit(document)
+    available = {f'source:{i + 1}' for i in range(source_count)}
+    if refs - available:
+        raise L1OwnerError('unknown_source_binding', field_path='candidate.source_refs')
+    if not refs:
+        raise L1OwnerError('candidate_sources_required', field_path='candidate.source_refs')
+    return refs
 
 
 def expand_model_document(document, base, source_texts=None):
@@ -142,7 +182,7 @@ def expand_model_document(document, base, source_texts=None):
     return doc
 
 
-def prepare_model_document(revisions, *, memory_id, document, sources, generation, request_id, previous=None, catalog_context=None, config=None):
+def prepare_model_document(revisions, *, memory_id, document, sources, generation, request_id, previous=None, catalog_context=None, config=None, candidate_refs=_UNSCOPED_CANDIDATE):
     if not isinstance(document, dict) or set(document) != MODEL_FIELDS:
         raise L1OwnerError('model_document_fields_required', field_path='document')
     if (not isinstance(generation, dict) or set(generation) != {'prompt_revision', 'model_route_revision', 'task_id', 'actor'}
@@ -152,6 +192,11 @@ def prepare_model_document(revisions, *, memory_id, document, sources, generatio
         raise L1OwnerError('generation_context_required', field_path='generation')
     catalog, catalog_revision = catalog_context if catalog_context is not None else revisions.catalog_provider()
     snapshots, bindings = bind_sources(sources, config=config)
+    if candidate_refs is not _UNSCOPED_CANDIDATE:
+        selected = candidate_source_refs(document, candidate_refs, len(sources))
+        pairs = [(snapshot, binding) for snapshot, binding in zip(snapshots, bindings)
+                 if binding['binding_id'] in selected]
+        snapshots, bindings = map(list, zip(*pairs))
     base = copy.deepcopy(previous) if previous else document_template(catalog=catalog, catalog_revision=catalog_revision)
     base['evidence_bindings'] = bindings
     doc = expand_model_document(document, base, {b['binding_id']: s['text'] for b, s in zip(bindings, snapshots)})

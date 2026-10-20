@@ -45,7 +45,7 @@ class DiaryL1Service:
         self.authority, self.commit = revisions.authority, revisions.commit
 
     async def prepare(self, *, day, document, scene_bodies, generation, input_ranges, request_id,
-                      confidence=0.0, requested_mode="review"):
+                      confidence=0.0, requested_mode="review", checkpoint=None, expected_candidate_revision=None, expected_root_revision=None):
         if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 128:
             raise L1OwnerError("invalid_request_id", field_path="request_id")
         if not isinstance(scene_bodies, dict): raise L1OwnerError("object_required", field_path="scene_bodies")
@@ -68,13 +68,24 @@ class DiaryL1Service:
             "generation": generation, "input_ranges": input_ranges, "confidence": confidence, "requested_mode": requested_mode})
         prior_candidate = self.authority.get_candidate(candidate_id)
         if prior_candidate:
-            if prior_candidate["proposal"]["metadata"].get("diary_request_sha256") != request_hash:
+            if prior_candidate['proposal']['metadata'].get('diary_request_sha256') == request_hash:
+                return prior_candidate
+            if expected_candidate_revision is None:
                 raise IdempotencyConflict("diary request id has different task result")
-            return prior_candidate
+            old_checkpoint = prior_candidate['proposal']['metadata'].get('diary_l1_checkpoint')
+            if (prior_candidate['status'] != 'pending'
+                    or prior_candidate['revision'] != expected_candidate_revision
+                    or not old_checkpoint
+                    or old_checkpoint.get('candidate_revision') != expected_candidate_revision):
+                raise RevisionConflict('diary candidate changed after checkpoint')
+        elif expected_candidate_revision is not None:
+            raise RevisionConflict('diary candidate disappeared')
         memory = self.authority.get_memory(memory_id)
         if memory and memory["state"] != "active":
             raise L1OwnerError("diary_root_not_active", status=409, field_path="memory.state")
         expected = memory["active_revision"] if memory else 0
+        if expected_root_revision is not None and expected != expected_root_revision:
+            raise RevisionConflict('diary root changed during generation')
         catalog, catalog_revision = self.revisions.catalog_provider()
         prior = (await self.revisions.detail(memory_id))["l1"]["document"] if memory else document_template(catalog=catalog, catalog_revision=catalog_revision)
         doc = copy.deepcopy(document)
@@ -144,6 +155,8 @@ class DiaryL1Service:
                     "diary_request_sha256": request_hash,
                     "diary_l1_bundle": {"memory_id": memory_id, "expected_revision": expected,
                         "scene_bodies": body_map, "coverage": coverage, "source_binding": binding}})
+        if checkpoint is not None:
+            metadata['diary_l1_checkpoint'] = copy.deepcopy(checkpoint)
         # An incomplete source input or a previously owner-edited root stays
         # on the existing Review path; it cannot silently replace owner work.
         review_reasons = []
@@ -155,6 +168,14 @@ class DiaryL1Service:
         decision = self.policy.evaluate(proposal)
         if review_reasons:
             decision = PolicyDecision("queue_review", tuple(review_reasons), "review", requires_owner_confirmation=True)
+        if prior_candidate:
+            # Existing partial Review does not become Auto-approved when its
+            # tail completes. Revision CAS also protects owner decisions made
+            # during capture/validation above.
+            return self.authority.revise_candidate(candidate_id,
+                expected_revision=expected_candidate_revision, proposal=proposal,
+                request_id=request_id + ':resume:' + str(expected_candidate_revision + 1),
+                actor='diary_first_pass_resume')
         return self.authority.put_candidate(proposal, decision)
 
     async def adopt(self, candidate_id):

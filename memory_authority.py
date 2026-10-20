@@ -673,7 +673,7 @@ class MemoryAuthorityStore:
                 "INSERT INTO candidate_decisions(decision_id,candidate_id,from_status,to_status,candidate_revision,"
                 "request_id,fingerprint,actor,reason_codes_json,result_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (str(uuid.uuid4()), candidate_id, current["status"], current["status"], next_revision,
-                 request_id, fingerprint, actor, _json(["OWNER_EDITED_PROPOSAL"]), _json(result), now),
+                 request_id, fingerprint, actor, _json(["DIARY_WINDOW_RESUMED" if actor == "diary_first_pass_resume" else "OWNER_EDITED_PROPOSAL"]), _json(result), now),
             )
             conn.commit()
             return result
