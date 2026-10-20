@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
 import os
 import random
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -221,6 +223,58 @@ class DreamEngine:
             if isinstance(item, dict):
                 events.append(item)
         return events
+
+    def _read_attempt_state(self) -> dict:
+        """Bounded diagnostics, separate from the dream/event lifecycle."""
+        try:
+            value = json.loads((self.logs_dir / "latest_attempt.json").read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _record_attempt(self, result: dict, now_local: datetime, *, attempt: bool,
+                        material_count: int | None = None, phase: str = "decision",
+                        order_ns: int | None = None) -> None:
+        # No exception text, provider payload, key, or source content is persisted.
+        entry = {
+            "checked_at": now_local.isoformat(timespec="microseconds"),
+            "order_ns": time.time_ns() if order_ns is None else order_ns,
+            "timezone": str(self.tz),
+            "window_start_hour": self.daily_hour,
+            "window_end_hour": min(24, self.daily_hour + self.run_window_hours),
+            "status": result.get("status"),
+            "reason": result.get("reason"),
+            "material_count": material_count,
+            "min_material_count": self.min_material_count,
+            "phase": phase,
+            "failure_category": result.get("failure_category"),
+        }
+        previous = self._read_attempt_state()
+        state = {key: previous.get(key) for key in ("latest_check", "latest_attempt")}
+        # A slow earlier attempt must not erase a later check/attempt. Start and
+        # terminal updates share an ordering token, even within the same second.
+        for key in (("latest_check", "latest_attempt") if attempt else ("latest_check",)):
+            old = state[key]
+            old_order = old.get("order_ns", 0) if isinstance(old, dict) else 0
+            if not isinstance(old_order, int) or entry["order_ns"] >= old_order:
+                state[key] = entry
+        # One replaceable sidecar in existing state/log storage; no per-tick append.
+        temporary = self.logs_dir / (".latest_attempt." + uuid.uuid4().hex + ".tmp")
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(state, stream, ensure_ascii=False, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.logs_dir / "latest_attempt.json")
+        except OSError:
+            # Diagnostics must not change whether a dream is generated or retried.
+            logger.warning("Unable to persist dream attempt diagnostics")
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _dream_path(self, dream_id: str) -> Path:
         return self.dreams_dir / f"{dream_id}.md"
@@ -784,6 +838,35 @@ class DreamEngine:
         force: bool = False,
         raw_event_store=None,
     ) -> dict:
+        now_local = self._now(now)
+        observation = {"material_count": None, "phase": "decision", "order_ns": time.time_ns()}
+        self._record_attempt({"status": "started"}, now_local, attempt=True, **observation)
+        try:
+            result = await self._generate_impl(
+                bucket_mgr, embedding_engine, now_local, force=force,
+                raw_event_store=raw_event_store, _observation=observation,
+            )
+        except (Exception, asyncio.CancelledError) as exc:
+            category = "cancelled" if isinstance(exc, asyncio.CancelledError) else (
+                "timeout" if isinstance(exc, TimeoutError) else "error"
+            )
+            self._record_attempt(
+                {"status": "failed", "reason": ("post_generation_failed" if observation["phase"] == "post_generation" else "generation_failed"), "failure_category": category},
+                now_local, attempt=True, **observation,
+            )
+            raise
+        self._record_attempt(result, now_local, attempt=True, **observation)
+        return result
+
+    async def _generate_impl(
+        self,
+        bucket_mgr,
+        embedding_engine=None,
+        now: datetime | None = None,
+        force: bool = False,
+        raw_event_store=None,
+        _observation: dict | None = None,
+    ) -> dict:
         if not self.enabled:
             return {"status": "disabled"}
         if not self.client:
@@ -800,7 +883,11 @@ class DreamEngine:
                     "reason": "daily_probability_already_missed",
                     "date": date_key,
                 }
+        if _observation is not None:
+            _observation["phase"] = "materials"
         materials, identity_anchor = await self.select_materials(bucket_mgr, now_local)
+        if _observation is not None:
+            _observation["material_count"] = len(materials)
         if len(materials) < self.min_material_count:
             return {
                 "status": "skipped",
@@ -835,7 +922,11 @@ class DreamEngine:
         old_echo = self._select_old_echo(all_buckets, materials, now_local)
         raw_residue_turns, raw_residue_event_ids = self.select_raw_residue_turns(raw_event_store, now_local)
         payload = self._payload_for(materials, identity_anchor, old_echo, raw_residue_turns)
+        if _observation is not None:
+            _observation["phase"] = "model"
         dream_text = await self._call_dream_model(payload)
+        if _observation is not None:
+            _observation["phase"] = "persist"
         core_affect = self._core_affect_from_materials(materials)
         recall_cues = self._recall_cues_from_dream_text(dream_text)
         dream_id = f"dream_{now_local.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -867,6 +958,8 @@ class DreamEngine:
             "surface_attempts": 0,
         }
         record = self._write_record(metadata, dream_text)
+        if _observation is not None:
+            _observation["phase"] = "post_generation"
         self._log_event(
             "generated",
             {
@@ -890,13 +983,19 @@ class DreamEngine:
         now: datetime | None = None,
         raw_event_store=None,
     ) -> dict:
-        if not self.enabled or not self.auto_enabled:
-            return {"status": "disabled"}
         now_local = self._now(now)
+        if not self.enabled or not self.auto_enabled:
+            result = {"status": "disabled"}
+            self._record_attempt(result, now_local, attempt=False)
+            return result
         if now_local.hour < self.daily_hour:
-            return {"status": "skipped", "reason": "too_early"}
+            result = {"status": "skipped", "reason": "too_early"}
+            self._record_attempt(result, now_local, attempt=False)
+            return result
         if now_local.hour >= min(24, self.daily_hour + self.run_window_hours):
-            return {"status": "skipped", "reason": "outside_dream_window"}
+            result = {"status": "skipped", "reason": "outside_dream_window"}
+            self._record_attempt(result, now_local, attempt=False)
+            return result
         return await self.generate(
             bucket_mgr,
             embedding_engine,
@@ -1177,6 +1276,7 @@ class DreamEngine:
         return None
 
     def dashboard_payload(self, limit: int = 30) -> dict:
+        attempts = self._read_attempt_state()
         return {
             "enabled": self.enabled,
             "auto_enabled": self.auto_enabled,
@@ -1184,4 +1284,6 @@ class DreamEngine:
             "model": self.model,
             "api_ready": bool(self.api_key),
             "records": self.dashboard_records(limit),
+            "latest_check": attempts.get("latest_check"),
+            "latest_attempt": attempts.get("latest_attempt"),
         }

@@ -5208,6 +5208,39 @@ function dreamStatusLabel(status) {
   return '潜伏中';
 }
 
+function dreamAttemptSummary(data) {
+  function line(label, item) {
+    if (!item || typeof item !== 'object') return '';
+    var reasons = {
+      missing_api_key: '未配置梦境模型密钥',
+      not_enough_materials: '材料不足，未调用模型',
+      too_early: '尚未到自动做梦时段',
+      outside_dream_window: '当前不在自动做梦时段',
+      daily_probability_miss: '今天未抽中做梦概率',
+      daily_probability_already_missed: '今天已判定不做梦，不重复抽取',
+      post_generation_failed: '梦境已保存，后续处理未完成',
+      generation_failed: '生成尝试失败'
+    };
+    var states = {disabled: '自动生成未启用', created: '已生成梦境',
+      exists: '当天已有梦境', started: '尝试尚无结束记录，可能仍在执行或已中断'};
+    var message = reasons[item.reason] || states[item.status] || '状态未知';
+    var details = [label + '：' + message];
+    if (item.checked_at) details.push(String(item.checked_at));
+    if (item.timezone) details.push('时区 ' + item.timezone);
+    if (Number.isInteger(item.window_start_hour) && Number.isInteger(item.window_end_hour))
+      details.push('自动时段 ' + item.window_start_hour + ':00–' + item.window_end_hour + ':00');
+    if (Number.isInteger(item.material_count)) details.push('材料 ' + item.material_count + ' / 最少 ' + item.min_material_count);
+    else details.push('本次未统计材料');
+    if (item.failure_category) details.push('失败类别 ' + item.failure_category + '，阶段 ' + (item.phase || '未知'));
+    return '<div class="reflection-empty">' + details.map(esc).join(' · ') + '</div>';
+  }
+  var check = data.latest_check;
+  var attempt = data.latest_attempt;
+  var html = line('最近检查', check);
+  if (attempt && JSON.stringify(attempt) !== JSON.stringify(check)) html += line('最近生成尝试', attempt);
+  return html || '<div class="reflection-empty">暂无检查记录；不能据此判断是否运行过。</div>';
+}
+
 async function loadDreams() {
   var content = document.getElementById('dreams-content');
   content.innerHTML = '<div class="loading">加载梦境记录…</div>';
@@ -5216,11 +5249,12 @@ async function loadDreams() {
     if (!res) return;
     var data = await res.json();
     var records = data.records || [];
+    var attemptSummary = dreamAttemptSummary(data);
     if (!records.length) {
-      content.innerHTML = '<div class="reflection-empty">还没有梦。</div>';
+      content.innerHTML = attemptSummary + '<div class="reflection-empty">暂无梦境记录。</div>';
       return;
     }
-    content.innerHTML = '<div class="dream-list">' + records.map(function(record) {
+    content.innerHTML = attemptSummary + '<div class="dream-list">' + records.map(function(record) {
       var aiName = record.ai_name || dashboardAiAuthor || 'Haven';
       var title = formatDreamDate(record) + ' ' + esc(aiName) + ' 做了一个梦';
       if (!record.has_body) {
