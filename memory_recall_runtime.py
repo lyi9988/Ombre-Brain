@@ -328,6 +328,19 @@ async def verify_sources(service, request, query, items, *, refresh=False):
         try:
             response = await read_batch(service, request, "sources",
                 "/api/memory-authority/recall-sources", {"items": wanted})
+            # Only program-defined counts/timings enter the request trace.
+            # Source text, locator identities and arbitrary upstream fields do
+            # not become telemetry just because Brain returned them.
+            diagnostics = response.get("diagnostics") or {}
+            if isinstance(diagnostics, dict):
+                upstream = diagnostics.get("timing_ms") or {}
+                if isinstance(upstream, dict):
+                    stats["upstream_timing_ms"] = {
+                        key: value for key in ("prepare", "source_reads", "final_authority")
+                        if type(value := upstream.get(key)) is int and value >= 0}
+                for key in ("member_batches", "member_cache_hits", "unique_binding_reads"):
+                    if type(value := diagnostics.get(key)) is int and value >= 0:
+                        stats[key] = value
             for row in response["items"]:
                 identity = (row["memory_id"], row["revision"])
                 if identity in cache_keys:

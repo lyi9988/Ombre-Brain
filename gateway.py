@@ -13,7 +13,7 @@ import time
 import asyncio
 import threading
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from copy import copy, deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -1549,6 +1549,26 @@ class GatewayService:
             if value is not None:
                 row[str(key)[:80]] = value
         stage_log.append(row)
+
+    @contextmanager
+    def _timed_candidate_stage(self, timings, stages, name, input_count=0):
+        """Keep count-only stage evidence even when the shared deadline cancels IO."""
+        started = time.perf_counter()
+        stage = {"stage": name, "timing_key": name, "input_count": input_count,
+                 "output_count": 0, "status": "running", "skipped": False}
+        stages.append(stage)
+        try:
+            yield stage
+            stage["status"] = "completed"
+        except asyncio.CancelledError:
+            stage["status"] = "cancelled"
+            raise
+        except BaseException as exc:
+            stage.update(status="error", error_type=type(exc).__name__)
+            raise
+        finally:
+            self._add_timing_ms(timings, name, started)
+            stage["duration_ms"] = timings[name]
 
     @staticmethod
     def _rejected_bucket_evidence(items: list[dict] | None) -> dict[str, Any]:
@@ -17461,15 +17481,23 @@ class GatewayService:
             # A narrow pool with good lexical/identity evidence does not need a
             # Planner. Expansion is based on candidate uncertainty, not a magic
             # phrase in the user's message, and happens before the final rerank.
-            has_clear_candidate = any(
-                self._hard_bucket_evidence_labels(self._bucket_evidence_labels(query, item))
-                or ((item.get("natural_semantic") or {}).get("index_status") == "verified"
-                    and self._safe_float(item.get("semantic_score"), 0) >= self.recall_policy.semantic_threshold)
-                for item in pool)
-            if (not recall_input.get("local_only") and recall_input.get("allow_query_planner", True)
-                    and getattr(self, "query_planner_enabled", False) and pool
-                    and not has_clear_candidate):
-                plan, error = await self._call_query_planner(recall_input.get("q_context") or query)
+            planner_eligible = (not recall_input.get("local_only")
+                                and recall_input.get("allow_query_planner", True)
+                                and getattr(self, "query_planner_enabled", False) and bool(pool))
+            with self._timed_candidate_stage(timings, stages, "natural.planner_eligibility", len(pool)) as stage:
+                # Evidence scanning is useful only when expansion can run. The
+                # same evidence is still evaluated at final admission below.
+                has_clear_candidate = planner_eligible and any(
+                    self._hard_bucket_evidence_labels(self._bucket_evidence_labels(query, item))
+                    or ((item.get("natural_semantic") or {}).get("index_status") == "verified"
+                        and self._safe_float(item.get("semantic_score"), 0) >= self.recall_policy.semantic_threshold)
+                    for item in pool)
+                stage.update(output_count=len(pool), skipped=not planner_eligible)
+            if planner_eligible and not has_clear_candidate:
+                with self._timed_candidate_stage(timings, stages, "natural.query_planner", len(pool)) as stage:
+                    plan, error = await self._call_query_planner(recall_input.get("q_context") or query)
+                    stage.update(output_count=len((plan or {}).get("queries") or []),
+                                 cache=(plan or {}).get("_cache", {}))
                 debug.update(triggered=True, error=error)
                 recall_input["route"] = "deep"
                 for row in (plan or {}).get("queries", [])[:getattr(self, "query_planner_max_queries", 2)]:
@@ -17533,10 +17561,16 @@ class GatewayService:
                 debug["candidate_checkpoint"] = {"status": "authority_changed"}
             elif checkpoint:
                 debug["candidate_checkpoint"] = {"status": "invalidated"}
-        pool = memory_use.add_local_candidates(self, recall_input, query, pool)
+        with self._timed_candidate_stage(timings, stages, "natural.local_candidates", len(pool)) as stage:
+            pool = memory_use.add_local_candidates(self, recall_input, query, pool)
+            stage["output_count"] = len(pool)
         before_source_check = pool
-        pool = await memory_use.verify_sources(self, recall_input, query, pool)
-        pool = memory_use.score_pool(self, recall_input, query, pool)
+        with self._timed_candidate_stage(timings, stages, "natural.source_verification", len(pool)) as stage:
+            pool = await memory_use.verify_sources(self, recall_input, query, pool)
+            stage["output_count"] = len(pool)
+        with self._timed_candidate_stage(timings, stages, "natural.score_before_rerank", len(pool)) as stage:
+            pool = memory_use.score_pool(self, recall_input, query, pool)
+            stage["output_count"] = len(pool)
         surviving_ids = {str(item["bucket"]["id"]) for item in pool}
         suppressed.extend(item for item in before_source_check if str(item["bucket"]["id"]) not in surviving_ids)
         # Use the same current L1 semantic text as the embedding projector.
@@ -17596,7 +17630,9 @@ class GatewayService:
             )
         if rerank_debug.get("provider_failed"):
             recall_input.setdefault("incomplete_reasons", []).append("reranker_unavailable")
-        pool = memory_use.score_pool(self, recall_input, query, pool, after_rerank=True)
+        with self._timed_candidate_stage(timings, stages, "natural.score_after_rerank", len(pool)) as stage:
+            pool = memory_use.score_pool(self, recall_input, query, pool, after_rerank=True)
+            stage["output_count"] = len(pool)
         semantic_threshold = memory_use.option(self, "semantic_threshold", self.recall_policy.semantic_threshold)
         rerank_threshold = memory_use.option(self, "rerank_threshold", self.recall_policy.rerank_threshold)
         local_threshold = memory_use.option(self, "local_threshold")
