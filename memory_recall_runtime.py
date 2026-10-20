@@ -270,6 +270,8 @@ def score_pool(service, request, query, pool, *, after_rerank=False):
         calculation["window_score"] = (calculation["score"] if not formula_failed
             and (custom_formula or time_applied or item.get("l1_local_match")) else None)
         item["_configured_score"] = calculation
+        if not after_rerank:
+            item["_configured_score_before_rerank"] = calculation
         if calculation["score"] is not None:
             item["score"] = calculation["score"]
             if after_rerank:

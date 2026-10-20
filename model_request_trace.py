@@ -574,6 +574,8 @@ class ModelRequestTraceStore:
                                          and 0 <= value < float("inf")) else None
                     active_prepare = {
                         "prepare_ordinal": prepare_ordinal,
+                        "request_id": payload.get("request_id"),
+                        "logical_request_id": payload.get("logical_request_id"),
                         "created_at_ms": event["created_at_ms"],
                         "total_ms": duration(timing.get("total_ms")),
                         "steps_ms": {k: v for k, v in steps.items() if duration(v) is not None},
@@ -584,6 +586,9 @@ class ModelRequestTraceStore:
                     boundaries = boundary_projection(event_metadata.get("request_boundary_timing"))
                     if boundaries:
                         active_prepare["request_boundary_timing"] = boundaries
+                    if isinstance(event_metadata.get("memory_score_evidence"), dict):
+                        active_prepare["memory_configuration_revision"] = event_metadata.get("memory_configuration_revision")
+                        active_prepare["memory_score_evidence"] = event_metadata["memory_score_evidence"]
                     preparations.append(active_prepare)
             elif event.get("type") == "metadata.updated" and active_prepare is not None:
                 boundaries = boundary_projection(payload.get("request_boundary_timing"))

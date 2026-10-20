@@ -470,6 +470,7 @@ adjustment. Formula errors retain the base with reasons, never a guessed input.
             value, calculation = base, {"error": exc.payload()["error"]}
             reasons.append("formula_error_retained_base")
         rows.append({"statement_id": sid, "score": value,
+                     "topic_ids": list(classification.get("topics") or []),
                      "participates_in_aggregation": sid in direct or not document.get("statements"),
                      "match_kind": features["statement_match_kind"],
                      "match_evidence": selection.get("matches", {}).get(sid),

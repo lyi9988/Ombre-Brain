@@ -5634,6 +5634,10 @@ class GatewayService:
             debug_payload["recent_context_selection"] = recent_context_selection
             debug_payload["effective_config"] = effective_config
             debug_payload["candidate_stages"] = candidate_stages
+            # Freeze the completed computation from this request, never the
+            # service-wide last_request slot (which another chat can replace).
+            from memory_score_evidence import request_score_evidence
+            debug_payload["memory_score_evidence"] = request_score_evidence(self, natural_input)
             debug_payload["prompt_composer"] = prompt_composer_debug
             debug_payload["memory_recall_projection"] = {
                 key: value
@@ -6137,6 +6141,10 @@ class GatewayService:
                 "prompt_composer": debug.get("prompt_composer") or {
                     "status": "legacy_default"},
             }
+            score_snapshot = debug.get("memory_score_evidence")
+            if isinstance(score_snapshot, dict):
+                metadata["memory_configuration_revision"] = (score_snapshot.get("configuration") or {}).get("revision")
+                metadata["memory_score_evidence"] = score_snapshot
             detail_debug = debug.get("memory_detail_recall_debug")
             if not isinstance(detail_debug, dict):
                 detail_debug = self._memory_detail_recall_debug_base(
@@ -17492,6 +17500,11 @@ class GatewayService:
         if rerank_debug.get("provider_failed"):
             recall_input.setdefault("incomplete_reasons", []).append("reranker_unavailable")
         pool = memory_use.score_pool(self, recall_input, query, pool, after_rerank=True)
+        semantic_threshold = memory_use.option(self, "semantic_threshold", self.recall_policy.semantic_threshold)
+        rerank_threshold = memory_use.option(self, "rerank_threshold", self.recall_policy.rerank_threshold)
+        local_threshold = memory_use.option(self, "local_threshold")
+        if memory_use.option(self, "mode", "inherit") == "fast_local" and local_threshold is None:
+            local_threshold = self.first_card_min_score
         accepted = []
         for item in pool:
             labels = self._bucket_evidence_labels(query, item)
@@ -17501,11 +17514,6 @@ class GatewayService:
             rerank = item.get("rerank_score")
             semantic = self._safe_float(item.get("semantic_score"), 0)
             semantic_verified = (item.get("natural_semantic") or {}).get("index_status") == "verified"
-            semantic_threshold = memory_use.option(self, "semantic_threshold", self.recall_policy.semantic_threshold)
-            rerank_threshold = memory_use.option(self, "rerank_threshold", self.recall_policy.rerank_threshold)
-            local_threshold = memory_use.option(self, "local_threshold")
-            if memory_use.option(self, "mode", "inherit") == "fast_local" and local_threshold is None:
-                local_threshold = self.first_card_min_score
             local_signal = bool(self._safe_float(item.get("keyword_score"), 0) > 0
                                 or any((item.get("l1_local_match") or {}).values()))
             local_admit = local_threshold is not None and local_signal and item["score"] >= local_threshold
@@ -17551,12 +17559,27 @@ class GatewayService:
             "query_use": {key: value for key, value in (recall_input.get("_use_context") or {}).items()
                           if key in {"purpose", "purpose_reason", "temporal_reference"}},
             "recall": dict(memory_use.values(self).get("recall") or {}),
+            "selection_policy": {
+                "semantic_threshold": semantic_threshold, "rerank_threshold": rerank_threshold,
+                "local_threshold": local_threshold, "max_cards": getattr(self, "inject_max_cards", None),
+                "first_card_min_score": getattr(self, "first_card_min_score", None),
+                "second_card_min_score": getattr(self, "second_card_min_score", None),
+                "second_card_relative_score": getattr(self, "second_card_relative_score", None),
+                "rerank_score_weight": getattr(getattr(self, "reranker_engine", None), "score_weight", None),
+            },
             "signal_sources": (recall_input.get("_use_context") or {}).get("signals", {}),
             "hierarchy_suppressed": list(recall_input.get("hierarchy_suppressed") or []),
             "scores": [{"bucket_id": str(item["bucket"]["id"]), "computation": item.get("_configured_score")}
                        for item in selected],
             "candidate_scores": [{"bucket_id": str(item["bucket"]["id"]), "computation": item.get("_configured_score"),
+                        "before_rerank": item.get("_configured_score_before_rerank"),
                         "selected": item in selected, "admission_reason": item.get("admission_reason"),
+                        "admitted": item in accepted,
+                        "admitted_before_hierarchy": str(item["bucket"]["id"]) in admitted_before_hierarchy,
+                        "selection_reason": (selection_diagnostics.get("decisions", {}).get(str(item["bucket"]["id"])) or {}).get("reason"),
+                        "raw_base_score": item.get("_raw_base_score"), "raw_fused_score": item.get("_raw_fused_score"),
+                        "keyword_score": item.get("keyword_score"), "semantic_score": item.get("semantic_score"),
+                        "rerank_score": item.get("rerank_score"), "final_score": item.get("score"),
                         "correction_statement_ids": item.get("correction_statement_ids", [])}
                        for item in pool],
             "usage_by_bucket": {bid: {"state": row["state"],
