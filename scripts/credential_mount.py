@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -65,7 +66,7 @@ def inspect(name):
     return data
 
 
-def snapshot(source, destination):
+def locked_bytes(source):
     # /proc/PID/root/... intentionally retains the original mount namespace.
     # Do not resolve it into a host /app path before opening it.
     import fcntl
@@ -76,9 +77,14 @@ def snapshot(source, destination):
         after = os.fstat(stream.fileno())
     require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) ==
             (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns), "source changed during snapshot")
+    return raw, {"device": before.st_dev, "inode": before.st_ino,
+                 "mode": before.st_mode & 0o777, "uid": before.st_uid, "gid": before.st_gid}
+
+
+def snapshot(source, destination):
+    raw, identity = locked_bytes(source)
     private_write(destination, raw)
-    return {"device": before.st_dev, "inode": before.st_ino,
-            "mode": before.st_mode & 0o777, "uid": before.st_uid, "gid": before.st_gid}
+    return identity
 
 
 def compose_model(info):
@@ -136,6 +142,7 @@ def prepare(args):
     os.chown(target_dir / ".env", state["host_identity"]["uid"], state["host_identity"]["gid"])
     runtime = state_dir / "runtime"
     runtime.mkdir(mode=0o700)
+    state["runtime_dir"] = str(runtime)
     for source in (Path(__file__).with_name("credential_bootstrap.py"),
                    Path(__file__).resolve().parents[1] / "credential_file.py"):
         private_write(runtime / source.name, source.read_bytes())
@@ -185,8 +192,36 @@ def render_model(original, name, state, operation_dir, image):
     return escape(model)
 
 
+def check_preimage(state, directory):
+    require(state["phase"] == "prepared", "preimage check requires prepared operation")
+    # Invalidate any previous check before observing a new potentially failed one.
+    state.pop("preimage_checked_at", None)
+    save_state(directory, state)
+    entry = Path(state["host_entry"])
+    require(str(entry.resolve()) == state["host_resolved"], "host source path changed after preparation")
+    with file_lock(entry):
+        raw, identity = locked_bytes(entry)
+    require(identity == state["host_identity"] and raw == (directory / "host-current.env").read_bytes(),
+            "host preimage changed; preserve current values and reconcile")
+    require(raw == (Path(state["credentials_dir"]) / ".env").read_bytes(), "staged credential preimage changed")
+    for name, original in state["services"].items():
+        info = inspect(name)
+        require(info["Id"] == original["container"] and info["State"]["Running"],
+                "original containers must still be running for preimage verification")
+        source = Path("/proc") / str(info["State"]["Pid"]) / "root/app/.env"
+        raw, identity = locked_bytes(source)
+        require(identity == original["identity"] and raw == (directory / (name + ".env")).read_bytes(),
+                "container preimage changed; preserve late saves before stopping")
+    state["preimage_checked_at"] = time.time()
+    save_state(directory, state)
+    return {"phase": "preimages_verified", "operation": state["operation"],
+            "writer_coordination_required_until_stop": True}
+
+
 def activate(state, directory):
     require(state["phase"] in ("prepared", "activating", "active"), "operation is not prepared")
+    require(state["phase"] in ("activating", "active") or state.get("preimage_checked_at"),
+            "run check-preimage while both original containers are running before stopping")
     entry = Path(state["host_entry"])
     target = Path(state["credentials_dir"]) / ".env"
     if entry.is_symlink() and entry.resolve() == target:
@@ -229,6 +264,11 @@ def verify(state):
         mounted = mounts.get(CONTAINER_DIR, {})
         require(mounted.get("Type") == "bind" and mounted.get("RW") and
                 mounted.get("Source") == state["credentials_dir"], "service directory source differs")
+        runtime = mounts.get(RUNTIME_DIR, {})
+        require(runtime.get("Type") == "bind" and not runtime.get("RW") and
+                runtime.get("Source") == state["runtime_dir"], "startup runtime mount differs")
+        require(info["Config"].get("Entrypoint") == ["python", RUNTIME_DIR + "/credential_bootstrap.py"],
+                "service is not using the current-file startup reader")
         visible = Path("/proc") / str(info["State"]["Pid"]) / "root" / CONTAINER_DIR.lstrip("/") / ".env"
         actual = visible.stat()
         require((actual.st_dev, actual.st_ino) == (canonical.st_dev, canonical.st_ino), "service sees another inode")
@@ -241,7 +281,7 @@ def verify(state):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "render", "activate", "verify", "rollback"))
+    parser.add_argument("action", choices=("prepare", "render", "check-preimage", "activate", "verify", "rollback"))
     parser.add_argument("--operation-dir", required=True)
     parser.add_argument("--host-env", default="/srv/ombre-brain/.env")
     parser.add_argument("--credentials-dir", default="/srv/ombre-brain/credentials")
@@ -256,13 +296,15 @@ def main():
     else:
         with file_lock(directory / "operation"):
             state = json.loads((directory / "state.json").read_text())
-            if args.action == "activate":
+            if args.action == "check-preimage":
+                return check_preimage(state, directory)
+            elif args.action == "activate":
                 state = activate(state, directory)
             elif args.action == "verify":
                 return verify(state)
             else:
                 require(args.service, "service required")
-                image = state["services"][args.service]["image"] if args.action == "rollback" else args.image
+                image = (args.image or state["services"][args.service]["image"]) if args.action == "rollback" else args.image
                 require(image, "explicit release image required")
                 original = json.loads((directory / (args.service + ".original.json")).read_text())
                 model = render_model(original, args.service, state, directory, image)

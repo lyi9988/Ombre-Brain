@@ -87,11 +87,45 @@ class MigrationTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             mount.private_write(path, b"replacement")
 
+    def test_rollback_can_select_a_compatible_image(self):
+        self.state["services"] = {self.service: {"image": "sha256:old", "project": "test"}}
+        (self.operation / "state.json").write_text(json.dumps(self.state))
+        (self.operation / (self.service + ".original.json")).write_text(json.dumps(self.model))
+        with patch.object(sys, "platform", "linux"), patch.object(sys, "argv", [
+                "credential_mount.py", "rollback", "--operation-dir", str(self.operation),
+                "--service", self.service, "--image", "sha256:compatible"]):
+            mount.main()
+        rendered = json.loads((self.operation / (self.service + ".rollback.json")).read_text())
+        self.assertEqual(rendered["services"][self.service]["image"], "sha256:compatible")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process root verification")
+    def test_verify_requires_runtime_source_and_bootstrap(self):
+        self.credentials.chmod(0o700)
+        (self.credentials / ".env").chmod(0o600)
+        entry = self.root / ".env"
+        entry.symlink_to(self.credentials / ".env")
+        self.state.update(host_entry=str(entry), runtime_dir=str(self.operation / "runtime"))
+        info = {"State": {"Running": True, "Pid": os.getpid()}, "Mounts": [
+            {"Destination": str(self.credentials), "Type": "bind", "RW": True, "Source": str(self.credentials)},
+            {"Destination": mount.RUNTIME_DIR, "Type": "bind", "RW": False, "Source": self.state["runtime_dir"]}],
+            "Config": {"Env": ["OMBRE_ENV_PATH=" + str(self.credentials / ".env")],
+                       "Entrypoint": ["python", mount.RUNTIME_DIR + "/credential_bootstrap.py"]}}
+        with patch.object(mount, "SERVICES", ("one",)), patch.object(mount, "CONTAINER_DIR", str(self.credentials)), \
+                patch.object(mount, "inspect", return_value=info):
+            self.assertEqual(mount.verify(self.state)["phase"], "mounts_verified")
+            info["Config"]["Entrypoint"] = []
+            with self.assertRaises(mount.Refused):
+                mount.verify(self.state)
+            info["Config"]["Entrypoint"] = ["python", mount.RUNTIME_DIR + "/credential_bootstrap.py"]
+            info["Mounts"][1]["RW"] = True
+            with self.assertRaises(mount.Refused):
+                mount.verify(self.state)
+
     def test_activate_refuses_live_containers_and_changed_source(self):
         entry = self.root / ".env"
         shutil.copyfile(self.operation / "host-current.env", entry)
         self.state.update(phase="prepared", operation=uuid.uuid4().hex, host_entry=str(entry),
-                          host_resolved=str(entry), services={"original": {"container": "id"}})
+                          host_resolved=str(entry), services={"original": {"container": "id"}}, preimage_checked_at=1)
         with patch.object(mount, "inspect", return_value={"Id": "id", "State": {"Running": True}}):
             with self.assertRaises(mount.Refused):
                 mount.activate(self.state, self.operation)
@@ -107,7 +141,7 @@ class MigrationTests(unittest.TestCase):
         entry = self.root / ".env"
         shutil.copyfile(self.operation / "host-current.env", entry)
         self.state.update(phase="prepared", operation=uuid.uuid4().hex, host_entry=str(entry),
-                          host_resolved=str(entry), services={"original": {"container": "id"}})
+                          host_resolved=str(entry), services={"original": {"container": "id"}}, preimage_checked_at=1)
         with patch.object(mount, "inspect", return_value={"Id": "id", "State": {"Running": False}}):
             mount.activate(self.state, self.operation)
         self.assertEqual(entry.resolve(), self.credentials / ".env")
@@ -258,6 +292,23 @@ print(json.dumps({'status':r.status,'body':json.loads(r.read())}))"""
                     args.operation_dir = str(root / "operation")
                     state = mount.prepare(args)
                     operation = Path(args.operation_dir)
+                    mount.check_preimage(state, operation)
+                    # Late write reaches the orphan inode, leaving host unchanged.
+                    request(names[1], "/save", {"updates": {"LATE_SAVE": "fake-late-owner-save"}})
+                    self.assertNotIn("LATE_SAVE", read_values(entry)[0])
+                    with self.assertRaises(mount.Refused):
+                        mount.check_preimage(state, operation)
+                    self.assertNotIn("preimage_checked_at", state)
+                    with self.assertRaises(mount.Refused):
+                        mount.activate(state, operation)
+                    self.assertFalse(entry.is_symlink())
+                    # Explicit fake-value reconciliation and a new operation; no replay.
+                    write_values(entry, {"LATE_SAVE": "fake-late-owner-save"})
+                    (root / "credentials").rename(operation / "unused-stage")
+                    args.operation_dir = str(root / "operation-current")
+                    state = mount.prepare(args)
+                    operation = Path(args.operation_dir)
+                    mount.check_preimage(state, operation)
                     forward, rollback = {}, {}
                     for name in names:
                         original_model = json.loads((operation / (name + ".original.json")).read_text())
@@ -317,6 +368,7 @@ print(json.dumps({'status':r.status,'body':json.loads(r.read())}))"""
                         self.assertEqual(after["startup"], "fake-atomic-latest")
                         self.assertEqual(after["values"]["BACKUP_KEY"], "fake-backup")
                         self.assertEqual(after["values"]["SECOND_KEY"], "fake-secondary")
+                        self.assertEqual(after["values"]["LATE_SAVE"], "fake-late-owner-save")
                     mount.verify(state)
             finally:
                 subprocess.run(["docker", "rm", "-f", *names], capture_output=True)
