@@ -8576,20 +8576,13 @@ async def hold(
     if not content or not content.strip():
         return "内容为空，无法存储。"
 
-    source_descriptor = None
-    if source_metadata is not None:
-        from memory_l1_contract import canonical_json
-        allowed = {"schema", "namespace", "source_id", "source_revision", "content_sha256", "author", "coverage", "source_scope"}
-        if (not whisper or not isinstance(source_metadata, dict) or set(source_metadata) != allowed
-                or source_metadata.get("schema") != "aiz.memory-source-ref-v1"
-                or source_metadata.get("namespace") not in {"snapshot.aiz.diary.private", "snapshot.aiz.diary.digest"}
-                or any(not isinstance(source_metadata.get(k), str) or not source_metadata[k]
-                       for k in ("source_id", "source_revision", "content_sha256"))
-                or source_metadata["content_sha256"] != hashlib.sha256(content.encode("utf-8")).hexdigest()):
-            return "来源描述无效，未写入。"
-        canonical_json(source_metadata)
-        # A provider's descriptor is not a current source observation.
-        source_descriptor = {"descriptor": source_metadata, "observation": "not_checked", "eligible_source": None}
+    from memory_hold_source import hold_source_descriptor, browse_classification
+    try:
+        source_descriptor = hold_source_descriptor(
+            content, source_metadata, whisper=whisper, feel=feel)
+    except (ValueError, TypeError, UnicodeError):
+        return "来源描述无效，未写入。"
+    source_extra = {"aiz_source_descriptor": source_descriptor} if source_descriptor else {}
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
@@ -8704,6 +8697,7 @@ async def hold(
         tags=all_tags,
         content=content,
     )
+    classification = browse_classification(source_descriptor) or classification
     if _has_favorite_tag(all_tags) and not _has_favorite_reason(content):
         return _favorite_reason_error()
 
@@ -8720,6 +8714,7 @@ async def hold(
             "name": suggested_name or None,
             "bucket_type": "permanent",
             "pinned": True,
+            **source_extra,
             "date": event_date or None,
             **_memory_classification_metadata(
                 classification["memory_subject"],
@@ -8742,6 +8737,7 @@ async def hold(
                 classification["memory_layer"],
                 classification["memory_classification_source"],
             )
+            extra_metadata.update(source_extra)
             bucket_id = await bucket_mgr.create(
                 content=content, tags=all_tags, importance=10, domain=domain,
                 valence=valence, arousal=arousal, name=suggested_name or None,
@@ -8766,6 +8762,7 @@ async def hold(
                 "valence": valence,
                 "arousal": arousal,
                 "name": suggested_name or None,
+                **source_extra,
                 "date": event_date or None,
                 **_memory_classification_metadata(
                     classification["memory_subject"],
@@ -8780,6 +8777,18 @@ async def hold(
         )
         result_name = suggested_name or bucket_id
         is_merged = False
+    elif source_descriptor:
+        related_bucket = await _find_readonly_related_bucket(content)
+        bucket_id = await bucket_mgr.create(
+            content=content, tags=all_tags, importance=importance, domain=domain,
+            valence=valence, arousal=arousal, name=suggested_name or None,
+            date=event_date or None,
+            extra_metadata={**_memory_classification_metadata(
+                classification["memory_subject"], classification["memory_layer"],
+                classification["memory_classification_source"]), **source_extra},
+        )
+        _queue_embedding_refresh(bucket_id)
+        result_name, is_merged = suggested_name or bucket_id, False
     else:
         bucket_id, result_name, is_merged, related_bucket = await _merge_or_create(
             content=content,
