@@ -1586,7 +1586,11 @@ class GatewayService:
         """
         path = GatewayService._runtime_env_path()
         try:
-            text = path.read_text(encoding="utf-8-sig")
+            with path.open(encoding="utf-8-sig") as source:
+                if os.name == "posix":
+                    import fcntl
+                    fcntl.flock(source, fcntl.LOCK_SH)
+                text = source.read()
         except FileNotFoundError:
             return {}
         except (OSError, UnicodeError):
@@ -1594,6 +1598,10 @@ class GatewayService:
         names = ("OMBRE_EMBEDDING_API_KEY", "OMBRE_RERANKER_API_KEY")
         values: dict[str, str] = {}
         for raw in text.splitlines():
+            marker = re.fullmatch(r"# guyan-credential-generation (OMBRE_EMBEDDING_API_KEY|OMBRE_RERANKER_API_KEY) ([0-9a-f]{32})", raw)
+            if marker:
+                values["generation:" + marker.group(1)] = marker.group(2)
+                continue
             line = raw.strip()
             if line.startswith("export "):
                 line = line[7:].lstrip()
@@ -1717,6 +1725,10 @@ class GatewayService:
         if status is None:
             status = self._runtime_overlay_status = {}
         status["credential_source_readable"] = env_values is not None
+        status["credential_generations"] = {
+            name: (env_values or {}).get("generation:" + name)
+            for name in ("OMBRE_EMBEDDING_API_KEY", "OMBRE_RERANKER_API_KEY")
+        }
         initial_credentials = any(
             name not in getattr(self, "_runtime_credential_seen", {})
             for name in ("OMBRE_EMBEDDING_API_KEY", "OMBRE_RERANKER_API_KEY")
@@ -2148,7 +2160,11 @@ class GatewayService:
                 if secret_key in raw:
                     sanitized[secret_key] = raw[secret_key]
                 elif isinstance(existing, dict) and secret_key in existing:
-                    sanitized[secret_key] = existing[secret_key]
+                    if not (secret_key == "api_key" and raw.get("credential_mode") == "replace"):
+                        sanitized[secret_key] = existing[secret_key]
+            primary = raw.get("credential_primary_env") or existing.get("credential_primary_env")
+            if primary:
+                sanitized["credential_primary_env"] = primary
             upstreams.append(sanitized)
         return upstreams
 
@@ -2777,7 +2793,9 @@ class GatewayService:
             updated.extend(self._apply_persona_config(persona_payload))
         if dream_payload is not None:
             updated.extend(self._apply_dream_config(dream_payload))
+        from credential_activation import adoption_receipt
         return JSONResponse({
+            "credential_adoption": adoption_receipt(self, body),
             "ok": True,
             "updated": updated,
             "gateway": self._gateway_memory_config_payload(),
@@ -27664,6 +27682,16 @@ class GatewayService:
                 return
             seen_values.add(key)
             entries.append({"value": key, "label": label})
+
+        primary = str(raw.get("credential_primary_env") or "")
+        if primary:
+            envs = raw.get("api_key_envs") or []
+            if isinstance(envs, str):
+                envs = [name.strip() for name in envs.split(",") if name.strip()]
+            for env_name in dict.fromkeys([primary] + list(envs)):
+                explicit = next((item.get("api_key") for item in raw.get("api_keys", [])
+                    if isinstance(item, dict) and item.get("label") == f"env:{env_name}"), None)
+                add(explicit if explicit is not None else os.environ.get(env_name, ""), f"env:{env_name}")
 
         if fallback_api_key:
             add(fallback_api_key, "env:OMBRE_GATEWAY_UPSTREAM_API_KEY")
