@@ -246,14 +246,21 @@ class MemoryL1Runtime:
         from memory_daily_attachment_jobs import run_attachment_jobs
         return await run_attachment_jobs(self, bucket_mgr, day=day, mode=mode, options=task_options(self.config))
 
-    def _memory_l1_daily_context(self, window, *, attachment_sources=()):
+    def _memory_l1_daily_context(self, window, *, attachment_sources=(), segment_context=None):
         from memory_source_identity import source_model_identity
         service = self._memory_l1_revisions()
         catalog, catalog_revision = service.catalog_provider()
         sources = daily_sources(window, profile_id=self.memory_semantic_profile_id) + list(attachment_sources)
+        if segment_context is not None:
+            for index, source in enumerate(sources):
+                extent = segment_context['views'].get(str(index))
+                if extent is None:
+                    source['_model_excluded'] = True
+                else:
+                    source['_model_range'] = copy.deepcopy(extent)
         snapshots, bindings = bind_sources(sources, config=self.config)
-        for source, snapshot in zip(sources, snapshots):
-            source['_participant_revision'] = snapshot['source_revision']
+        for binding, snapshot in zip(bindings, snapshots):
+            sources[int(binding['binding_id'].split(':')[1])-1]['_participant_revision'] = snapshot['source_revision']
         contract = semantic_contract([b['binding_id'] for b in bindings], catalog=catalog,
             initial_chat=True, require_keywords=True, identity=source_model_identity(self.config, sources))
         contract['document']['required'].append('narrative')
@@ -266,10 +273,24 @@ class MemoryL1Runtime:
                           'reason': 'string', 'document': 'Document (document/types above)'},
             'rules': '只输出上述JSON对象。catalog中key为输出值，中文为释义。Candidate.kind是入库类别；Statement.classification.kind只用catalog.kinds。subject_ref/about_refs只引用本稿实体ID，例如e1，不能用user/assistant代替。保留主体、改口、否定、条件和未知；不同日期的状态分别表达，计划目标日不自动作为截止日。每份document独立填写完整narrative与非空retrieval.keywords，关键词按内容提取。',
         }
-        return {'identity': source_model_identity(self.config, sources),
-                'source_texts': semantic_sources(snapshots, bindings, chat_view=True,
-                    source_timezone=getattr(self, 'tz', None)),
-                'catalog_revision': catalog_revision, 'semantic_contract': contract}, sources, (copy.deepcopy(catalog), catalog_revision)
+        projected = semantic_sources(snapshots, bindings, chat_view=True,
+                    source_timezone=getattr(self, 'tz', None))
+        if segment_context is not None:
+            for item, snapshot, binding in zip(projected, snapshots, bindings):
+                anchor = binding['anchors'][0]
+                item.update(text=snapshot['text'][anchor['start']:anchor['end']],
+                    input_range={'start': anchor['start'], 'end': anchor['end']},
+                    source_length=len(snapshot['text']), source_revision=snapshot['source_revision'],
+                    original_text_sha256=hashlib.sha256(snapshot['text'].encode()).hexdigest())
+        payload = {'identity': source_model_identity(self.config, sources),
+                   'source_texts': projected,
+                   'catalog_revision': catalog_revision, 'semantic_contract': contract}
+        if segment_context is not None:
+            payload['segment'] = {key: segment_context[key] for key in ('core_source', 'core_range')}
+            payload['segment'].update(coordinate_unit='unicode_codepoint_absolute_half_open',
+                candidate_requires_core_support=True, context_only_candidates=False,
+                source_ranges_coordinate_origin='original_text')
+        return payload, sources, (copy.deepcopy(catalog), catalog_revision)
 
     def _memory_l1_daily_document(self, candidate, memory_id):
         sources = candidate.get('_l1_sources')

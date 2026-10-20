@@ -4192,12 +4192,43 @@ class ReflectionEngine(MemoryL1Runtime):
         if self.memory_authority_enabled and self.memory_authority_store and mode is not None:
             from memory_candidate_preparation import MemoryCandidatePreparation
             preparation_queue = MemoryCandidatePreparation(self.memory_authority_store)
+        window_budget_used = 0
         for index, window in enumerate(windows):
             remaining = candidate_budget - len(raw_candidates)
-            if index >= self.daily_chat_memory_max_windows_per_run or remaining <= 0:
+            if window_budget_used >= self.daily_chat_memory_max_windows_per_run or remaining <= 0:
                 meta.update(partial=True, reason=("window_budget_exhausted"
-                    if index >= self.daily_chat_memory_max_windows_per_run else "candidate_budget_exhausted"))
+                    if window_budget_used >= self.daily_chat_memory_max_windows_per_run else "candidate_budget_exhausted"))
                 break
+            if plans[index].exceeds_char_target and preparation_queue:
+                from memory_chat_segments import extract_segments
+                try:
+                    segmented, segment_meta = await extract_segments(self, key, window,
+                        mode=mode, min_confidence=min_confidence, candidate_budget=remaining,
+                        call_budget=self.daily_chat_memory_max_windows_per_run-window_budget_used,
+                        self_context=self_context, audit=audit)
+                except Exception as exc:
+                    meta.update(partial=True, reason=getattr(exc, 'code', type(exc).__name__),
+                                failed_window_index=index+1)
+                    break
+                raw_candidates.extend(segmented)
+                calls = segment_meta.get('model_call_count', 0)
+                window_budget_used += calls
+                meta['model_call_count'] += calls
+                meta['model_candidate_count'] += segment_meta.get('model_candidate_count', 0)
+                meta['segment_progress'] = segment_meta
+                if audit is not None:
+                    audit['model_call_count'] = meta['model_call_count']
+                    audit['segment_progress'] = segment_meta
+                if segment_meta['partial']:
+                    meta.update(partial=True, reason=segment_meta['reason'],
+                                requires_manual_retry=segment_meta.get('requires_manual_retry', False),
+                                failed_window_index=index+1)
+                    break
+                processed_stop = plans[index].next_start
+                if audit is not None:
+                    audit['processed_window_count'] = index+1
+                continue
+            window_budget_used += 1
             if self._daily_chat_memory_window_is_noise(window):
                 processed_stop = plans[index].next_start
                 meta["skipped_noise_window_count"] += 1
@@ -4417,6 +4448,9 @@ class ReflectionEngine(MemoryL1Runtime):
         window_index: int = 1,
         window_total: int = 1,
         attachment_sources=(),
+        segment_context=None,
+        saved_response=None,
+        response_checkpoint=None,
     ) -> tuple[list[dict], dict]:
         route = self._memory_task_route("auto_l1")
         client, model, use_daily_client = route["client"], route["model"], route["connection"] == "daily"
@@ -4435,7 +4469,8 @@ class ReflectionEngine(MemoryL1Runtime):
         l1_sources = None
         prompt_context = None
         if self.memory_authority_enabled and self.memory_authority_store:
-            l1_payload, l1_sources, l1_catalog_context = self._memory_l1_daily_context(window, attachment_sources=attachment_sources)
+            l1_payload, l1_sources, l1_catalog_context = self._memory_l1_daily_context(window,
+                attachment_sources=attachment_sources, segment_context=segment_context)
             payload['identity'] = l1_payload['identity']
             payload.pop('conversation_turns', None)
             payload["l1_contract"] = l1_payload
@@ -4465,22 +4500,29 @@ class ReflectionEngine(MemoryL1Runtime):
             # Keep sources in the middle and the output contract last, including
             # when comparison-only records have been added above.
             payload["l1_contract"] = payload.pop("l1_contract")
-        response = await self._daily_chat_memory_create_completion(
-            client,
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": prompt,
-                },
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            task_stage="auto_l1",
-            task_route=route,
-            max_tokens=self.daily_chat_memory_candidate_max_tokens,
-            temperature=self.temperature,
-            use_daily_client=use_daily_client,
-        )
+        if saved_response is not None:
+            from types import SimpleNamespace
+            response = SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=saved_response['content']),
+                                         finish_reason=saved_response['finish_reason'])],
+                native_schema=saved_response.get('native_schema'),
+                native_status=saved_response.get('native_status', 'completed'))
+        else:
+            response = await self._daily_chat_memory_create_completion(
+                client,
+                model=model,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                task_stage="auto_l1",
+                task_route=route,
+                max_tokens=self.daily_chat_memory_candidate_max_tokens,
+                temperature=self.temperature,
+                use_daily_client=use_daily_client,
+            )
+            if response_checkpoint is not None:
+                response_checkpoint(response)
         raw = self._completion_content(response)
         stats: dict = {
             "empty_output": not str(raw or "").strip(),
@@ -4521,6 +4563,16 @@ class ReflectionEngine(MemoryL1Runtime):
                     # to archive/event/turn identities used by the existing policy.
                     from memory_l1_ingestion import candidate_source_refs
                     refs = candidate_source_refs(draft, item.get('source_refs', []), len(l1_sources))
+                    if segment_context is not None:
+                        from memory_l1_service import L1OwnerError
+                        core_ref = segment_context['core_source']
+                        core = segment_context['core_range']
+                        if core_ref not in refs:
+                            raise L1OwnerError('candidate_outside_segment_core', field_path='candidate.source_refs')
+                        core_ranges = [r for scene in draft.get('scenes', []) for r in scene.get('source_ranges', [])
+                                       if r.get('source_ref') == core_ref]
+                        if core_ranges and not any(r['start'] < core['end'] and core['start'] < r['end'] for r in core_ranges):
+                            raise L1OwnerError('candidate_outside_segment_core', field_path='document.scenes')
                     available = {'source:' + str(i + 1): source for i, source in enumerate(l1_sources)}
                     if refs:
                         selected_keys = {available[ref]['source_key'] for ref in refs}
@@ -4533,6 +4585,8 @@ class ReflectionEngine(MemoryL1Runtime):
                             and raw_event_source(event, profile_id=self.memory_semantic_profile_id)['source_key'] in selected_keys]
                     task_seed = {"date": key, "window": window_index, "candidate": index,
                         "prompt": prompt_context["prompt_revision"], "sources": [s["source_key"] for s in l1_sources]}
+                    if segment_context is not None:
+                        task_seed['segment'] = segment_context
                     from memory_l1_contract import semantic_sha256
                     item["_l1_sources"] = l1_sources
                     item["_l1_catalog_context"] = l1_catalog_context
@@ -5349,6 +5403,19 @@ class ReflectionEngine(MemoryL1Runtime):
                 # Review keeps low-confidence candidates visible with a flag.
                 soft_flags.append("low_confidence")
             evidence_sources = daily_sources(clean_turns, profile_id=self.memory_semantic_profile_id)
+            if isinstance(model_doc, dict) and candidate.get('_l1_sources'):
+                from memory_l1_ingestion import candidate_source_refs
+                try:
+                    supported = candidate_source_refs(model_doc, candidate.get('source_refs', []),
+                                                       len(candidate['_l1_sources']))
+                    evidence_sources = [s for i, s in enumerate(candidate['_l1_sources'])
+                                        if f'source:{i+1}' in supported]
+                except Exception as exc:
+                    record_hard('invalid_l1_document')
+                    if audit is not None:
+                        from memory_chat_preparation import issue
+                        audit.setdefault('l1_issues', []).append(issue(exc))
+                    continue
             evidence_keys = sorted(s["source_key"] for s in evidence_sources)
             candidate_id = self._daily_chat_memory_candidate_id(key, kind, content, source_keys=evidence_keys)
             semantic = build_annotations(body=content, proposed=candidate.get("annotations"),

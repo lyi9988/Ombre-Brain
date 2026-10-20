@@ -55,16 +55,24 @@ def bind_sources(sources, *, config=None):
         raise L1OwnerError('sources_required', field_path='sources')
     snapshots, bindings = [], []
     for index, source in enumerate(sources):
+        if source.get('_model_excluded'):
+            continue
         snapshot = source_snapshot(source, config=config)
         expected = source.get('_participant_revision')
         if expected is not None and expected != snapshot['source_revision']:
             raise L1OwnerError('source_participant_changed', status=409, field_path='sources')
+        extent = source.get('_model_range', {'start': 0, 'end': len(snapshot['text'])})
+        if (set(extent) != {'start', 'end'} or type(extent['start']) is not int
+                or type(extent['end']) is not int
+                or not 0 <= extent['start'] < extent['end'] <= len(snapshot['text'])):
+            raise L1OwnerError('invalid_model_source_range', field_path='sources')
         snapshots.append(snapshot)
         bindings.append({'binding_id': f'source:{index + 1}',
             'source_namespace': snapshot['source_namespace'], 'source_id': snapshot['source_id'],
             'source_revision': snapshot['source_revision'], 'author_ref': snapshot['participant']['subject_id'], 'speaker_ref': snapshot['participant']['subject_id'],
             'anchors': [make_text_anchor(snapshot['text'], target_namespace='l0', target_id=snapshot['source_id'],
-                target_revision=snapshot['source_revision'], text_view_id=snapshot['text_view_id'], start=0, end=len(snapshot['text']))]})
+                target_revision=snapshot['source_revision'], text_view_id=snapshot['text_view_id'],
+                start=extent['start'], end=extent['end'])]})
     return snapshots, bindings
 
 
@@ -194,6 +202,8 @@ def prepare_model_document(revisions, *, memory_id, document, sources, generatio
     snapshots, bindings = bind_sources(sources, config=config)
     if candidate_refs is not _UNSCOPED_CANDIDATE:
         selected = candidate_source_refs(document, candidate_refs, len(sources))
+        if selected - {binding['binding_id'] for binding in bindings}:
+            raise L1OwnerError('source_outside_observed_segment', field_path='candidate.source_refs')
         pairs = [(snapshot, binding) for snapshot, binding in zip(snapshots, bindings)
                  if binding['binding_id'] in selected]
         snapshots, bindings = map(list, zip(*pairs))
