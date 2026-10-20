@@ -221,6 +221,7 @@ def _natural_finish_service(monkeypatch, buckets, candidates_by_query, *, manual
     )
     service.recall_policy = SimpleNamespace(semantic_threshold=0.8, rerank_threshold=0.8)
     service.semantic_candidate_top_k = 24
+    service.moment_search_limit = 13
     service.query_planner_enabled = False
     service.query_planner_max_queries = 2
     service.relevance_options = {}
@@ -1012,6 +1013,7 @@ def test_fresh_content_moment_enters_parent_pool_and_supplies_final_rerank_docum
         return [dict(fresh_moment)]
 
     def search_fresh(_query, moments, *, limit):
+        assert limit == 13
         searched.extend(moments)
         return [dict(fresh_moment)]
 

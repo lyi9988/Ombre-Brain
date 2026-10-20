@@ -17308,7 +17308,7 @@ class GatewayService:
                              if str(moment.get("source") or "content") == "content"]
                 for moment in self.memory_moment_store.search_moment_items(
                     recall_input.get("q_context") or query, all_parts,
-                    limit=self.semantic_candidate_top_k,
+                    limit=self.moment_search_limit,
                 ):
                     parent = str(moment.get("bucket_id") or "")
                     if parent in metadata_map:
