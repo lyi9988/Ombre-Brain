@@ -118,9 +118,18 @@ class MemoryL0Sources:
 
     async def locate(self, binding, *, start=None, end=None, verify_only=False):
         adapter = self.adapters.get(binding["source_namespace"])
+        failure_kind, http_status = None, None
         try:
             current = await asyncio.wait_for(adapter.read(binding), timeout=self.read_timeout_seconds) if adapter else {"state": "unavailable", "reason": "source_adapter_unconfigured"}
-        except Exception:
+        except Exception as exc:
+            # Never expose exception text, URL, request headers, or credentials.
+            name = type(exc).__name__
+            failure_kind = ('timeout' if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+                or name in {'ReadTimeout', 'ConnectTimeout', 'PoolTimeout', 'WriteTimeout'}
+                else 'http_status' if name == 'HTTPStatusError' else 'read_error')
+            status = getattr(getattr(exc, 'response', None), 'status_code', None)
+            if failure_kind == 'http_status' and type(status) is int and 100 <= status <= 599:
+                http_status = status
             current = {"state": "unavailable", "reason": "source_read_failed"}
         eligible = (current.get("state") == "available" and current.get("source_namespace") == binding["source_namespace"]
                     and current.get("source_id") == binding["source_id"]
@@ -135,8 +144,32 @@ class MemoryL0Sources:
                 eligible = False
                 current = {"state": "mismatch", "reason": "source_anchor_mismatch"}
         if verify_only:
+            diagnostic = None
+            if not eligible:
+                fields = ('source_namespace', 'source_id', 'source_revision')
+                changes = []
+                if current.get('state') == 'available':
+                    for field in fields:
+                        if type(current.get(field)) is not type(binding.get(field)) or current.get(field) != binding.get(field):
+                            def digest(value):
+                                return hashlib.sha256(canonical_json(value).encode('utf-8')).hexdigest()
+                            changes.append({'field': field, 'expected_sha256': digest(binding.get(field)),
+                                            'current_sha256': digest(current.get(field))})
+                diagnostic = {'failure_kind': failure_kind or ('identity_mismatch' if changes else
+                    'anchor_mismatch' if current.get('reason') == 'source_anchor_mismatch' else 'unavailable'),
+                    'field_changes': changes}
+                if http_status is not None:
+                    diagnostic['http_status'] = http_status
+                reason = current.get('reason')
+                # These are program-defined reason codes, not upstream prose.
+                if isinstance(reason, str) and reason in {'source_adapter_unconfigured', 'source_read_failed', 'source_anchor_mismatch',
+                    'source_not_found', 'source_identity_mismatch', 'source_outside_bound_conversation',
+                    'canonical_source_reader_unconfigured', 'upstream_version_unknown', 'configured_source_changed',
+                    'binding_not_in_revision', 'source_namespace_changed', 'archive_unavailable', 'turn_archive_unavailable'}:
+                    diagnostic['reason_code'] = reason
             return {"state": "available" if eligible else "changed" if current.get("state") == "available" else current.get("state", "unavailable"),
-                    "eligible_source": eligible, "reason": current.get("reason")}
+                    "eligible_source": eligible, "reason": current.get("reason"),
+                    **({"source_diagnostic": diagnostic} if diagnostic else {})}
         if eligible:
             self.retain_copy(current)
         snapshot = current if eligible else self.copy(binding)

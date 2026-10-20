@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import hashlib
 
 from memory_authority import MemoryNotFound, RevisionConflict
 from memory_l1_contract import L1ContractError, semantic_sha256
@@ -366,7 +367,15 @@ class MemoryL2Service:
                     checked = source_status['items'][index]
                     result = row['result']
                     if checked['state'] != 'ok' or any(not s.get('eligible_source') for s in checked['sources'].values()):
-                        result.update(state='stale', reason='source_dependency_changed')
+                        failures = [{'binding_id_sha256': hashlib.sha256(str(binding_id).encode('utf-8')).hexdigest(),
+                            'detail': source.get('source_diagnostic', {'failure_kind': 'unavailable'})}
+                            for binding_id, source in sorted(checked['sources'].items())
+                            if not source.get('eligible_source')]
+                        state = checked['state'] if isinstance(checked['state'], str) and checked['state'] in {
+                            'ok', 'memory_not_current_or_eligible', 'revision_unavailable', 'legacy', 'dependency_changed'} else 'unknown'
+                        result.update(state='stale', reason='source_dependency_changed',
+                            source_diagnostic={'state': state, 'failures': failures[:16],
+                                'omitted_failures': max(0, len(failures) - 16)})
                         continue
                     try:
                         result.update(text=row['text'], units=row['units'], coverage=row['coverage'],
