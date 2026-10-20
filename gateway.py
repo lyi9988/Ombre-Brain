@@ -17483,7 +17483,8 @@ class GatewayService:
         accepted = memory_use.hierarchy_pool(self, recall_input, accepted)
         if any(item.get("_configured_score", {}).get("window_score") is not None for item in accepted):
             accepted.sort(key=lambda item: item["score"], reverse=True)
-        selected = self._pick_dynamic_cards(accepted, query=query)
+        selection_diagnostics = {}
+        selected = self._pick_dynamic_cards(accepted, query=query, diagnostics=selection_diagnostics)
         self._record_candidate_stage(
             stages, "natural.admit_candidates", len(pool), len(accepted),
             rejection_evidence=self._rejected_bucket_evidence(suppressed),
@@ -17491,6 +17492,13 @@ class GatewayService:
                 pool, accepted, selected,
                 semantic_threshold=memory_use.option(self, "semantic_threshold", self.recall_policy.semantic_threshold),
                 rerank_threshold=memory_use.option(self, "rerank_threshold", self.recall_policy.rerank_threshold),
+                selection_limits={"max_cards": getattr(self, "inject_max_cards", None),
+                    "first_card_min_score": getattr(self, "first_card_min_score", None),
+                    "second_card_min_score": getattr(self, "second_card_min_score", None),
+                    "second_card_relative_score": getattr(self, "second_card_relative_score", None)},
+                query_purpose=(recall_input.get("_use_context") or {}).get("purpose"),
+                hierarchy_suppressed=recall_input.get("hierarchy_suppressed") or (),
+                selection_diagnostics=selection_diagnostics,
             ),
         )
         debug["final_bucket_ids"] = [str(item["bucket"]["id"]) for item in selected]
@@ -23717,32 +23725,66 @@ class GatewayService:
                 if value not in values:
                     values.append(value)
 
-    def _pick_dynamic_cards(self, scored_candidates: list[dict], *, query: str = "") -> list[dict]:
-        ordinary = self._pick_dynamic_cards_by_score(scored_candidates, query=query)
+    def _pick_dynamic_cards(self, scored_candidates: list[dict], *, query: str = "",
+                            diagnostics: dict | None = None) -> list[dict]:
+        ordinary = self._pick_dynamic_cards_by_score(scored_candidates, query=query,
+            **({"diagnostics": diagnostics} if diagnostics is not None else {}))
         if len(explicit_query_parts(query)) < 2 or self.inject_max_cards < 2:
             return ordinary
         groups = {}
+        eligible_parts = {}
         for item in scored_candidates:
             part = (item.get("_rerank_window") or {}).get("query_part")
             if part is not None and (item["score"] >= self.first_card_min_score
                     or self._dynamic_bucket_item_has_reliable_recall_signal(query, item)):
                 groups.setdefault(part, item)
+                eligible_parts[str(item["bucket"]["id"])] = part
         if len(groups) < 2:
+            if diagnostics is not None:
+                diagnostics["coverage_state"] = "fewer_than_two_eligible_parts"
             return ordinary
         chosen = list(groups.values())[:self.inject_max_cards]
+        coverage_chosen = list(chosen)
         for item in ordinary:
             if len(chosen) >= self.inject_max_cards:
                 break
             if item not in chosen:
                 chosen.append(item)
+        if diagnostics is not None:
+            diagnostics["mode"] = "multiquestion_coverage"
+            diagnostics["coverage_state"] = "applied"
+            for item in scored_candidates:
+                bid = str(item["bucket"]["id"])
+                part = eligible_parts.get(bid)
+                reason = ("multiquestion_part_selected" if item in coverage_chosen else
+                          "ordinary_fill_selected" if item in chosen else
+                          "multiquestion_part_lower_rank" if part in groups and groups[part] is not item else
+                          "multiquestion_card_limit" if part in groups else
+                          "multiquestion_not_eligible_or_no_slot")
+                diagnostics.setdefault("decisions", {}).setdefault(bid, {})["reason"] = reason
         return chosen
 
-    def _pick_dynamic_cards_by_score(self, scored_candidates: list[dict], *, query: str = "") -> list[dict]:
+    def _pick_dynamic_cards_by_score(self, scored_candidates: list[dict], *, query: str = "",
+                                     diagnostics: dict | None = None) -> list[dict]:
+        def record(item, reason):
+            if diagnostics is not None:
+                diagnostics.setdefault("decisions", {})[str(item["bucket"]["id"])] = {"reason": reason}
+
+        if diagnostics is not None:
+            diagnostics["mode"] = "score"
+            for item in scored_candidates:
+                record(item, "card_limit_reached")
         if self.inject_max_cards <= 0 or not scored_candidates:
+            for item in scored_candidates:
+                record(item, "card_limit_disabled")
             return []
 
         axis_diverse = self._pick_axis_diverse_dynamic_cards(scored_candidates, query=query)
         if axis_diverse:
+            if diagnostics is not None:
+                diagnostics["mode"] = "axis_diversity"
+                for item in scored_candidates:
+                    record(item, "axis_diversity_selected" if item in axis_diverse else "axis_diversity_not_selected")
             return axis_diverse
 
         chosen = []
@@ -23752,13 +23794,17 @@ class GatewayService:
             has_reliable_signal = self._dynamic_bucket_item_has_reliable_recall_signal(query, candidate)
             if candidate["score"] >= self.first_card_min_score or has_reliable_signal:
                 first = candidate
+                record(candidate, "first_card_selected")
                 remaining_candidates = scored_candidates[:index] + scored_candidates[index + 1:]
                 break
+            record(candidate, "below_first_card_threshold")
         if not first:
             return []
         chosen.append(first)
 
         if self.inject_max_cards < 2 or not remaining_candidates:
+            for item in remaining_candidates:
+                record(item, "card_limit_reached")
             return chosen
 
         if first.get("category_overview_item"):
@@ -23767,9 +23813,13 @@ class GatewayService:
                     continue
                 if self._dynamic_bucket_item_has_reliable_recall_signal(query, candidate):
                     chosen.append(candidate)
+                    record(candidate, "category_overview_selected")
                     if len(chosen) >= self.inject_max_cards:
                         return chosen
             if len(chosen) > 1:
+                for item in remaining_candidates:
+                    if item not in chosen:
+                        record(item, "category_overview_path_returned")
                 return chosen
 
         covered_terms = set(first.get("matched_query_terms") or [])
@@ -23784,6 +23834,7 @@ class GatewayService:
                     or self._dynamic_bucket_item_has_reliable_recall_signal(query, candidate)
                 ):
                     chosen.append(candidate)
+                    record(candidate, "new_term_coverage_selected")
                     covered_terms.update(candidate_terms)
                     if len(chosen) >= self.inject_max_cards:
                         return chosen
@@ -23799,6 +23850,10 @@ class GatewayService:
                 and candidate_score >= first["score"] * self.second_card_relative_score
             ) or self._dynamic_bucket_item_has_reliable_recall_signal(query, candidate):
                 chosen.append(candidate)
+                record(candidate, "second_card_selected")
+            else:
+                record(candidate, "below_second_card_threshold" if candidate_score < self.second_card_min_score
+                       else "below_relative_score")
         return chosen
 
     def _pick_axis_diverse_dynamic_cards(self, scored_candidates: list[dict], *, query: str = "") -> list[dict]:

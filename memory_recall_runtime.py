@@ -565,6 +565,45 @@ def render_presentation(service, usage, header, presentation, budget):
     return "", "no_complete_unit_fits_remaining_budget", [], False
 
 
+def source_diagnostic_trace(value):
+    """Bounded body-free allowlist at the Brain-to-Gateway trace boundary."""
+    if not isinstance(value, dict):
+        return None
+    def sha(value):
+        return isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
+    state = value.get('state')
+    out = {'state': state if isinstance(state, str) and state in {'ok', 'memory_not_current_or_eligible',
+        'revision_unavailable', 'legacy', 'dependency_changed'} else 'unknown', 'failures': []}
+    failures = value.get('failures')
+    if not isinstance(failures, list):
+        failures = []
+    for row in failures[:16]:
+        if not isinstance(row, dict) or not sha(row.get('binding_id_sha256')):
+            continue
+        detail = row.get('detail') if isinstance(row.get('detail'), dict) else {}
+        kind = detail.get('failure_kind')
+        clean = {'failure_kind': kind if isinstance(kind, str) and kind in {'timeout', 'http_status', 'read_error',
+            'identity_mismatch', 'anchor_mismatch', 'unavailable'} else 'unknown', 'field_changes': []}
+        status = detail.get('http_status')
+        if type(status) is int and 100 <= status <= 599:
+            clean['http_status'] = status
+        changes = detail.get('field_changes')
+        for change in (changes[:3] if isinstance(changes, list) else []):
+            if (isinstance(change, dict) and isinstance(change.get('field'), str) and change.get('field') in {'source_namespace', 'source_id', 'source_revision'}
+                and sha(change.get('expected_sha256')) and sha(change.get('current_sha256'))):
+                clean['field_changes'].append({key: change[key] for key in ('field', 'expected_sha256', 'current_sha256')})
+        code = detail.get('reason_code')
+        if isinstance(code, str) and code in {'source_adapter_unconfigured', 'source_read_failed', 'source_anchor_mismatch',
+            'source_not_found', 'source_identity_mismatch', 'source_outside_bound_conversation',
+            'canonical_source_reader_unconfigured', 'upstream_version_unknown', 'configured_source_changed',
+            'binding_not_in_revision', 'source_namespace_changed', 'archive_unavailable', 'turn_archive_unavailable'}:
+            clean['reason_code'] = code
+        out['failures'].append({'binding_id_sha256': row['binding_id_sha256'], 'detail': clean})
+    omitted = value.get('omitted_failures')
+    out['omitted_failures'] = (max(0, omitted) if type(omitted) is int else 0) + max(0, len(failures) - 16)
+    return out
+
+
 async def resolve_presentations(service, candidates, *, request=None):
     """Resolve only source-qualified, non-targeted L1 memories in one Brain call."""
     if not candidates:
@@ -653,6 +692,9 @@ async def resolve_presentations(service, candidates, *, request=None):
             state = str(row.get("state") or "unknown")
             reason = str(row.get("reason") or "").strip()
             common["resolver_state"] = state
+            diagnostic = source_diagnostic_trace(row.get("source_diagnostic"))
+            if diagnostic is not None:
+                common["source_diagnostic"] = diagnostic
             common["fallback_reason"] = None
             if state != "ready":
                 common["fallback_reason"] = reason or f"presentation_{state}"
@@ -922,11 +964,16 @@ async def _project_sections(service, request, query, buckets, sections):
         item = candidate_by_bucket.get(bid)
         reason = (item or {}).get("admission_reason") or "l1_source_or_body_not_eligible"
         record = records.get(bid) or {}
+        # Keep the earlier resolver observation, not stale authority/body fields.
+        diagnostic = source_diagnostic_trace((trace_by_bucket.get(bid) or {}).get("source_diagnostic"))
         trace_by_bucket[bid] = {
             "bucket_id": bid, "memory_id": record.get("memory_id"),
             "l1_revision": record.get("revision"), "presentation_revision": None,
             "source": "none", "resolver_state": None, "fallback_reason": reason,
         }
+        if diagnostic is not None:
+            trace_by_bucket[bid]["source_diagnostic"] = diagnostic
+            trace_by_bucket[bid]["source_diagnostic_scope"] = "resolver_observation_before_final_eligibility"
 
     rendered = {}
     spans = []

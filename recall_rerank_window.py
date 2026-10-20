@@ -137,6 +137,9 @@ Types, narrator and text length are deliberately not eligibility conditions.
         if index in part_for_index:
             notes[index]["query_part"] = part_for_index[index]
         notes[index]["fusion_score"] = round(notes[index]["fusion_score"], 8)
+        # Actual ordering keys, not an inferred explanation of the final decision.
+        notes[index]["priority_tier"] = [value if type(value) is bool else None
+                                         for value in priorities[index][:4]]
     selected_counts = Counter(name for index in selected for name in notes[index]["channel_ranks"])
     summary = {
         "policy": POLICY, "candidate_count": len(items), "limit": limit,
@@ -151,19 +154,33 @@ Types, narrator and text length are deliberately not eligibility conditions.
     return selected, notes, summary
 
 
-def admission_evidence(items, accepted, selected, *, semantic_threshold, rerank_threshold):
+def admission_evidence(items, accepted, selected, *, semantic_threshold, rerank_threshold,
+                       selection_limits=None, query_purpose=None, hierarchy_suppressed=(),
+                       selection_diagnostics=None):
     """Bounded, owner-safe score/window evidence, including not-scored candidates."""
     def bucket_id(item):
         return str((item.get("bucket") or {}).get("id") or "")
 
     admitted_ids = {bucket_id(item) for item in accepted}
     selected_ids = {bucket_id(item) for item in selected}
+    admitted_ranks = {bucket_id(item): index + 1 for index, item in enumerate(accepted)}
+    selection_ranks = {bucket_id(item): index + 1 for index, item in enumerate(selected)}
+    hierarchy_ids = set(hierarchy_suppressed)
+    selection_diagnostics = selection_diagnostics or {}
+    decisions = selection_diagnostics.get("decisions") or {}
+    reasons = {"card_limit_disabled", "card_limit_reached", "axis_diversity_selected",
+        "axis_diversity_not_selected", "first_card_selected", "below_first_card_threshold",
+        "category_overview_selected", "category_overview_path_returned", "new_term_coverage_selected",
+        "second_card_selected", "below_second_card_threshold", "below_relative_score",
+        "multiquestion_part_selected", "ordinary_fill_selected", "multiquestion_part_lower_rank",
+        "multiquestion_card_limit", "multiquestion_not_eligible_or_no_slot"}
     rows = []
     for item in items[:EVIDENCE_LIMIT]:
         identifier = bucket_id(item)
         window = item.get("_rerank_window") or {}
         reason = str(item.get("admission_reason") or "unclassified")
         status = str(window.get("status") or "not_requested")
+        decision = (decisions.get(identifier) or {}).get("reason")
         rows.append({
             "bucket_ref": hashlib.sha256(identifier.encode()).hexdigest()[:16],
             "channel_ranks": {name: rank for name, rank in window.get("channel_ranks", {}).items()
@@ -177,6 +194,21 @@ def admission_evidence(items, accepted, selected, *, semantic_threshold, rerank_
             "keyword_score": finite_score(item.get("keyword_score")),
             "semantic_score": finite_score(item.get("semantic_score")),
             "rerank_score": finite_score(item.get("rerank_score")),
+            "raw_base_score": finite_score(item.get("_raw_base_score")),
+            "raw_fused_score": finite_score(item.get("_raw_fused_score")),
+            "final_score": finite_score(item.get("score")),
+            "configured_window_score": finite_score((item.get("_configured_score") or {}).get("window_score")),
+            "query_part": window.get("query_part") if type(window.get("query_part")) is int else None,
+            "window_fusion_score": finite_score(window.get("fusion_score")),
+            "window_priority_tier": [v if type(v) is bool else None
+                                     for v in (window.get("priority_tier") or [])[:4]],
+            "admitted_rank": admitted_ranks.get(identifier),
+            "selection_rank": selection_ranks.get(identifier),
+            "selection_reason": decision if isinstance(decision, str) and decision in reasons else None,
+            # Do not fabricate quota/threshold causes the picker did not record.
+            "selection_state": ("selected" if identifier in selected_ids else
+                "hierarchy_suppressed" if identifier in hierarchy_ids else
+                "admitted_not_selected" if identifier in admitted_ids else "not_admitted"),
             "semantic_verified": (item.get("natural_semantic") or {}).get("index_status") == "verified",
             "admission_reason": reason if re.fullmatch(r"[a-z0-9_]{1,80}", reason) else "other",
             "admitted": identifier in admitted_ids, "selected": identifier in selected_ids,
@@ -184,4 +216,13 @@ def admission_evidence(items, accepted, selected, *, semantic_threshold, rerank_
     return {"candidate_count": len(items), "recorded_count": len(rows),
             "truncated_count": max(0, len(items) - len(rows)),
             "semantic_threshold": finite_score(semantic_threshold),
-            "rerank_threshold": finite_score(rerank_threshold), "candidates": rows}
+            "rerank_threshold": finite_score(rerank_threshold),
+            "selection_limits": {key: finite_score((selection_limits or {}).get(key)) for key in
+                ("max_cards", "first_card_min_score", "second_card_min_score", "second_card_relative_score")},
+            "query_purpose": query_purpose if isinstance(query_purpose, str) and query_purpose in
+                {"current", "history", "conditional", "comparison"} else "unknown",
+            "selection_mode": selection_diagnostics.get("mode") if selection_diagnostics.get("mode") in
+                ("score", "axis_diversity", "multiquestion_coverage") else None,
+            "coverage_state": selection_diagnostics.get("coverage_state") if selection_diagnostics.get("coverage_state") in
+                ("fewer_than_two_eligible_parts", "applied") else None,
+            "candidates": rows}
