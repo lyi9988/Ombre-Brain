@@ -9395,29 +9395,35 @@ class GatewayService:
         )
 
     def _anthropic_usage_to_openai_usage(self, usage: dict[str, Any]) -> dict[str, Any]:
-        prompt_tokens = self._usage_int(
-            usage.get("prompt_tokens") if usage.get("prompt_tokens") is not None else usage.get("input_tokens")
-        )
-        completion_tokens = self._usage_int(
-            usage.get("completion_tokens")
-            if usage.get("completion_tokens") is not None
-            else usage.get("output_tokens")
-        )
-        openai_usage: dict[str, Any] = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        }
+        def number(value):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return int(value)
+            return None
 
-        cache_read = usage.get("cache_read_input_tokens")
-        cache_creation = usage.get("cache_creation_input_tokens")
+        prompt_tokens = number(usage.get("prompt_tokens"))
+        cache_read = number(usage.get("cache_read_input_tokens"))
+        cache_creation = number(usage.get("cache_creation_input_tokens"))
+        if prompt_tokens is None:
+            prompt_tokens = number(usage.get("input_tokens"))
+            # Native Anthropic input_tokens excludes cache reads and creations.
+            # Do not add them again to an already-normalized prompt_tokens.
+            if prompt_tokens is not None:
+                prompt_tokens += (cache_read or 0) + (cache_creation or 0)
+        completion_tokens = number(usage.get("completion_tokens"))
+        if completion_tokens is None:
+            completion_tokens = number(usage.get("output_tokens"))
+        openai_usage: dict[str, Any] = {}
+        if prompt_tokens is not None:
+            openai_usage["prompt_tokens"] = prompt_tokens
+        if completion_tokens is not None:
+            openai_usage["completion_tokens"] = completion_tokens
+        if prompt_tokens is not None and completion_tokens is not None:
+            openai_usage["total_tokens"] = prompt_tokens + completion_tokens
         if cache_read is not None:
-            openai_usage["cache_read_input_tokens"] = self._usage_int(cache_read)
-            openai_usage["prompt_tokens_details"] = {
-                "cached_tokens": openai_usage["cache_read_input_tokens"]
-            }
+            openai_usage["cache_read_input_tokens"] = cache_read
+            openai_usage["prompt_tokens_details"] = {"cached_tokens": cache_read}
         if cache_creation is not None:
-            openai_usage["cache_creation_input_tokens"] = self._usage_int(cache_creation)
+            openai_usage["cache_creation_input_tokens"] = cache_creation
         return openai_usage
 
     @staticmethod
