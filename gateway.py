@@ -17480,6 +17480,7 @@ class GatewayService:
                 accepted.append(item)
             else:
                 suppressed.append(item)
+        admitted_before_hierarchy = {str(item["bucket"]["id"]) for item in accepted}
         accepted = memory_use.hierarchy_pool(self, recall_input, accepted)
         if any(item.get("_configured_score", {}).get("window_score") is not None for item in accepted):
             accepted.sort(key=lambda item: item["score"], reverse=True)
@@ -17499,6 +17500,7 @@ class GatewayService:
                 query_purpose=(recall_input.get("_use_context") or {}).get("purpose"),
                 hierarchy_suppressed=recall_input.get("hierarchy_suppressed") or (),
                 selection_diagnostics=selection_diagnostics,
+                admitted_before_hierarchy=admitted_before_hierarchy,
             ),
         )
         debug["final_bucket_ids"] = [str(item["bucket"]["id"]) for item in selected]

@@ -156,7 +156,7 @@ Types, narrator and text length are deliberately not eligibility conditions.
 
 def admission_evidence(items, accepted, selected, *, semantic_threshold, rerank_threshold,
                        selection_limits=None, query_purpose=None, hierarchy_suppressed=(),
-                       selection_diagnostics=None):
+                       selection_diagnostics=None, admitted_before_hierarchy=None):
     """Bounded, owner-safe score/window evidence, including not-scored candidates."""
     def bucket_id(item):
         return str((item.get("bucket") or {}).get("id") or "")
@@ -204,6 +204,8 @@ def admission_evidence(items, accepted, selected, *, semantic_threshold, rerank_
                                      for v in (window.get("priority_tier") or [])[:4]],
             "admitted_rank": admitted_ranks.get(identifier),
             "selection_rank": selection_ranks.get(identifier),
+            "admitted_before_hierarchy": (identifier in admitted_before_hierarchy
+                if admitted_before_hierarchy is not None else None),
             "selection_reason": decision if isinstance(decision, str) and decision in reasons else None,
             # Do not fabricate quota/threshold causes the picker did not record.
             "selection_state": ("selected" if identifier in selected_ids else

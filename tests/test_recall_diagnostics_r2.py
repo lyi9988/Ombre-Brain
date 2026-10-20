@@ -140,3 +140,14 @@ def test_actual_threshold_branch_is_recorded_without_weakening_it():
     assert selected == pool[:1]
     assert observed["decisions"]["relative"]["reason"] == "below_relative_score"
     assert observed["decisions"]["absolute"]["reason"] == "below_second_card_threshold"
+
+
+def test_hierarchy_filter_is_distinct_from_initial_admission():
+    pool = [row("kept", .9, .8), row("suppressed", .8, .7)]
+    trace = admission_evidence(pool, pool[:1], pool[:1], semantic_threshold=.72,
+        rerank_threshold=.6, hierarchy_suppressed=["suppressed"],
+        admitted_before_hierarchy={"kept", "suppressed"})
+    suppressed = trace["candidates"][1]
+    assert suppressed["admitted_before_hierarchy"] is True
+    assert suppressed["admitted"] is False and suppressed["selected"] is False
+    assert suppressed["selection_state"] == "hierarchy_suppressed"
