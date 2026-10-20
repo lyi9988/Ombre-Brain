@@ -9117,17 +9117,26 @@ async function saveConfig(persist, persistEnv) {
     if (Object.keys(changed).length) target[sectionName] = changed;
   }
 
-  var recentContextEnabled = document.getElementById('cfg-recent-context-enabled').value === 'true';
-  var recentContextBudget = recentContextEnabled ? numberValue('cfg-recent-context-budget', 300) : 0;
-  if (recentContextEnabled && recentContextBudget <= 0) recentContextBudget = 300;
-  var personaContextEnabled = document.getElementById('cfg-persona-context-enabled').value === 'true';
-  var personaContextRounds = personaContextEnabled ? numberValue('cfg-persona-context-rounds', 15) : 0;
-  if (personaContextEnabled && personaContextRounds <= 0) personaContextRounds = 15;
-
   var activeTab = document.querySelector('.tab.active');
   var activeTarget = activeTab ? activeTab.dataset.tab : '';
+  var recentContextBudget, personaContextRounds;
   var memoryLimitValues = null;
   if (activeTarget === 'memory-config') {
+    // Validate even when switched off; never silently discard an invalid draft.
+    function contextIntegerValue(id, label) {
+      var raw = String(document.getElementById(id).value ?? '').trim();
+      var value = /^\d+$/.test(raw) ? Number(raw) : NaN;
+      if (!Number.isSafeInteger(value) || value < 0) {
+        setConfigStatus('<span style="color:var(--negative)">✗ ' + label + '须为非负整数；本次未提交，草稿已保留。</span>');
+        return null;
+      }
+      return value;
+    }
+    recentContextBudget = contextIntegerValue('cfg-recent-context-budget', '最近上下文预算');
+    personaContextRounds = contextIntegerValue('cfg-persona-context-rounds', 'Persona 轮数');
+    if (recentContextBudget === null || personaContextRounds === null) return;
+    if (document.getElementById('cfg-recent-context-enabled').value !== 'true') recentContextBudget = 0;
+    if (document.getElementById('cfg-persona-context-enabled').value !== 'true') personaContextRounds = 0;
     if (memoryConfigConflict) {
       setConfigStatus('<span style="color:var(--negative)">配置版本冲突；当前草稿和原版本号已保留。请确认重载服务器新版后再保存。</span>');
       return;
