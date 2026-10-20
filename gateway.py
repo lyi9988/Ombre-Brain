@@ -3266,6 +3266,10 @@ class GatewayService:
             return JSONResponse({"error": {"code": "memory_configuration_unavailable"}}, status_code=503, headers=headers)
 
     async def handle_chat(self, request: Request) -> Response:
+        # This is handler entry, not socket accept. Only request-local offsets
+        # are comparable; wall time locates events without assuming Aiz sync.
+        request.scope["guyan_request_boundary_clock"] = {
+            "start": time.perf_counter(), "received_at_unix_ms": time.time_ns() // 1_000_000}
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
             return auth_result
@@ -3296,6 +3300,11 @@ class GatewayService:
             REQUEST_CONFIGURATION.reset(token)
 
     async def _handle_chat_unfrozen(self, request: Request) -> Response:
+        boundary_clock = request.scope.get("guyan_request_boundary_clock") or {
+            "start": time.perf_counter(), "received_at_unix_ms": time.time_ns() // 1_000_000}
+        boundaries = {"received_at_unix_ms": boundary_clock["received_at_unix_ms"]}
+        def mark_boundary(name):
+            boundaries[name] = round((time.perf_counter() - boundary_clock["start"]) * 1000, 3)
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
             return auth_result
@@ -3322,6 +3331,7 @@ class GatewayService:
                 "continuation" if self._continuation_phase_enabled(request) else "initial"
             ), client_id=request.headers.get("X-Ombre-Client-Id", "reality"),
         )
+        mark_boundary("request_parsed_ms")
 
         logger.info(
             "Gateway incoming chat | session=%s model=%s stream=%s messages=%s",
@@ -3352,9 +3362,12 @@ class GatewayService:
                 canonical_current_user = self._extract_current_turn_user_query(
                     payload.get("messages", [])
                 )
+            mark_boundary("canonical_enter_ms")
             payload, canonical_state = await self._prepare_canonical_turn(
                 request, payload, session_id, canonical_current_user,
             )
+            mark_boundary("canonical_exit_ms")
+            mark_boundary("prepare_enter_ms")
             forward_payload, recalled_ids, injection_debug = await self.prepare_payload(
                 payload,
                 session_id,
@@ -3369,8 +3382,19 @@ class GatewayService:
                 prompt_plan=prompt_plan,
                 request=request,
             )
+            mark_boundary("prepare_exit_ms")
+            injection_debug["request_boundary_timing"] = dict(boundaries)
             self._attach_canonical_trace_debug(injection_debug, canonical_state)
             self._record_logical_trace(forward_payload, injection_debug, client_label)
+            mark_boundary("trace_record_done_ms")
+            try:
+                # Persist the actual exit from trace serialization separately;
+                # request.started remains a post-prepare record, not an entry.
+                self.model_request_trace.update_metadata(
+                    str(self._trace_from_payload(forward_payload).get("trace_id") or ""),
+                    {"request_boundary_timing": dict(boundaries)}, nonblocking=True)
+            except Exception:
+                logger.warning("Request boundary timing observation unavailable")
         except ValueError as exc:
             return JSONResponse(
                 {"error": {"message": str(exc), "type": "invalid_request_error"}},
@@ -6096,6 +6120,7 @@ class GatewayService:
                 # The exact physical payload remains in raw_requests; this
                 # metadata explains where request preparation spent time.
                 "prepare_timing_debug": debug.get("prepare_timing_debug") or {},
+                "request_boundary_timing": debug.get("request_boundary_timing") or {},
                 "time_context": debug.get("time_context") or {},
                 "recall_input": (debug.get("prepare_timing_debug") or {}).get("recall_input", {}),
                 "recall_status": (debug.get("prepare_timing_debug") or {}).get("recall_status", {}),

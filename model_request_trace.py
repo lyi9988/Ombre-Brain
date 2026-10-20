@@ -420,7 +420,7 @@ class ModelRequestTraceStore:
         except Exception:
             return
 
-    def update_metadata(self, trace_id: str, patch: dict[str, Any]) -> None:
+    def update_metadata(self, trace_id: str, patch: dict[str, Any], *, nonblocking: bool = False) -> None:
         """Merge body-free resolved metadata after a provider response arrives.
 
         The logical row remains the authority for request identity; this is an
@@ -431,6 +431,8 @@ class ModelRequestTraceStore:
             return
         try:
             with self._connect() as db:
+                if nonblocking:
+                    db.execute("PRAGMA busy_timeout=0")
                 row = db.execute(
                     "SELECT metadata_json FROM logical_requests WHERE trace_id=?",
                     (str(trace_id or "")[:120],),
@@ -546,6 +548,12 @@ class ModelRequestTraceStore:
         preparations = []
         active_prepare = None
         prepare_ordinal = 0
+        boundary_fields = ("received_at_unix_ms", "request_parsed_ms", "canonical_enter_ms",
+                           "canonical_exit_ms", "prepare_enter_ms", "prepare_exit_ms", "trace_record_done_ms")
+        def boundary_projection(value):
+            return {key: item for key, item in (value.items() if isinstance(value, dict) else ())
+                    if key in boundary_fields and isinstance(item, (int, float))
+                    and not isinstance(item, bool) and 0 <= item < float("inf")}
         for event in event_items:
             payload = event.get("payload")
             payload = payload if isinstance(payload, dict) else {}
@@ -573,7 +581,14 @@ class ModelRequestTraceStore:
                                             if snapshot.get("status") in ("hit", "miss", "bypass", "disabled") else None),
                         "attempt_ids": [],
                     }
+                    boundaries = boundary_projection(event_metadata.get("request_boundary_timing"))
+                    if boundaries:
+                        active_prepare["request_boundary_timing"] = boundaries
                     preparations.append(active_prepare)
+            elif event.get("type") == "metadata.updated" and active_prepare is not None:
+                boundaries = boundary_projection(payload.get("request_boundary_timing"))
+                if boundaries:
+                    active_prepare.setdefault("request_boundary_timing", {}).update(boundaries)
             elif event.get("type") == "attempt" and active_prepare is not None:
                 attempt_id = payload.get("attempt_id")
                 if attempt_id and attempt_id not in active_prepare["attempt_ids"]:
