@@ -8,7 +8,7 @@ const test = require("node:test");
 
 const dashboard = fs.readFileSync(path.join(__dirname, "..", "dashboard.html"), "utf8");
 const start = dashboard.indexOf("function configSavePresentation(result) {");
-const marker = "\n}\n\nasync function saveConfig";
+const marker = "\n}\n";
 const close = dashboard.indexOf(marker, start);
 assert.ok(start >= 0 && close > start, "Dashboard save presentation function must exist");
 const source = dashboard.slice(start, close + 2);

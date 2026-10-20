@@ -118,6 +118,85 @@ def test_embedding_missing_credentials_and_runtime_mismatch_are_not_confirmed(mo
     assert all(r["reason"] == "embedding_runtime_not_confirmed" for r in receipts)
 
 
+def test_embedding_generation_distinguishes_two_nonempty_mount_values():
+    expected = dict(enabled=True, model="embed-v2", base_url="https://embed.invalid/v1",
+                    credential_generation="a" * 32)
+    snapshot = health()
+    overlay = snapshot["gateway"]["retrieval_runtime"]["runtime_overlay"]
+    overlay["credential_generations"] = {"OMBRE_EMBEDDING_API_KEY": "b" * 32}
+    assert not config_activation._embedding_matches(snapshot, expected, {"embedding.api_key"})
+    overlay["credential_generations"]["OMBRE_EMBEDDING_API_KEY"] = "a" * 32
+    assert config_activation._embedding_matches(snapshot, expected, {"embedding.api_key"})
+
+
+def test_local_consumer_receipt_compares_values_without_exposing_them():
+    result = config_activation.local_credential_receipt(
+        {"reflection.api_key": SECRET, "dream.api_key": SECRET},
+        {"reflection.api_key": SimpleNamespace(api_key=SECRET),
+         "dream.api_key": SimpleNamespace(api_key="TEST_ONLY_older")})
+    assert result["confirmed_fields"] == ["reflection.api_key"]
+    assert result["unconfirmed_fields"] == ["dream.api_key"]
+    assert result["state"] == "unconfirmed" and result["provider_verified"] is False
+    assert SECRET not in repr(result) and "TEST_ONLY_older" not in repr(result)
+
+
+def test_stale_adoption_nonce_cannot_confirm_current_credential(monkeypatch):
+    def handler(request):
+        return httpx.Response(200, json={"ok": True, "updated": ["reranker.api_key"],
+            "credential_adoption": {"generation": "0" * 32, "state": "consumer_snapshot",
+                                    "confirmed_fields": ["reranker.api_key"]},
+            "reranker": {"api_ready": True}})
+    install_transport(monkeypatch, handler)
+    result = run(config_activation.activate_gateway({"reranker": {"api_key": SECRET}},
+        admin_url=ADMIN, token=TOKEN))
+    assert result["reason"] == "credential_consumer_not_confirmed"
+
+
+def test_upstream_save_preserves_effective_base_backups_in_runtime_overlay(monkeypatch, tmp_path):
+    import yaml
+    from test_credential_persistence_r1 import HELPERS
+    runtime = tmp_path / "runtime.yaml"
+    env = tmp_path / "synthetic.env"
+    monkeypatch.setenv("OMBRE_ENV_PATH", str(env))
+    monkeypatch.delenv("OMBRE_GATEWAY_ADMIN_URL", raising=False)
+    existing = dict(name="fixture", base_url="https://old.invalid/v1",
+        api_key="TEST_ONLY_old_primary",
+        api_keys=[dict(api_key="TEST_ONLY_backup", label="owner-backup")])
+    ns, route = load_route({"config": {"_runtime_config_path": str(runtime),
+        "state_dir": str(tmp_path), "gateway": {"upstreams": [existing]}}})
+    ns.update(HELPERS)
+    ns["_dashboard_gateway_upstreams_have_key_values"] = lambda raw: any(
+        HELPERS["_dashboard_api_key_values"](item.get("api_key_values", [])) for item in raw)
+    raw = dict(name="fixture", base_url="https://new.invalid/v1",
+        api_key_envs=["FIRST", "SECOND"], api_key_values=["TEST_ONLY_one", "TEST_ONLY_two"],
+        models=["model-fixture"], credential_mode="replace")
+    result = response_json(run(route(Request(dict(gateway={"upstreams": [raw]},
+                                                  persist=True, persist_env=True)))))
+    assert result["ok"] is True
+    saved = yaml.safe_load(runtime.read_text(encoding="utf-8"))["gateway"]["upstreams"][0]
+    assert "api_key" not in saved
+    assert saved["credential_primary_env"] == "FIRST"
+    assert saved["api_keys"] == existing["api_keys"]
+    assert "api_key_values" not in saved
+    assert "TEST_ONLY" not in repr(result)
+
+
+def test_old_model_settings_page_conflicts_before_mutating_consumer(monkeypatch, tmp_path):
+    monkeypatch.delenv("OMBRE_GATEWAY_ADMIN_URL", raising=False)
+    ns, route = load_route({"config": {"_runtime_config_path": str(tmp_path / "runtime.yaml"),
+        "dehydration": {"model": "before", "api_key": ""}}})
+    revision = config_activation.credential_edit_revision(ns["config"])
+    first = response_json(run(route(Request({"dehydration": {"model": "first-page"},
+                                            "expected_credential_revision": revision}))))
+    assert first["ok"] is True and first["credential_revision"] != revision
+    second = run(route(Request({"dehydration": {"model": "stale-second-page"},
+                                "expected_credential_revision": revision})))
+    assert second.status_code == 409
+    assert response_json(second)["error"] == "credential_revision_conflict"
+    assert ns["config"]["dehydration"]["model"] == "first-page"
+    assert ns["dehydrator"].model == "first-page"
+
+
 def load_route(overrides=None):
     tree = ast.parse(SERVER.read_text(encoding="utf-8"), filename=str(SERVER))
     names = {"api_config_update", "_hot_update_gateway_config"}
@@ -130,11 +209,13 @@ def load_route(overrides=None):
     assert {n.name for n in defs} == names
     module = ast.fix_missing_locations(ast.Module(body=defs, type_ignores=[]))
     ns = {"__file__": str(SERVER), "os": os,
+          "reflection_engine": None, "memory_authority_store": None, "memory_commit_service": None,
           "logger": SimpleNamespace(warning=lambda *a, **k: None), "config": {},
           "dehydrator": SimpleNamespace(model="old", base_url="", api_key=""),
           "embedding_engine": SimpleNamespace(enabled=False, model="", base_url="", reconfigure=lambda _: None),
           "_require_dashboard_auth": lambda _: None,
           "_write_dashboard_env_values": lambda updates: list(updates),
+          "_dashboard_env_path": lambda: str(Path(ns["config"].get("_runtime_config_path", "synthetic-only.runtime")).with_suffix(".env")),
           "activate_gateway": config_activation.activate_gateway,
           "activation_receipt": config_activation.activation_receipt,
           "config_save_result": config_activation.config_save_result}
@@ -168,6 +249,8 @@ def test_actual_route_persists_yaml_and_env_before_embedding_health_readback(mon
     def save_env(updates):
         events.append("env_saved")
         assert runtime.exists() and updates == {"OMBRE_EMBEDDING_API_KEY": SECRET}
+        from credential_file import write_values
+        write_values(ns["_dashboard_env_path"](), updates, preserve_inode=True)
         return ["OMBRE_EMBEDDING_API_KEY"]
     ns["_write_dashboard_env_values"] = save_env
     monkeypatch.setenv("OMBRE_GATEWAY_ADMIN_URL", ADMIN)
@@ -179,7 +262,10 @@ def test_actual_route_persists_yaml_and_env_before_embedding_health_readback(mon
         assert saved["embedding"] == {"enabled": True, "model": "embed-v2", "base_url": "https://embed.invalid/v1"}
         assert "api_key" not in saved["embedding"]
         assert events == ["env_saved"] and req.method == "GET"
-        return httpx.Response(200, json=health())
+        from credential_file import read_values
+        observed = health()
+        observed["gateway"]["retrieval_runtime"]["runtime_overlay"]["credential_generations"] = read_values(ns["_dashboard_env_path"]())[1]
+        return httpx.Response(200, json=observed)
     install_transport(monkeypatch, handler)
     response = run(route(Request({"embedding": {
         "enabled": True, "model": "embed-v2", "base_url": "https://embed.invalid/v1", "api_key": SECRET},
@@ -222,13 +308,12 @@ def test_actual_route_yaml_and_env_persistence_failures_never_sync(monkeypatch, 
     yaml_path = tmp_path / "yaml-fail.yaml"
     ns, route = load_route({"config": {
         "_runtime_config_path": str(yaml_path), "state_dir": str(tmp_path), "dehydration": {"api_key": ""}}})
-    real_open = builtins.open
-    def disk_full(path, mode="r", *args, **kwargs):
-        if Path(path) == yaml_path and "w" in mode:
-            raise OSError("disk full")
-        return real_open(path, mode, *args, **kwargs)
-    ns["open"] = disk_full
-    yaml_failure = response_json(run(route(Request({"dehydration": {"model": "new"}, "persist": True}))))
+    import memory_system_config
+    def disk_full(*args, **kwargs):
+        raise OSError("disk full")
+    with monkeypatch.context() as scoped:
+        scoped.setattr(memory_system_config, 'update_overlay', disk_full)
+        yaml_failure = response_json(run(route(Request({"dehydration": {"model": "new"}, "persist": True}))))
     assert yaml_failure["error"] == "runtime_persist_failed"
     assert yaml_failure["persistence"]["runtime_yaml"] == "failed" and gateway_calls == []
 
@@ -242,7 +327,7 @@ def test_actual_route_yaml_and_env_persistence_failures_never_sync(monkeypatch, 
         "dehydration": {"model": "new", "api_key": SECRET}, "persist": True, "persist_env": True}))))
     assert env_failure["error"] == "credential_persist_failed"
     assert env_failure["persistence"]["runtime_yaml"] == "saved"
-    assert env_failure["persistence"]["credentials"] == "failed"
+    assert env_failure["persistence"]["credentials"] == "unconfirmed"
     assert env_path.exists() and gateway_calls == []
 
 
@@ -271,12 +356,12 @@ def test_reranker_ack_must_include_matching_effective_runtime(monkeypatch, obser
     receipt = run(config_activation.activate_gateway(
         {"reranker": {"enabled": True, "model": "r1", "api_key": SECRET}},
         admin_url=ADMIN, token=TOKEN))
-    matches = observed == {"enabled": True, "model": "r1", "api_ready": True}
-    assert (receipt["state"] == "confirmed") is matches
+    # Existence and even matching parameters cannot prove which credential
+    # the consumer adopted. Legacy ACK has no per-operation identity.
+    assert receipt["state"] == "unconfirmed"
     assert SECRET not in repr(receipt)
-    if not matches:
-        assert receipt["reason"] == "reranker_runtime_not_confirmed"
-        assert receipt["confirmed_fields"] == []
+    assert receipt["reason"] == "credential_consumer_not_confirmed"
+    assert "reranker.api_key" not in receipt["confirmed_fields"]
 
 
 def test_actual_reranker_runtime_key_is_saved_before_sync_without_other_key_writes(monkeypatch, tmp_path):
@@ -301,9 +386,11 @@ def test_actual_reranker_runtime_key_is_saved_before_sync_without_other_key_writ
     def handler(req):
         saved = dotenv_values(env_path, interpolate=False)
         assert saved == {"OMBRE_RERANKER_API_KEY": SECRET, "OMBRE_API_KEY": "keep-existing"}
-        assert json.loads(req.content) == {"reranker": {"api_key": SECRET}}
+        sent = json.loads(req.content)
+        assert sent["reranker"] == {"api_key": SECRET}
         return httpx.Response(200, json={"ok": True, "updated": ["reranker.api_key"],
-                                        "reranker": {"api_ready": True}})
+            "credential_adoption": {"generation": sent["_credential_generation"], "state": "consumer_snapshot", "confirmed_fields": ["reranker.api_key"]},
+            "reranker": {"api_ready": True}})
     install_transport(monkeypatch, handler)
     result = response_json(run(route(Request({"reranker": {}, "persist_env": True}))))
     assert result["gateway_activation"]["state"] == "confirmed"

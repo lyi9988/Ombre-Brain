@@ -1,9 +1,35 @@
 """Owner-safe save/activation receipts; never call an inference provider here."""
 
 import asyncio
+from uuid import uuid4
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+
+
+def credential_edit_revision(config):
+    # Restart creates a new editing epoch so an old open page cannot silently
+    # overwrite the new process. No secret-derived fingerprint is involved.
+    return config.setdefault("_credential_edit_revision", uuid4().hex)
+
+
+def is_credential_edit(body):
+    return any(isinstance(section, dict) and any(
+        key in ("model", "base_url", "upstreams") or key.endswith("api_key")
+        for key in section) for section in body.values())
+
+
+def local_credential_receipt(expected, consumers):
+    """Record in-memory consumer comparison, never a provider authentication."""
+    requested = {name for name, value in expected.items() if value}
+    confirmed = {name for name in requested if getattr(consumers.get(name), "api_key", None) == expected[name]}
+    return {
+        "generation": uuid4().hex if requested else None,
+        "state": "not_required" if not requested else "consumer_snapshot" if requested == confirmed else "unconfirmed",
+        "confirmed_fields": sorted(confirmed),
+        "unconfirmed_fields": sorted(requested - confirmed),
+        "provider_verified": False,
+    }
 
 
 def activation_receipt(fields=(), *, state="not_required", reason=None, attempted=False):
@@ -56,6 +82,9 @@ def _embedding_matches(health, expected, fields):
     if "embedding.api_key" in fields:
         name = "OMBRE_EMBEDDING_API_KEY"
         sources, matches = overlay.get("credential_sources"), overlay.get("credential_matches_observed_mount")
+        generations = overlay.get("credential_generations") or {}
+        if not expected.get("credential_generation") or generations.get(name) != expected["credential_generation"]:
+            return False
         if (overlay.get("credential_source_readable") is not True
                 or not isinstance(sources, dict) or sources.get(name) != "mounted_env"
                 or not isinstance(matches, dict) or matches.get(name) is not True
@@ -69,8 +98,8 @@ def _reranker_matches(observed, expected):
         return False
     for key, wanted in expected.items():
         if key == "api_key":
-            if wanted and observed.get("api_ready") is not True:
-                return False
+            # Exact requested-key adoption is independently checked using the
+            # per-operation nonce and in-memory equality at the consumer.
             continue
         actual = observed.get(key)
         if key == "base_url" and isinstance(wanted, str) and isinstance(actual, str):
@@ -93,6 +122,11 @@ async def activate_gateway(payload, *, admin_url, token, embedding_fields=(),
     embedding_fields = set(embedding_fields)
     fields = post_fields | embedding_fields
     receipt = activation_receipt(fields)
+    credential_fields = {field for field in post_fields if field.endswith("api_key") or field == "gateway.upstreams"}
+    generation = uuid4().hex if credential_fields else None
+    wire_payload = {**payload, "_credential_generation": generation} if generation else payload
+    receipt["credential_generation"] = generation
+    receipt["host_target_confirmed"] = False
     if not fields:
         return receipt
     receipt.update(state="unconfirmed", reason="not_attempted")
@@ -108,7 +142,7 @@ async def activate_gateway(payload, *, admin_url, token, embedding_fields=(),
             headers = {"Authorization": f"Bearer {token}"}
             if payload:
                 receipt["attempted"] = True
-                response = await client.post(admin_url, headers=headers, json=payload)
+                response = await client.post(admin_url, headers=headers, json=wire_payload)
                 receipt["http_status"] = response.status_code
                 if not 200 <= response.status_code < 300:
                     receipt.update(state="failed", reason="gateway_http_error")
@@ -127,6 +161,17 @@ async def activate_gateway(payload, *, admin_url, token, embedding_fields=(),
                 if post_fields - confirmed:
                     receipt["reason"] = "incomplete_acknowledgement"
                     return
+                if credential_fields:
+                    adoption = ack.get("credential_adoption") or {}
+                    adopted = set(adoption.get("confirmed_fields") or [])
+                    if (adoption.get("generation") != generation or adoption.get("state") != "consumer_snapshot"
+                            or not credential_fields.issubset(adopted)):
+                        confirmed -= credential_fields
+                        receipt["confirmed_fields"] = sorted(confirmed)
+                        receipt["unconfirmed_fields"] = sorted(fields - confirmed)
+                        receipt["reason"] = "credential_consumer_not_confirmed"
+                        return
+                    receipt["credential_adoption"] = "consumer_snapshot"
                 if "reranker" in payload:
                     if not _reranker_matches(ack.get("reranker"), payload["reranker"]):
                         confirmed -= {f for f in post_fields if f.startswith("reranker.")}
@@ -174,7 +219,8 @@ async def activate_gateway(payload, *, admin_url, token, embedding_fields=(),
 
 def config_save_result(updated, persistence, gateway_activation, *, error=None):
     """Keep legacy ok for the local save, with a distinct activation contract."""
-    attention = bool(error) or gateway_activation["state"] not in ("confirmed", "not_required")
+    attention = (bool(error) or gateway_activation["state"] not in ("confirmed", "not_required")
+                 or persistence.get("host_target_confirmed") is False)
     result = {
         "ok": error is None,
         "updated": list(updated),

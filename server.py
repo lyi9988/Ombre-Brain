@@ -275,38 +275,12 @@ def _quote_env_value(value: str) -> str:
 
 
 def _write_dashboard_env_values(updates: dict[str, str]) -> list[str]:
-    updates = {
-        str(key): str(value)
-        for key, value in (updates or {}).items()
-        if str(key or "").strip() and str(value or "")
-    }
+    from credential_file import write_values
     if not updates:
         return []
-
-    env_path = os.path.abspath(_dashboard_env_path())
-    os.makedirs(os.path.dirname(env_path), exist_ok=True)
-    lines = []
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            lines = f.read().splitlines()
-
-    remaining = dict(updates)
-    output = []
-    for line in lines:
-        match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
-        key = match.group(1) if match else ""
-        if key in remaining:
-            output.append(f"{key}={_quote_env_value(remaining.pop(key))}")
-        else:
-            output.append(line)
-    for key, value in remaining.items():
-        output.append(f"{key}={_quote_env_value(value)}")
-
-    with open(env_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(output).rstrip() + "\n")
-
-    for key, value in updates.items():
-        os.environ[key] = value
+    # Existing file bind mounts pin the inode. Preserve it, with a shared
+    # inode lock, instead of claiming an atomic rename synchronized a mount.
+    write_values(_dashboard_env_path(), updates, preserve_inode=True)
     return [f"env.{key}" for key in updates]
 
 
@@ -332,16 +306,29 @@ def _dashboard_api_key_values(value) -> list[str]:
         candidates = value.splitlines()
     else:
         candidates = []
-    return [str(candidate or "").strip() for candidate in candidates if str(candidate or "").strip()]
+    from credential_file import validate_values
+    for candidate in candidates:
+        validate_values({"KEY": candidate})
+    values = [str(candidate or "").strip() for candidate in candidates]
+    while values and not values[-1]:
+        values.pop()
+    return values
 
 
 def _dashboard_sanitize_env_names(value) -> list[str]:
-    env_names = []
-    for env_name in _dashboard_split_names(value):
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
-            raise ValueError(f'invalid api key env name "{env_name}"')
-        env_names.append(env_name)
-    return env_names
+    if isinstance(value, str):
+        candidates = re.split(r"[\n,]", value.strip()) if value.strip() else []
+    elif isinstance(value, list):
+        candidates = value
+    else:
+        candidates = []
+    names = []
+    for candidate in candidates:
+        name = str(candidate or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or name in names:
+            raise ValueError("credential env names must be valid, nonempty and unique")
+        names.append(name)
+    return names
 
 
 def _dashboard_sanitize_upstream_models(raw_models) -> list:
@@ -433,9 +420,35 @@ def _dashboard_sanitize_gateway_upstreams(raw_upstreams, existing_upstreams=None
             sanitized["models"] = models
 
         existing = existing_by_name.get(name, {})
+        mode = raw.get("credential_mode", "replace")
+        if mode not in ("replace", "append"):
+            raise ValueError("credential_mode must be replace or append")
+        values = _dashboard_api_key_values(raw.get("api_key_values", []))
+        if len(values) > len(env_names):
+            raise ValueError("credential values require matching env slots")
+        replacing = bool(values and values[0]) and mode == "replace"
+        old_envs = _dashboard_sanitize_env_names(existing.get("api_key_envs", existing.get("api_key_env", [])))
+        if values and mode == "append":
+            if any(env_names[i] in old_envs for i, value in enumerate(values) if value and i < len(env_names)):
+                raise ValueError("append requires new credential env names; use replace to update existing slots")
+            sanitized["api_key_envs"] = list(dict.fromkeys(old_envs + env_names))
         for secret_key in ("api_key", "api_keys"):
             if isinstance(existing, dict) and secret_key in existing:
-                sanitized[secret_key] = existing[secret_key]
+                # Explicit replacement removes the legacy primary, retaining
+                # the independently configured backup pool.
+                if not (replacing and secret_key == "api_key"):
+                    sanitized[secret_key] = existing[secret_key]
+        if values and isinstance(sanitized.get("api_keys"), list):
+            labels = {f"env:{env_names[i]}" for i, value in enumerate(values) if value and i < len(env_names)}
+            sanitized["api_keys"] = [item for item in sanitized["api_keys"]
+                if not isinstance(item, dict) or item.get("label") not in labels]
+        if replacing:
+            sanitized["credential_mode"] = "replace"
+            sanitized["credential_primary_env"] = env_names[0]
+        elif existing.get("credential_primary_env"):
+            sanitized["credential_primary_env"] = existing["credential_primary_env"]
+        elif values and old_envs and not existing.get("api_key"):
+            sanitized["credential_primary_env"] = old_envs[0]
         upstreams.append(sanitized)
     return upstreams
 
@@ -451,7 +464,12 @@ def _dashboard_gateway_upstream_env_updates(raw_upstreams) -> dict[str, str]:
             name = str(raw.get("name") or "upstream").strip()
             raise ValueError(f'gateway upstream "{name}" has api key values without matching env names')
         for index, key_value in enumerate(key_values):
-            updates[env_names[index]] = key_value
+            if not key_value:
+                continue  # blank slot means keep this key, never shift later slots
+            env_name = env_names[index]
+            if env_name in updates and updates[env_name] != key_value:
+                raise ValueError("conflicting credential updates for one env reference")
+            updates[env_name] = key_value
     return updates
 
 
@@ -474,7 +492,7 @@ def _dashboard_gateway_hot_upstreams(config_upstreams: list[dict], raw_upstreams
         values = _dashboard_api_key_values(raw.get("api_key_values", []))
         hot_keys = []
         for index, value in enumerate(values):
-            if index < len(env_names):
+            if value and index < len(env_names):
                 env_name = env_names[index]
                 if env_updates.get(env_name):
                     hot_keys.append({"api_key": value, "label": f"env:{env_name}"})
@@ -486,7 +504,14 @@ def _dashboard_gateway_hot_upstreams(config_upstreams: list[dict], raw_upstreams
         hot = dict(upstream)
         name = str(hot.get("name") or "").strip()
         if name in key_values_by_name:
-            hot["api_keys"] = key_values_by_name[name]
+            backups = list(hot.get("api_keys") or [])
+            # Drop stale runtime copies of the very env slots being replaced,
+            # not other explicitly configured backup credentials.
+            labels = {key["label"] for key in key_values_by_name[name]}
+            backups = [key for key in backups if not isinstance(key, dict) or key.get("label") not in labels]
+            hot["api_keys"] = key_values_by_name[name] + backups
+            if hot.get("credential_mode") == "replace":
+                hot.pop("api_key", None)
         hot_upstreams.append(hot)
     return hot_upstreams
 
@@ -13135,7 +13160,9 @@ async def api_config_get(request):
         or dehy.get("api_key", "")
         or ""
     )
+    from config_activation import credential_edit_revision
     return JSONResponse({
+        "credential_revision": credential_edit_revision(config),
         "dehydration": {
             "model": dehy.get("model", ""),
             "base_url": dehy.get("base_url", ""),
@@ -13430,6 +13457,30 @@ async def api_config_update(request):
     # Validate before mutating any runtime section or persisting a partial save.
     if not isinstance(body, dict):
         return JSONResponse({"error": "invalid config object"}, status_code=400)
+    from config_activation import credential_edit_revision, is_credential_edit
+    credential_edit = is_credential_edit(body)
+    current_credential_revision = credential_edit_revision(config)
+    expected_credential_revision = body.get("expected_credential_revision")
+    if credential_edit and expected_credential_revision is not None and expected_credential_revision != current_credential_revision:
+        return JSONResponse({"error": "credential_revision_conflict", "local_update": "not_applied"}, status_code=409)
+    # Validate credentials before any live config section or file is changed.
+    try:
+        from credential_file import validate_values
+        for section in body.values():
+            if isinstance(section, dict):
+                for key, value in section.items():
+                    if key == "api_key" or key.endswith("_api_key"):
+                        validate_values({"KEY": value})
+                        if isinstance(value, str):
+                            section[key] = value.strip()
+        raw_upstreams = (body.get("gateway") or {}).get("upstreams")
+        if raw_upstreams is not None:
+            _dashboard_sanitize_gateway_upstreams(raw_upstreams, (config.get("gateway") or {}).get("upstreams", []))
+            _dashboard_gateway_upstream_env_updates(raw_upstreams)
+            if _dashboard_gateway_upstreams_have_key_values(raw_upstreams) and not body.get("persist_env"):
+                raise ValueError("gateway upstream api_key_values require persist_env=true")
+    except (ValueError, TypeError, AttributeError):
+        return JSONResponse({"error": "invalid credential input or persistence request"}, status_code=400)
     if isinstance(body.get("reflection"), dict) and "memory_task_routes" in body["reflection"]:
         from memory_task_routes import normalize_task_routes, task_routes_revision
         try:
@@ -13496,8 +13547,12 @@ async def api_config_update(request):
             except ValueError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
 
+    if credential_edit:
+        from uuid import uuid4
+        current_credential_revision = config["_credential_edit_revision"] = uuid4().hex
     updated = []
     env_updates: dict[str, str] = {}
+    persisted_credential_generations = {}
     persistence = {
         "runtime_yaml": "pending" if body.get("persist") else "not_requested",
         "credentials": "pending" if body.get("persist_env") else "not_requested",
@@ -14237,10 +14292,9 @@ async def api_config_update(request):
                     )
                 )
                 if "upstreams" in body["gateway"]:
-                    sc_gateway["upstreams"] = _dashboard_sanitize_gateway_upstreams(
-                        body["gateway"]["upstreams"],
-                        sc_gateway.get("upstreams", []),
-                    )
+                    # Persist the same validated effective candidate used by
+                    # this operation, including legitimate base-config backups.
+                    sc_gateway["upstreams"] = deepcopy(sanitized_upstreams)
                 if "cooldown_hours" in body["gateway"]:
                     sc_gateway["cooldown_hours"] = max(0.0, float(body["gateway"]["cooldown_hours"]))
                 if "skip_recent_rounds" in body["gateway"]:
@@ -14619,9 +14673,16 @@ async def api_config_update(request):
             if env_updated:
                 updated.extend(env_updated)
                 updated.append("persisted_to_env")
+            if env_updated:
+                from credential_file import read_values
+                persisted_credential_generations = read_values(_dashboard_env_path())[1]
             persistence["credentials"] = "saved" if env_updated else "not_needed"
+            persistence["credential_scope"] = "brain_visible_file"
+            persistence["host_target_confirmed"] = False
+            persistence["inode_preserved"] = True
         except Exception:
-            persistence["credentials"] = "failed"
+            persistence["credentials"] = "unconfirmed"
+            persistence["host_target_confirmed"] = False
             return JSONResponse(config_save_result(
                 updated, persistence,
                 activation_receipt(state="unconfirmed", reason="persistence_failed"),
@@ -14638,6 +14699,7 @@ async def api_config_update(request):
         gateway_hot_update_payload, embedding_fields=embedding_fields,
         embedding_persisted=embedding_persisted,
         embedding_expected={
+            "credential_generation": persisted_credential_generations.get("OMBRE_EMBEDDING_API_KEY"),
             "enabled": bool(config.get("embedding", {}).get("enabled", False)),
             "model": config.get("embedding", {}).get("model") or getattr(embedding_engine, "model", ""),
             "base_url": config.get("embedding", {}).get("base_url") or getattr(embedding_engine, "base_url", ""),
@@ -14646,7 +14708,24 @@ async def api_config_update(request):
     )
     if activation["state"] == "confirmed":
         updated.append("gateway_hot_reloaded")
-    return JSONResponse(config_save_result(updated, persistence, activation))
+    from config_activation import local_credential_receipt
+    local_sources = {
+        "dehydration.api_key": ("OMBRE_API_KEY", "dehydrator"),
+        "embedding.api_key": ("OMBRE_EMBEDDING_API_KEY", "embedding_engine"),
+        "reranker.api_key": ("OMBRE_RERANKER_API_KEY", "reranker_engine"),
+        "persona.api_key": ("OMBRE_PERSONA_API_KEY", "persona_engine"),
+        "reflection.api_key": ("OMBRE_REFLECTION_API_KEY", "reflection_engine"),
+        "portrait.api_key": ("OMBRE_PORTRAIT_API_KEY", "portrait_engine"),
+        "dream.api_key": ("OMBRE_DREAM_API_KEY", "dream_engine"),
+    }
+    local_adoption = local_credential_receipt(
+        {field: env_updates.get(source[0]) for field, source in local_sources.items()},
+        {field: globals().get(source[1]) for field, source in local_sources.items()})
+    result = config_save_result(updated, persistence, activation)
+    result["credential_revision"] = current_credential_revision
+    result["brain_credential_adoption"] = local_adoption
+    result["attention_required"] = result["attention_required"] or local_adoption["state"] == "unconfirmed"
+    return JSONResponse(result)
 
 
 @mcp.custom_route("/api/status", methods=["GET"])
