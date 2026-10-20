@@ -479,6 +479,7 @@ class MemoryL1Runtime:
                 return {'status': 'not_prepared', 'reason': 'progress_changed_before_model_call',
                     'task_id': task_id, 'code': type(exc).__name__}
             response_received = False
+            validated_window = False
             try:
                 response = await self._daily_chat_memory_create_completion(route['client'], model=route['model'],
                     messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}],
@@ -536,10 +537,17 @@ class MemoryL1Runtime:
                 checkpoint = {'previous_revision': previous_revision, 'combined': copy.deepcopy(combined),
                     'prose': list(prose), 'scene_bodies': dict(scene_bodies),
                     'input_ranges': copy.deepcopy(input_ranges), 'confidence': list(confidence)}
+                validated_window = True
                 progress_record = progress_store.save(candidate_id, checkpoint,
                     expected_revision=progress_record['revision'] if progress_record else 0)
             except Exception as exc:
                 failures.append({'window': index, 'reason': type(exc).__name__, 'code': getattr(exc, 'code', None)})
+                if validated_window:
+                    # A valid result followed by a failed durable write is not
+                    # an invalid model response. Keep the original intent so
+                    # restart cannot automatically pay for that window again.
+                    return {'status': 'not_prepared', 'reason': 'validated_checkpoint_requires_recovery',
+                        'task_id': task_id, 'candidate_id': candidate_id, 'failures': failures}
                 if response_received:
                     # A received but invalid result is known, not an unknown
                     # provider outcome. Keep the pre-attempt successful state.

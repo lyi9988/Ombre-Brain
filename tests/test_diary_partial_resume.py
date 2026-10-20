@@ -65,6 +65,19 @@ def test_budget_resume_durable_no_duplicate_scenes(tmp_path):
     assert row['revision']==3
     assert task(e)['replayed'] and calls==[0,1,2]
 
+def test_valid_result_checkpoint_failure_does_not_allow_paid_replay(tmp_path, monkeypatch):
+    e,s,state,calls=fixture(tmp_path)
+    original=DiaryProgress.save
+    def fail_validated(self, ident, progress, **kwargs):
+        if progress.get('input_ranges') and 'uncertain_window' not in progress:
+            raise RuntimeError('checkpoint write failed after valid model result')
+        return original(self, ident, progress, **kwargs)
+    monkeypatch.setattr(DiaryProgress, 'save', fail_validated)
+    assert task(e)['reason']=='validated_checkpoint_requires_recovery'
+    monkeypatch.setattr(DiaryProgress, 'save', original)
+    assert task(e)['reason']=='model_outcome_unknown_requires_retry_decision'
+    assert calls==[0]
+
 def test_failure_second_resumes_only_missing(tmp_path):
     e,s,state,calls=fixture(tmp_path,limit=3)
     state['fail']=1

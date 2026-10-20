@@ -37,9 +37,14 @@ accept/reject/defer and committed revisions win. Partial Auto remains Review;
 an all-in-one-run complete Auto task still follows the original Auto policy.
 Completed working state compacts only after canonical candidate save.
 
-Validation: 41 source-narrowing/diary-resume/ingestion tests, 7 full
+Additional local review found and fixed a follow-on edge: a validated window
+whose checkpoint write fails must retain its original dispatch intent, not be
+treated as an invalid model response eligible for automatic retry. A dedicated
+fault-injection test verifies zero replay after this failure.
+
+Validation: 42 source-narrowing/diary-resume/ingestion tests, 7 full
 ReflectionEngine runtime tests, 39 diary-service/Authority regressions passed
-(87 unique tests). Actual native Schema request path was exercised with fixture
+(88 unique tests). Actual native Schema request path was exercised with fixture
 responses. The old runtime fixture needed `base_url`/`with_options` and a
 native `semantic-v1` output format; production validation was not bypassed.
 Initial default Python failed due to temporary-directory access and an
