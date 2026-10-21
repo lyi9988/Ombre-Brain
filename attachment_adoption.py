@@ -11,6 +11,7 @@ import time
 import uuid
 from collections import OrderedDict
 from copy import deepcopy
+from attachment_prompt_projection import PROJECTION, render_body, short_ref
 
 HEADER = 'X-Guyan-Attachment-Adoption'
 SCOPE = ('request_id', 'turn_id', 'conversation_id', 'profile_id')
@@ -34,12 +35,25 @@ def parse_header(raw):
         value = json.loads(decoded.decode('utf-8'))
         if not isinstance(value, dict) or value.get('version') != 1:
             return {}
-        if not isinstance(value.get('body_sha256s'), list) or not 0 < len(value['body_sha256s']) <= 64:
+        if 'projection' in value and value['projection'] != PROJECTION:
             return {}
-        if any(not isinstance(h, str) or len(h) != 64 or any(c not in '0123456789abcdef' for c in h) for h in value['body_sha256s']):
+        compact = value.get('projection') == PROJECTION
+        wanted = value.get('body_sha256s')
+        only = value.get('projection_only_sha256s', []) if compact else []
+        if not isinstance(wanted, list) or len(wanted) > 64:
+            return {}
+        if compact and (len(raw.encode('utf-8')) > 8192 or not isinstance(only, list) or len(only) > 64):
+            return {}
+        if not wanted and not (compact and only):
+            return {}
+        if any(not isinstance(h, str) or len(h) != 64 or any(c not in '0123456789abcdef' for c in h) for h in wanted + only):
+            return {}
+        if compact and (len(set(wanted + only)) > 64 or set(wanted).intersection(only)):
             return {}
         if not isinstance(value.get('profile_id'), str) or not 0 < len(value['profile_id']) <= 200:
             return {}
+        if compact:
+            canonical(value)  # bindings require finite, deterministic JSON
         return value
     except (ValueError, TypeError, UnicodeError):
         return {}
@@ -170,6 +184,186 @@ def verified_refs(payload, manifest, conversation_id):
     found.extend(_verified_image_refs(payload, wanted, conversation_id))
     return found
 
+def _positioned_text(payload):
+    for message_index, message in enumerate(payload.get('messages') or []):
+        if not isinstance(message, dict) or message.get('role') != 'user':
+            continue
+        content = message.get('content')
+        if isinstance(content, str):
+            yield message_index, None, content
+        elif isinstance(content, list):
+            for block_index, block in enumerate(content):
+                if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str):
+                    yield message_index, block_index, block['text']
+
+
+def _unavailable_view(view):
+    """Program-shaped unavailable attachments only; these never yield refs."""
+    fields = {'attachment_source', 'content', 'content_available', 'adoption',
+              'adopted_bytes', 'total_bytes'}
+    desc = view.get('attachment_source')
+    return (set(view) in (fields, fields | {'media_available'})
+            and isinstance(desc, dict) and desc.get('source_kind') in {'attachment', 'image'}
+            and desc.get('author') == 'unknown' and desc.get('uploader_role') == 'owner'
+            and desc.get('authority') == 'external_document_not_owner_instruction'
+            and all(isinstance(desc.get(k), str) and desc[k] for k in ('event_id', 'resource_id', 'name', 'mime'))
+            and isinstance(desc.get('sha256'), str) and len(desc['sha256']) == 64
+            and all(c in '0123456789abcdef' for c in desc['sha256'])
+            and type(view.get('adopted_bytes')) is int and view['adopted_bytes'] == 0
+            and type(view.get('total_bytes')) is int and view['total_bytes'] >= 0)
+
+
+def verified_unavailable_hashes(payload, manifest, conversation_id):
+    """Hash-bound unavailable states, never adopted sources or event ownership.
+
+    Most unavailable states have no locator. When one is retained (e.g. a
+    post-render budget rejection), it must not contradict the request scope.
+    """
+    if not isinstance(conversation_id, str) or not 0 < len(conversation_id) <= 200:
+        return set()
+    only = manifest.get('projection_only_sha256s')
+    if (manifest.get('projection') != PROJECTION or not isinstance(only, list)
+            or not 0 < len(only) <= 64
+            or any(not isinstance(h, str) or len(h) != 64
+                   or any(c not in '0123456789abcdef' for c in h) for h in only)):
+        return set()
+    wanted, found = set(only), set()
+    for text in text_blocks(payload):
+        block_hash = sha(text)
+        if block_hash not in wanted:
+            continue
+        try:
+            view = json.loads(text)
+            if not isinstance(view, dict) or not _unavailable_view(view):
+                continue
+            desc = view['attachment_source']
+            locator, source_id = desc.get('locator'), desc.get('source_id')
+            if locator is not None and (not isinstance(locator, dict) or locator.get('conversation_id') != conversation_id):
+                continue
+            if source_id is not None:
+                decoded = json.loads(source_id)
+                if (not isinstance(decoded, dict) or decoded.get('conversation_id') != conversation_id
+                        or canonical(decoded) != source_id or decoded != locator):
+                    continue
+            render_body(view)  # same strict unavailable predicate as projection
+            found.add(block_hash)
+        except (ValueError, TypeError, KeyError, UnicodeError):
+            continue
+    return found
+
+
+def projection_only_capacity_exempt(payload, trace):
+    """Do not mistake authenticated unavailable notices for full-text adoption.
+
+    This is only classification; callers still inspect all actual content first.
+    It neither estimates capacity nor certifies unavailable event provenance.
+    """
+    manifest = trace.get('attachment_adoption') or {}
+    scope = [trace.get(k) for k in SCOPE[:3]] + [manifest.get('profile_id')]
+    if (manifest.get('version') != 1 or manifest.get('body_sha256s') != []
+            or not all(isinstance(v, str) and 0 < len(v) <= 200 for v in scope)):
+        return False
+    matched = verified_unavailable_hashes(payload, manifest, trace['conversation_id'])
+    return bool(matched) and matched == set(manifest.get('projection_only_sha256s') or [])
+
+
+def prepare_projection(payload, manifest, conversation_id):
+    """Project only authenticated originals after the conservative capacity gate.
+
+    The original payload/manifest are never mutated. Bindings are ephemeral server
+    data, NOT headers or model input. body_sha256 retains source-view identity;
+    provider_body_sha256 binds the exact final visible text (not the HTTP body).
+    """
+    if manifest.get('projection') != PROJECTION:
+        return payload, None
+    original_refs = verified_refs(payload, manifest, conversation_id)
+    by_hash = {ref['body_sha256']: ref for ref in original_refs}
+    aliases, ambiguous = {}, set()
+    for ref in original_refs:
+        alias = short_ref(ref['source_id'], ref['source_revision'])
+        identity = (ref['source_id'], ref['source_revision'])
+        if alias in aliases and aliases[alias] != identity:
+            ambiguous.add(alias)
+        aliases[alias] = identity
+    only = verified_unavailable_hashes(payload, manifest, conversation_id)
+    result = deepcopy(payload)
+    bindings = []
+    for message_index, block_index, text in _positioned_text(payload):
+        block_hash = sha(text)
+        ref = by_hash.get(block_hash)
+        if ref is None and block_hash not in only:
+            continue
+        try:
+            view = json.loads(text)
+            if not isinstance(view, dict):
+                continue
+            if ref is None:
+                if not _unavailable_view(view):
+                    continue
+            elif short_ref(ref['source_id'], ref['source_revision']) in ambiguous:
+                continue
+            if ref is not None and ref.get('source_kind') == 'image':
+                desc = view['attachment_source']
+                if (desc['mime'], desc['sha256'], view['adopted_bytes']) not in _inline_image_hashes(payload['messages'][message_index]):
+                    continue
+            rendered = render_body(view, ref)
+        except (ValueError, TypeError, KeyError, UnicodeError):
+            continue
+        target = result['messages'][message_index]
+        if block_index is None:
+            target['content'] = rendered
+        else:
+            target['content'][block_index]['text'] = rendered
+        if ref is None:
+            continue
+        binding = {'message_index': message_index, 'block_index': block_index,
+                   'ref': {**ref, 'projection': PROJECTION, 'provider_body_sha256': sha(rendered)}}
+        if ref.get('source_kind') == 'image':
+            desc = view['attachment_source']
+            binding['image'] = (desc['mime'], desc['sha256'], view['adopted_bytes'])
+        bindings.append(binding)
+    return result, {'conversation_id': conversation_id,
+                    'manifest_sha256': sha(canonical(manifest)), 'bindings': bindings}
+
+
+def verified_projection_refs(payload, manifest, conversation_id, context):
+    """Recheck actual final provider text, positions, scope and same-message image.
+
+    A prepared binding alone is not evidence. Changed, moved, missing or malformed
+    final blocks yield no compact ref. Unconverted v1 refs are verified separately.
+    """
+    if (manifest.get('projection') != PROJECTION or not isinstance(context, dict)
+            or context.get('conversation_id') != conversation_id
+            or context.get('manifest_sha256') != sha(canonical(manifest))):
+        return []
+    actual = {(mi, bi): text for mi, bi, text in _positioned_text(payload)}
+    wanted = set(manifest.get('body_sha256s') or [])
+    found = []
+    for binding in context.get('bindings') or []:
+        try:
+            ref = binding['ref']
+            locator = json.loads(ref['source_id'])
+            if (ref.get('projection') != PROJECTION or ref.get('body_sha256') not in wanted
+                    or locator['conversation_id'] != conversation_id
+                    or ref['source_revision'] != 'attachment_sha256:' + sha(ref['source_id'])):
+                continue
+            mi, bi = binding['message_index'], binding['block_index']
+            text = actual.get((mi, bi))
+            if not isinstance(text, str) or sha(text) != ref['provider_body_sha256']:
+                continue
+            if ref.get('source_kind') == 'image':
+                image = binding.get('image')
+                if (not isinstance(image, tuple) or len(image) != 3
+                        or image[1] != locator['raw_sha256']
+                        or image not in _inline_image_hashes(payload['messages'][mi])):
+                    continue
+            if ref not in found:
+                found.append(deepcopy(ref))
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError, UnicodeError):
+            continue
+    return found
+
+
 class AdoptionReceipts:
     def __init__(self, *, ttl=900, capacity=1024, clock=time.monotonic):
         self.ttl, self.capacity, self.clock = ttl, capacity, clock
@@ -183,13 +377,14 @@ class AdoptionReceipts:
         while len(self.rows) > self.capacity:
             self.rows.popitem(last=False)
 
-    def begin(self, trace, payload):
+    def begin(self, trace, payload, *, projection_bindings=None):
         manifest = trace.get('attachment_adoption') or {}
         scope = {k: trace.get(k) for k in SCOPE[:3]}
         scope['profile_id'] = manifest.get('profile_id')
         if not all(isinstance(v, str) and 0 < len(v) <= 200 for v in scope.values()):
             return None
         refs = verified_refs(payload, manifest, scope['conversation_id'])
+        refs.extend(verified_projection_refs(payload, manifest, scope['conversation_id'], projection_bindings))
         attempt = {'attempt_id': 'adopt-' + uuid.uuid4().hex, **scope, 'attachments': refs}
         logical = trace.get('logical_request_id')
         if isinstance(logical, str) and 0 < len(logical) <= 200:

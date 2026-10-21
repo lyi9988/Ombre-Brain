@@ -1,5 +1,5 @@
 import logging
-from attachment_adoption import AdoptionReceipts, parse_header as parse_adoption_header
+from attachment_adoption import AdoptionReceipts, parse_header as parse_adoption_header, prepare_projection
 from gateway_request_capacity import explicit_limits, has_full_attachment, route_limits
 from request_capacity import (HEADER as CAPACITY_HEADER, assess_capacity, blocked as capacity_blocked,
                               error_body as capacity_error_body, read_header as read_capacity_header)
@@ -6862,6 +6862,23 @@ class GatewayService:
                 protocol="openai", stream=False)
             if capacity_response is not None:
                 return capacity_response
+            # Capacity is assessed on the original, conservative source view.
+            # Only the final provider view is compacted; retries start from original.
+            projection_trace = self._trace_from_payload(payload)
+            provider_payload, projection_bindings = prepare_projection(
+                upstream_payload, projection_trace.get("attachment_adoption") or {},
+                projection_trace.get("conversation_id"),
+            )
+            outbound_request = self.http_client.build_request(
+                "POST", url,
+                headers={
+                    "Authorization": f"Bearer {key_entry['value']}",
+                    "Content-Type": "application/json",
+                },
+                json=provider_payload,
+            )
+            # Verify the serialized request body that is actually dispatched.
+            provider_payload = json.loads(outbound_request.content)
             started_at = time.perf_counter()
             trace = self._trace_from_payload(payload)
             attempt_id = self.model_request_trace.record_attempt(
@@ -6870,18 +6887,12 @@ class GatewayService:
                 model=route["upstream_model"], alias=model,
                 retry_reason=str(trace.get("retry_reason") or "")
                 or ("provider_retry" if attempt > 1 else ""),
-                payload=upstream_payload,
+                payload=provider_payload,
             )
-            adoption_attempt = self.attachment_adoption.begin(trace, upstream_payload)
+            adoption_attempt = self.attachment_adoption.begin(
+                trace, provider_payload, projection_bindings=projection_bindings)
             try:
-                response = await self.http_client.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {key_entry['value']}",
-                        "Content-Type": "application/json",
-                    },
-                    json=upstream_payload,
-                )
+                response = await self.http_client.send(outbound_request)
             except httpx.RequestError as exc:
                 latency_ms = int((time.perf_counter() - started_at) * 1000)
                 if attempt_id:
@@ -6969,6 +6980,20 @@ class GatewayService:
                 protocol="anthropic", stream=False)
             if capacity_response is not None:
                 return capacity_response
+            # Capacity is assessed on the original, conservative source view.
+            # Only the final provider view is compacted; retries start from original.
+            projection_trace = self._trace_from_payload(payload)
+            provider_payload, projection_bindings = prepare_projection(
+                upstream_payload, projection_trace.get("attachment_adoption") or {},
+                projection_trace.get("conversation_id"),
+            )
+            outbound_request = self.http_client.build_request(
+                "POST", url,
+                headers=self._anthropic_upstream_headers(upstream, key_entry, request=request),
+                json=provider_payload,
+            )
+            # Verify the serialized request body that is actually dispatched.
+            provider_payload = json.loads(outbound_request.content)
             started_at = time.perf_counter()
             trace = self._trace_from_payload(payload)
             attempt_id = self.model_request_trace.record_attempt(
@@ -6977,15 +7002,12 @@ class GatewayService:
                 model=route["upstream_model"], alias=model,
                 retry_reason=str(trace.get("retry_reason") or "")
                 or ("provider_retry" if attempt > 1 else ""),
-                payload=upstream_payload,
+                payload=provider_payload,
             )
-            adoption_attempt = self.attachment_adoption.begin(trace, upstream_payload)
+            adoption_attempt = self.attachment_adoption.begin(
+                trace, provider_payload, projection_bindings=projection_bindings)
             try:
-                response = await self.http_client.post(
-                    url,
-                    headers=self._anthropic_upstream_headers(upstream, key_entry, request=request),
-                    json=upstream_payload,
-                )
+                response = await self.http_client.send(outbound_request)
             except httpx.RequestError as exc:
                 latency_ms = int((time.perf_counter() - started_at) * 1000)
                 if attempt_id:
@@ -7068,6 +7090,13 @@ class GatewayService:
                 protocol="openai", stream=True)
             if capacity_response is not None:
                 return capacity_response
+            # Capacity is assessed on the original, conservative source view.
+            # Only the final provider view is compacted; retries start from original.
+            projection_trace = self._trace_from_payload(payload)
+            provider_payload, projection_bindings = prepare_projection(
+                upstream_payload, projection_trace.get("attachment_adoption") or {},
+                projection_trace.get("conversation_id"),
+            )
             request = self.http_client.build_request(
                 "POST",
                 url,
@@ -7075,8 +7104,10 @@ class GatewayService:
                     "Authorization": f"Bearer {key_entry['value']}",
                     "Content-Type": "application/json",
                 },
-                json=upstream_payload,
+                json=provider_payload,
             )
+            # Verify the serialized request body that is actually dispatched.
+            provider_payload = json.loads(request.content)
             started_at = time.perf_counter()
             trace = self._trace_from_payload(payload)
             attempt_id = self.model_request_trace.record_attempt(
@@ -7085,9 +7116,10 @@ class GatewayService:
                 model=route["upstream_model"], alias=model,
                 retry_reason=str(trace.get("retry_reason") or "")
                 or ("provider_retry" if attempt > 1 else ""),
-                payload=upstream_payload,
+                payload=provider_payload,
             )
-            adoption_attempt = self.attachment_adoption.begin(trace, upstream_payload)
+            adoption_attempt = self.attachment_adoption.begin(
+                trace, provider_payload, projection_bindings=projection_bindings)
             try:
                 upstream_response = await self.http_client.send(request, stream=True)
             except httpx.RequestError as exc:
@@ -7182,12 +7214,21 @@ class GatewayService:
                 protocol="anthropic", stream=True)
             if capacity_response is not None:
                 return capacity_response
+            # Capacity is assessed on the original, conservative source view.
+            # Only the final provider view is compacted; retries start from original.
+            projection_trace = self._trace_from_payload(payload)
+            provider_payload, projection_bindings = prepare_projection(
+                upstream_payload, projection_trace.get("attachment_adoption") or {},
+                projection_trace.get("conversation_id"),
+            )
             request = self.http_client.build_request(
                 "POST",
                 url,
                 headers=self._anthropic_upstream_headers(upstream, key_entry),
-                json=upstream_payload,
+                json=provider_payload,
             )
+            # Verify the serialized request body that is actually dispatched.
+            provider_payload = json.loads(request.content)
             started_at = time.perf_counter()
             trace = self._trace_from_payload(payload)
             attempt_id = self.model_request_trace.record_attempt(
@@ -7196,9 +7237,10 @@ class GatewayService:
                 model=route["upstream_model"], alias=model,
                 retry_reason=str(trace.get("retry_reason") or "")
                 or ("provider_retry" if attempt > 1 else ""),
-                payload=upstream_payload,
+                payload=provider_payload,
             )
-            adoption_attempt = self.attachment_adoption.begin(trace, upstream_payload)
+            adoption_attempt = self.attachment_adoption.begin(
+                trace, provider_payload, projection_bindings=projection_bindings)
             try:
                 upstream_response = await self.http_client.send(request, stream=True)
             except httpx.RequestError as exc:

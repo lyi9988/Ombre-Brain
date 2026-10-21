@@ -100,6 +100,11 @@ def has_full_attachment(payload, trace):
     # This classifies input only; adoption still verifies the actual image bytes.
     if manifest:
         wanted = manifest.get("body_sha256s")
+        # This optional unavailable-only manifest declares no adopted full text.
+        # Actual text detected above still wins; capacity estimation is unchanged.
+        from attachment_adoption import projection_only_capacity_exempt
+        if projection_only_capacity_exempt(payload, trace):
+            return False
         return not (isinstance(wanted, list) and wanted
                     and all(isinstance(item, str) for item in wanted)
                     and set(wanted) <= image_descriptors)
