@@ -191,7 +191,8 @@ recall_diagnostics = RecallDiagnosticsLogger(config)  # Recall diagnostics / 召
 import_engine = ImportEngine(
     config, bucket_mgr, dehydrator, embedding_engine, prompt_plan_mirror
 )  # Import engine / 导入引擎
-persona_engine = PersonaStateEngine(config)           # Persona state engine / 人格状态引擎
+from persona_b1_runtime import make_engine as make_b1_persona_engine
+persona_engine = make_b1_persona_engine(config)  # Explicit persisted owner only.
 memory_edge_store = MemoryEdgeStore(config)            # Explicit memory relationship edges / 显式记忆关系边
 entity_edge_store = EntityEdgeStore(config)            # Person/object hint edges / 人物对象轻边
 memory_node_store = MemoryNodeStore(config)            # Computable memory node index / 可计算记忆节点
@@ -1081,12 +1082,29 @@ def _authorized_memory_write(request) -> bool:
 
 
 # Candidate-only internal ingress, protected by the existing internal bearer.
-# Default persona_engine has no B1 adapter: authenticated calls receive 503.
-# No public tool, cookie-only write permission, or production authority switch.
+# Off mode has no B1 adapter: authenticated calls receive 503.
+# Candidate mode requires a persisted fence before startup; no public tool or
+# cookie-only write permission is introduced here.
 from persona_b1_http import register_candidate_route
 _b1_candidate_ingest = register_candidate_route(
     mcp, lambda: persona_engine, _authorized_memory_write,
 )
+
+@mcp.custom_route('/internal/persona/b1/snapshot', methods=['GET'])
+async def _b1_candidate_snapshot(request):
+    """Existing internal bearer; a bounded projection of the installed owner."""
+    from starlette.responses import JSONResponse
+    if not _authorized_memory_write(request):
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+    adapter = getattr(persona_engine, 'b1_candidate', None)
+    if adapter is None:
+        return JSONResponse({'error': 'b1_candidate_not_configured'}, status_code=503)
+    if set(request.query_params) != {'scope'} or request.query_params['scope'] != adapter.scope:
+        return JSONResponse({'error': 'b1_scope_mismatch'}, status_code=400)
+    from persona_projection import safe_persona_projection
+    snapshot = adapter.snapshot()
+    return JSONResponse({'snapshot': snapshot,
+                         'projection': safe_persona_projection(snapshot)})
 
 
 def _require_owner_or_internal_memory_read(request):
@@ -14013,7 +14031,7 @@ async def api_config_update(request):
         if "model" in persona_gateway_payload and persona_gateway_payload["model"]:
             os.environ["OMBRE_PERSONA_MODEL"] = persona_gateway_payload["model"]
         if persona_gateway_payload:
-            persona_engine = PersonaStateEngine(config)
+            persona_engine = make_b1_persona_engine(config)
             gateway_hot_update_payload["persona"] = persona_gateway_payload
 
     # --- Reflection config ---
@@ -15012,7 +15030,7 @@ if __name__ == "__main__":
             await asyncio.sleep(20)
             local_bucket_mgr = BucketManager(config)
             local_embedding_engine = EmbeddingEngine(config)
-            local_persona_engine = PersonaStateEngine(config)
+            local_persona_engine = make_b1_persona_engine(config)
             local_reflection_engine = ReflectionEngine(config, prompt_plan_mirror)
             local_portrait_engine = DailyPortraitMaintainer(config, prompt_plan_mirror)
             local_memory_edge_store = MemoryEdgeStore(config)
@@ -15221,7 +15239,7 @@ if __name__ == "__main__":
         async def _portrait_loop():
             await asyncio.sleep(25)
             local_bucket_mgr = BucketManager(config)
-            local_persona_engine = PersonaStateEngine(config)
+            local_persona_engine = make_b1_persona_engine(config)
             local_portrait_engine = DailyPortraitMaintainer(config, prompt_plan_mirror)
             while True:
                 try:
