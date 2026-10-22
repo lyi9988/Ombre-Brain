@@ -1080,6 +1080,15 @@ def _authorized_memory_write(request) -> bool:
     return any(hmac.compare_digest(candidate, token) for candidate in candidates)
 
 
+# Candidate-only internal ingress, protected by the existing internal bearer.
+# Default persona_engine has no B1 adapter: authenticated calls receive 503.
+# No public tool, cookie-only write permission, or production authority switch.
+from persona_b1_http import register_candidate_route
+_b1_candidate_ingest = register_candidate_route(
+    mcp, lambda: persona_engine, _authorized_memory_write,
+)
+
+
 def _require_owner_or_internal_memory_read(request):
     """Authorize owner Dashboard sessions or the existing internal bearer.
 

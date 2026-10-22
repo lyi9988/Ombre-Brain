@@ -99,7 +99,8 @@ class PersonaStateEngine:
         "protective_drive",
     ]
 
-    def __init__(self, config: dict, db_path: str | None = None):
+    def __init__(self, config: dict, db_path: str | None = None, *, b1_candidate=None):
+        self.b1_candidate = b1_candidate  # Explicit offline injection; no production setting.
         self.config = config
         self.prompt_resolver = None
         self.identity = identity_names(config)
@@ -107,6 +108,8 @@ class PersonaStateEngine:
         self.persona_cfg = config.get("persona", {})
         self.enabled = bool(self.persona_cfg.get("enabled", True))
         self.profile_id = self.persona_cfg.get("profile_id", "haven_xiaoyu")
+        if self.b1_candidate is not None and self.b1_candidate.scope != self.profile_id:
+            raise ValueError("B1 candidate identity must match configured profile")
         self.canonical_session_id = str(
             self.persona_cfg.get("canonical_session_id") or ""
         ).strip()
@@ -199,13 +202,20 @@ class PersonaStateEngine:
             or self.persona_cfg.get("db_path")
             or os.path.join(config.get("state_dir") or config["buckets_dir"], "persona_state.db")
         )
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self._init_db()
+        if self.b1_candidate is None:
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+            self._init_db()
         self.client = None
-        if self.enabled and self.mode == "llm" and self.api_key:
+        if self.b1_candidate is None and self.enabled and self.mode == "llm" and self.api_key:
             self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url, timeout=30.0)
 
+    def verify_b1_authority(self,scope,epoch):
+        from persona_b1_authority import verify
+        return verify(self.db_path,self.b1_candidate,profile_id=self.profile_id,scope=scope,epoch=epoch)
+
     def _connect(self) -> sqlite3.Connection:
+        if self.b1_candidate is not None:
+            raise ValueError("legacy Persona DB unavailable under explicit B1 candidate owner")
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
@@ -350,12 +360,20 @@ class PersonaStateEngine:
         return self.canonical_session_id or str(session_id or "").strip() or "main"
 
     async def build_pre_reply_guidance(self, session_id: str, latest_user_message: str = "") -> dict:
+        if self.b1_candidate is not None:
+            return self.b1_candidate.snapshot()
         now = self._now()
         affect_session_id = self._affect_session_id(session_id)
         global_state = self._ensure_global_state(now)
         session_state = self._ensure_session_state(affect_session_id, now)
         session_state = self._apply_session_decay(affect_session_id, session_state, now)
         return self._snapshot(global_state, session_state, self.fallback_guidance)
+
+    def advance_b1_clock(self,event_id,when,policy_revision,growth_frames=None,pressure_frames=None):
+        """Explicit candidate scheduler seam; no automatic cadence or growth defaults."""
+        if self.b1_candidate is None:
+            raise ValueError('B1 clock requires explicit candidate owner')
+        return self.b1_candidate.advance_clock(event_id,when,policy_revision,growth_frames,pressure_frames)
 
     async def update_from_user_message(self, session_id: str, user_message: str) -> dict:
         return await self.build_pre_reply_guidance(session_id, user_message)
@@ -368,7 +386,16 @@ class PersonaStateEngine:
         recalled_memory_ids: list[str] | None = None,
         tool_summary: str = "",
         recent_conversation_turns: list[dict] | None = None,
+        *, b1_event: dict | None = None, b1_turn: dict | None = None,
     ) -> dict:
+        if self.b1_candidate is not None:
+            if b1_event is None or b1_turn is None:
+                raise ValueError('B1 candidate requires source-bound completed turn; legacy fallback forbidden')
+            if b1_turn.get('user_event',{}).get('content') != user_message or b1_turn.get('assistant_event',{}).get('content') != assistant_response or b1_turn.get('conversation_id') != session_id:
+                raise ValueError('B1 turn does not match engine exchange')
+            return self.b1_candidate.settle(b1_event,b1_turn)
+        if b1_event is not None or b1_turn is not None:
+            raise ValueError('B1 input without explicit candidate owner')
         source_session_id = str(session_id or "").strip() or "main"
         affect_session_id = self._affect_session_id(source_session_id)
         lock_key = (self.profile_id, affect_session_id)
@@ -580,6 +607,8 @@ class PersonaStateEngine:
         return not cleaned
 
     def get_current_state(self, session_id: str) -> dict:
+        if self.b1_candidate is not None:
+            return self.b1_candidate.snapshot()
         now = self._now()
         affect_session_id = self._affect_session_id(session_id)
         global_state = self._ensure_global_state(now)
@@ -593,6 +622,8 @@ class PersonaStateEngine:
         Falls back to old tables if self_model has no data for this session.
         Does NOT read pending_review or legacy_imported narrative.
         """
+        if self.b1_candidate is not None:
+            return self.b1_candidate.snapshot()
         affect_session_id = self._affect_session_id(session_id)
         conn = self._connect()
         try:
@@ -686,6 +717,10 @@ class PersonaStateEngine:
         events_limit: int = 20,
         sessions_limit: int = 20,
     ) -> dict:
+        if self.b1_candidate is not None:
+            from persona_projection import safe_persona_projection
+            return {"profile_id":self.profile_id,"state":safe_persona_projection(self.b1_candidate.snapshot()),
+                    "sessions":[],"events":[],"source":"b1_candidate","legacy_history_included":False}
         now = self._now()
         global_state = self._ensure_global_state(now)
         sessions = self._list_sessions(sessions_limit)
@@ -1853,3 +1888,4 @@ PersonaStateEngine.sm_propose_evolving = _sm_propose_evolving
 PersonaStateEngine.sm_propose_identity_core = _sm_propose_identity_core
 PersonaStateEngine.sm_validate = _sm_validate
 PersonaStateEngine.sm_decide = _sm_decide
+
