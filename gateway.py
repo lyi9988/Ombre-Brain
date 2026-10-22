@@ -1,4 +1,5 @@
 import logging
+from b1_persona_writer_gate import parse_writer_gate
 from attachment_adoption import AdoptionReceipts, parse_header as parse_adoption_header, prepare_projection
 from gateway_request_capacity import explicit_limits, has_full_attachment, route_limits
 from request_capacity import (HEADER as CAPACITY_HEADER, assess_capacity, blocked as capacity_blocked,
@@ -600,6 +601,9 @@ class GatewayService:
         word_map_store: WordMapStore | None = None,
         http_client: httpx.AsyncClient | None = None,
     ):
+        # Validate before constructing stores or engines; no unsafe takeover fallback.
+        b1_gate = parse_writer_gate(config.get("gateway", {}).get("b1_persona_writer"))
+        b1_gate.verify_engine(persona_engine, config.get("persona", {}).get("profile_id", "haven_xiaoyu"))
         self.config = config
         self.identity = identity_names(config)
         self.gateway_cfg = config.get("gateway", {})
@@ -2693,6 +2697,9 @@ class GatewayService:
     def _apply_persona_config(self, payload: dict[str, Any]) -> list[str]:
         if not isinstance(payload, dict):
             return []
+        gate = parse_writer_gate(self.config.get("gateway", {}).get("b1_persona_writer"))
+        if gate.mode == "candidate_authority" and gate.binding(getattr(self.persona_engine, "profile_id", None)):
+            raise ValueError("b1_writer_authority_requires_planned_reconfiguration")
         persona_cfg = self.config.setdefault("persona", {})
         updated: list[str] = []
         if "enabled" in payload:
@@ -5047,6 +5054,7 @@ class GatewayService:
                 self.current_inner_state_interval_rounds,
             ):
                 stage_started_at = time.perf_counter()
+                self._b1_persona_authority_active()
                 persona_state = await self.persona_engine.build_pre_reply_guidance(
                     session_id, current_user_query
                 )
@@ -8681,6 +8689,10 @@ class GatewayService:
             recalled_ids,
         )
 
+    def _b1_persona_authority_active(self) -> bool:
+        gate = parse_writer_gate(self.config.get("gateway", {}).get("b1_persona_writer"))
+        return gate.verify_engine(self.persona_engine, getattr(self.persona_engine, "profile_id", None))
+
     async def _update_persona_after_assistant_message(
         self,
         session_id: str,
@@ -8688,6 +8700,11 @@ class GatewayService:
         assistant_message: dict[str, Any] | None,
         recalled_ids: list[str],
     ) -> None:
+        # Profile-wide fence covers canonical aliases; source-bound B1 settlement
+        # arrives via its separate original-turn protocol, not this legacy call.
+        if self._b1_persona_authority_active():
+            logger.info("Persona post-reply update skipped | reason=b1_profile_authority")
+            return
         if not self.persona_engine.enabled:
             logger.info(
                 "Persona post-reply update skipped | session=%s reason=disabled",
@@ -11456,6 +11473,7 @@ class GatewayService:
         ), ids
 
     def _get_persona_state_for_context_mode(self, session_id: str) -> dict[str, Any]:
+        self._b1_persona_authority_active()
         # Phase C: route to self_model read if enabled
         sm_cfg = self.config.get("self_model", {}) if isinstance(self.config.get("self_model"), dict) else {}
         if sm_cfg.get("read_enabled") and sm_cfg.get("profile_id", "jiajia-main") == getattr(self.persona_engine, "profile_id", ""):
