@@ -601,8 +601,18 @@ class GatewayService:
         word_map_store: WordMapStore | None = None,
         http_client: httpx.AsyncClient | None = None,
     ):
+        # Reopen the persisted candidate before the existing writer gate checks it.
+        # Candidate mode fails closed on a missing or mismatched fence.
+        if persona_engine is None and (config.get('b1') or {}).get('mode') == 'candidate_authority':
+            from persona_b1_runtime import make_engine as make_b1_persona_engine
+            persona_engine = make_b1_persona_engine(config)
         # Validate before constructing stores or engines; no unsafe takeover fallback.
         b1_gate = parse_writer_gate(config.get("gateway", {}).get("b1_persona_writer"))
+        b1_cfg = config.get('b1') or {}
+        if b1_cfg.get('mode') == 'candidate_authority':
+            expected = (b1_cfg.get('profile_id'), b1_cfg.get('scope'), b1_cfg.get('epoch'))
+            if b1_gate.mode != 'candidate_authority' or b1_gate.binding(expected[0]) != expected:
+                raise ValueError('b1_gateway_authority_gate_mismatch')
         b1_gate.verify_engine(persona_engine, config.get("persona", {}).get("profile_id", "haven_xiaoyu"))
         self.config = config
         self.identity = identity_names(config)
@@ -2698,8 +2708,56 @@ class GatewayService:
         if not isinstance(payload, dict):
             return []
         gate = parse_writer_gate(self.config.get("gateway", {}).get("b1_persona_writer"))
-        if gate.mode == "candidate_authority" and gate.binding(getattr(self.persona_engine, "profile_id", None)):
-            raise ValueError("b1_writer_authority_requires_planned_reconfiguration")
+        profile_id = getattr(self.persona_engine, "profile_id", None)
+        if gate.mode == "candidate_authority" and gate.binding(profile_id):
+            # Preserve the installed short-state owner while changing ordinary
+            # model settings.  Never interpret an authority/enable change as a
+            # harmless model edit or let a fresh legacy engine replace it.
+            if (set(payload) & {"mode", "profile_id", "canonical_session_id", "db_path"}
+                    or ("enabled" in payload and
+                        (type(payload["enabled"]) is not bool or
+                         payload["enabled"] != bool(self.persona_engine.enabled)))):
+                raise ValueError("b1_writer_authority_requires_planned_reconfiguration")
+            gate.verify_engine(self.persona_engine, profile_id)
+            current = self.config.get("persona", {}) or {}
+            staged = dict(current)
+            updated: list[str] = []
+            if "enabled" in payload:
+                staged["enabled"] = payload["enabled"]
+                updated.append("persona.enabled")
+            if "event_recording_enabled" in payload:
+                staged["event_recording_enabled"] = bool(payload["event_recording_enabled"])
+                updated.append("persona.event_recording_enabled")
+            for key in ("model", "base_url"):
+                if key in payload:
+                    staged[key] = str(payload[key] or "").strip()
+                    updated.append(f"persona.{key}")
+            if "api_key" in payload and payload["api_key"]:
+                staged["api_key"] = str(payload["api_key"])
+                updated.append("persona.api_key")
+            if not updated:
+                return []
+            from persona_b1_runtime import make_engine as make_b1_persona_engine
+            candidate_config = {**self.config, "persona": staged}
+            replacement = make_b1_persona_engine(candidate_config)
+            gate.verify_engine(replacement, profile_id)
+            if "api_key" in payload and payload["api_key"]:
+                replacement.api_key = staged["api_key"]
+            for key in ("model", "base_url"):
+                if key in payload and staged[key]:
+                    setattr(replacement, key, staged[key])
+            replacement.prompt_resolver = self._resolve_gateway_background_prompt
+            self.config["persona"] = staged
+            replacement.config = self.config
+            replacement.persona_cfg = staged
+            if "api_key" in payload and payload["api_key"]:
+                os.environ["OMBRE_PERSONA_API_KEY"] = staged["api_key"]
+            for key, env_name in (("model", "OMBRE_PERSONA_MODEL"),
+                                  ("base_url", "OMBRE_PERSONA_BASE_URL")):
+                if key in payload and staged[key]:
+                    os.environ[env_name] = staged[key]
+            self.persona_engine = replacement
+            return updated
         persona_cfg = self.config.setdefault("persona", {})
         updated: list[str] = []
         if "enabled" in payload:
@@ -2809,6 +2867,13 @@ class GatewayService:
             return JSONResponse({"error": "invalid dream config"}, status_code=400)
 
         updated = []
+        if persona_payload is not None:
+            try:
+                updated.extend(self._apply_persona_config(persona_payload))
+            except ValueError as exc:
+                if str(exc) == "b1_writer_authority_requires_planned_reconfiguration":
+                    return JSONResponse({"error": str(exc)}, status_code=409)
+                raise
         if dehydration_payload is not None:
             updated.extend(self._apply_dehydration_config(dehydration_payload))
         if gateway_payload is not None:
@@ -2817,8 +2882,6 @@ class GatewayService:
             updated.extend(self._apply_memory_diffusion_config(diffusion_payload))
         if reranker_payload is not None:
             updated.extend(self._apply_reranker_config(reranker_payload))
-        if persona_payload is not None:
-            updated.extend(self._apply_persona_config(persona_payload))
         if dream_payload is not None:
             updated.extend(self._apply_dream_config(dream_payload))
         from credential_activation import adoption_receipt
