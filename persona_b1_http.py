@@ -5,9 +5,15 @@ bearer). A missing explicit candidate adapter returns 503, never a legacy write.
 """
 import json,sqlite3
 from starlette.responses import JSONResponse
-from persona_b1 import Conflict
+from persona_b1 import Conflict,ModulationSourceUnavailable
 from persona_projection import safe_persona_projection
 MAX_BODY=128*1024
+
+
+def _source_unavailable(exc):
+    return JSONResponse({'error':'b1_modulation_source_unavailable','code':exc.code,
+        'source_kind':exc.source_kind,'coordinate':exc.coordinate,
+        'interval_start':exc.interval_start,'interval_end':exc.interval_end},status_code=503)
 
 def register_candidate_route(mcp,engine_getter,authorized_internal):
     @mcp.custom_route('/internal/persona/b1/candidate',methods=['POST'])
@@ -34,6 +40,7 @@ def register_candidate_route(mcp,engine_getter,authorized_internal):
             return JSONResponse({'status':'candidate_applied','replayed':result_receipt['replayed'],
                 'scope':receipt['scope'],'event_id':receipt['event_id'],'source_hash':receipt['source_hash'],
                 'revision':receipt['after_revision'],'b1_receipt':{'receipt':{k:receipt[k] for k in ('scope','event_id','source_hash','occurred_at','after_revision','status')},'replayed':result_receipt['replayed']},'projection':safe_persona_projection(result)})
+        except ModulationSourceUnavailable as exc:return _source_unavailable(exc)
         except Conflict:return JSONResponse({'error':'b1_identity_or_revision_conflict'},status_code=409)
         except (ValueError,TypeError,KeyError,OverflowError):return JSONResponse({'error':'invalid_b1_candidate_input'},status_code=400)
         except sqlite3.OperationalError:return JSONResponse({'error':'b1_candidate_storage_unavailable'},status_code=503)
@@ -55,6 +62,7 @@ def register_candidate_route(mcp,engine_getter,authorized_internal):
             if data['source_kind'] not in ('internal_owner_request','internal_rest_plan'):raise ValueError('internal lifecycle, not physical sleep claim')
             result=adapter.set_phase(data['phase_id'],data['occurred_at'],data['policy_revision'],data['phase'],data['source_kind']);r=result['b1_receipt']
             return JSONResponse({'status':'candidate_applied','physical_sleep_claim':False,'b1_receipt':{'replayed':r['replayed'],'receipt':{k:r['receipt'][k] for k in ('scope','event_id','source_hash','occurred_at','after_revision','status')}},'projection':safe_persona_projection(result)})
+        except ModulationSourceUnavailable as exc:return _source_unavailable(exc)
         except Conflict:return JSONResponse({'error':'b1_identity_or_revision_conflict'},status_code=409)
         except (ValueError,TypeError,KeyError,OverflowError):return JSONResponse({'error':'invalid_b1_phase_input'},status_code=400)
         except sqlite3.OperationalError:return JSONResponse({'error':'b1_candidate_storage_unavailable'},status_code=503)
@@ -90,6 +98,7 @@ def register_candidate_route(mcp,engine_getter,authorized_internal):
             result=engine.advance_b1_clock(event_id,when,data['policy_revision'],data['growth_frames'],data.get('pressure_frames'))
             receipt=result['b1_receipt']
             return JSONResponse({'status':'candidate_applied','b1_receipt':{'replayed':receipt['replayed'],'receipt':{key:receipt['receipt'][key] for key in ('scope','event_id','source_hash','occurred_at','after_revision','status')}},'projection':safe_persona_projection(result)})
+        except ModulationSourceUnavailable as exc:return _source_unavailable(exc)
         except Conflict:return JSONResponse({'error':'b1_identity_or_revision_conflict'},status_code=409)
         except (ValueError,TypeError,KeyError,OverflowError):return JSONResponse({'error':'invalid_b1_clock_input'},status_code=400)
         except sqlite3.OperationalError:return JSONResponse({'error':'b1_candidate_storage_unavailable'},status_code=503)
@@ -110,6 +119,7 @@ def register_candidate_route(mcp,engine_getter,authorized_internal):
             result=engine.b1_candidate._record_verified_operation(data['result'],data['policy_revision'])
             receipt=result['b1_receipt']
             return JSONResponse({'status':'candidate_applied','b1_receipt':{'replayed':receipt['replayed'],'receipt':{key:receipt['receipt'][key] for key in ('scope','event_id','source_hash','occurred_at','after_revision','status')}},'projection':safe_persona_projection(result)})
+        except ModulationSourceUnavailable as exc:return _source_unavailable(exc)
         except Conflict:return JSONResponse({'error':'b1_identity_or_revision_conflict'},status_code=409)
         except (ValueError,TypeError,KeyError,OverflowError):return JSONResponse({'error':'invalid_b1_result_input'},status_code=400)
         except sqlite3.OperationalError:return JSONResponse({'error':'b1_candidate_storage_unavailable'},status_code=503)

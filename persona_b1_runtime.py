@@ -11,8 +11,9 @@ from pathlib import Path
 import sqlite3
 from contextlib import closing
 
-from persona_b1 import FIELDS, PersonaB1Adapter, PersonaB1Store, number, at
+from persona_b1 import FIELDS, PersonaB1Adapter, PersonaB1Store, Conflict, number, at, policy
 from persona_b1_authority import activate, verify
+from persona_inner_state import STATE_SCHEMA, TENDENCIES, normalize_tendencies
 
 
 def _settings(config):
@@ -72,6 +73,56 @@ def _current_global(b1):
     return dict(row)
 
 
+def _candidate_checkpoint(b1, path=None):
+    path = Path(path or b1['candidate_db_path'])
+    if path.is_symlink() or not path.is_file():
+        raise ValueError('b1_candidate_not_prepared')
+    with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute('SELECT * FROM b1_state WHERE scope=?', (b1['scope'],)).fetchone()
+    if row is None:
+        raise ValueError('b1_candidate_scope_missing')
+    return dict(row)
+
+
+def _v2_policy_ready(config):
+    return (isinstance(config, dict) and not config.get('conflict_policy')
+            and 'reconciliation' not in config.get('events', {})
+            and 'reconciliation' not in config.get('slow_axis_events', {})
+            and bool(config.get('soothing_policy')) and 'soothing' in config.get('events', {}))
+
+
+def _require_v2_checkpoint(b1):
+    # store.read intentionally supports historical v1 inspection in memory.
+    # Only the raw persisted marker can authorize a live v2 factory binding.
+    row = _candidate_checkpoint(b1)
+    if json.loads(row['state']).get('state_schema') != STATE_SCHEMA or not _v2_policy_ready(json.loads(row['policy'])):
+        raise ValueError('b1_explicit_inner_state_upgrade_required')
+    return row
+
+
+def _tendency_initial(b1):
+    path = b1.get('tendency_source_path')
+    if not path:
+        return None, None, {'status': 'source_not_configured', 'known_keys': [], 'unknown_keys': list(TENDENCIES)}
+    source = json.loads(Path(path).read_text(encoding='utf-8'))
+    if (not isinstance(source, dict) or set(source) != {'schema', 'scope', 'revision', 'tendencies'}
+            or source['schema'] != 'persona-tendency-source-v1' or source['scope'] != b1['scope']
+            or not isinstance(source['revision'], str) or not source['revision'].strip()
+            or not isinstance(source['tendencies'], dict) or set(source['tendencies']) - set(TENDENCIES)):
+        raise ValueError('b1_tendency_source_binding_invalid')
+    values, sources = {}, {}
+    for key, item in source['tendencies'].items():
+        if not isinstance(item, dict) or set(item) != {'value', 'unit', 'status', 'source_ref'}:
+            raise ValueError('b1_tendency_source_row_invalid')
+        values[key] = item['value']
+        sources[key] = {field: item[field] for field in ('unit', 'status', 'source_ref')}
+    values, sources, _, issues = normalize_tendencies(values, sources)
+    return values, sources, {'status': 'explicit_versioned_source', 'revision': source['revision'],
+        'known_keys': [key for key, value in values.items() if value is not None],
+        'unknown_keys': [key for key, value in values.items() if value is None], 'issues': issues}
+
+
 class LiveGlobalPersonaB1Adapter(PersonaB1Adapter):
     """B1 owns short affect; original global table remains the sole long-state read."""
     def __init__(self, store, scope, global_snapshot, *, binding):
@@ -115,11 +166,14 @@ def preflight(config):
     source = {'profile_id': b1['profile_id'], 'session_id': b1['legacy_session_id'],
               'global': global_row, 'session': session}
     source_hash = hashlib.sha256(json.dumps(source, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    tendencies, tendency_sources, tendency_diagnostic = _tendency_initial(b1)
     return {'mode': 'candidate_authority', 'scope': b1['scope'],
             'source_sha256': source_hash, 'original_at': session['updated_at'],
             'handoff_at': handoff_at, 'gap_coverage': 'unknown',
             'operator_initial_keys': sorted(operator_initial),
-            'initial': initial, 'global_snapshot': snapshot}
+            'initial': initial, 'global_snapshot': snapshot,
+            'tendency_initial': tendencies, 'tendency_sources': tendency_sources,
+            'tendency_source': tendency_diagnostic}
 
 
 def _snapshot_file(b1, result):
@@ -154,7 +208,8 @@ def prepare(config):
     if not candidate.exists():
         candidate.parent.mkdir(parents=True, exist_ok=True)
     store = PersonaB1Store(candidate, legacy_path=b1['legacy_db_path'])
-    store.initialize(b1['scope'], result['initial'], result['handoff_at'], policy)
+    store.initialize(b1['scope'], result['initial'], result['handoff_at'], policy,
+                     tendencies=result['tendency_initial'], tendency_sources=result['tendency_sources'])
     if preflight(config)['source_sha256'] != result['source_sha256']:
         raise ValueError('b1_legacy_source_changed_during_prepare')
     return {'scope': b1['scope'], 'source_sha256': result['source_sha256'],
@@ -168,6 +223,7 @@ def reopen(config, *, require_fence=True):
     candidate = Path(b1['candidate_db_path'])
     if candidate.is_symlink() or not candidate.is_file():
         raise ValueError('b1_candidate_not_prepared')
+    _require_v2_checkpoint(b1)
     snapshot_path = Path(b1['global_snapshot_path'])
     if snapshot_path.is_symlink() or not snapshot_path.is_file():
         raise ValueError('b1_global_snapshot_missing')
@@ -183,6 +239,102 @@ def reopen(config, *, require_fence=True):
         verify(b1['legacy_db_path'], adapter, profile_id=b1['profile_id'],
                scope=b1['scope'], epoch=b1['epoch'])
     return adapter
+
+
+def _backup_checkpoint(b1, destination, before):
+    destination = Path(destination)
+    if destination.is_symlink() or destination.resolve() in {Path(b1['candidate_db_path']).resolve(), Path(b1['legacy_db_path']).resolve()}:
+        raise ValueError('b1_upgrade_backup_alias')
+    if destination.exists() and any(destination.samefile(Path(b1[key])) for key in ('candidate_db_path', 'legacy_db_path')):
+        raise ValueError('b1_upgrade_backup_alias')
+    if not destination.exists():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+        with closing(sqlite3.connect(Path(b1['candidate_db_path']).resolve().as_uri() + '?mode=ro', uri=True)) as source:
+            with closing(sqlite3.connect(destination)) as target:
+                source.backup(target)
+    if _candidate_checkpoint(b1, destination) != before:
+        raise Conflict('b1_upgrade_backup_preimage_mismatch')
+    return str(destination.resolve())
+
+
+def _authority_binding(b1, before):
+    from persona_b1_authority import _check_triggers
+    with closing(sqlite3.connect(Path(b1['legacy_db_path']).resolve().as_uri() + '?mode=ro', uri=True)) as db:
+        db.row_factory = sqlite3.Row
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='persona_b1_authority'").fetchone():
+            return None
+        row = db.execute('SELECT * FROM persona_b1_authority WHERE profile_id=?', (b1['profile_id'],)).fetchone()
+        if row is None:
+            return None
+        _check_triggers(db)
+    binding = dict(row)
+    expected = (b1['profile_id'], b1['scope'], b1['epoch'], 'candidate', str(Path(b1['candidate_db_path']).resolve()), before['seed_hash'])
+    if tuple(binding[key] for key in ('profile_id', 'scope', 'epoch', 'mode', 'candidate_path', 'seed_hash')) != expected:
+        raise ValueError('b1_upgrade_authority_identity_mismatch')
+    allowed_revisions = {json.loads(before['policy'])['revision']}
+    with closing(sqlite3.connect(Path(b1['candidate_db_path']).resolve().as_uri() + '?mode=ro', uri=True)) as db:
+        migrations = db.execute("SELECT receipt FROM b1_events WHERE scope=? AND (event_id=? OR event_id LIKE 'policy-upgrade:%')", (b1['scope'], 'migration:' + STATE_SCHEMA)).fetchall()
+        for migrated in migrations:
+            receipt = json.loads(migrated[0])
+            prior = db.execute('SELECT snapshot FROM b1_numeric WHERE scope=? AND revision=?', (b1['scope'], receipt['before_revision'])).fetchone()
+            if prior:
+                allowed_revisions.add(json.loads(prior[0])['policy_revision'])
+    if binding['policy_revision'] not in allowed_revisions:
+        raise ValueError('b1_upgrade_authority_policy_mismatch')
+    return binding
+
+
+def upgrade(config, *, upgraded_policy_path, expected_revision, backup_path):
+    """Explicit local maintenance, never invoked by startup or an HTTP request.
+
+    The operator supplies a complete approved v2 policy and a backup path. Both
+    databases retain their existing identities; an installed fence is rebound
+    only by comparing its exact preimage. A failed second-database rebind blocks
+    startup and the same approved upgrade can reconcile the recorded migration.
+    Serving processes must be stopped or otherwise controlled by the operator.
+    """
+    b1 = _settings(config)
+    if b1 is None or type(expected_revision) is not int or expected_revision < 0:
+        raise ValueError('b1_explicit_upgrade_binding_and_revision_required')
+    approved = policy(json.loads(Path(upgraded_policy_path).read_text(encoding='utf-8')))
+    if not _v2_policy_ready(approved):
+        raise ValueError('b1_explicit_v2_policy_required')
+    before = _candidate_checkpoint(b1)
+    binding = _authority_binding(b1, before)
+    unchanged = json.loads(before['state']).get('state_schema') == STATE_SCHEMA and json.loads(before['policy']) == approved
+    if not unchanged and before['revision'] != expected_revision:
+        raise Conflict('stale upgrade revision')
+    backup = _backup_checkpoint(b1, backup_path, before) if not unchanged else None
+    tendencies, sources, tendency_diagnostic = _tendency_initial(b1)
+    store = PersonaB1Store(b1['candidate_db_path'], legacy_path=b1['legacy_db_path'])
+    if json.loads(before['state']).get('state_schema') == STATE_SCHEMA and _v2_policy_ready(json.loads(before['policy'])):
+        result = store.upgrade_policy(b1['scope'], approved, expected_revision=expected_revision)
+    else:
+        result = store.migrate_scope(b1['scope'], expected_revision=expected_revision,
+                                    upgraded_policy=approved, tendencies=tendencies, tendency_sources=sources)
+    _require_v2_checkpoint(b1)
+    rebound = False
+    if binding is not None and binding['policy_revision'] != approved['revision']:
+        from persona_b1_authority import _check_triggers
+        with closing(sqlite3.connect(Path(b1['legacy_db_path']).resolve().as_uri() + '?mode=rw', uri=True)) as db, db:
+            db.row_factory = sqlite3.Row
+            db.execute('BEGIN IMMEDIATE')
+            _check_triggers(db)
+            current = db.execute('SELECT * FROM persona_b1_authority WHERE profile_id=?', (b1['profile_id'],)).fetchone()
+            if current is None or dict(current) != binding:
+                raise Conflict('b1_upgrade_authority_preimage_changed')
+            db.execute('UPDATE persona_b1_authority SET policy_revision=? WHERE profile_id=?', (approved['revision'], b1['profile_id']))
+            rebound = True
+    if binding is not None:
+        verify(b1['legacy_db_path'], PersonaB1Adapter(store, b1['scope'], {}),
+               profile_id=b1['profile_id'], scope=b1['scope'], epoch=b1['epoch'])
+    return {'scope': b1['scope'], 'state': 'upgraded', 'state_schema': STATE_SCHEMA,
+            'migrated': result['migrated'], 'revision': result['state']['revision'],
+            'policy_revision': approved['revision'], 'backup_path': backup,
+            'authority_rebound': rebound, 'activation_required': binding is None,
+            'tendency_source': tendency_diagnostic, 'production_applied': False}
 
 
 def make_engine(config):
@@ -210,17 +362,26 @@ def activate_prepared(config):
 def main():
     import yaml
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=('preflight', 'prepare', 'activate', 'verify'))
+    parser.add_argument('action', choices=('preflight', 'prepare', 'upgrade', 'activate', 'verify'))
     parser.add_argument('--config', required=True)
+    parser.add_argument('--upgraded-policy')
+    parser.add_argument('--expected-revision', type=int)
+    parser.add_argument('--backup')
     args = parser.parse_args()
     config = yaml.safe_load(Path(args.config).read_text(encoding='utf-8'))
     if args.action == 'preflight':
         value = preflight(config)
         value.pop('initial', None); value.pop('global_snapshot', None)
+        value.pop('tendency_initial', None); value.pop('tendency_sources', None)
     elif args.action == 'prepare':
         value = prepare(config)
     elif args.action == 'activate':
         value = activate_prepared(config)
+    elif args.action == 'upgrade':
+        if not args.upgraded_policy or args.expected_revision is None or not args.backup:
+            parser.error('upgrade requires --upgraded-policy, --expected-revision and --backup')
+        value = upgrade(config, upgraded_policy_path=args.upgraded_policy,
+                        expected_revision=args.expected_revision, backup_path=args.backup)
     else:
         reopen(config); value = {'state': 'verified'}
     print(json.dumps(value, ensure_ascii=False, sort_keys=True))

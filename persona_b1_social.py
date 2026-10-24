@@ -1,6 +1,7 @@
 """Bound empathy shares and event lights; no name/keyword inference."""
 import math
 from datetime import datetime,timedelta,timezone
+from persona_inner_state import bound_observation, safe_source_refs
 SUBS={'心疼':'grieve','不平':'anger','想帮忙':'expression','替人高兴':None}
 CLOSENESS=('owner','family','known','stranger','unknown')
 LIGHTS=('心动','害羞','得意','骄傲')
@@ -29,7 +30,23 @@ def validate_policies(p,number):
 
 def bound_detail(detail,kind,accepted):
     if not isinstance(detail,dict) or detail.get('type')!=kind:raise ValueError('typed source detail')
-    if not any(r['type']==kind and r['evidence_hash']==detail.get('evidence_hash') for r in accepted):raise ValueError('detail evidence mismatch')
+    return bound_observation(detail,accepted,kind)
+
+def validate_empathy_detail(detail,accepted):
+    observation=bound_detail(detail,'empathy',accepted)
+    if set(detail)!={'observation_id','type','sub','subject_ref','incident_ref','closeness','identity_status','evidence_hash','subject_binding'} or detail['sub'] not in SUBS or detail['closeness'] not in CLOSENESS:raise ValueError('complete empathy subject binding')
+    for key in ('subject_ref','incident_ref'):
+        if not isinstance(detail[key],str) or not 0<len(detail[key])<=256:raise ValueError('bounded subject/incident')
+    if observation['subject_binding'] is None or detail['subject_binding']!=observation['subject_binding']:raise ValueError('empathy mention identity mismatch')
+    if detail['closeness']=='owner' and observation['target']=='third_party':raise ValueError('third-party source cannot resolve to owner')
+    if detail['identity_status'] not in ('resolved','unresolved'):raise ValueError('explicit identity status')
+    return observation
+
+def validate_light_detail(detail,accepted):
+    if not isinstance(detail,dict) or set(detail)!={'observation_id','type','sub','strength','evidence_hash'} or detail['type'] not in ('affection','intimacy','empathy') or detail['strength'] not in ('light','heavy'):raise ValueError('complete light detail')
+    bound_detail(detail,detail['type'],accepted)
+    word=detail['sub']
+    if word not in ('心动','害羞','骄傲') or (word=='骄傲')!=(detail['type']=='empathy'):raise ValueError('light subject mismatch')
 
 def day(now,offset):return now.astimezone(timezone(timedelta(minutes=offset))).date().isoformat()
 
@@ -48,12 +65,7 @@ def cap_loads(state):
             for row in rows:row['value']*=total/amount
 
 def apply_empathy(state,p,d,accepted,now):
-    bound_detail(d,'empathy',accepted)
-    if set(d)!={'type','sub','subject_ref','incident_ref','closeness','identity_status','evidence_hash'} or d['sub'] not in SUBS or d['closeness'] not in CLOSENESS:raise ValueError('complete empathy subject binding')
-    for key in ('subject_ref','incident_ref'):
-        if not isinstance(d[key],str) or not 0<len(d[key])<=256:raise ValueError('bounded subject/incident')
-    if d['closeness']=='owner' and any(r['type']=='empathy' and r['target']=='third_party' for r in accepted):raise ValueError('third-party source cannot resolve to owner')
-    if d['identity_status'] not in ('resolved','unresolved'):raise ValueError('explicit identity status')
+    validate_empathy_detail(d,accepted)
     if d['identity_status']=='unresolved' or d['closeness']=='unknown':return {'status':'unknown_closeness','key':SUBS[d['sub']]}
     if not p:return {'status':'policy_not_configured','key':SUBS[d['sub']]}
     key=SUBS[d['sub']]
@@ -82,7 +94,7 @@ def apply_empathy(state,p,d,accepted,now):
     for coordinate,delta in p['impulses'][d['sub']].items():
         v=state['values'][coordinate]
         if v is not None:state['values'][coordinate]=min(1,max(0,v+delta*weight*((1-v) if delta>0 else v)))
-    return {'status':'applied' if add or key is None else 'capped','key':key}
+    return {'status':'applied' if add or key is None else 'capped','key':key,'observation_id':d['observation_id'],'subject_ref':d['subject_ref'],'incident_ref':d['incident_ref']}
 
 def help_share(state,p,subject_ref,incident_ref,sub):
     if sub not in SUBS or not subject_ref or not incident_ref:raise ValueError('help result must identify corresponding incident')
@@ -96,17 +108,15 @@ def help_share(state,p,subject_ref,incident_ref,sub):
             drop=min(row['value']*p['helped_relief'],state['values'][key]);row['value']-=drop;state['values'][key]-=drop;dropped+=drop
     return {'status':'relieved' if dropped else 'no_corresponding_share','amount':dropped}
 
-def light(state,p,d,accepted,now,*,operation=False):
+def light(state,p,d,accepted,now,*,operation=False,source_refs=None):
+    if not operation:validate_light_detail(d,accepted)
     if not p:return
     if operation:
         confidence=state['values']['slow_confidence']
         if confidence is None or confidence<p['proof_confidence_min']:return
         word='得意'
     else:
-        if not isinstance(d,dict) or set(d)!={'type','sub','strength','evidence_hash'} or d['type'] not in ('affection','intimacy','empathy') or d['strength'] not in ('light','heavy'):raise ValueError('complete light detail')
-        bound_detail(d,d['type'],accepted)
         word=d['sub']
-        if word not in ('心动','害羞','骄傲') or (word=='骄傲')!=(d['type']=='empathy'):raise ValueError('light subject mismatch')
         if word!='骄傲' and d['strength']=='light' and d['type']!='intimacy' and word!='害羞':
             state['light_taps']=[t for t in state['light_taps'] if (now-datetime.fromisoformat(t)).total_seconds()<=p['window_minutes']*60]+[now.isoformat()]
             if len(state['light_taps'])<p['light_needed']:return
@@ -115,7 +125,8 @@ def light(state,p,d,accepted,now,*,operation=False):
     if word in ('心动','害羞'):
         today=day(now,p['offset_minutes']);count=state['heart_days'].get(today,0);state['heart_days'][today]=count+1
         minutes=max(p['min_minutes'],minutes*p['repeat_factor']**count)
-    state['lit']={'word':word,'at':now.isoformat(),'until':(now+timedelta(minutes=minutes)).isoformat()}
-    state['light_marks'].append({'word':word,'at':now.isoformat()})
+    refs=safe_source_refs(source_refs)
+    state['lit']={'word':word,'at':now.isoformat(),'until':(now+timedelta(minutes=minutes)).isoformat(),'source_refs':refs}
+    state['light_marks'].append({'word':word,'at':now.isoformat(),'source_refs':refs})
     state['light_marks']=state['light_marks'][-128:]
     return dict(state['lit'])

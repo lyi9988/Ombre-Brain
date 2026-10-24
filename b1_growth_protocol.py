@@ -45,7 +45,8 @@ def digest(value):return hashlib.sha256(canonical(value).encode('utf-8')).hexdig
 
 FRAME_SCHEMA='b1-growth-frame-v2'
 
-TARGETS={'expression','curiosity','boredom','duty','reflection','longing','possessiveness','protective_drive','libido'}
+TARGETS={'expression','curiosity','boredom','duty','reflection','longing','possessiveness','protective_drive','libido','novelty','creativity','autonomy','competence','solitude'}
+TENDENCY_SOURCES=('exploration_affinity','social_recovery_rate','connection_initiative','creative_satisfaction','challenge_tolerance','reflection_preference')
 def validate_policy(raw):
     if not isinstance(raw,dict) or not {'revision','grid_seconds','source_scope','source_policy_revision','targets'}<=set(raw) or set(raw)-{'revision','grid_seconds','source_scope','source_policy_revision','targets','anchor_utc'}:raise ValueError('explicit modulation policy required')
     identity(raw['revision'],'modulation revision');identity(raw['source_scope'],'source scope');identity(raw['source_policy_revision'],'source policy')
@@ -109,6 +110,10 @@ def derive_frame(policy,at,source):
     clean_source={'scope':p['source_scope'],'policy_revision':p['source_policy_revision'],'revision':revision if valid_identity else None,'as_of':as_of,
         'values':{k:values[k] if finite(values.get(k)) and 0<=values[k]<=1 else None for k in ('valence','arousal','anger','grieve','favored','fatigue')}}
     clean_source['availability']=availability
+    # Optional canonical source keys preserve old historical frame hashes when
+    # absent; new normalized sources carry them without a second state read.
+    clean_source['values'].update({k: values[k] if valid_identity and finite(values.get(k)) and 0<=values[k]<=1 else None
+                                  for k in TENDENCY_SOURCES if k in values})
     frame={'schema':FRAME_SCHEMA,'policy_revision':p['revision'],'grid_start':start.isoformat(),'grid_end':end.isoformat(),
         'policy_hash':digest(p),'source':clean_source,'targets':out,'coverage_complete':all(v['status']=='known' for v in out.values())}
     frame['frame_hash']=digest(frame)
