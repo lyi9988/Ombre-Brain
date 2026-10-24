@@ -45,6 +45,7 @@ PROMPT_REVISION_HEADER = "X-Guyan-Prompt-Preset-Revision"
 PROMPT_SHA_HEADER = "X-Guyan-Prompt-Plan-Sha256"
 PROMPT_BINDING_REVISION_HEADER = "X-Guyan-Prompt-Binding-Revision"
 PROMPT_SCOPE_HEADER = "X-Guyan-Prompt-Scope"
+INNER_STATE_SCHEMA_HEADER = "X-Guyan-Inner-State-Schema"
 
 
 class AnthropicOutputBudgetError(ValueError):
@@ -4476,6 +4477,8 @@ class GatewayService:
             ).hexdigest()[:32]
 
         prompt_scope_group = self._prepare_snapshot_scope_group(prompt_scope)
+        inner_state_schema = header_or_value("inner_state_schema", INNER_STATE_SCHEMA_HEADER)
+        inner_state_schema = "inner-state-v1" if inner_state_schema == "inner-state-v1" else ""
 
         key_material = {
             "snapshot_parent_key": snapshot_parent_key,
@@ -4499,6 +4502,7 @@ class GatewayService:
             "prompt_plan_sha256": prompt_plan_sha256,
             "prompt_binding_revision": prompt_binding_revision,
             "prompt_scope_group": prompt_scope_group,
+            "inner_state_schema": inner_state_schema,
             "turn_clock": clock_metadata(),
             "input_options_sha256": payload_options_sha,
             "include_favorite_memory": bool(include_favorite_memory),
@@ -4964,6 +4968,7 @@ class GatewayService:
         mark_step("list_all_buckets", stage_started_at)
 
         persona_block = ""
+        recent_material_blocks = []
         core_memory = ""
         portrait_memory = ""
         portrait_memory_debug: dict[str, Any] = self._portrait_memory_debug_base()
@@ -5000,6 +5005,7 @@ class GatewayService:
         diffused_moment_debug: list[dict[str, Any]] = []
         context_mode = ""
         persona_state: dict[str, Any] | None = None
+        inner_state_debug: dict[str, Any] = {"state": "not_requested"}
         injected_ids: list[str] | None = None
         query_planner_debug: dict[str, Any] = self._query_planner_debug_base(current_user_query)
         memory_sentinel_debug: dict[str, Any] = self._memory_sentinel_debug_base(current_user_query)
@@ -5112,23 +5118,24 @@ class GatewayService:
                     if recall_plan_skip_reason == "recall_meta_without_target"
                     else "low_signal_auto_recall"
                 )
-            if self.persona_engine.enabled and self._should_inject_interval(
-                session_id,
-                self.current_inner_state_interval_rounds,
-            ):
+            stage_started_at = time.perf_counter()
+            unified = await self._read_unified_inner_state_for_context(request, session_id, messages=messages)
+            recent_material_blocks = unified.get('recent_blocks') or []
+            inner_state_debug = unified["diagnostics"]
+            mark_step("unified_inner_state", stage_started_at)
+            if self.persona_engine.enabled:
+                if not self._unified_state_owned_upstream(request):
+                    # A direct client has no upstream producer. Replace its
+                    # state signals as one checkpoint, never mix in local B1.
+                    natural_input["_signal_snapshots"] = [row for row in natural_input["_signal_snapshots"]
+                        if isinstance(row, dict) and row.get("producer") not in {"aiz.needs", "ombre.persona"}]
+                    natural_input["_signal_snapshots"].extend(unified["signals"])
+                    if self._should_inject_interval(session_id, self.current_inner_state_interval_rounds):
+                        persona_block = unified["text"]
                 stage_started_at = time.perf_counter()
-                self._b1_persona_authority_active()
-                persona_state = await self.persona_engine.build_pre_reply_guidance(
-                    session_id, current_user_query
-                )
-                persona_block = self.persona_engine.format_state_block(persona_state)
-                mark_step("persona_pre_reply", stage_started_at)
-            if self.persona_engine.enabled and persona_state is None:
-                stage_started_at = time.perf_counter()
-                persona_state = self._get_persona_state_for_context_mode(session_id)
-                mark_step("persona_state_read", stage_started_at)
-            from memory_affinity import persona_snapshot
-            natural_input["_signal_snapshots"].append(persona_snapshot(persona_state))
+                persona_state = self._get_persona_state_for_context_mode(
+                    session_id, signal_snapshots=natural_input["_signal_snapshots"])
+                mark_step("persona_relationship_read", stage_started_at)
             natural_input["_signal_sampled_at"] = datetime.now(timezone.utc)
             stage_started_at = time.perf_counter()
             context_mode = self._classify_context_mode(current_user_query, persona_state)
@@ -5575,6 +5582,12 @@ class GatewayService:
             composed_messages=composed_messages,
             coverage=(payload.get('_ombre_trace_context') or {}).get('coverage'),
         )
+        if recent_material_blocks:
+            # The authenticated Aiz Compiler already applied the owner's source
+            # toggle, character budgets and placement. Keep it separate from
+            # emotion/Persona and never regenerate it when owned upstream.
+            from prompt_placement import place_context_messages
+            forward_payload['messages'] = place_context_messages(forward_payload['messages'], recent_material_blocks)
         self._reconcile_memory_recall_injection(
             memory_recall_projection, stable_context, dynamic_context,
             enabled=natural_input.get("composer_recall_enabled", True),
@@ -5731,6 +5744,7 @@ class GatewayService:
             from memory_score_evidence import request_score_evidence
             debug_payload["memory_score_evidence"] = request_score_evidence(self, natural_input)
             debug_payload["prompt_composer"] = prompt_composer_debug
+            debug_payload["inner_state"] = inner_state_debug
             debug_payload["memory_recall_projection"] = {
                 key: value
                 for key, value in memory_recall_projection.items()
@@ -8756,6 +8770,76 @@ class GatewayService:
         gate = parse_writer_gate(self.config.get("gateway", {}).get("b1_persona_writer"))
         return gate.verify_engine(self.persona_engine, getattr(self.persona_engine, "profile_id", None))
 
+    @staticmethod
+    def _unified_state_owned_upstream(request) -> bool:
+        """Producer responsibility survives Composer off; never inspect prose.
+
+        Aiz sends this only for its installed unified main-chat producer. The
+        Gateway retains relationship and other context sources but must not
+        regenerate a second short-state block, even when the first is off.
+        """
+        headers = getattr(request, "headers", {})
+        return headers.get(INNER_STATE_SCHEMA_HEADER) == "inner-state-v1"
+
+    async def _read_unified_inner_state_for_context(self, request, session_id: str, *, messages=None) -> dict:
+        """Use the fixed authenticated Aiz bridge, never a local Brain-only view."""
+        result = {"text": "", "signals": [], "recent_blocks": [], "diagnostics": {"state": "unavailable"}}
+        if self._unified_state_owned_upstream(request):
+            result["diagnostics"] = {"state": "upstream_owned", "schema": "inner-state-v1"}
+            return result
+        if not self._canonical_continuation_active(session_id):
+            result["diagnostics"]["reason"] = "canonical_scope_not_connected"
+            return result
+        adapter = self.canonical_adapter
+        try:
+            if messages is None:
+                response = await adapter.http_client.get(
+                    adapter.base_url + "/bridge/v1/inner-state", headers=adapter._headers())
+            else:
+                # The fixed authenticated bridge owns conversation and identity.
+                # Caller metadata cannot impersonate a source or a canonical event.
+                plain = [{'role': m['role'], 'content': m['content']} for m in messages
+                         if isinstance(m, dict) and m.get('role') in {'system', 'user', 'assistant', 'tool'}
+                         and isinstance(m.get('content'), str)]
+                response = await adapter.http_client.post(
+                    adapter.base_url + "/bridge/v1/inner-state", headers=adapter._headers(), json={'messages': plain})
+            response.raise_for_status()
+            body = response.json()
+            if messages is not None and body.get('context_schema') != 'recent-materials-v1':
+                raise ValueError('recent_context_bridge_contract_mismatch')
+            if (not isinstance(body, dict) or body.get("conversation_id") != adapter.conversation_id
+                    or body.get("generation") is not False):
+                raise ValueError("unified_bridge_identity_mismatch")
+            snapshot, expression = body.get("inner_state"), body.get("expression")
+            recent_context = body.get('recent_context') or {}
+            recent_blocks = recent_context.get('blocks') or []
+            if recent_blocks:
+                if recent_context.get('source_id') != 'context.recent_materials' or len(recent_blocks) != 1:
+                    raise ValueError('recent_context_source_mismatch')
+                for block in recent_blocks:
+                    if (not isinstance(block, dict) or block.get('source_id') != 'context.recent_materials'
+                            or block.get('role') not in {'system', 'developer', 'user', 'assistant'}
+                            or not isinstance(block.get('content'), str)
+                            or block.get('anchor') not in {'instructions.start', 'instructions.end', 'history.start',
+                                'history.depth', 'current_user.before', 'current_user.after', 'current_user.prefix'}
+                            or any(type(block.get(key)) is not int for key in ('order', 'priority', 'history_depth'))):
+                        raise ValueError('recent_context_placement_invalid')
+            from memory_affinity import inner_state_snapshots
+            signals = inner_state_snapshots(snapshot)
+            if (not isinstance(expression, dict) or expression.get("schema") != "inner-state-expression-v1"
+                    or expression.get("checkpoint_id") != snapshot.get("checkpoint_id")
+                    or expression.get("revision") != snapshot.get("revision")
+                    or not isinstance(expression.get("text"), str)):
+                raise ValueError("unified_expression_checkpoint_mismatch")
+            result.update(text=expression["text"], signals=signals, recent_blocks=recent_blocks,
+                diagnostics={"state": "read", "schema": snapshot["schema"],
+                    "availability": snapshot["availability"], "as_of": snapshot.get("settled_at"),
+                    "checkpoint": signals[0].get("checkpoint")})
+        except Exception as exc:
+            result["diagnostics"]["reason"] = "unified_bridge_read_failed"
+            result["diagnostics"]["error_type"] = type(exc).__name__
+        return result
+
     async def _update_persona_after_assistant_message(
         self,
         session_id: str,
@@ -8763,6 +8847,18 @@ class GatewayService:
         assistant_message: dict[str, Any] | None,
         recalled_ids: list[str],
     ) -> None:
+        # Completed direct turns are mirrored by _finalize_canonical_turn. Aiz
+        # binds that assistant's correlation_id to the original user and uses
+        # the same unified settlement hook as Aiz-originated turns. There is no
+        # second local Persona evaluator or writer for live chat.
+        self._b1_persona_authority_active()
+        logger.info("Persona post-reply update skipped | reason=unified_canonical_settlement")
+
+    async def _update_legacy_persona_after_assistant_message(
+        self, session_id: str, user_message: str,
+        assistant_message: dict[str, Any] | None, recalled_ids: list[str],
+    ) -> None:
+        """Historical characterization only; live chat never calls this path."""
         # Profile-wide fence covers canonical aliases; source-bound B1 settlement
         # arrives via its separate original-turn protocol, not this legacy call.
         if self._b1_persona_authority_active():
@@ -11535,39 +11631,43 @@ class GatewayService:
             runtime_values={"content": "\n".join(lines)},
         ), ids
 
-    def _get_persona_state_for_context_mode(self, session_id: str) -> dict[str, Any]:
+    def _get_persona_state_for_context_mode(self, session_id: str, *, signal_snapshots=()) -> dict[str, Any]:
+        """Combine unified affect signals with existing long relationship facts.
+
+        Reading the original global table does not read, decay, seed or use its
+        retired session affect. No local B1 snapshot is consulted.
+        """
         self._b1_persona_authority_active()
-        # Phase C: route to self_model read if enabled
-        sm_cfg = self.config.get("self_model", {}) if isinstance(self.config.get("self_model"), dict) else {}
-        if sm_cfg.get("read_enabled") and sm_cfg.get("profile_id", "jiajia-main") == getattr(self.persona_engine, "profile_id", ""):
-            sm_getter = getattr(self.persona_engine, "get_self_model_state", None)
-            if callable(sm_getter):
-                try:
-                    state = sm_getter(session_id)
-                    if isinstance(state, dict) and state:
-                        return state
-                except Exception as exc:
-                    logger.warning("Gateway self_model read failed, fallback | session=%s error=%s", session_id, exc)
-        # Original path
-        getter = getattr(self.persona_engine, "get_current_state", None)
-        if not callable(getter):
-            return {}
+        from memory_affinity import INNER_AFFECT, resolve_signals, _unit
+        resolved = resolve_signals({"recall": {"signal_bindings": [
+            {"id": key, "producer": "ombre.persona", "key": key} for key in INNER_AFFECT]}},
+            signal_snapshots, datetime.now(timezone.utc))
+        state = {"affect": {key: row["value"] for key, row in resolved.items()}, "relationship": {}}
+        path = (self.config.get("b1") or {}).get("legacy_db_path") or getattr(self.persona_engine, "db_path", None)
+        if not path or not Path(path).is_file():
+            return state
         try:
-            state = getter(session_id)
+            import sqlite3
+            from contextlib import closing
+            with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                db.row_factory = sqlite3.Row
+                row = db.execute("SELECT affinity,dominance,defensiveness,trust FROM persona_global_state WHERE profile_id=?",
+                    (self.persona_engine.profile_id,)).fetchone()
+            if row:
+                state["relationship"] = {key: row[key] if _unit(row[key]) else None for key in row.keys()}
         except Exception as exc:
-            logger.warning("Gateway context mode state lookup failed | session=%s error=%s", session_id, exc)
-            return {}
-        return state if isinstance(state, dict) else {}
+            logger.warning("Gateway relationship lookup failed | session=%s error_type=%s", session_id, type(exc).__name__)
+        return state
 
     def _classify_context_mode(self, query: str, persona_state: dict[str, Any] | None = None) -> str:
         text = " ".join(str(query or "").lower().split())
         state = persona_state if isinstance(persona_state, dict) else {}
         affect = state.get("affect", {}) if isinstance(state.get("affect"), dict) else {}
         relationship = state.get("relationship", {}) if isinstance(state.get("relationship"), dict) else {}
-        defensiveness = self._safe_float(relationship.get("defensiveness"), 0.0)
-        security = self._safe_float(affect.get("security"), 0.5)
-        tenderness = self._safe_float(affect.get("tenderness"), 0.0)
-        longing = self._safe_float(affect.get("longing"), 0.0)
+        defensiveness = self._safe_float(relationship.get("defensiveness"), None)
+        security = self._safe_float(affect.get("security"), None)
+        tenderness = self._safe_float(affect.get("tenderness"), None)
+        longing = self._safe_float(affect.get("longing"), None)
 
         conflict_terms = query_intent_terms("dialogue_intent.conflict")
         repair_terms = query_intent_terms("dialogue_intent.repair")
@@ -11582,7 +11682,8 @@ class GatewayService:
 
         has_conflict = self._text_has_any(text, conflict_terms)
         has_repair = self._text_has_any(text, repair_terms)
-        if has_conflict and (has_repair or defensiveness >= 0.35 or security <= 0.4):
+        if has_conflict and (has_repair or (defensiveness is not None and defensiveness >= 0.35)
+                             or (security is not None and security <= 0.4)):
             return "conflict_repair"
         if self._text_has_any(text, reflective_terms):
             return "reflective_repair"
@@ -11590,7 +11691,8 @@ class GatewayService:
             return "memory_lookup"
         relationship_terms = ("你", "我们", *self._identity_match_terms(lowercase=True))
         if self._text_has_any(text, intimate_terms) or (
-            tenderness >= 0.78 and longing >= 0.45 and self._text_has_any(text, relationship_terms)
+            tenderness is not None and longing is not None
+            and tenderness >= 0.78 and longing >= 0.45 and self._text_has_any(text, relationship_terms)
         ):
             return "intimate"
         if self._text_has_any(text, playful_terms):

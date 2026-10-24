@@ -102,8 +102,9 @@ def record_mood(state,start,end,sample,p,*,max_step_hours=1.0):
     state['mood_days']={k:v for k,v in state['mood_days'].items() if k>=firstday.isoformat()}
     hours=sum(v['covered_hours'] for v in state['mood_days'].values());unknown=sum(v['unknown_hours'] for v in state['mood_days'].values())
     mean=sum(v['integral'] for v in state['mood_days'].values())/hours if hours else None
-    state['slow_mood']={'value':None if mean is None or unknown else min(1,max(-1,(mean-p['midpoint'])/p['span'])),
-                        'covered_hours':hours,'unknown_hours':unknown,'window_days':p['window_days'],'unit':'-1..1'}
+    centered=None if mean is None or unknown else min(1,max(-1,(mean-p['midpoint'])/p['span']))
+    state['slow_mood']={'value':None if centered is None else (centered+1)/2,
+                        'covered_hours':hours,'unknown_hours':unknown,'window_days':p['window_days'],'unit':'0..1'}
 
 
 def track_base_segment(state,policy,start,end,sample,*,budget):

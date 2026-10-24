@@ -13,6 +13,22 @@ import math
 
 TARGETS = ("interest_affinity", "drive_affinity", "goal_alignment")
 AIZ_PRODUCERS = {"aiz.needs", "aiz.goals", "aiz.interests"}
+TRANSPORT_PRODUCERS = AIZ_PRODUCERS | {"ombre.persona"}
+# These are projections for existing bindings, never separate state authorities.
+INNER_NEEDS = ("energy", "rest", "curiosity", "novelty", "expression",
+               "creativity", "autonomy", "competence", "solitude")
+INNER_AFFECT = ("valence", "arousal", "tenderness", "possessiveness",
+                "longing", "security", "protective_drive")
+INNER_DIMENSIONS = {
+    "energy": ("aiz", "resource"),
+    **{key: ("aiz", "need") for key in (*INNER_NEEDS[1:], "boredom", "duty", "reflection")},
+    **{key: ("brain", "affect") for key in (*INNER_AFFECT, "libido", "grieve", "anger",
+        "favored", "session_defensiveness", "cling")},
+    "fatigue": ("brain", "resource"),
+    **{key: ("brain", "slow") for key in ("slow_security", "slow_confidence", "slow_mood")},
+    **{key: ("brain", "tendency") for key in ("exploration_affinity", "social_recovery_rate",
+        "connection_initiative", "creative_satisfaction", "challenge_tolerance", "reflection_preference")},
+}
 
 
 def _unit(value):
@@ -28,6 +44,61 @@ def _date(value):
         return result if isinstance(result, datetime) and result.tzinfo is not None else None
     except (ValueError, TypeError):
         return None
+
+
+def inner_state_snapshots(snapshot):
+    """Validate one full checkpoint and project the existing recall bindings.
+
+    No unit conversion, default affect, clock advance or private source prose is
+    used. Both wire producer names bind to the same complete checkpoint digest.
+    """
+    if not isinstance(snapshot, dict) or snapshot.get("schema") != "inner-state-v1":
+        raise ValueError("unified_snapshot_required")
+    if snapshot.get("availability") == "unavailable":
+        return [{"producer": producer, "state": "unavailable", "revision": None,
+            "as_of": None, "signals": {key: {"state": "unknown", "value": None, "evidence_refs": []}
+                for key in keys}, "reason": "inner_state_unavailable"}
+            for producer, keys in (("aiz.needs", INNER_NEEDS), ("ombre.persona", INNER_AFFECT))]
+    if snapshot.get("availability") not in ("complete", "stale"):
+        raise ValueError("settled_unified_snapshot_required")
+    if any(not isinstance(snapshot.get(key), str) or not snapshot[key].strip()
+           for key in ("subject_id", "checkpoint_id", "rules_version")) or not _date(snapshot.get("settled_at")):
+        raise ValueError("unified_checkpoint_identity_required")
+    revision = snapshot.get("revision")
+    if (not isinstance(revision, dict) or set(revision) != {"aiz", "brain"}
+            or any(type(value) is not int or value < 0 for value in revision.values())):
+        raise ValueError("both_owner_revisions_required")
+    dimensions = snapshot.get("dimensions")
+    if not isinstance(dimensions, dict) or set(dimensions) != set(INNER_DIMENSIONS):
+        raise ValueError("complete_unified_dimensions_required")
+    for key, row in dimensions.items():
+        if (not isinstance(row, dict) or set(row) != {"value", "unit", "owner", "kind", "status", "reason"}
+                or row.get("unit") != "0..1" or (row.get("owner"), row.get("kind")) != INNER_DIMENSIONS[key]):
+            raise ValueError("normalized_dimension_required")
+        if row["status"] == "known":
+            if not _unit(row["value"]) or row["reason"] is not None:
+                raise ValueError("known_dimension_invalid")
+        elif (row["status"] != "unknown" or row["value"] is not None
+              or not isinstance(row["reason"], str) or not row["reason"].strip()):
+            raise ValueError("unknown_dimension_invalid")
+    material = {key: snapshot[key] for key in
+        ("schema", "subject_id", "checkpoint_id", "revision", "rules_version", "settled_at")}
+    material.update(unit="0..1", values={key: row["value"] for key, row in dimensions.items()})
+    reference = "inner-" + hashlib.sha256(json.dumps(material, ensure_ascii=True,
+        sort_keys=True, separators=(",", ":"), allow_nan=False).encode("ascii")).hexdigest()
+    result = []
+    for producer, keys in (("aiz.needs", INNER_NEEDS), ("ombre.persona", INNER_AFFECT)):
+        signals = {key: {"state": "unknown", "value": None, "evidence_refs": []} for key in keys}
+        for key in keys:
+            if dimensions[key]["status"] == "known":
+                signals[key] = {"state": "known", "value": dimensions[key]["value"],
+                    "as_of": snapshot["settled_at"],
+                    "evidence_refs": [f"{producer}@{reference}:dimensions.{key}"]}
+        result.append({"producer": producer, "revision": reference, "as_of": snapshot["settled_at"],
+            "state": "available", "signals": signals, "checkpoint": {"schema": "inner-state-v1",
+                "unit": "0..1", "reference": reference, "revision": copy.deepcopy(revision),
+                "availability": snapshot["availability"]}})
+    return result
 
 
 def read_transport(raw, *, conversation_id, turn_id, source_event_id):
@@ -49,11 +120,28 @@ def read_transport(raw, *, conversation_id, turn_id, source_event_id):
         if not all(isinstance(v, str) and v for v in expected.values()) or scope != expected:
             return {"state": "unavailable", "reason": "scope_mismatch", "snapshots": []}
         snapshots = value.get("snapshots")
-        if not isinstance(snapshots, list) or len(snapshots) > len(AIZ_PRODUCERS):
+        if not isinstance(snapshots, list) or len(snapshots) > len(TRANSPORT_PRODUCERS):
             raise ValueError("snapshots")
         producers = [item.get("producer") for item in snapshots if isinstance(item, dict)]
-        if len(producers) != len(snapshots) or len(set(producers)) != len(producers) or set(producers) - AIZ_PRODUCERS:
+        if len(producers) != len(snapshots) or len(set(producers)) != len(producers) or set(producers) - TRANSPORT_PRODUCERS:
             raise ValueError("producer")
+        if "ombre.persona" in producers:
+            persona = snapshots[producers.index("ombre.persona")]
+            if persona.get("state") == "available":
+                needs = snapshots[producers.index("aiz.needs")] if "aiz.needs" in producers else {}
+                checkpoint = persona.get("checkpoint")
+                if (not isinstance(checkpoint, dict) or checkpoint.get("schema") != "inner-state-v1"
+                        or checkpoint.get("unit") != "0..1" or checkpoint.get("availability") not in ("complete", "stale")
+                        or not isinstance(checkpoint.get("revision"), dict)
+                        or set(checkpoint["revision"]) != {"aiz", "brain"}
+                        or any(type(v) is not int or v < 0 for v in checkpoint["revision"].values())
+                        or checkpoint != needs.get("checkpoint") or needs.get("state") != "available"
+                        or checkpoint.get("reference") != persona.get("revision")
+                        or persona.get("revision") != needs.get("revision")
+                        or persona.get("as_of") != needs.get("as_of")
+                        or set(persona.get("signals") or {}) != set(INNER_AFFECT)
+                        or set(needs.get("signals") or {}) != set(INNER_NEEDS)):
+                    raise ValueError("unified_checkpoint_mismatch")
         return {"state": "received", "scope": scope, "snapshots": copy.deepcopy(snapshots)}
     except (ValueError, TypeError, UnicodeError, RecursionError):
         return {"state": "unavailable", "reason": "invalid_transport", "snapshots": []}
