@@ -484,6 +484,11 @@ def test_memory_task_route_persist_failure_restores_old_runtime_then_retry_saves
     old_engine, old_store, old_commit, clients = install_temporary_config_runtime(
         config_api, monkeypatch, tmp_path
     )
+    # The real owner page reads config before saving its revisioned draft.
+    initial = asyncio.run(config_api.server.api_config_get(FakeRequest()))
+    assert initial.status_code == 200, initial.body
+    initial_credential_revision = response_json(initial)["credential_revision"]
+    assert config_api.config["_credential_edit_revision"] == initial_credential_revision
     old_config = copy.deepcopy(config_api.config)
     previous_routes = copy.deepcopy(config_api.config["reflection"]["memory_task_routes"])
     expected_revision = task_routes_revision(previous_routes)
@@ -505,6 +510,10 @@ def test_memory_task_route_persist_failure_restores_old_runtime_then_retry_saves
 
     assert failed.status_code == 500
     assert config_api.config == old_config
+    worker_snapshot, _credentials, _signature = config_api.server.reflection_configuration_source.snapshot(config_api.config)
+    assert worker_snapshot == old_config
+    assert worker_snapshot["reflection"]["memory_task_routes"] == previous_routes
+    assert config_api.config["_credential_edit_revision"] == initial_credential_revision
     assert config_api.config["reflection"]["memory_task_routes"] == previous_routes
     assert config_api.server.reflection_engine is old_engine
     assert config_api.server.memory_authority_store is old_store
@@ -518,6 +527,9 @@ def test_memory_task_route_persist_failure_restores_old_runtime_then_retry_saves
     saved = asyncio.run(config_api.server.api_config_update(FakeRequest(request_body)))
 
     assert saved.status_code == 200, saved.body
+    worker_snapshot, _credentials, _signature = config_api.server.reflection_configuration_source.snapshot(config_api.config)
+    assert worker_snapshot["reflection"]["memory_task_routes"] == new_routes
+    assert config_api.config["_credential_edit_revision"] == initial_credential_revision
     fetched = asyncio.run(config_api.server.api_config_get(FakeRequest()))
     assert fetched.status_code == 200, fetched.body
     reflection = response_json(fetched)["reflection"]

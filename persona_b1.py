@@ -242,7 +242,7 @@ def decision_check(d):
         if r['type']=='correction' and (r['actor']!='owner' or r['target']!='assistant' or roles!={'user','assistant'}):raise ValueError('correction dual source required')
         if r['type']=='soothing' and (r['actor']!='owner' or r['target']!='assistant' or 'user' not in roles):raise ValueError('soothing owner source required')
         if r['observation_id'] not in seen:result['accepted'].append(deepcopy(r));seen.add(r['observation_id'])
-    reasons={'not_direct_interaction','not_asserted_occurrence','uncertain_interpretation','different_or_unknown_participants','actor_source_role_mismatch','operation_result_required_not_chat_claim','correction_dual_source_required','soothing_owner_source_required'}
+    reasons={'not_direct_interaction','not_asserted_occurrence','uncertain_interpretation','different_or_unknown_participants','actor_source_role_mismatch','operation_result_required_not_chat_claim','correction_dual_source_required','soothing_owner_source_required','correction_occurrence_unproven'}
     if not isinstance(d['rejected'],list) or len(d['rejected'])>16:raise ValueError('bounded rejected decisions required')
     rejected_seen=set()
     for r in d['rejected']:
@@ -496,9 +496,13 @@ class PersonaB1Store:
     def receipt(self,scope,event_id):
         with closing(self._connect(True)) as db:
             r=db.execute('SELECT receipt FROM b1_events WHERE scope=? AND event_id=?',(ident(scope),ident(event_id))).fetchone();return json.loads(r[0]) if r else None
-    def settle(self,envelope,*,expected_revision):
-        if set(envelope)-{'nuances','tone','phase','operation_result','empathy_details','light_details','interaction_modes','feeling_sources','conversation_observed_at','correction_details','growth_frames','pressure_frames','phase_source_kind'}!={'namespace','scope','event_id','occurred_at','policy_revision','decision','labels'} or envelope['namespace']!='b1-completed-turn-v2':raise ValueError('internal v2 completed-turn envelope required')
+    def settle(self,envelope,*,expected_revision,memory_validation=None):
+        if set(envelope)-{'nuances','tone','phase','operation_result','empathy_details','light_details','interaction_modes','feeling_sources','conversation_observed_at','correction_details','growth_frames','pressure_frames','phase_source_kind','memory_context','memory_reactions'}!={'namespace','scope','event_id','occurred_at','policy_revision','decision','labels'} or envelope['namespace']!='b1-completed-turn-v2':raise ValueError('internal v2 completed-turn envelope required')
         e=deepcopy(envelope);e['scope']=ident(e['scope']);e['event_id']=ident(e['event_id']);e['occurred_at']=at(e['occurred_at']);e['decision']=decision_check(e['decision'])
+        memory_rows=[]
+        if 'memory_context' in e or 'memory_reactions' in e:
+            from persona_memory_reaction_context import validate_reactions
+            memory_rows=validate_reactions(e.get('memory_reactions'),e.get('memory_context'),e['decision']['source_hash'],e['decision']['accepted'])
         if isinstance(expected_revision,bool) or not isinstance(expected_revision,int) or expected_revision<0:raise ValueError('revision required')
         modes=e.get('interaction_modes',{})
         if not isinstance(modes,dict) or not set(modes)<={r['observation_id'] for r in e['decision']['accepted']} or any(v not in ('apply','mark_only') for v in modes.values()):raise ValueError('observation-bound interaction mode required')
@@ -715,12 +719,17 @@ class PersonaB1Store:
                 for key,weights in s['subtypes'].items():
                     half=segment_laws[key]['half_life_hours'];retention=math.exp(-math.log(2)*hstep/half) if half else 1
                     for label in weights:weights[label]*=retention
-            time_state=_coordinates(s);effects=[];deferred=[];event_sources={};event_reasons={}
+            time_state=_coordinates(s);effects=[];deferred=[];event_sources={};event_reasons={};interaction_directions={}
+            accepted_ids={row['observation_id'] for row in e['decision']['accepted']}
             def trace(prior,reason,refs):
                 for key,value in _coordinates(s).items():
                     if prior.get(key) is not None and value is not None and prior[key]!=value:
                         event_sources.setdefault(key,[]).extend(refs)
                         event_reasons.setdefault(key,[]).append(reason)
+                        for ref in refs:
+                            observation=ref.get('observation_id')
+                            if ref.get('kind')=='conversation' and observation in accepted_ids:
+                                interaction_directions.setdefault((observation,key),set()).add('increase' if value>prior[key] else 'decrease')
             # Multiple grounded observations retain their identity, but one
             # canonical event never repeats its kind's base reward.
             base_interactions={}
@@ -838,6 +847,12 @@ class PersonaB1Store:
                 if s['values'][key] is not None:
                     weights=s['subtypes'].setdefault(key,{})
                     weights[label]=min(1,weights.get(label,0)+p['subtype_policy']['bump'])
+            memory_results=[]
+            if memory_rows:
+                from persona_memory_reaction_context import settle_reactions
+                event_before=_coordinates(s)
+                memory_results=settle_reactions(s,p,memory_rows,e['memory_context'],memory_validation,e['occurred_at'],interaction_directions)
+                trace(event_before,'memory_reaction',[source_ref('conversation',e['event_id'],e['occurred_at'])])
             if p['subtype_policy']:
                 for key in list(s['subtypes']):
                     if s['values'][key] is not None and s['values'][key]<p['subtype_policy']['clear_below']:del s['subtypes'][key]
@@ -877,6 +892,11 @@ class PersonaB1Store:
                 s['last_conversation_at']=e['occurred_at']
             stored=self._stored(s)
             receipt={'scope':e['scope'],'event_id':e['event_id'],'source_hash':e['decision']['source_hash'],'occurred_at':e['occurred_at'],'before_revision':s['revision'],'after_revision':s['revision']+1,'before':before,'after':s['values'],'effects':effects,'growth_frame_hashes':[frame['frame_hash'] for frame in frames],'pressure_frame_hashes':[frame['frame_hash'] for frame in pressure_frames],'observed_labels':labels,'applied_labels':applied_labels,'interaction_modes':{r['observation_id']:modes.get(r['observation_id'],'apply') for r in e['decision']['accepted']},'time_methods':time_methods,'deferred':deferred,'rejected':e['decision']['rejected'],'status':'candidate_applied','global_personality_changed':False,'production_applied':False}
+            if 'memory_context' in e:
+                from persona_memory_reactions import RULES_VERSION
+                receipt['memory_reactions']={'schema':'memory-reaction-receipt-v1','rules_version':RULES_VERSION,
+                    'delivery_receipt_id':e['memory_context']['delivery_receipt_id'],
+                    'delivery_sha256':e['memory_context']['delivery_sha256'],'observations':memory_results}
             state_after=_coordinates(s);recent=[]
             clock_ref={'kind':'clock','event_id':e['event_id'],'occurred_at':e['occurred_at']}
             for key,value in state_before.items():
@@ -996,7 +1016,7 @@ class PersonaB1Adapter:
         if 'helped' in raw:envelope['operation_result']['helped']=deepcopy(raw['helped'])
         result=self.store.settle(envelope,expected_revision=self.store.read(self.scope)['revision'])
         return {**self.snapshot(),'b1_receipt':result}
-    def settle(self,envelope,turn):
+    def _validated_turn(self,envelope,turn):
         if 'phase' in envelope or 'phase_source_kind' in envelope or 'operation_result' in envelope:raise ValueError('lifecycle/result cannot be claimed by chat evaluator')
         if not isinstance(turn,dict) or set(turn)!={'conversation_id','user_event','assistant_event'}:raise ValueError('original completed turn required in memory')
         u,a=turn['user_event'],turn['assistant_event']
@@ -1015,6 +1035,28 @@ class PersonaB1Adapter:
                 subject_binding(detail,observation,checked['source_hash'],src)
         except ValueError as exc:raise Conflict(str(exc)) from exc
         if envelope.get('scope')!=self.scope:raise Conflict('adapter scope mismatch')
+        if 'memory_context' in envelope or 'memory_reactions' in envelope:
+            from persona_memory_reaction_context import validate_reactions
+            validate_reactions(envelope.get('memory_reactions'),envelope.get('memory_context'),src,checked['accepted'])
+        return src,checked
+
+    async def settle_async(self,envelope,turn,*,resolver=None):
+        self._validated_turn(envelope,turn)
+        validation=None
+        if 'memory_context' in envelope and self.store.receipt(self.scope,envelope['event_id']) is None:
+            if callable(resolver):
+                try:
+                    import inspect
+                    validation=resolver(envelope['memory_context'],turn)
+                    if inspect.isawaitable(validation):validation=await validation
+                except Exception:
+                    validation={'state':'unavailable','eligible_fragment_ids':[],'reason':'memory_delivery_source_check_failed'}
+            else:
+                validation={'state':'unavailable','eligible_fragment_ids':[],'reason':'memory_delivery_lookup_unconfigured'}
+        return self.settle(envelope,turn,memory_validation=validation)
+
+    def settle(self,envelope,turn,*,memory_validation=None):
+        _src,checked=self._validated_turn(envelope,turn)
         envelope=deepcopy(envelope);envelope['decision']=checked;envelope['conversation_observed_at']=at(envelope['occurred_at'])
-        r=self.store.settle(envelope,expected_revision=self.store.read(self.scope)['revision'])
+        r=self.store.settle(envelope,expected_revision=self.store.read(self.scope)['revision'],memory_validation=memory_validation)
         return {**self.snapshot(),'b1_receipt':r}

@@ -203,6 +203,10 @@ class DiaryL1Service:
             # per-scene retry, not as a second editable copy in the root.
             scene_bodies = metadata["diary_l1_bundle"].pop("scene_bodies")
             metadata["diary_l1_bundle"]["scene_body_sha256"] = {key: hashlib.sha256(value.encode("utf-8")).hexdigest() for key, value in scene_bodies.items()}
+            # Keep the worker's identity; Authority resolves this immutable
+            # candidate revision and the real owner acceptance in its transaction.
+            metadata['diary_l1_review'] = {'candidate_id': candidate_id,
+                'candidate_revision': candidate['revision']}
             root = await self.commit.commit_memory(memory_id=memory_id, bucket_id=memory_id,
                 expected_revision=expected, body=proposal["proposed_body"], metadata=metadata,
                 source_refs=proposal["source_refs"], decision_source="diary_first_pass", idempotency_key=idem,

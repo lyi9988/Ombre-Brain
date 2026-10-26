@@ -155,6 +155,15 @@ class MemoryL1Reads:
                 results.append({"memory_id": item["memory_id"], "revision": item["revision"],
                                 "state": state, "sources": statuses,
                                 "historical": bool(latest and latest["active_revision"] != item["revision"])})
+                from memory_relation_dependencies import dependency_snapshot
+                connection = self.authority._connect()
+                try:
+                    dependency = dependency_snapshot(connection, item['memory_id'])
+                finally:
+                    connection.close()
+                results[-1].update(dependency_token=dependency['token'],
+                    l1_sync_required=dependency['l1_sync_required'], sync_scope=dependency['sync_scope'],
+                    relation_guards=dependency['guards'])
             return {"items": results, "diagnostics": {
                 "timing_ms": {"prepare": preparation_ms, "source_reads": source_ms,
                               "final_authority": max(0, int((time.perf_counter() - final_started) * 1000))},
@@ -287,6 +296,63 @@ class MemoryL1Reads:
         finally: conn.close()
         result["sources"] = [json.loads(row[0]) for row in rows]
         if scene: result["root_ref"] = {"memory_id": root_id, "revision": root_revision}
+        return result
+
+    async def relation_material(self, memory_id, revision):
+        """Exact adopted counterparts for L2; unrelated prose is never loaded."""
+        from memory_relation_dependencies import relation_context, dependency_snapshot
+        from memory_l1_contract import semantic_sha256
+        from memory_query_evidence import semantic_source_refs
+        conn = self.authority._connect()
+        try:
+            context = relation_context(conn, [memory_id])
+            dependency = dependency_snapshot(conn, memory_id)
+        finally:
+            conn.close()
+        refs = {}
+        for relation in context['relations']:
+            for side in ('from', 'to'):
+                key = (relation[side + '_memory_id'], relation[side + '_revision'])
+                if key != (memory_id, revision):
+                    refs.setdefault(key, []).append({'relation_id': relation['relation_id'], 'kind': relation['kind'],
+                        'object_type': relation[side + '_type'], 'object_id': relation[side + '_id']})
+        updates, issues = [], []
+        for (mid, rev), paths in sorted(refs.items()):
+            memory = self.authority.get_memory(mid)
+            record = self.authority.get_memory_revision(mid, rev)
+            if not memory or memory['state'] != 'active' or memory['recall_policy'] != 'enabled' or not record:
+                issues.append({'memory_id': mid, 'revision': rev, 'state': 'unavailable'})
+                continue
+            document = (record['metadata'].get('memory_l1') or {})
+            if not document:
+                issues.append({'memory_id': mid, 'revision': rev, 'state': 'semantic_revision_unavailable'})
+                continue
+            whole = any(path['object_type'] == 'memory' for path in paths)
+            ids = {path['object_id'] for path in paths if path['object_type'] == 'statement'}
+            for path in paths:
+                if path['object_type'] == 'scene':
+                    scene = next((s for s in document.get('scenes', []) if s['scene_id'] == path['object_id']), None)
+                    if scene:
+                        ids.update(scene['statement_refs'])
+            statements = [s for s in document.get('statements', []) if whole or s['statement_id'] in ids]
+            selected = {**document, 'statements': statements,
+                'scenes': [s for s in document.get('scenes', []) if set(s['statement_refs']) & {v['statement_id'] for v in statements}],
+                'relations': [r for r in document.get('relations', []) if r['relation_id'] in {p['relation_id'] for p in paths}]}
+            referenced = semantic_source_refs(selected)
+            bindings = [b for b in document.get('evidence_bindings', []) if not referenced or b['binding_id'] in referenced]
+            status = (await self.recall_source_status([{'memory_id': mid, 'revision': rev,
+                'binding_ids': [b['binding_id'] for b in bindings], 'allow_historical': True}]))['items'][0]
+            if status['state'] != 'ok' or any(s.get('eligible_source') is not True for s in status['sources'].values()):
+                issues.append({'memory_id': mid, 'revision': rev, 'state': status['state'],
+                    'source_states': {key: value['state'] for key, value in status['sources'].items()}})
+                continue
+            updates.append({'memory_id': mid, 'revision': rev, 'historical': memory['active_revision'] != rev,
+                'relations': paths, 'statements': statements, 'scenes': selected['scenes'],
+                'entities': document.get('entities', []), 'source_refs': bindings,
+                'sync_scope': status.get('sync_scope')})
+        result = {'updates': updates, 'guards': context['guards'], 'issues': issues,
+            'dependency_token': dependency['token']}
+        result['token'] = semantic_sha256(result)
         return result
 
     async def locate(self, memory_id, revision, binding_id, *, start=None, end=None):

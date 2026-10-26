@@ -76,9 +76,10 @@ class MemoryL1SourceTasks:
         if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0:
             raise L1OwnerError('invalid_task_page_limit', field_path='limit')
         from memory_chat_preparation import PREFIX as CHAT_PREFIX, ChatMemoryPreparation
+        from memory_browse_preparation import PREFIX as BROWSE_PREFIX, BrowseMemoryPreparation
         action_prefix = PREFIX + 'action_source_'
-        where = '((key>=? AND key<?) OR (key>=? AND key<?))'
-        params = (action_prefix, action_prefix + '\uffff', CHAT_PREFIX, CHAT_PREFIX + '\uffff')
+        where = '((key>=? AND key<?) OR (key>=? AND key<?) OR (key>=? AND key<?))'
+        params = (action_prefix, action_prefix + '\uffff', CHAT_PREFIX, CHAT_PREFIX + '\uffff', BROWSE_PREFIX, BROWSE_PREFIX + '\uffff')
         db = self.authority._connect()
         try:
             total = db.execute('SELECT count(*) FROM authority_meta WHERE ' + where, params).fetchone()[0]
@@ -86,6 +87,7 @@ class MemoryL1SourceTasks:
                 + " ORDER BY json_extract(value,'$.created_at') DESC,json_extract(value,'$.task_id') DESC,key DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset)).fetchall()
             values = [ChatMemoryPreparation.public(json.loads(row['value'])) if row['key'].startswith(CHAT_PREFIX)
+                      else BrowseMemoryPreparation.public(json.loads(row['value'])) if row['key'].startswith(BROWSE_PREFIX)
                       else json.loads(row['value']) for row in rows]
         finally:
             db.close()

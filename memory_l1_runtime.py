@@ -431,6 +431,7 @@ class MemoryL1Runtime:
         combined = model_template(catalog=catalog)
         prose, scene_bodies, input_ranges, confidence = [], {}, [], []
         batch_identity = {'source': source['source_revision'], 'prompt': prompt_context, 'options': options,
+                          'input_contract': 'diary-source-grounding-v2',
                           'catalog_revision': catalog_revision, 'model_task': {k: v for k, v in route.items() if k != 'client'}}
         task_id = 'diary-task-' + semantic_sha256(batch_identity)[:40]
         model_route = 'route_sha256:' + semantic_sha256({k: v for k, v in route.items() if k != 'client'})
@@ -462,6 +463,11 @@ class MemoryL1Runtime:
         if checkpoint and checkpoint['previous_revision'] != previous_revision:
             return {'status': 'not_prepared', 'reason': 'diary_root_changed_after_checkpoint', 'candidate_id': candidate_id}
         previous = (await service.detail(memory_id))['l1']['document'] if previous_memory else None
+        # Prior generated prose is an identity/revision aid, never another L0.
+        # A withdrawn or disabled memory must not re-enter generation through
+        # this side door. Retain `previous` for immutable revision/history work.
+        previous_input_allowed = bool(previous_memory and previous_memory.get('state') == 'active'
+                                      and previous_memory.get('recall_policy') == 'enabled')
         if checkpoint:
             combined = copy.deepcopy(checkpoint['combined'])
             prose = copy.deepcopy(checkpoint['prose'])
@@ -488,7 +494,13 @@ class MemoryL1Runtime:
                 'source_text': text[start:end], 'input_range': {'start': start, 'end': end},
                 'binding_id': binding['binding_id'], 'semantic_contract': semantic_contract([binding['binding_id']], catalog=catalog),
                 'catalog_revision': catalog_revision, 'options': options,
-                'existing_members': {module: (previous or {}).get(module, []) for module in ('entities', 'scenes', 'statements', 'relations')},
+                'existing_members': {module: (previous or {}).get(module, []) if previous_input_allowed else []
+                    for module in ('entities', 'scenes', 'statements', 'relations')},
+                'existing_members_use': {
+                    'state': 'identity_reference_only' if previous_input_allowed else 'not_available',
+                    'reason': None if previous_input_allowed else 'no_eligible_previous_memory',
+                    'instructions': '已有成员是旧派生稿的身份/修订参考，不是本轮事实来源。每条内容重新以原日记为据；'
+                        '与本轮来源的条件、未知、否定或更正冲突时，不沿用旧稿结论。'},
                 'window_index': index, 'source_length': len(text)}
             attempt_checkpoint = {'previous_revision': previous_revision, 'combined': copy.deepcopy(combined),
                 'prose': list(prose), 'scene_bodies': dict(scene_bodies),

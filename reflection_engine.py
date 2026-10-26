@@ -283,7 +283,12 @@ class ReflectionEngine(MemoryL1Runtime):
         self,
         config: dict,
         prompt_plan_mirror: PromptPlanMirrorStore | None = None,
+        *,
+        credential_environment: dict | None = None,
     ):
+        # Background batches freeze their own named credentials without
+        # changing process ENV or sharing a client across event loops.
+        credentials = os.environ if credential_environment is None else credential_environment
         self.config = config
         self.identity = identity_names(config)
         self.memory_semantic_profile_id = str((config.get("persona") or {}).get("profile_id") or "haven_xiaoyu")
@@ -311,7 +316,7 @@ class ReflectionEngine(MemoryL1Runtime):
         )
         legacy_candidate_model = str(cfg.get("daily_chat_memory_candidate_model") or "").strip()
         self.reflection_connection_explicit = bool(cfg.get("base_url") and (
-            os.environ.get("OMBRE_REFLECTION_API_KEY", "") or cfg.get("api_key")))
+            credentials.get("OMBRE_REFLECTION_API_KEY", "") or cfg.get("api_key")))
         self.base_url = (
             cfg.get("base_url")
             or emb_cfg.get("base_url")
@@ -320,12 +325,12 @@ class ReflectionEngine(MemoryL1Runtime):
         )
         self.model = cfg.get("model") or legacy_candidate_model or persona_cfg.get("model") or dehy_cfg.get("model", "deepseek-chat")
         self.api_key = (
-            os.environ.get("OMBRE_REFLECTION_API_KEY", "")
+            credentials.get("OMBRE_REFLECTION_API_KEY", "")
             or cfg.get("api_key", "")
-            or os.environ.get("OMBRE_EMBEDDING_API_KEY", "")
+            or credentials.get("OMBRE_EMBEDDING_API_KEY", "")
             or emb_cfg.get("api_key", "")
             or persona_cfg.get("api_key", "")
-            or os.environ.get("OMBRE_PERSONA_API_KEY", "")
+            or credentials.get("OMBRE_PERSONA_API_KEY", "")
             or dehy_cfg.get("api_key", "")
         )
         self.thinking_mode = self._normalize_thinking_mode(
@@ -393,7 +398,7 @@ class ReflectionEngine(MemoryL1Runtime):
             or ""
         ).strip()
         self.daily_chat_memory_api_key = (
-            os.environ.get(self.daily_chat_memory_api_key_env, "")
+            credentials.get(self.daily_chat_memory_api_key_env, "")
             if self.daily_chat_memory_api_key_env
             else ""
         ) or str(
@@ -442,7 +447,7 @@ class ReflectionEngine(MemoryL1Runtime):
         )
         self.dehydration_base_url = str(dehy_cfg.get("base_url") or "").strip().rstrip("/")
         self.dehydration_model = str(dehy_cfg.get("model") or "").strip()
-        self.dehydration_api_key = str(dehy_cfg.get("api_key") or os.environ.get("OMBRE_API_KEY", "")).strip()
+        self.dehydration_api_key = str(dehy_cfg.get("api_key") or credentials.get("OMBRE_API_KEY", "")).strip()
         state_dir = config.get("state_dir") or os.path.join(
             os.path.dirname(os.path.abspath(config.get("buckets_dir", "buckets"))),
             "state",
@@ -811,6 +816,19 @@ class ReflectionEngine(MemoryL1Runtime):
             "status": status,
             "authority_revision": int(row.get("revision") or 1),
         })
+        followup = metadata.get('l3_followup')
+        if isinstance(followup, dict):
+            from memory_l3_followup import FollowupTasks
+            task = FollowupTasks(self.memory_authority_store).get(followup['task_id'])
+            plan = followup.get('plan') or {}
+            document = (followup.get('compiled') or {}).get('document') or {}
+            candidate['l3_followup'] = {'memory_id': followup['memory_id'],
+                'target_title': document.get('narrative', {}).get('title') or followup['memory_id'],
+                'expected_revision': followup['expected_revision'], 'kind': followup['kind'],
+                'preparation_state': task['phase'] if task else 'unavailable', 'reason': plan.get('reason', ''),
+                'changes': [{'field': patch['path'], 'before': patch['old'], 'after': patch['value']}
+                    for patch in plan.get('patch', [])]}
+            candidate['source_bindings'] = (followup.get('compiled') or {}).get('source_bindings', [])
         if isinstance(metadata.get("memory_l1"), dict):
             from memory_l1_schema import join_document
             candidate["memory_l1"] = metadata["memory_l1"]
@@ -3516,6 +3534,36 @@ class ReflectionEngine(MemoryL1Runtime):
         if not rid:
             return {"status": "missing"}
         row = self.memory_authority_store.get_candidate(rid) if self.memory_authority_store else None
+        if row and row.get('proposal', {}).get('metadata', {}).get('l3_followup'):
+            from memory_l3_followup import FollowupTasks
+            followup = row['proposal']['metadata']['l3_followup']
+            task = FollowupTasks(self.memory_authority_store).get(followup['task_id'])
+            if task is None:
+                return {'status': 'missing', 'candidate_id': rid}
+            # Read the original actual message versions. Retained text alone
+            # is not permission to return withdrawn or replaced source content.
+            from memory_l1_ingestion import bind_sources
+            from memory_source_provenance import canonical_source
+            originals = [s for s in task['envelope']['sources'] if not source_id or s['event_id'] == str(source_id)]
+            safe_offset, safe_limit = max(0, int(offset or 0)), max(256, min(20000, int(limit or 4000)))
+            sources = [canonical_source(s, conversation_id=task['envelope']['turn']['conversation_id'],
+                profile_id=self.memory_semantic_profile_id) for s in originals]
+            evidence = bind_sources(sources, config=self.config) if sources else ([], [])
+            reader, events, missing = self._memory_l1_sources(), [], []
+            for original, snapshot, binding in zip(originals, *evidence):
+                reader.retain_copy(snapshot)
+                observed = await reader.locate(binding)
+                if not observed.get('eligible_source'):
+                    missing.append(original['event_id']); continue
+                text = self._daily_chat_memory_owner_text(observed['text'])
+                end = min(safe_offset + safe_limit, len(text))
+                events.append({'id': original['event_id'], 'role': original['role'],
+                    'version_id': original['version_id'], 'created_at': original['created_at'],
+                    'text': text[safe_offset:end], 'full_length': len(text),
+                    'truncated': end < len(text), 'continue_after': end if end < len(text) else -1})
+            return {'status': 'ok', 'candidate_id': rid, 'source_authority': 'aizizhu_canonical_snapshot',
+                'offset': safe_offset, 'limit': safe_limit, 'events': events, 'turns': [],
+                'missing_event_ids': missing or ([source_id] if source_id and not originals else []), 'missing_turn_ids': []}
         if row and row.get("proposal", {}).get("source_type") == "chat_tool":
             safe_offset, safe_limit = max(0, int(offset or 0)), max(256, min(20000, int(limit or 4000)))
             sources = row["proposal"].get("metadata", {}).get("runtime_context", {}).get("sources", [])
@@ -3907,6 +3955,13 @@ class ReflectionEngine(MemoryL1Runtime):
                     results.append({"id": candidate_id, "status": decided.get("status")})
                     continue
 
+                if row.get('proposal', {}).get('metadata', {}).get('l3_followup'):
+                    from memory_l3_followup import MemoryFollowups
+                    candidate_result = await MemoryFollowups(self, bucket_mgr).adopt(row, owner=True,
+                        edit=safe_edits.get(candidate_id), request_id=f"{rid}:{candidate_id}")
+                    created += int(candidate_result.get('status') == 'created')
+                    results.append(candidate_result)
+                    continue
                 if isinstance(row.get("proposal", {}).get("metadata", {}).get("memory_l1"), dict):
                     candidate_result = await self._memory_l1_adopt_candidate(row, bucket_mgr,
                         edit=safe_edits.get(candidate_id), request_id=f"{rid}:{candidate_id}", owner=True)
@@ -4335,12 +4390,15 @@ class ReflectionEngine(MemoryL1Runtime):
                     window_candidates = unique
                     if preparation_queue:
                         invalid_count = window_audit.get('hard_rejects', {}).get('invalid_l1_document', 0)
+                        incomplete_count = sum(c.get('l1_state') == 'preparation_required' for c in window_candidates)
                         receipt = preparation_queue.prepare(preparation_key,
                             [self._daily_chat_memory_proposal(candidate, mode=mode) for candidate in window_candidates],
                             self.memory_ingestion_policy, scope=scope, source_fingerprint=source_fingerprint,
                             generated_count=window_generated_count, generation_fingerprint=generation_fingerprint,
                             issue=({'code': 'invalid_l1_document', 'rejected_count': invalid_count,
-                                    'schema_error': window_stats.get('schema_error')} if invalid_count else None),
+                                    'schema_error': window_stats.get('schema_error')} if invalid_count else
+                                   {'code': 'first_pass_document_required', 'pending_count': incomplete_count}
+                                   if incomplete_count else None),
                             replace_failure=replace_failure)
                         window_candidates = [self._authority_candidate_legacy_item(row)['candidate']
                             for row in preparation_queue.remaining(receipt)]
@@ -4552,7 +4610,7 @@ class ReflectionEngine(MemoryL1Runtime):
                     if not isinstance(draft, dict):
                         # Owner custom legacy prompts remain identifiable; they
                         # cannot masquerade as a generated structured first pass.
-                        item["l1_state"] = "legacy_body_only"
+                        item["l1_state"] = "preparation_required"
                         continue
                     from memory_l1_semantic_wire import assemble_document
                     draft = assemble_document(draft, require_keywords=True)
@@ -5298,6 +5356,7 @@ class ReflectionEngine(MemoryL1Runtime):
             candidate_tags = self._string_list(candidate.get("tags"), limit=8)
             model_doc = candidate.get("document")
             content = (str(model_doc.get("narrative", {}).get("body") or "").strip() if isinstance(model_doc, dict)
+                       else str(candidate.get("content") or "").strip() if self.memory_authority_enabled
                        else self._trim_daily_chat_memory_content(str(candidate.get("content") or "").strip()))
             if not content:
                 # proposed_memory empty: hard reject (invalid structure).
@@ -5490,6 +5549,12 @@ class ReflectionEngine(MemoryL1Runtime):
                         from memory_chat_preparation import issue
                         audit.setdefault('l1_issues', []).append(issue(exc))
                     continue
+            if self.memory_authority_enabled and not isinstance(model_doc, dict):
+                # Preserve the submitted narrative as an inspectable candidate;
+                # it is not a completed first pass or a new legacy memory.
+                item['l1_state'] = 'preparation_required'
+                item['l1_issue'] = {'code': 'first_pass_document_required', 'field_path': 'document'}
+                soft_flags.append('l1_preparation_required')
             for flag in soft_flags:
                 record_soft(flag)
             existing_duplicate = next(
@@ -5974,6 +6039,36 @@ class ReflectionEngine(MemoryL1Runtime):
                 results.append({"id": bucket_id, "status": "failed", "reason": type(exc).__name__})
         return {"created": created, "exists": exists, "failed": failed, "results": results}
 
+    def _daily_chat_memory_original_commit(self, row):
+        """Recover only an already-created operation, never a new legacy write.
+
+        Candidate revisions change on failure/owner decisions. They must not
+        cause a prepared operation to acquire a second commit identity.
+        """
+        from memory_l1_service import L1OwnerError
+        from memory_commit_service import body_sha256
+        candidate_id = row['candidate_id']
+        prefix = f'daily-chat:{candidate_id}:candidate-revision:'
+        db = self.memory_authority_store._connect()
+        try:
+            matches = db.execute("SELECT operation_id FROM commit_log WHERE aggregate_id=? "
+                "AND operation_kind='memory_revision' AND substr(idempotency_key,1,?)=? "
+                "AND status IN ('prepared','body_written','committed') ORDER BY created_at LIMIT 2",
+                (candidate_id, len(prefix), prefix)).fetchall()
+        finally:
+            db.close()
+        if len(matches) > 1:
+            raise L1OwnerError('legacy_commit_identity_ambiguous', field_path='candidate')
+        if not matches:
+            return None
+        original = self.memory_authority_store.get_commit(matches[0]['operation_id'])
+        payload, proposal = original['payload'], row['proposal']
+        if (payload['body_sha256'] != body_sha256(proposal['proposed_body'])
+                or set(payload['source_refs']) != set(proposal['source_refs'])
+                or payload.get('metadata', {}).get('memory_l1')):
+            raise L1OwnerError('legacy_commit_source_or_draft_changed', field_path='candidate')
+        return original
+
     async def _write_daily_chat_memory_candidates_authority(
         self,
         candidates: list[dict],
@@ -6005,11 +6100,35 @@ class ReflectionEngine(MemoryL1Runtime):
                 results.append({"id": candidate_id, "status": "exists"})
                 continue
             if row.get("status") == "pending":
-                results.append({"id": candidate_id, "status": "pending"})
+                results.append({"id": candidate_id, "status": "pending",
+                    **({'preparation_status': 'required', 'reason': 'first_pass_document_required'}
+                       if not isinstance(row["proposal"].get("metadata", {}).get("memory_l1"), dict) else {})})
                 continue
             if row.get("status") == "rejected":
                 failed += 1
                 results.append({"id": candidate_id, "status": "rejected", "reason": "policy_rejected"})
+                continue
+            has_l1 = isinstance(row["proposal"].get("metadata", {}).get("memory_l1"), dict)
+            try:
+                old_commit = self._daily_chat_memory_original_commit(row) if not has_l1 else None
+            except Exception as exc:
+                failed += 1
+                results.append({'id': candidate_id, 'status': 'failed',
+                    'reason': getattr(exc, 'code', type(exc).__name__)})
+                continue
+            # Already-prepared legacy operations keep their identity and recovery
+            # path. An accepted draft alone is not permission to create a new
+            # body-only memory. Existing committed candidates returned above.
+            if (not has_l1 and row.get('status') in {'accepted', 'commit_failed'}
+                    and not (old_commit and old_commit.get('status') in {'prepared', 'body_written', 'committed'})):
+                if row['status'] == 'accepted':
+                    self.memory_authority_store.decide_candidate(
+                        candidate_id, action='commit_failed', expected_revision=int(row['revision']),
+                        request_id=f"daily-l1-required:{candidate_id}:{row['revision']}",
+                        actor='commit_service', reason_codes=['L1_PREPARATION_REQUIRED'])
+                failed += 1
+                results.append({'id': candidate_id, 'status': 'failed',
+                    'preparation_status': 'required', 'reason': 'first_pass_document_required'})
                 continue
             if row.get("status") == "commit_failed":
                 row = self.memory_authority_store.decide_candidate(
@@ -6037,8 +6156,8 @@ class ReflectionEngine(MemoryL1Runtime):
                     results.append({"id": candidate_id, "status": "failed", "reason": type(exc).__name__})
                 continue
             key = str(candidate.get("date") or datetime.now(self.tz).date().isoformat())
-            commit_key = f"daily-chat:{candidate_id}:candidate-revision:{row.get('revision')}"
-            prior_commit = self.memory_authority_store.get_commit_by_idempotency(commit_key)
+            commit_key = old_commit['idempotency_key']
+            prior_commit = old_commit
             prior_payload = (prior_commit or {}).get("payload") or {}
             prior_metadata = prior_payload.get("metadata") or {}
             # A process may stop after prepare/commit but before the candidate
@@ -6074,17 +6193,20 @@ class ReflectionEngine(MemoryL1Runtime):
             expected_revision = int(existing_memory.get("active_revision") or 0) if existing_memory else 0
             if prior_commit:
                 expected_revision = int(prior_payload["expected_revision"])
+                metadata = dict(prior_payload['metadata'])
             try:
                 commit = await service.commit_memory(
                     memory_id=candidate_id,
                     bucket_id=candidate_id,
                     expected_revision=expected_revision,
-                    body=str(candidate.get("content") or candidate.get("proposed_memory") or ""),
+                    body=row['proposal']['proposed_body'],
                     metadata=metadata,
-                    source_refs=self._daily_chat_memory_source_refs(candidate),
-                    decision_source=("owner" if mode == "review" else "auto"),
+                    source_refs=prior_payload['source_refs'],
+                    decision_source=prior_payload['decision_source'],
                     idempotency_key=commit_key,
-                    actor=("owner" if mode == "review" else "daily_chat_memory"),
+                    actor=prior_payload['actor'],
+                    memory_state=prior_payload['memory_state'],
+                    recall_policy=prior_payload['recall_policy'],
                 )
                 self._commit_candidate_aliases_best_effort(
                     candidate_id,

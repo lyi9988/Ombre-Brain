@@ -127,10 +127,22 @@ def guard_metadata(metadata: dict, body: str) -> dict:
     return result
 
 
+def binding_source_keys(bindings) -> list[str]:
+    """Exact formal-source identity for the existing candidate reverse index.
+
+    This establishes overlap only, never factual equivalence or authority.
+    """
+    fields = ('source_namespace', 'source_id', 'source_revision')
+    return list(dict.fromkeys(identity_hash({key: row[key] for key in fields}) for row in bindings
+        if isinstance(row, dict) and all(key in row and row[key] is not None for key in fields)))
+
+
 def source_keys(proposal: dict) -> list[str]:
     semantic = current_annotations(proposal.get("metadata") or {}, str(proposal.get("proposed_body") or ""))
-    return list(dict.fromkeys(str(s["source_key"]) for s in semantic.get("source_coverage", [])
-                             if isinstance(s, dict) and isinstance(s.get("source_key"), str) and len(s["source_key"]) == 64))[:80]
+    keys = [str(s['source_key']) for s in semantic.get('source_coverage', [])
+        if isinstance(s, dict) and isinstance(s.get('source_key'), str) and len(s['source_key']) == 64]
+    keys.extend(binding_source_keys(((proposal.get('metadata') or {}).get('memory_l1') or {}).get('evidence_bindings', [])))
+    return list(dict.fromkeys(keys))[:80]
 
 
 def attach_source_links(semantic: dict, related: list[dict], *, proposal_id: str) -> dict:

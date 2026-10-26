@@ -116,6 +116,42 @@ class CanonicalMemorySourceReader:
         return attributed_snapshot(actual, binding, self.config)
 
 
+class AizBrowseSourceReader(CanonicalMemorySourceReader):
+    def __init__(self, config, view):
+        super().__init__(config)
+        self.namespace = 'snapshot.aiz.browse.' + view
+        self.view = view
+
+    async def capture(self, content_item_id, version='current'):
+        from memory_l1_contract import canonical_json
+        source_id = canonical_json({'content_item_id': content_item_id, 'view': self.view})
+        options = self.options
+        token = os.environ.get('OMBRE_CANONICAL_BRIDGE_TOKEN', '')
+        if not options.get('enabled') or not token or not options.get('base_url'):
+            return {'state': 'unavailable', 'reason': 'browse_source_reader_unconfigured'}
+        async with httpx.AsyncClient(timeout=15, trust_env=False, follow_redirects=False) as client:
+            response = await client.get(str(options['base_url']).rstrip('/') + '/bridge/v1/memory-source',
+                params={'kind': 'browse_material', 'source_id': source_id, 'version': version},
+                headers={'Authorization': 'Bearer ' + token,
+                    'X-Guyan-Device-ID': str(options.get('device_id') or 'ombre-gateway-operit')})
+            response.raise_for_status()
+            value = response.json().get('source', {})
+        if (value.get('source_namespace') != self.namespace or value.get('source_id') != source_id
+                or (version != 'current' and value.get('source_revision') != version)):
+            return {'state': 'changed', 'reason': 'browse_source_identity_mismatch'}
+        return value
+
+    async def read(self, binding):
+        from memory_browse_source import model_source, snapshot
+        version = self.upstream_version(binding) if hasattr(self, 'upstream_version') else None
+        if not version:
+            return {'state': 'unavailable', 'reason': 'browse_upstream_revision_unknown'}
+        value = await self.capture(json.loads(binding['source_id'])['content_item_id'], version)
+        if value.get('state') != 'available' or value.get('eligible_source') is not True:
+            return value
+        return snapshot(model_source(value, self.config))
+
+
 class AizDiarySourceReader(CanonicalMemorySourceReader):
     def __init__(self, config, kind):
         super().__init__(config)
@@ -240,14 +276,20 @@ def configured_source_readers(config, authority=None):
     readers = [LocalMemorySourceReader(config, 'raw_event'), LocalMemorySourceReader(config, 'conversation_turn')]
     canonical = CanonicalMemorySourceReader(config)
     action = AizActionSourceReader(config)
+    browse = [AizBrowseSourceReader(config, view) for view in ('article', 'reading')]
     if authority:
+        from memory_owner_l2_source import OwnerL2EditSourceReader
+        readers.append(OwnerL2EditSourceReader(authority))
         from memory_l0_sources import MemoryL0Sources
         def version(binding):
             retained = MemoryL0Sources(authority).copy(binding)
             return retained.get('upstream_revision') if retained else None
         canonical.upstream_version = version
         action.upstream_version = version
+        for reader in browse:
+            reader.upstream_version = version
     readers.append(canonical)
+    readers.extend(browse)
     readers.append(AizAttachmentTextSourceReader(config))
     from memory_daily_attachments import AdoptedAttachmentReader
     readers.append(AdoptedAttachmentReader(config))

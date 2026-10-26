@@ -72,13 +72,15 @@ def validate_submission(envelope):
 
 
 class ChatMemoryPreparation:
+    prefix = PREFIX
+
     def __init__(self, authority):
         self.authority = authority
 
     def get(self, memory_id):
         db = self.authority._connect()
         try:
-            row = db.execute('SELECT value FROM authority_meta WHERE key=?', (PREFIX + memory_id,)).fetchone()
+            row = db.execute('SELECT value FROM authority_meta WHERE key=?', (self.prefix + memory_id,)).fetchone()
             return json.loads(row['value']) if row else None
         finally:
             db.close()
@@ -98,7 +100,7 @@ class ChatMemoryPreparation:
         db = self.authority._connect()
         try:
             db.execute('BEGIN IMMEDIATE')
-            prior = db.execute('SELECT value FROM authority_meta WHERE key=?', (PREFIX + memory_id,)).fetchone()
+            prior = db.execute('SELECT value FROM authority_meta WHERE key=?', (self.prefix + memory_id,)).fetchone()
             if prior:
                 if json.loads(prior['value'])['submission_hash'] != digest:
                     raise IdempotencyConflict('operation payload changed')
@@ -109,7 +111,7 @@ class ChatMemoryPreparation:
                     'envelope': copy.deepcopy(envelope), 'created_at': stamp, 'updated_at': stamp,
                     'candidate_ids': [], 'attempts': 0, 'issue': None, 'lease_until': 0,
                     'history': [], 'edit_requests': {}}
-                db.execute('INSERT INTO authority_meta(key,value) VALUES(?,?)', (PREFIX + memory_id, canonical_json(row)))
+                db.execute('INSERT INTO authority_meta(key,value) VALUES(?,?)', (self.prefix + memory_id, canonical_json(row)))
             db.commit()
         except Exception:
             db.rollback()
@@ -123,7 +125,7 @@ class ChatMemoryPreparation:
             raise L1OwnerError('invalid_task_page_limit', field_path='limit')
         db = self.authority._connect()
         try:
-            where, params = '', [PREFIX + '%']
+            where, params = '', [self.prefix + '%']
             if phase is not None:
                 where = " AND (json_extract(value,'$.phase')=?"
                 params.append(phase)
@@ -144,7 +146,7 @@ class ChatMemoryPreparation:
         db = self.authority._connect()
         try:
             db.execute('BEGIN IMMEDIATE')
-            record = db.execute('SELECT value FROM authority_meta WHERE key=?', (PREFIX + memory_id,)).fetchone()
+            record = db.execute('SELECT value FROM authority_meta WHERE key=?', (self.prefix + memory_id,)).fetchone()
             if not record:
                 raise L1OwnerError('task_not_found', status=404, field_path='task_id')
             row = json.loads(record['value'])
@@ -152,7 +154,7 @@ class ChatMemoryPreparation:
                 raise L1OwnerError('submission_revision_conflict', status=409, field_path='revision')
             row = transform(row)
             row.update(revision=expected_revision + 1, updated_at=datetime.now(timezone.utc).isoformat(timespec='seconds'))
-            db.execute('UPDATE authority_meta SET value=? WHERE key=?', (canonical_json(row), PREFIX + memory_id))
+            db.execute('UPDATE authority_meta SET value=? WHERE key=?', (canonical_json(row), self.prefix + memory_id))
             db.commit()
             return row
         except Exception:
@@ -230,7 +232,7 @@ class ChatMemoryPreparation:
                 'issue': row.get('issue')}
 
 
-async def prepare_chat_tasks(engine, bucket_mgr):
+async def prepare_chat_tasks(engine, bucket_mgr, *, max_jobs=None):
     """Runs outside the chat request; never executes the original tool again."""
     from chat_memory_tool import ChatMemoryTool
     from memory_l1_ingestion import bind_sources
@@ -240,7 +242,8 @@ async def prepare_chat_tasks(engine, bucket_mgr):
     if getattr(engine, '_chat_preparation_running', False):
         return {'status': 'locked'}
     options = task_options(engine.config)
-    if not engine.memory_authority_enabled or not engine.memory_authority_store or options['chat_memory_jobs_per_run'] == 0:
+    allowance = options['chat_memory_jobs_per_run'] if max_jobs is None else min(options['chat_memory_jobs_per_run'], max_jobs)
+    if not engine.memory_authority_enabled or not engine.memory_authority_store or allowance <= 0:
         return {'status': 'disabled'}
     if engine.daily_chat_memory_mode == 'off':
         return {'status': 'disabled', 'reason': 'memory_policy_off'}
@@ -256,7 +259,7 @@ async def prepare_chat_tasks(engine, bucket_mgr):
     model_io = MemoryModelIO(engine.memory_authority_store)
     results = []
     try:
-        for pending in tasks.list(limit=options['chat_memory_jobs_per_run'], phase='queued', private=True):
+        for pending in tasks.list(limit=allowance, phase='queued', private=True):
             completion_meta = {}
             io_id = None
             try:

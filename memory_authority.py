@@ -619,6 +619,21 @@ class MemoryAuthorityStore:
         request_id: str,
         actor: str,
     ) -> dict[str, Any]:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            result = self._revise_candidate(conn, candidate_id, expected_revision=expected_revision,
+                proposal=proposal, request_id=request_id, actor=actor)
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _revise_candidate(self, conn, candidate_id, *, expected_revision, proposal, request_id, actor):
+        """Original revision operation inside the caller's Authority transaction."""
         if proposal.proposal_id != candidate_id:
             raise ValueError("candidate identity cannot change during revision")
         payload = {
@@ -627,61 +642,51 @@ class MemoryAuthorityStore:
             "proposal": proposal.payload(),
         }
         fingerprint = self.fingerprint(payload)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            if request_id:
-                prior = conn.execute(
-                    "SELECT * FROM candidate_decisions WHERE request_id=?", (request_id,)
-                ).fetchone()
-                if prior:
-                    if str(prior["fingerprint"]) != fingerprint:
-                        raise IdempotencyConflict("request_id payload differs")
-                    conn.commit()
-                    return _loads(prior["result_json"], {})
-            row = conn.execute("SELECT * FROM candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
-            if not row:
-                raise CandidateNotFound(candidate_id)
-            current = self._candidate_row(row) or {}
-            if int(current["revision"]) != int(expected_revision):
-                raise RevisionConflict(f"expected {expected_revision}, current {current['revision']}")
-            if current["status"] not in {"pending", "deferred", "commit_failed"}:
-                raise InvalidTransition(f"cannot revise candidate in {current['status']}")
-            proposal_payload = proposal.payload()
-            proposal_sha = _sha(proposal_payload)
-            next_revision = int(current["revision"]) + 1
-            now = _now()
-            result = {
-                **current,
-                "revision": next_revision,
-                "proposal_sha256": proposal_sha,
-                "proposal": proposal_payload,
-                "updated_at": now,
-            }
-            conn.execute(
-                "UPDATE candidates SET revision=?,proposal_sha256=?,proposal_json=?,updated_at=? WHERE candidate_id=?",
-                (next_revision, proposal_sha, _json(proposal_payload), now, candidate_id),
-            )
-            self._index_candidate_sources(conn, proposal_payload)
-            conn.execute(
-                "INSERT INTO candidate_revisions(candidate_id,revision,status,proposal_sha256,proposal_json,"
-                "policy_json,actor,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (candidate_id, next_revision, current["status"], proposal_sha,
-                 _json(proposal_payload), _json(current["policy"]), actor, now),
-            )
-            conn.execute(
-                "INSERT INTO candidate_decisions(decision_id,candidate_id,from_status,to_status,candidate_revision,"
-                "request_id,fingerprint,actor,reason_codes_json,result_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), candidate_id, current["status"], current["status"], next_revision,
-                 request_id, fingerprint, actor, _json(["DIARY_WINDOW_RESUMED" if actor == "diary_first_pass_resume" else "OWNER_EDITED_PROPOSAL"]), _json(result), now),
-            )
-            conn.commit()
-            return result
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        if request_id:
+            prior = conn.execute(
+                "SELECT * FROM candidate_decisions WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if prior:
+                if str(prior["fingerprint"]) != fingerprint:
+                    raise IdempotencyConflict("request_id payload differs")
+                return _loads(prior["result_json"], {})
+        row = conn.execute("SELECT * FROM candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
+        if not row:
+            raise CandidateNotFound(candidate_id)
+        current = self._candidate_row(row) or {}
+        if int(current["revision"]) != int(expected_revision):
+            raise RevisionConflict(f"expected {expected_revision}, current {current['revision']}")
+        if current["status"] not in {"pending", "deferred", "commit_failed"}:
+            raise InvalidTransition(f"cannot revise candidate in {current['status']}")
+        proposal_payload = proposal.payload()
+        proposal_sha = _sha(proposal_payload)
+        next_revision = int(current["revision"]) + 1
+        now = _now()
+        result = {
+            **current,
+            "revision": next_revision,
+            "proposal_sha256": proposal_sha,
+            "proposal": proposal_payload,
+            "updated_at": now,
+        }
+        conn.execute(
+            "UPDATE candidates SET revision=?,proposal_sha256=?,proposal_json=?,updated_at=? WHERE candidate_id=?",
+            (next_revision, proposal_sha, _json(proposal_payload), now, candidate_id),
+        )
+        self._index_candidate_sources(conn, proposal_payload)
+        conn.execute(
+            "INSERT INTO candidate_revisions(candidate_id,revision,status,proposal_sha256,proposal_json,"
+            "policy_json,actor,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (candidate_id, next_revision, current["status"], proposal_sha,
+             _json(proposal_payload), _json(current["policy"]), actor, now),
+        )
+        conn.execute(
+            "INSERT INTO candidate_decisions(decision_id,candidate_id,from_status,to_status,candidate_revision,"
+            "request_id,fingerprint,actor,reason_codes_json,result_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), candidate_id, current["status"], current["status"], next_revision,
+             request_id, fingerprint, actor, _json(["DIARY_WINDOW_RESUMED" if actor == "diary_first_pass_resume" else "OWNER_EDITED_PROPOSAL"]), _json(result), now),
+        )
+        return result
 
     def decide_candidate(
         self,
@@ -762,6 +767,20 @@ class MemoryAuthorityStore:
         finally:
             conn.close()
 
+    @staticmethod
+    def _validate_program_commit_context(conn, payload):
+        context = (payload.get('metadata') or {}).get('memory_l1_program_context') or {}
+        if context.get('origin') != 'owner_l2':
+            return
+        row = conn.execute('SELECT h.presentation_revision,r.document_json FROM memory_l2_heads h '
+            'JOIN memory_l2_revisions r ON r.memory_id=h.memory_id AND r.presentation_revision=h.presentation_revision '
+            'WHERE h.memory_id=?', (payload['memory_id'],)).fetchone()
+        from memory_l1_contract import semantic_sha256
+        if (not row or type(context.get('expected_owner_head_revision')) is not int
+                or row['presentation_revision'] != context['expected_owner_head_revision']
+                or semantic_sha256(json.loads(row['document_json'])) != context.get('expected_owner_head_sha256')):
+            raise RevisionConflict('owner L2 head changed before L1 adoption')
+
     def prepare_memory_commit(
         self,
         *,
@@ -805,6 +824,8 @@ class MemoryAuthorityStore:
             if prior:
                 if str(prior["fingerprint"]) != fingerprint:
                     raise IdempotencyConflict("idempotency_key payload differs")
+                if prior['status'] != 'committed':
+                    self._validate_program_commit_context(conn, payload)
                 conn.commit()
                 value = dict(prior)
                 value["payload"] = _loads(value.pop("payload_json"), {})
@@ -814,6 +835,7 @@ class MemoryAuthorityStore:
             current_revision = int(memory["active_revision"]) if memory else 0
             if current_revision != int(expected_revision):
                 raise RevisionConflict(f"expected {expected_revision}, current {current_revision}")
+            self._validate_program_commit_context(conn, payload)
             payload["revision"] = current_revision + 1
             try:
                 conn.execute(
@@ -896,6 +918,7 @@ class MemoryAuthorityStore:
             current_revision = int(current["active_revision"]) if current else 0
             if current_revision != int(payload["expected_revision"]):
                 raise RevisionConflict(f"expected {payload['expected_revision']}, current {current_revision}")
+            self._validate_program_commit_context(conn, payload)
             if current:
                 conn.execute(
                     "UPDATE memories SET bucket_id=?,active_revision=?,body_sha256=?,updated_at=? WHERE memory_id=?",
@@ -918,6 +941,10 @@ class MemoryAuthorityStore:
             event_id = f"memory:{memory_id}:revision:{revision}"
             from memory_l1_index import project
             project(conn, memory_id, revision, payload["metadata"])
+            from memory_relation_dependencies import record_adoptions, propagate_change
+            record_adoptions(conn, memory_id, revision, operation_id, payload['actor'],
+                payload['decision_source'], payload['metadata'])
+            propagate_change(conn, memory_id, revision, operation_id)
             outbox_payload = {
                 "memory_id": memory_id, "bucket_id": payload["bucket_id"],
                 "revision": revision, "body_sha256": payload["body_sha256"],
@@ -1674,6 +1701,8 @@ class MemoryAuthorityStore:
                 "UPDATE memories SET state=?,recall_policy=?,updated_at=? WHERE memory_id=?",
                 (state, recall_policy, now, memory_id),
             )
+            from memory_relation_dependencies import propagate_change
+            propagate_change(conn, memory_id, current_revision, operation_id, reason='lifecycle_changed')
             event_id = f"memory:{memory_id}:state:{operation_id}"
             event_payload = {"memory_id": memory_id, "state": state, "recall_policy": recall_policy}
             conn.execute(

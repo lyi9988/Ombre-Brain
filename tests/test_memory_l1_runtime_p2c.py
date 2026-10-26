@@ -57,6 +57,33 @@ def runtime(tmp_path, text, *, fail_window=None, limit=32, compact=False):
 def run(task): return asyncio.run(task)
 
 
+@pytest.mark.parametrize('state,policy,allowed', [
+    ('active','enabled',True), ('active','manual_only',False),
+    ('active','disabled',False), ('archived','disabled',False)])
+def test_diary_model_input_respects_previous_memory_eligibility(tmp_path,state,policy,allowed):
+    from test_memory_diary_l1_p2b import accept
+    env,engine,calls=runtime(tmp_path,'原日记仅说明一项尚未确认的条件。',compact=True)
+    first=run(engine._memory_l1_diary_task(DAY,env['buckets']))
+    candidate=env['authority'].get_candidate(first['candidate_id'])
+    accept(env,candidate)
+    adopted=run(env['diary'].adopt(first['candidate_id']))
+    root_id=adopted['root']['memory_id']
+    original=run(env['revisions'].detail(root_id,1))['l1']['document']
+    run(env['commit'].change_memory_state(memory_id=root_id,state=state,recall_policy=policy,
+        idempotency_key='prior-eligibility:'+state+policy,actor='owner',expected_revision=1))
+    env['source_state']['record']['content']='原日记现有更正：条件仍然未知，不是已经成立。'
+    before=len(calls)
+    run(engine._memory_l1_diary_task(DAY,env['buckets']))
+    assert len(calls)==before+1
+    payload=calls[-1]
+    assert bool(payload['existing_members']['statements']) is allowed
+    assert payload['source_text']==env['source_state']['record']['content']
+    if not allowed:
+        assert all(not values for values in payload['existing_members'].values())
+        assert payload['existing_members_use']['state']=='not_available'
+    assert run(env['revisions'].detail(root_id,1))['l1']['document']==original
+
+
 def test_memory_l2_generation_options_have_bounded_defaults():
     from memory_l1_runtime import GENERATION_OPTIONS, task_options
     from memory_l1_service import L1OwnerError

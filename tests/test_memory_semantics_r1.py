@@ -206,6 +206,14 @@ def test_daily_and_chat_link_by_runtime_evidence_without_overwriting_author(tmp_
     assert "shared_source_not_same_fact" in item["soft_flags"]
     assert tool.store.get_candidate(ident) == original and not projection.revisions
     calls = patch_model(tool.engine, model_candidates_json([]))
+    tool.engine.daily_chat_memory_client.with_options = lambda **kwargs: tool.engine.daily_chat_memory_client
+    tool.engine.daily_chat_memory_client.base_url = 'https://synthetic.invalid/v1'
+    original_create = tool.engine.daily_chat_memory_client.create
+    async def native_fixture(**kwargs):
+        response = await original_create(**kwargs)
+        response.choices[0].finish_reason = 'stop'
+        return response
+    tool.engine.daily_chat_memory_client.create = native_fixture
     asyncio.run(tool.engine._extract_window_candidates("2026-10-09", turns))
     assert len(calls) == 1
     assert calls[0]["existing_source_memories"][0]["status"] == "pending"

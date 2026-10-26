@@ -202,7 +202,7 @@ def new_state_fields():
     tendencies, sources, _, _ = normalize_tendencies()
     return {'state_schema': STATE_SCHEMA, 'tendencies': tendencies,
             'tendency_sources': sources, 'tendency_evidence': {},
-            'migration_issues': [], 'state_migrations': [], 'label_sources': {}}
+            'migration_issues': [], 'state_migrations': [], 'label_sources': {}, 'memory_reaction_history': {}}
 
 
 def migrate_state(raw, *, tendencies=None, tendency_sources=None):
@@ -251,4 +251,5 @@ def migrate_state(raw, *, tendencies=None, tendency_sources=None):
     state['state_schema'] = STATE_SCHEMA
     state.setdefault('state_migrations', [])
     state.setdefault('label_sources', {})
+    state.setdefault('memory_reaction_history', {})
     return state

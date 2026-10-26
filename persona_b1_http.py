@@ -8,6 +8,9 @@ from starlette.responses import JSONResponse
 from persona_b1 import Conflict,ModulationSourceUnavailable
 from persona_projection import safe_persona_projection
 MAX_BODY=128*1024
+# Same finite source-message ceiling as the existing canonical memory-source
+# bridge; only completed-turn candidate transport carries full memory context.
+MAX_CANDIDATE_BODY=8*1024*1024
 
 
 def _source_unavailable(exc):
@@ -15,7 +18,7 @@ def _source_unavailable(exc):
         'source_kind':exc.source_kind,'coordinate':exc.coordinate,
         'interval_start':exc.interval_start,'interval_end':exc.interval_end},status_code=503)
 
-def register_candidate_route(mcp,engine_getter,authorized_internal):
+def register_candidate_route(mcp,engine_getter,authorized_internal,*,memory_context_resolver=None):
     @mcp.custom_route('/internal/persona/b1/candidate',methods=['POST'])
     async def ingest(request):
         if not authorized_internal(request):return JSONResponse({'error':'unauthorized'},status_code=401)
@@ -24,7 +27,7 @@ def register_candidate_route(mcp,engine_getter,authorized_internal):
         chunks=[];size=0
         async for part in request.stream():
             size+=len(part)
-            if size>MAX_BODY:return JSONResponse({'error':'request_too_large'},status_code=413)
+            if size>MAX_CANDIDATE_BODY:return JSONResponse({'error':'request_too_large'},status_code=413)
             chunks.append(part)
         try:
             data=json.loads(b''.join(chunks))
@@ -33,13 +36,14 @@ def register_candidate_route(mcp,engine_getter,authorized_internal):
             if not isinstance(turn,dict):raise ValueError('turn required')
             result=await engine.update_from_exchange(
                 turn.get('conversation_id'),turn.get('user_event',{}).get('content'),turn.get('assistant_event',{}).get('content'),
-                b1_event=data['envelope'],b1_turn=turn)
+                b1_event=data['envelope'],b1_turn=turn,
+                **({'b1_memory_resolver':memory_context_resolver} if 'memory_context' in data['envelope'] else {}))
             result_receipt=result['b1_receipt'];receipt=result_receipt['receipt']
             # Source hash is for the trusted transport acknowledgement only;
             # public/owner projection is the separate allowlist below.
             return JSONResponse({'status':'candidate_applied','replayed':result_receipt['replayed'],
                 'scope':receipt['scope'],'event_id':receipt['event_id'],'source_hash':receipt['source_hash'],
-                'revision':receipt['after_revision'],'b1_receipt':{'receipt':{k:receipt[k] for k in ('scope','event_id','source_hash','occurred_at','after_revision','status')},'replayed':result_receipt['replayed']},'projection':safe_persona_projection(result)})
+                'revision':receipt['after_revision'],'b1_receipt':{'receipt':{k:receipt[k] for k in ('scope','event_id','source_hash','occurred_at','after_revision','status','memory_reactions') if k in receipt},'replayed':result_receipt['replayed']},'projection':safe_persona_projection(result)})
         except ModulationSourceUnavailable as exc:return _source_unavailable(exc)
         except Conflict:return JSONResponse({'error':'b1_identity_or_revision_conflict'},status_code=409)
         except (ValueError,TypeError,KeyError,OverflowError):return JSONResponse({'error':'invalid_b1_candidate_input'},status_code=400)

@@ -9,7 +9,7 @@ import json
 
 from memory_l1_contract import L1ContractError, canonical_json, semantic_sha256
 
-INDEX_VERSION = "memory-l1-members-v2"
+INDEX_VERSION = "memory-l1-members-v3"
 
 
 def scene_memory_id(memory_id, scene_id):
@@ -51,6 +51,8 @@ def initialize(conn):
     """)
     from memory_l1_features import initialize as initialize_features
     initialize_features(conn)
+    from memory_relation_dependencies import initialize as initialize_relations
+    initialize_relations(conn)
 
 
 def project(conn, memory_id, revision, metadata):
@@ -85,6 +87,8 @@ def project(conn, memory_id, revision, metadata):
                      item["binding_id"], item["source_namespace"], item["source_id"], canonical_json(item["source_revision"])))
     from memory_l1_features import project as project_features
     project_features(conn, memory_id, revision, semantic)
+    from memory_relation_dependencies import project as project_relations
+    project_relations(conn, memory_id, revision, semantic)
 
 
 class MemoryL1Index:
@@ -109,9 +113,13 @@ class MemoryL1Index:
                     and row["index_version"] == INDEX_VERSION):
                 return True
             conn.execute("BEGIN IMMEDIATE")
-            record = conn.execute("SELECT metadata_json FROM memory_revisions WHERE memory_id=? AND revision=?",
+            record = conn.execute("SELECT metadata_json,operation_id,created_by,decision_source FROM memory_revisions WHERE memory_id=? AND revision=?",
                                   (memory_id, revision)).fetchone()
-            project(conn, memory_id, revision, json.loads(record[0]))
+            metadata = json.loads(record['metadata_json'])
+            project(conn, memory_id, revision, metadata)
+            from memory_relation_dependencies import record_adoptions
+            record_adoptions(conn, memory_id, revision, record['operation_id'],
+                record['created_by'], record['decision_source'], metadata)
             conn.commit()
             return True
         except Exception:

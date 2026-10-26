@@ -14,6 +14,8 @@ const CHAT_A = 'chat_memory_' + 'a'.repeat(32);
 const CHAT_B = 'chat_memory_' + 'b'.repeat(32);
 const CHAT_C = 'chat_memory_' + 'c'.repeat(32);
 const CHAT_D = 'chat_memory_' + 'd'.repeat(32);
+const BROWSE_A = 'memory_' + 'e'.repeat(16);
+const BROWSE_B = 'memory_' + 'f'.repeat(16);
 
 function copy(value) { return JSON.parse(JSON.stringify(value)); }
 
@@ -30,6 +32,15 @@ function makeDetail(task, body, title = '合成标题', hints = []) {
       preparation_status: task.phase } };
 }
 
+function makeBrowseDetail(task, body, title) {
+  const detail = makeDetail(task, body, title);
+  detail.draft = { content: body, metadata: { name: title, tags: ['browse_note'] },
+    descriptor: { schema: 'aiz.memory-source-ref-v1', namespace: 'snapshot.aiz.browse.summary',
+      source_id: 'synthetic-browse-item', source_revision: 'synthetic-source-revision',
+      source_scope: { source_kind: 'web_browse', source_event_id: 'synthetic-browse-event' } } };
+  return detail;
+}
+
 function fixtureState() {
   const action = { task_id: 'action/42', action_id: 'act-42', phase: 'failed',
     issue: { code: 'synthetic_action_failure' }, candidate_ids: ['action-candidate-42'] };
@@ -37,13 +48,18 @@ function fixtureState() {
     makeTask(CHAT_A, 'queued', 1, 1),
     makeTask(CHAT_B, 'generating', 2, 1),
     makeTask(CHAT_C, 'failed', 3, 2, { issue: { code: 'source_capture_failed', field_path: 'source.capture' } }),
-    makeTask(CHAT_D, 'prepared', 4, 2, { candidate_ids: ['review-candidate-42'] })];
+    makeTask(CHAT_D, 'prepared', 4, 2, { candidate_ids: ['review-candidate-42'] }),
+    makeTask(BROWSE_A, 'failed', 1, 1, { source_kind: 'web_browse', issue: { code: 'synthetic_browse_failure' } }),
+    makeTask(BROWSE_B, 'prepared', 5, 2, { source_kind: 'web_browse', candidate_ids: [BROWSE_B] })];
   const details = new Map([
     [CHAT_A, makeDetail(tasks[1], '原始聊天提交正文', '原标题', [{ text: '原始提示' }])],
     [CHAT_B, makeDetail(tasks[2], '处理中提交正文')],
     [CHAT_C, makeDetail(tasks[3], '失败任务仍保留的提交正文')],
     [CHAT_D, makeDetail(tasks[4], '已经生成候选的提交正文')],
+    [BROWSE_A, makeBrowseDetail(tasks[5], '浏览后保留的完整提交正文', '浏览原标题')],
+    [BROWSE_B, makeBrowseDetail(tasks[6], '已经完成准备的浏览提交正文', '浏览已准备标题')],
   ]);
+  details.get(BROWSE_B).receipt.memory_status = 'committed';
   return { tasks, details, puts: [], retries: [], gets: [], failList: false, failDetails: new Set(),
     conflictNext: false, dropNextPutReply: false, prepareNextPut: false, reordered: false };
 }
@@ -118,6 +134,10 @@ function startFixtureServer(state) {
       if (request.method === 'PUT') {
         const body = await readJson(request);
         state.puts.push({ taskId, body: copy(body) });
+        if (detail.task.source_kind === 'web_browse' &&
+            (Object.keys(body.draft).join(',') !== 'narrative' || !body.draft.narrative?.body)) {
+          sendJson(response, 400, { error: 'invalid_browse_submission_edit' }); return;
+        }
         if (state.prepareNextPut) {
           state.prepareNextPut = false;
           detail.task.revision += 1; detail.task.phase = 'prepared'; detail.task.issue = null;
@@ -129,7 +149,10 @@ function startFixtureServer(state) {
         if (state.conflictNext) {
           state.conflictNext = false;
           detail.task.revision += 1; detail.task.draft_revision += 1;
-          detail.draft = { narrative: { title: '服务器冲突标题', body: '409 时服务器已保存的版本' } };
+          if (detail.task.source_kind === 'web_browse') {
+            detail.draft.content = '409 时服务器已保存的浏览版本';
+            detail.draft.metadata.name = '服务器浏览冲突标题';
+          } else detail.draft = { narrative: { title: '服务器冲突标题', body: '409 时服务器已保存的版本' } };
           detail.receipt.preparation_status = 'queued'; detail.receipt.memory_status = 'absent';
           syncTaskFromDetail(state, taskId);
           sendJson(response, 409, { error: 'revision_conflict', task: copy(detail.task) }); return;
@@ -139,7 +162,11 @@ function startFixtureServer(state) {
         }
         detail.task.revision += 1; detail.task.draft_revision += 1; detail.task.phase = 'queued';
         detail.task.issue = null; detail.task.candidate_ids = [];
-        detail.draft = copy(body.draft);
+        if (detail.task.source_kind === 'web_browse') {
+          detail.draft.content = body.draft.narrative.body;
+          detail.draft.metadata.name = body.draft.narrative.title || '';
+          detail.draft.draft_arguments = copy(body.draft);
+        } else detail.draft = copy(body.draft);
         detail.receipt.preparation_status = 'queued'; detail.receipt.memory_status = 'absent';
         detail.history.push({ phase: 'queued', revision: detail.task.revision,
           draft_revision: detail.task.draft_revision, created_at: '2026-10-16T10:01:00Z' });
@@ -209,7 +236,7 @@ function readJson(request) {
       assert.match(text, /候选已准备 · 待 Review；尚未正式入库/);
       assert.match(text, /act-42/);
       assert.match(text, /synthetic_action_failure/);
-      assert.equal(await page.locator('#memory-source-tasks [data-chat-submission-task-id]').count(), 4);
+      assert.equal(await page.locator('#memory-source-tasks [data-chat-submission-task-id]').count(), 6);
       assert.equal(await page.locator('#memory-source-tasks button', { hasText: '重试整理' }).count(), 1,
         'the existing action retry stays visible');
       assert.equal(await page.locator(`#memory-source-tasks [data-chat-submission-task-id="${CHAT_C}"] button`, { hasText: '重试准备' }).count(), 1);
@@ -229,6 +256,72 @@ function readJson(request) {
         'prepared drafts are read only here');
       assert.equal(await detail.locator('[data-chat-submission-save]').count(), 0);
       if (screenshotDir) await page.screenshot({ path: path.join(screenshotDir, 'chat-submission-prepared-1280.png'), fullPage: true });
+      await row.locator('button', { hasText: '收起提交稿' }).click();
+    });
+
+    await test('browse envelope opens in the shared editor, saves narrative only, and reads back without changing provenance', async () => {
+      const row = await openTask(BROWSE_A);
+      await page.waitForFunction(id => document.querySelector(`[data-chat-submission-task-id="${id}"] [data-chat-submission-body]`)?.value === '浏览后保留的完整提交正文', BROWSE_A);
+      const detail = row.locator('[data-chat-submission-detail]');
+      assert.match(await row.textContent(), /浏览记忆提交/);
+      assert.equal(await detail.locator('[data-chat-submission-title]').inputValue(), '浏览原标题');
+      assert.equal(await detail.locator('[data-chat-submission-hints]').count(), 0);
+      assert.match(await detail.locator('[data-browse-submission-source]').textContent(), /synthetic-browse-event/);
+      assert.equal(await detail.locator('[data-browse-submission-source] input, [data-browse-submission-source] textarea').count(), 0);
+      const descriptor = copy(state.details.get(BROWSE_A).draft.descriptor);
+      await detail.locator('[data-chat-submission-title]').fill('编辑后的浏览标题');
+      await detail.locator('[data-chat-submission-body]').fill('编辑后的浏览完整正文，保留主体和未知。');
+      await detail.locator('button', { hasText: '读取服务器最新草稿' }).click();
+      await page.waitForFunction(id => document.querySelector(`[data-chat-submission-task-id="${id}"] [data-chat-submission-notice]`)?.textContent.includes('当前未保存输入保持不变'), BROWSE_A);
+      assert.equal(await detail.locator('[data-chat-submission-body]').inputValue(), '编辑后的浏览完整正文，保留主体和未知。');
+      await detail.locator('[data-chat-submission-save]').click();
+      await page.waitForFunction(id => document.querySelector(`[data-chat-submission-task-id="${id}"] [data-chat-submission-notice]`)?.textContent.includes('已保存并从服务器读回'), BROWSE_A);
+      assert.equal(state.puts.at(-1).taskId, BROWSE_A);
+      assert.deepEqual(state.puts.at(-1).body.draft, { narrative: {
+        title: '编辑后的浏览标题', body: '编辑后的浏览完整正文，保留主体和未知。' } });
+      assert.equal(state.puts.at(-1).body.expected_revision, 1);
+      assert.equal(state.details.get(BROWSE_A).task.draft_revision, 2);
+      assert.equal(state.details.get(BROWSE_A).draft.content, '编辑后的浏览完整正文，保留主体和未知。');
+      assert.deepEqual(state.details.get(BROWSE_A).draft.descriptor, descriptor);
+      assert.deepEqual(state.details.get(BROWSE_A).draft.metadata.tags, ['browse_note']);
+      assert.ok(state.gets.some(entry => entry.kind === 'detail' && entry.taskId === BROWSE_A));
+    });
+
+    await test('browse conflict, session reload, and lost acknowledgement preserve the same editable draft', async () => {
+      let row = page.locator(`[data-chat-submission-task-id="${BROWSE_A}"]`);
+      await row.locator('[data-chat-submission-body]').fill('浏览本地未保存稿，跨刷新与冲突保留。');
+      await page.locator('#memory-source-tasks button', { hasText: '刷新准备状态' }).click();
+      await page.waitForFunction(() => !document.querySelector('#memory-source-tasks [role="status"]')?.textContent.includes('正在刷新'));
+      assert.equal(await row.locator('[data-chat-submission-body]').inputValue(), '浏览本地未保存稿，跨刷新与冲突保留。');
+      await page.reload();
+      await page.evaluate(() => window.loadDailyChatMemoryPending());
+      await page.waitForFunction(() => Boolean(document.querySelector('#memory-source-tasks [data-source-task-list]')));
+      row = await openTask(BROWSE_A);
+      await page.waitForFunction(id => document.querySelector(`[data-chat-submission-task-id="${id}"] [data-chat-submission-body]`)?.value === '浏览本地未保存稿，跨刷新与冲突保留。', BROWSE_A);
+      assert.equal(await row.locator('[data-chat-submission-hints]').count(), 0);
+      state.conflictNext = true;
+      await row.locator('[data-chat-submission-save]').click();
+      await page.waitForFunction(id => document.querySelector(`[data-chat-submission-task-id="${id}"]`)?.textContent.includes('409 时服务器已保存的浏览版本'), BROWSE_A);
+      assert.equal(await row.locator('[data-chat-submission-body]').inputValue(), '浏览本地未保存稿，跨刷新与冲突保留。');
+      assert.equal(await row.locator('[data-chat-submission-save]').isDisabled(), true);
+      await row.locator('button', { hasText: '保留当前编辑并以服务器版本为基线' }).click();
+      state.dropNextPutReply = true;
+      await row.locator('[data-chat-submission-save]').click();
+      await page.waitForFunction(id => document.querySelector(`[data-chat-submission-task-id="${id}"] [data-chat-submission-notice]`)?.textContent.includes('保存响应未确认，但服务器读回已证明'), BROWSE_A);
+      assert.equal(state.puts.at(-1).body.expected_revision, 3);
+      assert.deepEqual(Object.keys(state.puts.at(-1).body.draft), ['narrative']);
+      assert.equal(state.details.get(BROWSE_A).draft.content, '浏览本地未保存稿，跨刷新与冲突保留。');
+      assert.equal(await row.locator('[data-chat-submission-save]').isDisabled(), true);
+    });
+
+    await test('prepared browse drafts retain their body and reflect committed receipt without inventing Review pending', async () => {
+      const row = await openTask(BROWSE_B);
+      await page.waitForFunction(id => document.querySelector(`[data-chat-submission-task-id="${id}"]`)?.textContent.includes('正式入库回执：已正式入库'), BROWSE_B);
+      assert.match(await row.textContent(), /已经完成准备的浏览提交正文/);
+      assert.doesNotMatch(await row.textContent(), /待 Review；尚未正式入库|正式记忆只有在 Review 确认后才入库/);
+      assert.equal(await row.locator('[data-chat-submission-editor]').count(), 0);
+      assert.equal(await row.locator('[data-chat-submission-hints]').count(), 0);
+      assert.match(await row.locator('[data-browse-submission-source]').textContent(), /synthetic-browse-item/);
       await row.locator('button', { hasText: '收起提交稿' }).click();
     });
 

@@ -15,7 +15,7 @@ from memory_l1_contract import canonical_json
 from memory_l1_service import L1OwnerError
 
 PREFIX = 'memory_model_io:'
-STAGES = ('chat_l1', 'presentation_l2')
+STAGES = ('chat_l1', 'presentation_l2', 'memory_l3_sync')
 
 
 def _stamp():

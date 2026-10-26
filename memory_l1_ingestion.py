@@ -29,6 +29,9 @@ def source_snapshot(source, *, config=None):
     if source.get('namespace') == 'attachment_text':
         from memory_attachment_source import snapshot
         return snapshot(source)
+    if source.get('namespace') == 'browse_material':
+        from memory_browse_source import snapshot
+        return snapshot(source)
     namespace = {'canonical_event': 'snapshot.aiz.canonical_event', 'raw_event': 'snapshot.ombre.raw_event',
                  'conversation_turn': 'snapshot.ombre.conversation_turn',
                  'action_receipt': 'snapshot.aiz.action_receipt'}.get(source.get('namespace'))
@@ -73,6 +76,9 @@ def bind_sources(sources, *, config=None):
             'anchors': [make_text_anchor(snapshot['text'], target_namespace='l0', target_id=snapshot['source_id'],
                 target_revision=snapshot['source_revision'], text_view_id=snapshot['text_view_id'],
                 start=extent['start'], end=extent['end'])]})
+        if source.get('namespace') == 'browse_material':
+            from memory_browse_source import read_bindings
+            read_bindings(source, snapshot, bindings[-1])
     return snapshots, bindings
 
 

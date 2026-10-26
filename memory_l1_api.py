@@ -65,6 +65,9 @@ def build_schema(source_ids, catalog, *, stage="auto_l1", narrative_from_draft=F
 
     for name in ('Condition', 'ConditionException'):
         defs[name]['required'] = ['state']
+        defs[name]['description'] = (
+            'A requirement or exception governing a claim. state=known means the condition is specified, '
+            'not that it has been satisfied. Preserve all jointly required clauses and unknown fulfilment.')
     defs['EventTime']['required'] = ['precision', 'interpretation']
     for field in ('start', 'end', 'timezone'):
         defs['EventTime']['properties'][field] = deepcopy(text_value)
@@ -84,8 +87,17 @@ def build_schema(source_ids, catalog, *, stage="auto_l1", narrative_from_draft=F
     statement['properties']['subject_ref'] = ref('SubjectRef')
     statement['properties']['time'] = nullable(ref('StatementTime'))
     statement['properties']['conditions'] = {'anyOf': [ref('Condition'), {'type': 'string'}, {'type': 'null'}]}
+    statement['properties']['conditions']['description'] = (
+        'Attach requirements to the plan/claim they govern. A and B are both required when joined by AND. '
+        'Do not turn a requirement into a separate asserted fact, especially when the source says its fulfilment is unknown.')
     statement['properties']['role_hint'] = value_schema({'type': 'string', 'enum': ['core', 'detail']})
     defs['Scene']['required'] = ['title', 'statement_refs']
+    defs['Scene']['properties']['source_refs']['description'] = (
+        'Source identifiers only: an array of strings chosen from the supplied source_ids. '
+        'Range objects belong in source_ranges, never in source_refs.')
+    defs['Scene']['properties']['source_ranges']['description'] = (
+        'Optional exact original-text spans: objects with source_ref, start and end. '
+        'Use source_refs for source identifiers without a verified span.')
     defs['Relation']['required'] = ['from', 'to', 'kind', 'evidence_refs']
     # The current initial-task projection permits only source-local relations.
     relation_values = [key for key in catalog['relation_types']
@@ -149,10 +161,18 @@ def prepare_request(messages, *, stage):
                           narrative_from_draft=bool(payload.get('narrative_from_draft')))
     # The compact model catalogue is a projection (including owner definitions),
     # not another classification authority. The same values constrain the API.
-    envelope['semantic_contract'] = {
-        'source_ids': context['source_ids'], 'catalog': catalog,
-        'output_rules': '按API提供的JSON Schema输出；保留全部主体、时间、条件、否定、未知及认知语义。只填写有来源的内容。',
-    }
+    # Keep the existing compact contract in the model-visible input as well.
+    # Sending response_format through a compatible provider does not prove that
+    # its backend enforces the schema. Do not strip the only text explanation
+    # of fields such as scene references versus source-relative ranges.
+    envelope['semantic_contract'] = deepcopy(context)
+    envelope['semantic_contract']['output_rules'] = (
+        '按API提供的JSON Schema及本结构说明输出JSON；保留全部主体、时间、条件、否定、未知及认知语义。'
+        '只填写有来源的内容。source_refs与evidence_refs只放来源标记字符串；'
+        '带source_ref、start、end的对象只能放在source_ranges，坐标必须对应实际原文。'
+        '没有可靠精确范围时省略source_ranges，保留有据的source_refs；不得猜测范围。'
+        'conditions.state=known仅表示条件内容明确，不表示已满足。联合条件挂在它约束的计划或承诺上，'
+        '不可拆成已经成立的事实；结合原文前后段的未知、否定和更正，逐条核对statements，不只核对正文。')
     result[-1]['content'] = json.dumps(payload, ensure_ascii=False)
     return result, schema
 

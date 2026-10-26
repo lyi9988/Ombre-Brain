@@ -37,6 +37,7 @@ DIARY_L1_PROMPT = """你在为{ai_name}整理日记第一遍记忆。返回JSON�
 依据输入中的全文或明确标记的完整分段，生成一条diary_full的完整连贯第一遍记忆，不能仅保留一条短摘要或复制原文冒充已整理。
 document按输入semantic_contract及其中catalog填写，format="semantic-v1"；narrative保存整篇整理后的完整经历；entities/statements必须给出且可空，scenes/retrieval/relations/attributes没有提取项时可省略，有内容就完整保留。
 每条陈述必须明确content、subject_ref、classification中的kind/stability/modality/basis、time、conditions、evidence_refs，不能漏掉语义判定字段。已知值可直接写语义值，明确未说明写null，未解决或不适用用state容器；已知值依据可继承本陈述evidence_refs，需区别时局部写明。time:null表示事件和适用时间均未说明；time为对象时event/applicability分别明确，可为null或按semantic_contract给出的语义对象。conditions:null表示未说明；真实条件、例外仍需完整保留，短文本条件只作文字理解，不冒充可执行谓词；话题和目标范围留在content。
+联合条件挂在它约束的计划或承诺上，保留“并且/同时”的全部门槛，不能拆成各条件已经成立的独立事实。conditions.state=known只表示条件内容明确，不表示条件已满足。逐条statements都要对照同段前后文：若前面提到某要求，后面明确“不知道是否/还未确认”，就保留要求及未知，不能肯定该要求已经满足；原文确有歧义或冲突时保留未确定，不自行裁定。正文写对不代表结构化陈述写对，输出前分别核对。
 scene是连贯子事件，不按字数或标点硬切；scene_bodies用scene局部key保存各自完整连贯正文；场景共享陈述由document.statements唯一维护。
 场景数量与最低价值遵守输入配置，0数量上限表示不设人为条数上限，不为凑数拆分。短边界/承诺不因字少丢失。
 scene.source_refs引用本次diary-source；精确范围用source_ranges，坐标为所给实际原文codepoint坐标，不输出hash/版本/anchor。场景正文和陈述中的主体遵循原日记作者，不固定把“我”当主人。

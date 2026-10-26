@@ -386,13 +386,15 @@ class PersonaStateEngine:
         recalled_memory_ids: list[str] | None = None,
         tool_summary: str = "",
         recent_conversation_turns: list[dict] | None = None,
-        *, b1_event: dict | None = None, b1_turn: dict | None = None,
+        *, b1_event: dict | None = None, b1_turn: dict | None = None, b1_memory_resolver=None,
     ) -> dict:
         if self.b1_candidate is not None:
             if b1_event is None or b1_turn is None:
                 raise ValueError('B1 candidate requires source-bound completed turn; legacy fallback forbidden')
             if b1_turn.get('user_event',{}).get('content') != user_message or b1_turn.get('assistant_event',{}).get('content') != assistant_response or b1_turn.get('conversation_id') != session_id:
                 raise ValueError('B1 turn does not match engine exchange')
+            if 'memory_context' in b1_event or 'memory_reactions' in b1_event:
+                return await self.b1_candidate.settle_async(b1_event,b1_turn,resolver=b1_memory_resolver)
             return self.b1_candidate.settle(b1_event,b1_turn)
         if b1_event is not None or b1_turn is not None:
             raise ValueError('B1 input without explicit candidate owner')

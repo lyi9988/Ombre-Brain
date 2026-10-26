@@ -51,6 +51,7 @@ RECALL_DEFAULTS = {
     "recent_context_mode": "auto", "recent_context_max_items": 6,
     "scoring_profiles": [],
     "signal_bindings": [], "affinity_mappings": [], "affinity_aggregation": "max",
+    "inner_state_affinity": {"enabled": True, "max_bonus": 0.05, "weights": {}},
     "cognition_chain_depth": 2, "cognition_chain_nodes": 8, "cognition_chain_budget": 300,
     "local_match_weights": LOCAL_MATCH_WEIGHTS,
 }
@@ -99,7 +100,7 @@ PENDING_RUNTIME_INPUTS = [
     ("feedback_score", "number", "真实反馈（未接入，运行时未知）"),
     ("repeat_penalty", "number", "跨轮重复惩罚（未接入，运行时未知）"),
 ]
-SIGNAL_PRODUCERS = frozenset({"aiz.needs", "aiz.goals", "aiz.interests", "ombre.persona"})
+SIGNAL_PRODUCERS = frozenset({"aiz.needs", "aiz.goals", "aiz.interests", "ombre.persona", "guyan.inner_state"})
 AFFINITY_TARGETS = frozenset({"interest_affinity", "drive_affinity", "goal_alignment"})
 _ID = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _FUNCTIONS = {"min", "max", "clamp", "coalesce", "exp", "abs"}
@@ -432,7 +433,7 @@ def validate_values(values):
                 _fail("boolean_required", "recall." + name)
             continue
         if name in {"mode", "formula_id", "hierarchy_mode", "recent_context_mode", "scoring_profiles", "local_match_weights",
-                    "signal_bindings", "affinity_mappings", "affinity_aggregation"} or value is None:
+                    "signal_bindings", "affinity_mappings", "affinity_aggregation", "inner_state_affinity"} or value is None:
             continue
         _number(value, "recall." + name)
         if name in COGNITION_LIMITS and (type(value) is not int or not 0 <= value <= COGNITION_LIMITS[name]):
@@ -446,6 +447,18 @@ def validate_values(values):
         if not 0 <= _number(value, "recall.local_match_weights." + name) <= 1:
             _fail("local_weight_out_of_range", "recall.local_match_weights." + name)
     recall["local_match_weights"] = {**LOCAL_MATCH_WEIGHTS, **weights}
+    from memory_inner_affinity import DEFAULT_POLICY, DEFAULT_WEIGHTS
+    inner = _object(recall["inner_state_affinity"], DEFAULT_POLICY, "recall.inner_state_affinity")
+    inner = {**copy.deepcopy(DEFAULT_POLICY), **inner}
+    if type(inner["enabled"]) is not bool:
+        _fail("boolean_required", "recall.inner_state_affinity.enabled")
+    if not 0 <= _number(inner["max_bonus"], "recall.inner_state_affinity.max_bonus") <= 0.05:
+        _fail("inner_affinity_bonus_out_of_range", "recall.inner_state_affinity.max_bonus", minimum=0, maximum=0.05)
+    inner_weights = _object(inner["weights"], DEFAULT_WEIGHTS, "recall.inner_state_affinity.weights")
+    for name, value in inner_weights.items():
+        if not 0 <= _number(value, "recall.inner_state_affinity.weights." + name) <= 1:
+            _fail("inner_affinity_weight_out_of_range", "recall.inner_state_affinity.weights." + name)
+    recall["inner_state_affinity"] = inner
     limits = _object(values["limits"], LIMITS, "limits", LIMITS)
     for key, value in limits.items():
         validate_limit(key, value)
@@ -838,6 +851,7 @@ def preview(values, inputs):
 
 
 def configuration(config, *, last_request=None):
+    from memory_inner_affinity import DEFAULT_POLICY, DEFAULT_WEIGHTS
     values = values_from_config(config)
     rev = revision(values)
     try:
@@ -887,6 +901,9 @@ def configuration(config, *, last_request=None):
         "bindings": {"limits": {name: {"section": row[0], "key": row[1], "minimum": row[2],
                       "maximum": row[3], "default": row[4], "label": row[5]} for name, row in LIMITS.items()},
             "runtime_inputs": runtime_inputs,
+            "inner_state_affinity": {"producer": "guyan.inner_state",
+                "defaults": copy.deepcopy(DEFAULT_POLICY), "default_weights": copy.deepcopy(DEFAULT_WEIGHTS),
+                "dimension_keys": sorted(DEFAULT_WEIGHTS), "max_bonus_range": [0, 0.05]},
             "recall": {name: {"value": recall.get(name) if recall.get(name) is not None else value,
                               "source": "owner" if name in configured_recall and recall.get(name) is not None else "inherited"}
                        for name, value in {**RECALL_DEFAULTS, **inherited}.items()}},

@@ -105,6 +105,20 @@ def semantic_input_projection(material):
             **{key: copy.deepcopy(source.get(key)) for key in
                ('text', 'title', 'author', 'speaker')},
             'source_recorded_at': source.get('recorded_at')}
+        if source['binding'].get('source_namespace') == 'snapshot.aiz.browse.article':
+            # L0 retains the full acquired page, but only actually read ranges
+            # qualify as this reading's evidence. Keep gaps/absolute offsets in
+            # the model view rather than quietly exposing the unread article.
+            text = projected.pop('text')
+            ranges = []
+            for anchor in sorted(source['binding']['anchors'], key=lambda a: (a['start'], a['end'])):
+                if ranges and anchor['start'] <= ranges[-1][1]:
+                    ranges[-1][1] = max(ranges[-1][1], anchor['end'])
+                else:
+                    ranges.append([anchor['start'], anchor['end']])
+            projected.update(read_ranges=[{'start': left, 'end': right, 'text': text[left:right]}
+                for left, right in ranges], source_length=len(text),
+                coordinate_unit='unicode_codepoint_absolute_half_open')
         # Current-source qualification is completed by _material, not by the
         # model. Keep substantive source limitations without repeating the
         # snapshot reader's technical disclaimer as if it were an experience.
@@ -119,6 +133,12 @@ def semantic_input_projection(material):
     if material['rings']:
         result['rings'] = [omit(item, {'memory_id', 'operation_id', 'content_sha256', 'ring_id', 'state'})
                            for item in material['rings']]
+    related = material.get('related_memory_updates')
+    if related and (related['updates'] or related['guards'] or related['issues']):
+        # These are fixed, adopted relation endpoints with live source checks,
+        # not a second retrieval or permission to rewrite unrelated memories.
+        result['related_memory_updates'] = copy.deepcopy({key: related[key]
+            for key in ('updates', 'guards', 'issues')})
     # Keep custom meanings used by this document without resending the whole
     # generation catalog snapshot and its unused vocabulary.
     from memory_l1_semantic_wire import semantic_catalog
@@ -242,7 +262,8 @@ class MemoryL2Service:
             refs = document['entry'].get('shared_statement_refs', [])
             shared = [reads.index.member(parent['memory_id'], parent['revision'], 'statements', ref) for ref in refs]
             if any(s is None for s in shared): raise L1OwnerError('scene_dependency_mismatch', status=409)
-        rings = [r for r in base['rings'] if r['state'] == 'active']
+        from memory_l3_records import relevant_rings
+        rings = relevant_rings(base['rings'], document)
         dependencies = source_dependency_ids(document, shared_statements=shared, rings=rings)
         bindings = reads.source_list(memory_id, expected)['sources']
         if dependencies - {binding['binding_id'] for binding in bindings}:
@@ -256,9 +277,59 @@ class MemoryL2Service:
                 raise L1OwnerError('l2_source_not_available', status=409)
             sources.append(source)
         return {'l1_document': document, 'shared_statements': shared, 'sources': sources,
-                'rings': rings}
+                'rings': rings, 'related_memory_updates': await reads.relation_material(memory_id, expected)}
+
+    async def _unaffected_sync_units(self, item, status):
+        """Only complete, explicitly disjoint units survive a known fact scope."""
+        product, scope = status['presentation'], status.get('sync_scope') or {}
+        if (scope.get('unknown_scope', True) or not product or product['units_state'] != 'current'
+                or product['first_pass_revision'] != item['revision']):
+            return {}
+        previous, current = copy.deepcopy(product['dependency_versions']), copy.deepcopy(status['current_dependencies'])
+        for dep in (previous, current):
+            relation = dep.get('relation_dependencies', {})
+            for key in ('token', 'sync_scope', 'l1_sync_required'):
+                relation.pop(key, None)
+        if not self.store.dependencies_match({**product, 'dependency_versions': previous}, current):
+            return {}
+        affected = set(scope.get('statement_ids', []))
+        uses = item.get('statement_uses', {})
+        allowed = {ref for ref in item['statement_ids'] if uses.get(ref) in item['allowed_uses']} - affected
+        selected = set(item.get('matched_statement_ids', item['statement_ids'])) | set(item.get('support_statement_ids', []))
+        doc = product['document']
+        candidates = [*doc['coherent_sections'], *[v for v in doc['optional_use_variants']
+            if v['intended_use'] in item['allowed_uses'] and all(uses.get(ref) == v['intended_use'] for ref in v['statement_refs'])]]
+        units = [v for v in candidates if v['statement_refs'] and set(v['statement_refs']) <= allowed
+                 and set(v['statement_refs']) & selected]
+        if not units:
+            return {}
+        refs = {ref for unit in units for ref in unit['statement_refs']}
+        reads = MemoryL1Reads(self.revisions, self.engine._memory_l1_sources())
+        base = await self.revisions.detail(item['memory_id'])
+        document = base['l1']['document']
+        # Shared scene units require the ordinary complete resolver path.
+        if document['entry'].get('parent_ref'):
+            return {}
+        from memory_l3_records import relevant_rings
+        dependencies = source_dependency_ids(document, rings=relevant_rings(base['rings'], document), statement_ids=refs)
+        checked = (await reads.recall_source_status([{'memory_id': item['memory_id'], 'revision': item['revision'],
+            'binding_ids': sorted(dependencies)}]))['items'][0]
+        related = await reads.relation_material(item['memory_id'], item['revision'])
+        if checked['state'] != 'ok' or any(not s.get('eligible_source') for s in checked['sources'].values()) or related['issues']:
+            return {}
+        latest = self.detail(item['memory_id'])['l2']
+        if (latest['state'] != 'pending_sync' or latest['current_presentation_revision'] != product['presentation_revision']
+                or latest['sync_scope'] != scope or latest['current_dependencies'] != status['current_dependencies']):
+            return {}
+        return {'text': '\n\n'.join(dict.fromkeys(v['text'] for v in units)),
+            'units': [{'unit_id': v.get('variant_id', v.get('section_id')), 'text': v['text'],
+                       'statement_refs': v['statement_refs']} for v in units],
+            'presentation_revision': product['presentation_revision'],
+            'coverage': {'used_statement_ids': sorted(refs), 'source_binding_ids': sorted(dependencies),
+                         'full_narrative': False, 'partial_sync': True}}
 
     async def resolve(self, payload):
+        from memory_l3_records import relevant_rings
         self.request(payload, {'items'})
         if not isinstance(payload['items'], list): raise L1OwnerError('array_required', field_path='items')
         results, pending = [], []
@@ -281,10 +352,22 @@ class MemoryL2Service:
             try:
                 status = self.detail(item['memory_id'])['l2']
                 result.update(state=status['state'], reason=status['reason'])
+                if status.get('sync_scope'):
+                    result['sync_scope'] = status['sync_scope']
+                if status['state'] == 'pending_sync':
+                    result.update(await self._unaffected_sync_units(item, status))
+                    results.append(result)
+                    continue
                 product = status['presentation']
                 if status['state'] == 'ready' and product['first_pass_revision'] == item['revision']:
                     if reads is None:
                         reads = MemoryL1Reads(self.revisions, self.engine._memory_l1_sources())
+                    related = await reads.relation_material(item['memory_id'], item['revision'])
+                    if related['issues']:
+                        result.update(state='stale', reason='related_memory_dependency_unavailable',
+                                      relation_issues=related['issues'], relation_guards=related['guards'])
+                        results.append(result)
+                        continue
                     doc = product['document']
                     statement_uses = item.get('statement_uses', {})
                     allowed = {ref for ref in item['statement_ids'] if statement_uses.get(ref) in item['allowed_uses']}
@@ -324,7 +407,7 @@ class MemoryL2Service:
                     used_refs = refs if full else unit_refs
                     bindings = reads.source_list(item['memory_id'], item['revision'])['sources']
                     dependencies = source_dependency_ids(l1, shared_statements=shared,
-                        rings=[r for r in base['rings'] if r['state'] == 'active'],
+                        rings=relevant_rings(base['rings'], l1),
                         statement_ids=None if full else used_refs)
                     if dependencies - {b['binding_id'] for b in bindings}:
                         raise L1OwnerError('l2_source_dependency_missing', status=409)
@@ -332,6 +415,7 @@ class MemoryL2Service:
                     pending.append({
                         'result': result, 'memory_id': item['memory_id'],
                         'presentation_revision': product['presentation_revision'],
+                        'relation_source_token': related['token'],
                         'source_request': {'memory_id': item['memory_id'], 'revision': item['revision'],
                             'binding_ids': [b['binding_id'] for b in bindings if b['binding_id'] in dependencies]},
                         'text': text,
@@ -385,6 +469,8 @@ class MemoryL2Service:
                         latest = self.detail(row['memory_id'])['l2']
                         if latest['state'] != 'ready' or latest['current_presentation_revision'] != row['presentation_revision']:
                             result.update(state='stale', text='', units=[], reason='dependency_changed')
+                        elif (await reads.relation_material(row['memory_id'], latest['presentation']['first_pass_revision']))['token'] != row['relation_source_token']:
+                            result.update(state='stale', text='', units=[], reason='related_memory_dependency_unavailable')
                     except MemoryNotFound:
                         result.update(state='not_prepared', text='', units=[], reason='memory_not_found')
                     except (L1OwnerError, L1ContractError) as exc:
@@ -450,7 +536,9 @@ class MemoryL2Service:
                 validate_output(document, schema)
                 # Recheck the full source material after a potentially long
                 # provider call; a revoked or changed source cannot be revived.
-                await self._material(job['memory_id'], dep['first_pass_revision'])
+                rechecked = await self._material(job['memory_id'], dep['first_pass_revision'])
+                if rechecked['related_memory_updates']['token'] != full_material['related_memory_updates']['token']:
+                    raise L1OwnerError('l2_relation_source_dependency_changed', status=409)
                 if self.generation_context()[2] != generation: raise L1OwnerError('l2_generation_configuration_changed')
                 result = self.store.save(job['memory_id'], document, dep, request_id=job['task_id'],
                     expected_revision=job['base_presentation_revision'], actor='model', job=job)

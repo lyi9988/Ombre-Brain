@@ -8,7 +8,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from persona_b1 import PersonaB1Store,PersonaB1Adapter,FIELDS
 from persona_engine import PersonaStateEngine
-from persona_b1_http import register_candidate_route
+from persona_b1_http import register_candidate_route,MAX_CANDIDATE_BODY
 from test_persona_b1 import NOW,turn,event
 from test_persona_b1_layers import layers_policy
 class RouteRegistry:
@@ -44,7 +44,7 @@ class HTTP(unittest.IsolatedAsyncioTestCase):
         e=event(turn());e['decision']['source_hash']='0'*64;r=await self.post({'envelope':e,'turn':turn()})
         self.assertEqual(r.status_code,409);self.assertNotIn('合成',r.text);self.assertEqual(self.store.read('guyan')['revision'],0)
     async def test_bounded_body_and_schema(self):
-        r=await self.client.post('/internal/persona/b1/candidate',content=b'x'*131073,headers={'Authorization':'Bearer fixture-only'})
+        r=await self.client.post('/internal/persona/b1/candidate',content=b'x'*(MAX_CANDIDATE_BODY+1),headers={'Authorization':'Bearer fixture-only'})
         self.assertEqual(r.status_code,413)
         r=await self.post({'private':'PRIVATE_SENTINEL'});self.assertEqual(r.status_code,400);self.assertNotIn('PRIVATE_SENTINEL',r.text)
     async def test_no_get_or_public_tool_write(self):

@@ -11,6 +11,7 @@ import httpx
 from memory_recall_semantics import (apply_relations, known, lexical_features, resolve_document,
                                      score_document, temporal_features)
 from memory_system_config import REQUEST_CONFIGURATION, values_from_config
+from memory_inner_affinity import (build_inner_context, document_inner_affinity, local_inner_candidates)
 
 
 def values(service):
@@ -41,6 +42,12 @@ def context(service, request, query):
             "facts": {"hour": {"state": "known", "value": now.hour},
                       "weekday": {"state": "known", "value": now.weekday()}},
         }
+    if "inner_state_affinity" not in request["_use_context"]:
+        request["_use_context"]["inner_state_affinity"] = build_inner_context(
+            values(service), request.get("_signal_snapshots", []),
+            request.get("_signal_sampled_at") or datetime.now(timezone.utc), query,
+            scope={key: request[key] for key in ("conversation_id", "source_event_id", "profile_id")
+                   if request.get(key)})
     return request["_use_context"]
 
 
@@ -77,6 +84,12 @@ def add_local_candidates(service, request, query, pool):
             pool.append({"bucket": request["_semantic_buckets"][bid], "score": strength,
                          "keyword_score": 0.0, "semantic_score": 0.0,
                          "l1_local_match": signals})
+    capacity = min(settings.get("limits", {}).get("semantic_candidate_top_k", 50),
+                   settings.get("limits", {}).get("rerank_candidate_limit", 20))
+    additions = local_inner_candidates(request.get("_semantic_records", {}),
+        request.get("_semantic_buckets", {}), context(service, request, query)["inner_state_affinity"],
+        settings, {str(item["bucket"]["id"]) for item in pool}, limit=max(0, capacity - len(pool)))
+    pool.extend(additions)
     return pool
 
 
@@ -111,6 +124,12 @@ def score_pool(service, request, query, pool, *, after_rerank=False):
                            for row in calculation["statements"])
         calculation["window_score"] = (calculation["score"] if not calculation["reason_codes"]
             and (custom_formula or time_applied or item.get("l1_local_match")) else None)
+        calculation["inner_state_affinity"] = document_inner_affinity(document,
+            use_context["inner_state_affinity"], usage=request.get("usage_by_bucket", {}).get(bid),
+            selection=item.get("_statement_selection") or calculation.get("statement_selection"),
+            calculation=calculation, settings=settings)
+        # Both scoring passes retain the original relevance/formula result.
+        # This component is adopted once, after ordinary admission/hierarchy.
         item["_configured_score"] = calculation
         if calculation["score"] is not None:
             item["score"] = calculation["score"]
@@ -196,6 +215,40 @@ async def verify_sources(service, request, query, items):
     apply_relations(records, usage_by_bucket, use_context)
     return result
 
+
+
+def apply_inner_ranking(service, request, query, pool):
+    """Adopt the independent component once after source/admission decisions."""
+    changed = False
+    for item in pool:
+        calculation = item.get("_configured_score") or {}
+        component = calculation.get("inner_state_affinity") or {}
+        base = calculation.get("score", item.get("_inner_ranking_base", item.get("score")))
+        item["_inner_ranking_base"] = base
+        bonus = component.get("bonus", 0)
+        if type(base) not in (int, float) or type(bonus) not in (int, float):
+            continue
+        item["_admission_score"] = base
+        # Card confidence thresholds also retain their original baseline.
+        reliable = getattr(service, "_dynamic_bucket_item_has_reliable_recall_signal", None)
+        baseline_eligible = (base >= getattr(service, "first_card_min_score", 0)
+            or callable(reliable) and reliable(query, item))
+        if not baseline_eligible:
+            bonus = 0
+            component["ranking_reason"] = "original_card_confidence_not_met"
+        item["score"] = base + bonus
+        component.update(applied_bonus=bonus, base_score=base, final_score=item["score"],
+                         applied_at="after_admission")
+        if "combined_score" in item:
+            item["combined_score"] = item["score"]
+        if bonus > 0:
+            # Preserve score/window_score as the formula evidence, separately
+            # expose final ranking adoption without overwriting owner formulas.
+            calculation["ranking_score"] = item["score"]
+            changed = True
+    if changed:
+        pool.sort(key=lambda item: item.get("score", 0), reverse=True)
+    return pool
 
 def usage_lines(usage):
     rows = []

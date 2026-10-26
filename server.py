@@ -66,6 +66,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import Context, FastMCP
 
 from bucket_manager import BucketManager
+from background_reflection_runtime import ReflectionConfigurationSource
 from config_activation import activate_gateway, activation_receipt, config_save_result
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
@@ -198,6 +199,7 @@ entity_edge_store = EntityEdgeStore(config)            # Person/object hint edge
 memory_node_store = MemoryNodeStore(config)            # Computable memory node index / 可计算记忆节点
 memory_moment_store = MemoryMomentStore(config)        # Structured bucket body/comment moment index / 记忆片段索引
 memory_write_gate = MemoryWriteGate(config)            # Automatic grow gate / 自动写入门卫
+reflection_configuration_source = ReflectionConfigurationSource()
 reflection_engine = ReflectionEngine(config, prompt_plan_mirror)  # Reflection worker / 关系天气与关系整理
 memory_authority_store = reflection_engine.memory_authority_store
 memory_commit_service = (
@@ -1086,9 +1088,72 @@ def _authorized_memory_write(request) -> bool:
 # Candidate mode requires a persisted fence before startup; no public tool or
 # cookie-only write permission is introduced here.
 from persona_b1_http import register_candidate_route
+
+
+async def _resolve_memory_reaction_context(context, turn):
+    from persona_memory_reaction_context import MemoryReactionResolver
+    resolver = MemoryReactionResolver(
+        lambda: (os.environ.get('OMBRE_GATEWAY_ADMIN_URL', '').strip(), os.environ.get('OMBRE_GATEWAY_TOKEN', '').strip()),
+        _memory_l1_reads, _memory_l2_service)
+    return await resolver(context, turn)
+
+
 _b1_candidate_ingest = register_candidate_route(
     mcp, lambda: persona_engine, _authorized_memory_write,
+    memory_context_resolver=_resolve_memory_reaction_context,
 )
+
+@mcp.custom_route('/internal/memory-followups', methods=['POST'])
+async def api_memory_followup_submission(request):
+    import json
+    from starlette.responses import JSONResponse
+    from memory_l3_followup import MemoryFollowups
+    from memory_l1_service import L1OwnerError
+    from memory_authority import IdempotencyConflict
+    if not _authorized_memory_write(request):
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+    if reflection_engine is None or memory_authority_store is None or not getattr(reflection_engine, 'memory_authority_enabled', False):
+        return JSONResponse({'error': 'memory_authority_unavailable'}, status_code=503)
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > 8 * 1024 * 1024:
+            return JSONResponse({'error': 'request_too_large'}, status_code=413)
+        chunks.append(chunk)
+    try:
+        result = await MemoryFollowups(reflection_engine, bucket_mgr, _resolve_memory_reaction_context).submit(json.loads(b''.join(chunks)))
+        return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+    except L1OwnerError as exc:
+        return JSONResponse({'error': {'code': exc.code, 'field_path': exc.field_path}}, status_code=exc.status)
+    except IdempotencyConflict:
+        return JSONResponse({'error': {'code': 'followup_idempotency_conflict'}}, status_code=409)
+    except (ValueError, TypeError, KeyError):
+        return JSONResponse({'error': {'code': 'invalid_followup_submission'}}, status_code=400)
+
+
+@mcp.custom_route('/api/memory-authority/memories/{memory_id}/evolution/followups/{task_id}/retry', methods=['POST'])
+async def api_memory_followup_retry(request):
+    from starlette.responses import JSONResponse
+    from memory_l3_followup import FollowupTasks
+    from memory_l1_service import L1OwnerError
+    from memory_authority import IdempotencyConflict
+    err = _require_owner_or_internal_index_maintenance(request)
+    if err:
+        return err
+    try:
+        raw = await request.body()
+        if len(raw) > 524288:
+            raise L1OwnerError('request_too_large', status=413)
+        result = FollowupTasks(memory_authority_store).retry(request.path_params['memory_id'],
+            request.path_params['task_id'], _json_lib.loads(raw))
+        return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+    except L1OwnerError as exc:
+        return JSONResponse({'error': {'code': exc.code, 'field_path': exc.field_path}}, status_code=exc.status)
+    except IdempotencyConflict:
+        return JSONResponse({'error': {'code': 'followup_idempotency_conflict'}}, status_code=409)
+    except (ValueError, TypeError, KeyError):
+        return JSONResponse({'error': {'code': 'invalid_followup_retry'}}, status_code=400)
+
 
 @mcp.custom_route('/internal/persona/b1/snapshot', methods=['GET'])
 async def _b1_candidate_snapshot(request):
@@ -8322,7 +8387,7 @@ async def _append_memory_ring(
             valence=valence,
             arousal=arousal,
             source=source,
-            touch=True,
+            touch=False,
         )
         return {"entry": entry, "authority": "legacy"}
     if not memory_authority_store or not memory_authority_store.get_memory(bucket_id):
@@ -8331,14 +8396,16 @@ async def _append_memory_ring(
         memory_id=bucket_id,
         content=content,
         kind=kind,
-        source_refs=[source] if source else [],
+        source_refs=[],
         idempotency_key=_memory_operation_key(f"ring:{bucket_id}", idempotency_key),
         actor=actor,
         metadata={
             "valence": valence,
             "arousal": arousal,
             "source": source,
-            "touch": True,
+            "touch": False,
+            "l3_role": "note",
+            "source_entry": source,
         },
     )
     bucket = await bucket_mgr.get(bucket_id)
@@ -8697,6 +8764,29 @@ async def hold(
         # No source bucket: keep a standalone feel for compatibility.
         # 没有源记忆时保留独立 whisper，兼容旧用法。
         return await create_whisper_bucket()
+
+    if source_descriptor and source_descriptor['descriptor']['namespace'] == 'snapshot.aiz.browse.summary':
+        # Browse drafts need real article/read-range qualification and full L1.
+        # Queue before tagging or any model work; the original operation key
+        # remains the identity for both old receipts and formal adoption.
+        if memory_authority_store is None or memory_commit_service is None:
+            return json.dumps({'ok': False, 'memory_status': 'preparation_unavailable', 'adopted': False, 'source_kind': 'web_browse'})
+        from memory_browse_preparation import BrowseMemoryPreparation
+        try:
+            result = BrowseMemoryPreparation(memory_authority_store).enqueue(
+                operation_key=_memory_operation_key('memory:hold', idempotency_key) if idempotency_key else '',
+                content=content, descriptor=source_descriptor['descriptor'],
+                metadata={'name': title.strip(), 'tags': extra_tags, 'importance': 10 if pinned else importance,
+                    'pinned': pinned, 'date': event_date or None, 'domain': requested_domain,
+                    **(browse_classification(source_descriptor) or {}),
+                    **({'bucket_type': 'permanent'} if pinned else {}),
+                    **({'valence': requested_valence} if requested_valence is not None else {}),
+                    **({'arousal': requested_arousal} if requested_arousal is not None else {})})
+            return json.dumps(result, ensure_ascii=False)
+        except (ValueError, TypeError) as exc:
+            return json.dumps({'ok': False, 'memory_status': 'preparation_rejected', 'adopted': False,
+                'source_kind': 'web_browse',
+                'issue': {'code': getattr(exc, 'code', type(exc).__name__)}})
 
     content = _normalize_memory_sections_for_write(content)
 
@@ -12521,39 +12611,55 @@ async def api_chat_memory_tool(request):
 
 async def _chat_memory_preparation_loop():
     """Consume durable submissions, including those queued before a restart."""
-    from memory_chat_preparation import prepare_chat_tasks
-    while True:
-        try:
-            if reflection_engine and bucket_mgr:
-                await prepare_chat_tasks(reflection_engine, bucket_mgr)
-        except Exception as exc:
-            logger.warning('Chat Memory preparation loop: %s', type(exc).__name__)
-        delay = task_options(config)['chat_memory_prepare_interval_seconds']
-        await asyncio.sleep(delay)
+    from memory_browse_preparation import prepare_memory_tasks
+    from background_reflection_runtime import BackgroundReflectionRuntime
+    runtime = BackgroundReflectionRuntime(prompt_plan_mirror, configuration_source=reflection_configuration_source)
+    try:
+        while True:
+            try:
+                if bucket_mgr:
+                    async with runtime.batch(config) as worker_engine:
+                        await prepare_memory_tasks(worker_engine, bucket_mgr)
+            except Exception as exc:
+                logger.warning('Chat Memory preparation loop: %s', type(exc).__name__)
+            delay = task_options(config)['chat_memory_prepare_interval_seconds']
+            await asyncio.sleep(delay)
+    finally:
+        await runtime.close()
 
 
-def _memory_l1_revision_service():
+def _memory_l1_revision_service(worker_engine=None):
     from memory_l1_service import MemoryL1RevisionService
     from memory_system_config import configuration, merge_config, read_overlay, runtime_overlay_path
+    service_config = worker_engine.config if worker_engine is not None else config
     def catalog_provider():
-        snapshot = configuration(merge_config(config, read_overlay(runtime_overlay_path(config))))
+        snapshot = configuration(merge_config(service_config, read_overlay(runtime_overlay_path(service_config))))
         return snapshot["values"]["catalog"], snapshot["revision"]
-    return MemoryL1RevisionService(memory_authority_store, memory_commit_service, bucket_mgr, catalog_provider)
+    authority = worker_engine.memory_authority_store if worker_engine is not None else memory_authority_store
+    commit = worker_engine._memory_authority_service(bucket_mgr) if worker_engine is not None else memory_commit_service
+    return MemoryL1RevisionService(authority, commit, bucket_mgr, catalog_provider)
 
 
-def _memory_l2_service():
+def _memory_l2_service(worker_engine=None):
     from memory_l2_service import MemoryL2Service
-    return MemoryL2Service(reflection_engine, _memory_l1_revision_service())
+    engine = worker_engine if worker_engine is not None else reflection_engine
+    return MemoryL2Service(engine, _memory_l1_revision_service(worker_engine))
 
 
 async def _memory_l2_preparation_loop():
-    while True:
-        try:
-            if reflection_engine and memory_authority_store and memory_commit_service:
-                await _memory_l2_service().run_once(task_options(config)['memory_l2_jobs_per_run'])
-        except Exception as exc:
-            logger.warning('L2 Memory preparation loop: %s', type(exc).__name__)
-        await asyncio.sleep(task_options(config)['memory_l2_prepare_interval_seconds'])
+    from background_reflection_runtime import BackgroundReflectionRuntime
+    runtime = BackgroundReflectionRuntime(prompt_plan_mirror, configuration_source=reflection_configuration_source)
+    try:
+        while True:
+            try:
+                async with runtime.batch(config) as worker_engine:
+                    if worker_engine.memory_authority_store:
+                        await _memory_l2_service(worker_engine).run_once(task_options(worker_engine.config)['memory_l2_jobs_per_run'])
+            except Exception as exc:
+                logger.warning('L2 Memory preparation loop: %s', type(exc).__name__)
+            await asyncio.sleep(task_options(config)['memory_l2_prepare_interval_seconds'])
+    finally:
+        await runtime.close()
 
 
 async def _memory_preparation_workers():
@@ -12646,6 +12752,92 @@ async def api_memory_l2(request):
         return JSONResponse({'error': {'code': 'l2_outcome_unknown'}}, status_code=503, headers=headers)
 
 
+@mcp.custom_route('/api/memory-authority/memories/{memory_id}/presentation/sync-proposals', methods=['GET'])
+@mcp.custom_route('/api/memory-authority/memories/{memory_id}/presentation/sync-proposals/{presentation_revision}/{action}', methods=['POST'])
+async def api_memory_l3_sync(request):
+    from starlette.responses import JSONResponse
+    from memory_l3_sync import MemoryL3SyncService, SyncProposals
+    from memory_l1_service import L1OwnerError
+    from memory_authority import MemoryNotFound, RevisionConflict, IdempotencyConflict
+    headers = {'Cache-Control': 'no-store'}
+    err = _require_owner_or_internal_index_maintenance(request)
+    if err: return err
+    if reflection_engine is None or memory_authority_store is None or memory_commit_service is None:
+        return JSONResponse({'error': {'code': 'memory_authority_unavailable'}}, status_code=503, headers=headers)
+    mid = str(request.path_params.get('memory_id') or '')
+    revision = None
+    try:
+        service = MemoryL3SyncService(_memory_l2_service())
+        if request.method == 'GET':
+            if request.query_params: raise L1OwnerError('unknown_query_field')
+            result = service.detail(mid)
+        else:
+            raw_revision = request.path_params.get('presentation_revision', '')
+            if not raw_revision.isascii() or not raw_revision.isdigit() or int(raw_revision) <= 0:
+                raise L1OwnerError('invalid_revision', field_path='presentation_revision')
+            revision = int(raw_revision)
+            raw = await request.body()
+            if len(raw) > 524288: raise L1OwnerError('request_too_large', status=413)
+            result = await service.action(mid, revision, request.path_params.get('action'), _json_lib.loads(raw))
+        return JSONResponse(result, headers=headers)
+    except (L1OwnerError, RevisionConflict, IdempotencyConflict) as exc:
+        payload = {'error': {'code': exc.code, 'field_path': getattr(exc, 'field_path', '')}}
+        if revision is not None:
+            try:
+                current = SyncProposals.public(SyncProposals(memory_authority_store).get(mid, revision))
+                payload.update(proposal=current, current_revision=current['revision'])
+            except L1OwnerError: pass
+        return JSONResponse(payload, status_code=getattr(exc, 'status', 409), headers=headers)
+    except MemoryNotFound:
+        return JSONResponse({'error': {'code': 'memory_not_found'}}, status_code=404, headers=headers)
+    except (ValueError, TypeError, UnicodeError):
+        return JSONResponse({'error': {'code': 'invalid_l3_sync_request'}}, status_code=400, headers=headers)
+    except Exception as exc:
+        logger.warning('L3 sync operation incomplete: %s', type(exc).__name__)
+        return JSONResponse({'error': {'code': 'l3_sync_outcome_unknown'}}, status_code=503, headers=headers)
+
+
+@mcp.custom_route('/api/memory-authority/memories/{memory_id}/evolution', methods=['GET'])
+@mcp.custom_route('/api/memory-authority/memories/{memory_id}/evolution/notes', methods=['POST'])
+@mcp.custom_route('/api/memory-authority/memories/{memory_id}/evolution/notes/{ring_id}/retract', methods=['POST'])
+async def api_memory_evolution(request):
+    from starlette.responses import JSONResponse
+    from memory_l3_records import MemoryL3Records
+    from memory_l1_service import L1OwnerError
+    from memory_authority import MemoryNotFound, RevisionConflict, IdempotencyConflict
+    err = _require_owner_or_internal_index_maintenance(request)
+    if err: return err
+    headers = {'Cache-Control': 'no-store'}
+    if memory_authority_store is None or memory_commit_service is None:
+        return JSONResponse({'error': {'code': 'memory_authority_unavailable'}}, status_code=503, headers=headers)
+    try:
+        service = MemoryL3Records(memory_authority_store, memory_commit_service)
+        mid = str(request.path_params.get('memory_id') or '')
+        if request.method == 'GET':
+            if set(request.query_params) - {'offset', 'limit'}: raise L1OwnerError('unknown_query_field')
+            values = {}
+            for key, default in (('offset', '0'), ('limit', '50')):
+                raw = request.query_params.get(key, default)
+                if len(request.query_params.getlist(key)) > 1 or not raw.isascii() or not raw.isdigit():
+                    raise L1OwnerError('invalid_pagination', field_path=key)
+                values[key] = int(raw)
+            result = service.timeline(mid, **values)
+        else:
+            raw = await request.body()
+            if len(raw) > 524288: raise L1OwnerError('request_too_large', status=413)
+            payload = _json_lib.loads(raw)
+            result = (await service.retract_note(mid, request.path_params['ring_id'], payload)
+                if request.url.path.endswith('/retract') else await service.save_note(mid, payload))
+        return JSONResponse(result, headers=headers)
+    except MemoryNotFound:
+        return JSONResponse({'error': {'code': 'memory_not_found'}}, status_code=404, headers=headers)
+    except (L1OwnerError, RevisionConflict, IdempotencyConflict) as exc:
+        return JSONResponse({'error': {'code': exc.code, 'field_path': getattr(exc, 'field_path', '')}},
+            status_code=getattr(exc, 'status', 409), headers=headers)
+    except (ValueError, TypeError, UnicodeError):
+        return JSONResponse({'error': {'code': 'invalid_l3_note_request'}}, status_code=400, headers=headers)
+
+
 @mcp.custom_route("/api/memory-authority/action-source", methods=["POST"])
 @mcp.custom_route("/api/memory-authority/source-tasks", methods=["GET"])
 @mcp.custom_route("/api/memory-authority/source-tasks/{task_id}", methods=["GET", "PUT"])
@@ -12669,7 +12861,12 @@ async def api_memory_l1_source_tasks(request):
         from memory_chat_preparation import ChatMemoryPreparation
         chat_tasks = ChatMemoryPreparation(memory_authority_store)
         task_id = request.path_params.get("task_id")
-        if task_id and str(task_id).startswith('chat_memory_') and not request.url.path.endswith('/retry'):
+        from memory_browse_preparation import BrowseMemoryPreparation
+        browse_tasks = BrowseMemoryPreparation(memory_authority_store)
+        is_browse = bool(task_id and browse_tasks.get(str(task_id)))
+        if is_browse:
+            chat_tasks = browse_tasks
+        if task_id and (str(task_id).startswith('chat_memory_') or is_browse) and not request.url.path.endswith('/retry'):
             # Draft bodies/edit are owner-only. The writer token can submit
             # its canonical envelope, not read/edit arbitrary owner drafts.
             if not _dashboard_authenticated(request):
@@ -12699,7 +12896,7 @@ async def api_memory_l1_source_tasks(request):
             # retries the source action or changes its completion status.
             if not isinstance(payload, dict) or set(payload) != {"expected_phase"} or payload["expected_phase"] not in {"failed", "generating"}:
                 raise L1OwnerError("invalid_source_task_retry", field_path="expected_phase")
-            if str(task_id).startswith('chat_memory_'):
+            if str(task_id).startswith('chat_memory_') or is_browse:
                 if not _dashboard_authenticated(request):
                     return _require_dashboard_auth(request)
                 current = chat_tasks.get(str(task_id))
@@ -13041,6 +13238,14 @@ async def api_daily_chat_memory_edit(request):
         candidate_id = body["candidate_id"]
         if not isinstance(candidate_id, str) or not MEMORY_ID_RE.fullmatch(candidate_id):
             raise ValueError("invalid_candidate_id")
+        current = reflection_engine.memory_authority_store.get_candidate(candidate_id)
+        if current and current['proposal'].get('metadata', {}).get('l3_followup'):
+            from memory_l3_followup import MemoryFollowups
+            saved = MemoryFollowups(reflection_engine, bucket_mgr).edit_draft(current, body['edit'],
+                request_id=body['request_id'], expected_revision=body['expected_revision'])
+            return JSONResponse({'status': 'saved', 'adopted': False,
+                'item': reflection_engine._authority_candidate_legacy_item(saved['candidate'])},
+                headers={'Cache-Control': 'no-store'})
         row = save_owner_candidate(reflection_engine.memory_authority_store, candidate_id,
             edit=body["edit"], expected_revision=body["expected_revision"], request_id=body["request_id"],
             revision_service=_memory_l1_revision_service())
@@ -13473,6 +13678,7 @@ async def api_config_get(request):
 
 
 @mcp.custom_route("/api/config", methods=["POST"])
+@reflection_configuration_source.applied_update(lambda: config)
 async def api_config_update(request):
     """Hot-update runtime config. Optionally persist to config.yaml."""
     from starlette.responses import JSONResponse
@@ -15031,136 +15237,143 @@ if __name__ == "__main__":
             local_bucket_mgr = BucketManager(config)
             local_embedding_engine = EmbeddingEngine(config)
             local_persona_engine = make_b1_persona_engine(config)
-            local_reflection_engine = ReflectionEngine(config, prompt_plan_mirror)
+            from background_reflection_runtime import BackgroundReflectionRuntime
+            local_reflection_runtime = BackgroundReflectionRuntime(prompt_plan_mirror, configuration_source=reflection_configuration_source)
+            local_reflection_engine = None
             local_portrait_engine = DailyPortraitMaintainer(config, prompt_plan_mirror)
             local_memory_edge_store = MemoryEdgeStore(config)
             local_gateway_state_store = GatewayStateStore(os.path.join(config["buckets_dir"], "gateway_state.db"))
-            while True:
-                try:
-                    reflection_cfg = config.get("reflection", {}) if isinstance(config.get("reflection", {}), dict) else {}
-                    local_reflection_engine.enabled = bool(
-                        reflection_cfg.get("enabled", True)
-                    )
-                    local_reflection_engine.auto_enabled = bool(
-                        reflection_cfg.get("auto_enabled", True)
-                    )
-                    if not local_reflection_engine.enabled or not local_reflection_engine.auto_enabled:
-                        await asyncio.sleep(local_reflection_engine.check_interval_minutes * 60)
-                        continue
-                    local_reflection_engine.daily_enabled = bool(
-                        reflection_cfg.get("daily_enabled", True)
-                    )
-                    local_reflection_engine.memory_affect_anchor_enabled = bool(
-                        reflection_cfg.get("memory_affect_anchor_enabled", True)
-                    )
-                    local_reflection_engine.relationship_weather_affect_anchor_enabled = bool(
-                        reflection_cfg.get("relationship_weather_affect_anchor_enabled", True)
-                    )
-                    local_reflection_engine.daily_min_memory_items = _int_between(
-                        reflection_cfg.get("daily_min_memory_items"),
-                        5,
-                        0,
-                        100,
-                    )
-                    local_reflection_engine.daily_conversation_turn_limit = _int_between(
-                        reflection_cfg.get("daily_conversation_turn_limit"),
-                        12,
-                        0,
-                        80,
-                    )
-                    local_reflection_engine.daily_activity_summary_enabled = bool(
-                        reflection_cfg.get("daily_activity_summary_enabled", True)
-                    )
-                    local_reflection_engine.daily_activity_summary_turn_limit = _int_between(
-                        reflection_cfg.get("daily_activity_summary_turn_limit"),
-                        getattr(local_reflection_engine, "daily_activity_summary_turn_limit", 0),
-                        0,
-                        10000,
-                    )
-                    local_reflection_engine.daily_activity_summary_max_tokens = _int_between(
-                        reflection_cfg.get("daily_activity_summary_max_tokens"),
-                        getattr(local_reflection_engine, "daily_activity_summary_max_tokens", 320),
-                        80,
-                        1000,
-                    )
-                    mode = str(reflection_cfg.get("daily_chat_memory_mode") or "review").strip().lower()
-                    local_reflection_engine.daily_chat_memory_mode = (
-                        mode if mode in {"auto", "review", "off"} else "review"
-                    )
-                    local_reflection_engine.daily_chat_memory_hour = _int_between(
-                        reflection_cfg.get("daily_chat_memory_hour"),
-                        0,
-                        0,
-                        23,
-                    )
-                    local_reflection_engine.daily_chat_memory_turn_limit = _int_between(
-                        reflection_cfg.get("daily_chat_memory_turn_limit"),
-                        0,
-                        0,
-                        10000,
-                    )
-                    local_reflection_engine.refresh_daily_chat_memory_options(config)
-                    results = await local_reflection_engine.run_due(
-                        local_bucket_mgr,
-                        local_persona_engine,
-                        local_embedding_engine,
-                        local_gateway_state_store,
-                        raw_event_store,
-                    )
-                    now_local = local_reflection_engine._local_now()
-                    if (
-                        getattr(local_reflection_engine, "daily_activity_summary_enabled", True)
-                        and now_local.hour >= local_reflection_engine.daily_chat_memory_hour
-                    ):
-                        activity_date = (now_local - timedelta(days=1)).date().isoformat()
-                        timeline_id = f"daily_activity_summary:{activity_date}"
-                        if not local_portrait_engine.has_recent_timeline_item(
-                            date_key=activity_date,
-                            source="daily_activity_summary",
-                            timeline_id=timeline_id,
-                        ):
-                            activity_candidates, activity_daily_impressions = (
-                                _daily_activity_materials_from_reflection_results(results)
+            try:
+                while True:
+                    try:
+                        async with local_reflection_runtime.batch(config) as local_reflection_engine:
+                            reflection_cfg = local_reflection_engine.config.get("reflection", {})
+                            local_reflection_engine.enabled = bool(
+                                reflection_cfg.get("enabled", True)
                             )
-                            if not activity_daily_impressions:
-                                existing_daily_impression = await _daily_impression_material_for_date(
-                                    activity_date,
-                                    local_bucket_mgr,
+                            local_reflection_engine.auto_enabled = bool(
+                                reflection_cfg.get("auto_enabled", True)
+                            )
+                            if not local_reflection_engine.enabled or not local_reflection_engine.auto_enabled:
+                                await asyncio.sleep(local_reflection_engine.check_interval_minutes * 60)
+                                continue
+                            local_reflection_engine.daily_enabled = bool(
+                                reflection_cfg.get("daily_enabled", True)
+                            )
+                            local_reflection_engine.memory_affect_anchor_enabled = bool(
+                                reflection_cfg.get("memory_affect_anchor_enabled", True)
+                            )
+                            local_reflection_engine.relationship_weather_affect_anchor_enabled = bool(
+                                reflection_cfg.get("relationship_weather_affect_anchor_enabled", True)
+                            )
+                            local_reflection_engine.daily_min_memory_items = _int_between(
+                                reflection_cfg.get("daily_min_memory_items"),
+                                5,
+                                0,
+                                100,
+                            )
+                            local_reflection_engine.daily_conversation_turn_limit = _int_between(
+                                reflection_cfg.get("daily_conversation_turn_limit"),
+                                12,
+                                0,
+                                80,
+                            )
+                            local_reflection_engine.daily_activity_summary_enabled = bool(
+                                reflection_cfg.get("daily_activity_summary_enabled", True)
+                            )
+                            local_reflection_engine.daily_activity_summary_turn_limit = _int_between(
+                                reflection_cfg.get("daily_activity_summary_turn_limit"),
+                                getattr(local_reflection_engine, "daily_activity_summary_turn_limit", 0),
+                                0,
+                                10000,
+                            )
+                            local_reflection_engine.daily_activity_summary_max_tokens = _int_between(
+                                reflection_cfg.get("daily_activity_summary_max_tokens"),
+                                getattr(local_reflection_engine, "daily_activity_summary_max_tokens", 320),
+                                80,
+                                1000,
+                            )
+                            mode = str(reflection_cfg.get("daily_chat_memory_mode") or "review").strip().lower()
+                            local_reflection_engine.daily_chat_memory_mode = (
+                                mode if mode in {"auto", "review", "off"} else "review"
+                            )
+                            local_reflection_engine.daily_chat_memory_hour = _int_between(
+                                reflection_cfg.get("daily_chat_memory_hour"),
+                                0,
+                                0,
+                                23,
+                            )
+                            local_reflection_engine.daily_chat_memory_turn_limit = _int_between(
+                                reflection_cfg.get("daily_chat_memory_turn_limit"),
+                                0,
+                                0,
+                                10000,
+                            )
+                            local_reflection_engine.refresh_daily_chat_memory_options(local_reflection_engine.config)
+                            results = await local_reflection_engine.run_due(
+                                local_bucket_mgr,
+                                local_persona_engine,
+                                local_embedding_engine,
+                                local_gateway_state_store,
+                                raw_event_store,
+                            )
+                            now_local = local_reflection_engine._local_now()
+                            if (
+                                getattr(local_reflection_engine, "daily_activity_summary_enabled", True)
+                                and now_local.hour >= local_reflection_engine.daily_chat_memory_hour
+                            ):
+                                activity_date = (now_local - timedelta(days=1)).date().isoformat()
+                                timeline_id = f"daily_activity_summary:{activity_date}"
+                                if not local_portrait_engine.has_recent_timeline_item(
+                                    date_key=activity_date,
+                                    source="daily_activity_summary",
+                                    timeline_id=timeline_id,
+                                ):
+                                    activity_candidates, activity_daily_impressions = (
+                                        _daily_activity_materials_from_reflection_results(results)
+                                    )
+                                    if not activity_daily_impressions:
+                                        existing_daily_impression = await _daily_impression_material_for_date(
+                                            activity_date,
+                                            local_bucket_mgr,
+                                        )
+                                        if existing_daily_impression:
+                                            activity_daily_impressions.append(existing_daily_impression)
+                                    activity_result = await local_reflection_engine.run_daily_activity_summary(
+                                        conversation_turn_store=local_gateway_state_store,
+                                        raw_event_store=raw_event_store,
+                                        persona_engine=local_persona_engine,
+                                        daily_chat_memory_candidates=activity_candidates,
+                                        daily_impressions=activity_daily_impressions,
+                                        key=activity_date,
+                                    )
+                                    stored_activity = _store_daily_activity_summary_result(
+                                        activity_result,
+                                        portrait_engine_arg=local_portrait_engine,
+                                    )
+                                    if stored_activity.get("status") not in {"disabled", "skipped"}:
+                                        results.append(stored_activity)
+                            if results:
+                                logger.info("Reflection run-due results / 反思定时结果: %s", results)
+                            if reflection_cfg.get("enrich_backfill_enabled", True):
+                                backfill_result = await _backfill_memory_enrichment(
+                                    limit=reflection_cfg.get("enrich_backfill_limit", 5),
+                                    bucket_mgr_arg=local_bucket_mgr,
+                                    reflection_engine_arg=local_reflection_engine,
+                                    edge_store_arg=local_memory_edge_store,
+                                    embedding_engine_arg=local_embedding_engine,
                                 )
-                                if existing_daily_impression:
-                                    activity_daily_impressions.append(existing_daily_impression)
-                            activity_result = await local_reflection_engine.run_daily_activity_summary(
-                                conversation_turn_store=local_gateway_state_store,
-                                raw_event_store=raw_event_store,
-                                persona_engine=local_persona_engine,
-                                daily_chat_memory_candidates=activity_candidates,
-                                daily_impressions=activity_daily_impressions,
-                                key=activity_date,
-                            )
-                            stored_activity = _store_daily_activity_summary_result(
-                                activity_result,
-                                portrait_engine_arg=local_portrait_engine,
-                            )
-                            if stored_activity.get("status") not in {"disabled", "skipped"}:
-                                results.append(stored_activity)
-                    if results:
-                        logger.info("Reflection run-due results / 反思定时结果: %s", results)
-                    if reflection_cfg.get("enrich_backfill_enabled", True):
-                        backfill_result = await _backfill_memory_enrichment(
-                            limit=reflection_cfg.get("enrich_backfill_limit", 5),
-                            bucket_mgr_arg=local_bucket_mgr,
-                            reflection_engine_arg=local_reflection_engine,
-                            edge_store_arg=local_memory_edge_store,
-                            embedding_engine_arg=local_embedding_engine,
-                        )
-                        if backfill_result.get("processed"):
-                            logger.info(
-                                "Memory enrichment backfill / 记忆 enrich 补跑: %s",
-                                backfill_result,
-                            )
-                except Exception as e:
-                    logger.warning("Reflection scheduler failed / 反思定时器失败: %s", e)
-                await asyncio.sleep(local_reflection_engine.check_interval_minutes * 60)
+                                if backfill_result.get("processed"):
+                                    logger.info(
+                                        "Memory enrichment backfill / 记忆 enrich 补跑: %s",
+                                        backfill_result,
+                                    )
+                    except Exception as e:
+                        logger.warning("Reflection scheduler failed / 反思定时器失败: %s", e)
+                    await asyncio.sleep(getattr(local_reflection_engine, "check_interval_minutes", 60) * 60)
+
+            finally:
+                await local_reflection_runtime.close()
 
         def _start_reflection_scheduler():
             loop = asyncio.new_event_loop()

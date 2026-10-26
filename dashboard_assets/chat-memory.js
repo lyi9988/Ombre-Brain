@@ -1566,7 +1566,7 @@
         panel.appendChild(more);
       }
       sourceTaskTasks.forEach(function(task) {
-        if (task && task.source_kind === 'chat_submission' && sourceTaskOpenIds.has(String(task.task_id || ''))) {
+        if (sourceTaskHasSubmissionDraft(task) && sourceTaskOpenIds.has(String(task.task_id || ''))) {
           var cached = sourceTaskDetails.get(String(task.task_id || ''));
           var state = sourceTaskDrafts.get(String(task.task_id || ''));
           if (!cached || (state && state.unconfirmed) || (cached && sourceTaskRevisionChanged({
@@ -1596,7 +1596,8 @@
     if (phase === 'queued') return '等待准备';
     if (phase === 'generating') return '准备中';
     if (phase === 'failed') return '准备失败';
-    if (phase === 'prepared') return '候选已准备 · 待 Review；尚未正式入库';
+    if (phase === 'prepared') return task.source_kind === 'web_browse'
+      ? '候选已准备 · 采用状态见正式入库回执' : '候选已准备 · 待 Review；尚未正式入库';
     return phase;
   }
 
@@ -1604,8 +1605,16 @@
     return dailyChatMemoryApiBase() + '/api/memory-authority/source-tasks/' + encodeURIComponent(taskId);
   }
 
-  function sourceTaskDraftValues(draft) {
+  function sourceTaskHasSubmissionDraft(task) {
+    return Boolean(task && (task.source_kind === 'chat_submission' || task.source_kind === 'web_browse'));
+  }
+
+  function sourceTaskDraftValues(draft, task) {
     draft = draft && typeof draft === 'object' ? draft : {};
+    if (task && task.source_kind === 'web_browse') {
+      return { sourceKind: 'web_browse', title: typeof (draft.metadata || {}).name === 'string' ? draft.metadata.name : '',
+        body: typeof draft.content === 'string' ? draft.content : '', hintsRaw: '[]' };
+    }
     var narrative = draft.narrative && typeof draft.narrative === 'object' ? draft.narrative : {};
     var hints = Array.isArray(draft.semantic_hints) ? draft.semantic_hints : [];
     return { title: typeof narrative.title === 'string' ? narrative.title : '',
@@ -1620,6 +1629,7 @@
     var draft = { narrative: { body: body } };
     var title = String(values.title == null ? '' : values.title);
     if (title.trim()) draft.narrative.title = title;
+    if (values.sourceKind === 'web_browse') return draft;
     var rawHints = String(values.hintsRaw == null ? '' : values.hintsRaw).trim();
     if (rawHints) {
       var hints;
@@ -1657,9 +1667,9 @@
   }
 
   function sourceTaskCreateDraftState(detail) {
-    var values = sourceTaskDraftValues(detail && detail.draft);
     var task = detail && detail.task || {};
-    return { title: values.title, body: values.body, hintsRaw: values.hintsRaw,
+    var values = sourceTaskDraftValues(detail && detail.draft, task);
+    return { sourceKind: task.source_kind, title: values.title, body: values.body, hintsRaw: values.hintsRaw,
       base: cloneValue(values), baseRevision: task.revision, baseDraftRevision: task.draft_revision,
       latestLoadedRevision: task.revision,
       dirty: false, conflict: false, unconfirmed: false, lastMessage: '', lastError: '' };
@@ -1708,13 +1718,13 @@
     captureSourceTaskEditors(list);
     list.replaceChildren();
     var help = document.createElement('p');
-    help.textContent = '聊天提交稿与正式记忆采用分开。提交稿可在这里查看和编辑；候选生成后，请到下方现有 Review 卡片完成审核与完整 L1 编辑。行动结果继续显示在同一列表；使用“加载更多准备任务”查看后续记录。';
+    help.textContent = '聊天与浏览提交稿和正式记忆采用分开。提交稿可在这里查看和编辑；候选生成后，请查看对应候选及正式入库回执，需要审核时到下方现有 Review 卡片完成审核与完整 L1 编辑。行动结果继续显示在同一列表；使用“加载更多准备任务”查看后续记录。';
     list.appendChild(help);
     if (!sourceTaskTasks.length) {
       var empty = document.createElement('p'); empty.textContent = '暂无来源提交任务。'; list.appendChild(empty); return;
     }
     sourceTaskTasks.forEach(function(task) {
-      if (task && task.source_kind === 'chat_submission') list.appendChild(renderChatSubmissionTask(task, target));
+      if (sourceTaskHasSubmissionDraft(task)) list.appendChild(renderChatSubmissionTask(task, target));
       else list.appendChild(renderActionSourceTask(task, target));
     });
   }
@@ -1758,6 +1768,7 @@
   }
 
   function renderChatSubmissionTask(task, target) {
+    var isBrowse = task.source_kind === 'web_browse';
     var taskId = String(task.task_id || '');
     var modelIoId = modelIoMemoryId(taskId);
     var row = document.createElement('div'); row.className = 'chat-memory-card';
@@ -1765,7 +1776,7 @@
     row.setAttribute('data-chat-submission-task-id', taskId);
     var status = document.createElement('p');
     var shortTaskId = taskId.length > 26 ? taskId.slice(0, 14) + '…' + taskId.slice(-6) : taskId;
-    status.textContent = '聊天提交 · ' + sourceTaskPhaseLabel(task) + (shortTaskId ? ' · ' + shortTaskId : '');
+    status.textContent = (isBrowse ? '浏览记忆提交 · ' : '聊天提交 · ') + sourceTaskPhaseLabel(task) + (shortTaskId ? ' · ' + shortTaskId : '');
     row.appendChild(status);
     if (task.issue) {
       var issue = document.createElement('p'); issue.className = 'chat-memory-stale';
@@ -1774,7 +1785,7 @@
     }
     if (task.candidate_ids && task.candidate_ids.length) {
       var refs = document.createElement('p');
-      refs.textContent = '对应 Review 候选：' + task.candidate_ids.join('、') + '；生成候选不代表正式入库。'; row.appendChild(refs);
+      refs.textContent = (isBrowse ? '对应候选：' : '对应 Review 候选：') + task.candidate_ids.join('、') + '；生成候选不代表正式入库。'; row.appendChild(refs);
     }
     var detail = sourceTaskDetails.get(taskId);
     if (detail && detail.receipt) {
@@ -1783,7 +1794,7 @@
         ' · 准备：' + sourceTaskReceiptLabel(detail.receipt.preparation_status, 'preparation'); row.appendChild(receipt);
     } else {
       var receiptHint = document.createElement('p'); receiptHint.className = 'chat-memory-card-meta';
-      receiptHint.textContent = task.phase === 'prepared'
+      receiptHint.textContent = task.phase === 'prepared' && !isBrowse
         ? '正式入库：待 Review 确认后才会写入。'
         : '正式入库：尚未显示回执；打开详情读取权威状态。';
       row.appendChild(receiptHint);
@@ -1839,6 +1850,15 @@
       sourceTaskDrafts.set(taskId, state);
     }
     var serverTask = detail.task || task;
+    var isBrowse = serverTask.source_kind === 'web_browse';
+    state.sourceKind = serverTask.source_kind;
+    if (isBrowse) {
+      var source = document.createElement('details');
+      source.setAttribute('data-browse-submission-source', '');
+      var sourceLabel = document.createElement('summary'); sourceLabel.textContent = '浏览来源（只读）'; source.appendChild(sourceLabel);
+      var sourceBody = document.createElement('pre'); sourceBody.style.whiteSpace = 'pre-wrap'; sourceBody.style.overflowWrap = 'anywhere';
+      sourceBody.textContent = JSON.stringify(detail.draft.descriptor || {}, null, 2); source.appendChild(sourceBody); panel.appendChild(source);
+    }
     if ((state.dirty || state.unconfirmed) && sourceTaskRevisionChanged(state, serverTask)) {
       state.conflict = true;
       state.latestServerRevision = serverTask.revision;
@@ -1855,7 +1875,9 @@
 
     if (serverTask.phase === 'prepared' || task.phase === 'prepared') {
       var reviewGuide = document.createElement('p'); reviewGuide.className = 'chat-memory-edit-needed';
-      reviewGuide.textContent = '候选已生成并进入待审核阶段，这里只保留提交稿回执。请在下方现有 Review 候选卡片中打开“编辑”，完成完整 L1 编辑并审核；正式记忆只有在 Review 确认后才入库。';
+      reviewGuide.textContent = isBrowse
+        ? '候选已准备，这里保留提交稿回执。正式入库状态以回执为准；需要审核或修订候选时，请在下方现有 Review 候选卡片中打开“编辑”，完成完整 L1 编辑并审核。'
+        : '候选已生成并进入待审核阶段，这里只保留提交稿回执。请在下方现有 Review 候选卡片中打开“编辑”，完成完整 L1 编辑并审核；正式记忆只有在 Review 确认后才入库。';
       panel.appendChild(reviewGuide);
       if (state.dirty || state.unconfirmed) {
         var preserved = document.createElement('p'); preserved.className = 'chat-memory-stale';
@@ -1863,13 +1885,15 @@
         panel.appendChild(preserved);
         appendSourceTaskDraftPreview(panel, state);
       }
-      appendSourceTaskReadOnlyDraft(panel, detail.draft);
+      appendSourceTaskReadOnlyDraft(panel, detail.draft, serverTask);
       return;
     }
 
     if (task.phase === 'failed') {
       var failure = document.createElement('p'); failure.className = 'chat-memory-stale';
-      failure.textContent = '这次准备失败；提交稿仍保存在服务器，可先修订后保存，再重试准备。重试不会重新执行原聊天或行动。';
+      failure.textContent = isBrowse
+        ? '这次准备失败；浏览提交稿仍保存在服务器，可先修订后保存，再重试准备。重试不会重新执行原浏览。'
+        : '这次准备失败；提交稿仍保存在服务器，可先修订后保存，再重试准备。重试不会重新执行原聊天或行动。';
       panel.appendChild(failure);
     }
     var editor = document.createElement('div'); editor.setAttribute('data-chat-submission-editor', taskId);
@@ -1881,8 +1905,10 @@
     var titleInput = document.createElement('input'); titleInput.type = 'text'; titleInput.setAttribute('data-chat-submission-title', ''); titleInput.value = state.title; titleLabel.appendChild(titleInput); editor.appendChild(titleLabel);
     var bodyLabel = document.createElement('label'); bodyLabel.className = 'chat-memory-edit-field'; bodyLabel.textContent = '完整提交正文';
     var bodyInput = document.createElement('textarea'); bodyInput.setAttribute('data-chat-submission-body', ''); bodyInput.value = state.body; bodyInput.rows = 8; bodyLabel.appendChild(bodyInput); editor.appendChild(bodyLabel);
-    var hintsLabel = document.createElement('label'); hintsLabel.className = 'chat-memory-edit-field'; hintsLabel.textContent = '语义提示 JSON（可选，数组元素需包含 text）';
-    var hintsInput = document.createElement('textarea'); hintsInput.setAttribute('data-chat-submission-hints', ''); hintsInput.value = state.hintsRaw; hintsInput.rows = 4; hintsLabel.appendChild(hintsInput); editor.appendChild(hintsLabel);
+    if (!isBrowse) {
+      var hintsLabel = document.createElement('label'); hintsLabel.className = 'chat-memory-edit-field'; hintsLabel.textContent = '语义提示 JSON（可选，数组元素需包含 text）';
+      var hintsInput = document.createElement('textarea'); hintsInput.setAttribute('data-chat-submission-hints', ''); hintsInput.value = state.hintsRaw; hintsInput.rows = 4; hintsLabel.appendChild(hintsInput); editor.appendChild(hintsLabel);
+    }
     var dirty = document.createElement('p'); dirty.className = 'chat-memory-edit-needed'; dirty.setAttribute('data-chat-submission-dirty', '');
     dirty.textContent = state.dirty ? '有未保存修改；刷新状态、读取失败或版本冲突不会替换这些输入。' : '当前内容与服务器已保存草稿一致。'; editor.appendChild(dirty);
     var error = document.createElement('p'); error.className = 'chat-memory-stale'; error.setAttribute('data-chat-submission-error', ''); error.textContent = state.lastError || ''; editor.appendChild(error);
@@ -1898,13 +1924,13 @@
       var conflict = document.createElement('p'); conflict.className = 'chat-memory-stale';
       conflict.textContent = '服务器 revision 已到 ' + String(state.latestServerRevision) + '。保留本地编辑；请先读取并核对服务器版本后，再继续保存。';
       panel.appendChild(conflict);
-      appendSourceTaskReadOnlyDraft(panel, detail.draft);
+      appendSourceTaskReadOnlyDraft(panel, detail.draft, serverTask);
       if (String(state.latestLoadedRevision == null ? '' : state.latestLoadedRevision) === String(detail.task.revision == null ? '' : detail.task.revision)) {
         var rebase = document.createElement('button'); rebase.type = 'button';
         rebase.textContent = '保留当前编辑并以服务器版本为基线';
         rebase.addEventListener('click', function() {
           captureSourceTaskDraft(editor);
-          state.base = sourceTaskDraftValues(detail.draft);
+          state.base = sourceTaskDraftValues(detail.draft, serverTask);
           state.baseRevision = detail.task.revision;
           state.baseDraftRevision = detail.task.draft_revision;
           state.latestServerRevision = detail.task.revision;
@@ -1926,8 +1952,8 @@
     });
   }
 
-  function appendSourceTaskReadOnlyDraft(panel, draft) {
-    var values = sourceTaskDraftValues(draft);
+  function appendSourceTaskReadOnlyDraft(panel, draft, task) {
+    var values = sourceTaskDraftValues(draft, task);
     var title = document.createElement('p'); title.textContent = '提交标题：' + (values.title || '（未填写）'); panel.appendChild(title);
     var body = document.createElement('div'); body.className = 'chat-memory-card-body';
     var heading = document.createElement('strong'); heading.textContent = '已保存的完整提交正文'; body.appendChild(heading);
@@ -1943,7 +1969,7 @@
     var body = document.createElement('div'); body.className = 'chat-memory-card-body';
     var heading = document.createElement('strong'); heading.textContent = '保留的未保存完整正文'; body.appendChild(heading);
     var text = document.createElement('p'); text.style.whiteSpace = 'pre-wrap'; text.textContent = state.body || '（正文为空）'; body.appendChild(text); panel.appendChild(body);
-    if (String(state.hintsRaw || '').trim() && String(state.hintsRaw).trim() !== '[]') {
+    if (state.sourceKind !== 'web_browse' && String(state.hintsRaw || '').trim() && String(state.hintsRaw).trim() !== '[]') {
       var hints = document.createElement('pre'); hints.style.whiteSpace = 'pre-wrap'; hints.style.overflowWrap = 'anywhere';
       hints.textContent = '保留的语义提示 JSON：\n' + state.hintsRaw; panel.appendChild(hints);
     }
@@ -2005,7 +2031,7 @@
         sourceTaskDrafts.set(taskId, next);
       } else if (current.unconfirmed &&
           String(current.baseDraftRevision == null ? '' : current.baseDraftRevision) !== String(detail.task.draft_revision == null ? '' : detail.task.draft_revision) &&
-          sourceTaskDraftsEqual(current, sourceTaskDraftValues(detail.draft))) {
+          sourceTaskDraftsEqual(current, sourceTaskDraftValues(detail.draft, detail.task))) {
         var confirmed = sourceTaskCreateDraftState(detail);
         confirmed.lastMessage = '保存响应未确认，但服务器读回已证明草稿内容和新 draft revision 均已持久保存。';
         sourceTaskDrafts.set(taskId, confirmed);
@@ -2085,7 +2111,7 @@
       }
 
       var readback = await fetchSourceTaskDetail(taskId);
-      if (!sourceTaskDraftsEqual(sourceTaskDraftValues(readback.draft), state)) {
+      if (!sourceTaskDraftsEqual(sourceTaskDraftValues(readback.draft, readback.task), state)) {
         throw new Error('服务器读回与提交内容不一致；本地编辑仍保留，请读取最新草稿核对。');
       }
       if (sameValue(expectedDraftRevision, readback.task.draft_revision)) {
@@ -2113,7 +2139,10 @@
   }
 
   async function retryChatSubmissionTask(task, button, target) {
-    if (!window.confirm('重试准备此聊天提交；可能调用已配置模型，但不会重新执行聊天或写入正式记忆。')) return;
+    var retryMessage = task.source_kind === 'web_browse'
+      ? '重试准备此浏览提交；可能调用已配置模型，但不会重新执行原浏览。正式入库状态以回执为准。'
+      : '重试准备此聊天提交；可能调用已配置模型，但不会重新执行聊天或写入正式记忆。';
+    if (!window.confirm(retryMessage)) return;
     button.disabled = true;
     try {
       var result = await readSourceTaskResponse(await authFetch(sourceTaskApiUrl(task.task_id) + '/retry', {
@@ -2159,10 +2188,44 @@
       '</div>';
   }
 
+  function renderL3FollowupPreview(followup) {
+    if (!followup || typeof followup !== 'object' || Array.isArray(followup)) return '';
+    var title = String(followup.target_title || followup.memory_id || '目标记忆未提供');
+    var revision = followup.expected_revision == null ? '未提供' : String(followup.expected_revision);
+    var state = String(followup.preparation_state || 'prepared');
+    var preparing = ['queued', 'pending', 'preparing', 'generating', 'running'].includes(state);
+    var failed = state === 'failed';
+    var changes = Array.isArray(followup.changes) ? followup.changes : [];
+    function valueText(value) {
+      if (value === undefined) return '未提供';
+      if (value === null) return '（空值）';
+      if (value === '') return '（空字符串）';
+      return modelIoText(value);
+    }
+    var rows = changes.map(function (change) {
+      change = change && typeof change === 'object' ? change : {};
+      return '<section class="chat-memory-followup-change">' +
+        '<strong>' + esc(String(change.field || '局部字段')) + '</strong>' +
+        '<div>修订前</div><pre style="white-space:pre-wrap;overflow-wrap:anywhere">' + esc(valueText(change.before)) + '</pre>' +
+        '<div>修订后</div><pre style="white-space:pre-wrap;overflow-wrap:anywhere">' + esc(valueText(change.after)) + '</pre></section>';
+    }).join('');
+    var status = preparing ? '修订方案正在重新准备；旧计划尚未采用，请等待最新局部变化后再核对。'
+      : failed ? '修订方案准备未完成；旧计划尚未采用，草稿与原记忆仍保留。'
+        : '以下是待采用的局部修订；原记忆与历史版本仍保留。';
+    return '<section class="chat-memory-followup-review" aria-label="原记忆局部修订预览">' +
+      '<strong>修订原记忆：' + esc(title) + ' / 原版本 ' + esc(revision) + '</strong>' +
+      '<p class="chat-memory-edit-needed">' + esc(status) + '</p>' +
+      (followup.reason ? '<p>' + esc(String(followup.reason)) + '</p>' : '') +
+      '<details class="chat-memory-followup-changes" open><summary>' +
+        (preparing || failed ? '上一版局部变化（仅供对照）' : '局部修订前后对照（只读）') + '</summary>' +
+        (rows || '<p>尚无可核对的局部变化；准备结果不会被当作已采用修订。</p>') + '</details></section>';
+  }
+
   function renderDailyChatMemoryCard(item) {
     var candidate = Object.assign({}, item.candidate || {});
     var id = item.id || '';
-    var modelIoId = modelIoMemoryId(id);
+    var followup = candidate.l3_followup;
+    var modelIoId = modelIoMemoryId(followup && followup.memory_id || id);
     var draft = memoryDrafts.get(id);
     var revision = draft ? draft.revision : Number(item.authority_revision || candidate.authority_revision || 0);
     var l1Document = itemL1Document(item);
@@ -2227,9 +2290,10 @@
           '<strong>' + esc(cardTitle || id) + '</strong>' +
           renderSoftFlagChips(flags) +
         '</div>' +
+        renderL3FollowupPreview(followup) +
         '<div class="chat-memory-card-grid">' +
           '<div class="chat-memory-column chat-memory-column-primary">' +
-            '<div class="chat-memory-column-title">建议记忆</div>' +
+            '<div class="chat-memory-column-title">' + (followup ? '后续修订建议（不是原始来源）' : '建议记忆') + '</div>' +
             '<div class="chat-memory-card-body">' + esc(proposed) + '</div>' +
           '</div>' +
           '<div class="chat-memory-column">' +

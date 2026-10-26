@@ -119,11 +119,36 @@ def test_prepare_request_retains_context_source_and_owner_catalog(stage):
     assert new_envelope["identity"] == old_envelope["identity"]
     assert new_envelope["semantic_contract"]["catalog"] == old_envelope["semantic_contract"]["catalog"]
     assert new_envelope["semantic_contract"]["source_ids"] == SOURCE_IDS
+    assert new_envelope["semantic_contract"]["types"] == old_envelope["semantic_contract"]["types"]
+    assert new_envelope["semantic_contract"]["document"] == old_envelope["semantic_contract"]["document"]
     assert schema["$defs"]["Attribute"]["properties"]["definition_id"]["enum"] == ["pressure"]
     assert schema["$defs"]["StatementProperty"]["oneOf"][0]["properties"]["key"]["enum"] == ["pressure"]
     if stage == "chat_l1":
         assert new_envelope["draft"] == old_envelope["draft"]
         assert "narrative" not in schema["$defs"]["Document"]["required"]
+
+
+def test_scene_range_objects_are_still_rejected_without_repair():
+    doc = document()
+    doc["scenes"][0]["source_refs"] = [{"source_ref": "source:1", "start": 0, "end": 5}]
+    raw = json.dumps(wrapped("chat_l1", doc), ensure_ascii=False)
+    response = NS(choices=[NS(message=NS(content=raw), finish_reason="stop")],
+                  native_schema=build_schema(SOURCE_IDS, catalog(), stage="chat_l1"))
+    with pytest.raises(L1OwnerError) as caught:
+        validate_response(response)
+    assert caught.value.field_path == "document.scenes.0.source_refs.0"
+    assert response.choices[0].message.content == raw
+
+
+def test_reference_guidance_uses_original_contract_without_adding_source_text():
+    original = messages(stage="chat_l1")
+    prepared, schema = prepare_request(original, stage="chat_l1")
+    payload = json.loads(prepared[-1]["content"])
+    assert payload["sources"] == json.loads(original[-1]["content"])["sources"]
+    assert payload["semantic_contract"]["types"]["Scene"]["source_refs?"] == "source_id[]"
+    assert "source_ranges" in payload["semantic_contract"]["output_rules"]
+    assert schema["$defs"]["Scene"]["properties"]["source_refs"]["items"] == {"$ref": "#/$defs/SceneSourceRef"}
+    assert schema["$defs"]["SceneSourceRef"]["enum"] == SOURCE_IDS
 
 
 class FakeClient:

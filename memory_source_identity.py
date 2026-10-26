@@ -12,6 +12,12 @@ _KINDS = {'human', 'ai', 'unknown'}
 
 
 def source_participant(source, config=None):
+    if source.get('namespace') == 'browse_material' and source.get('system') == 'aizizhu':
+        # Internal records originate only from the authenticated fixed reader,
+        # never the submitted hold descriptor or model-authored narrative.
+        participant = (source.get('browse_snapshot') or {}).get('participant')
+        if isinstance(participant, dict):
+            return deepcopy(participant)
     if source.get("system") == "aizizhu" and source.get("namespace") == "attachment_text":
         return {"subject_id": None, "kind": "unknown", "display_name": "文档作者未知", "resolution": "external_document"}
     config = config or {}

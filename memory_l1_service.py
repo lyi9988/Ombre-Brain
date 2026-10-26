@@ -201,7 +201,7 @@ class MemoryL1RevisionService:
         return validate_l1_document(doc, catalog=effective)
 
     async def save(self, memory_id, payload):
-        if not isinstance(payload, dict) or set(payload) - {"expected_revision", "request_id", "document", "edit_note"} or not {"expected_revision", "request_id", "document"} <= set(payload):
+        if not isinstance(payload, dict) or set(payload) - {"expected_revision", "request_id", "document", "edit_note", "owner_relation_adoptions"} or not {"expected_revision", "request_id", "document"} <= set(payload):
             raise L1OwnerError("invalid_revision_request")
         expected = payload["expected_revision"]; request_id = payload["request_id"]
         if type(expected) is not int or expected < 0: raise L1OwnerError("invalid_revision", field_path="expected_revision")
@@ -236,11 +236,157 @@ class MemoryL1RevisionService:
         metadata = copy.deepcopy(record["metadata"])
         metadata["memory_l1"] = semantic
         metadata["name"] = document["narrative"]["title"]
-        metadata["memory_l1_owner_request"] = {"request_id": request_id, "request_sha256": fingerprint, "edit_note": payload.get("edit_note", "")}
+        from memory_relation_dependencies import owner_adoption_ids
+        try:
+            adopted = owner_adoption_ids(previous, document, payload.get('owner_relation_adoptions', []))
+        except ValueError as exc:
+            raise L1OwnerError(str(exc), field_path='owner_relation_adoptions') from exc
+        metadata["memory_l1_owner_request"] = {"request_id": request_id, "request_sha256": fingerprint,
+            "edit_note": payload.get("edit_note", ""), 'owner_relation_adoptions': adopted}
         result = await self.commit.commit_memory(memory_id=memory_id, bucket_id=memory["bucket_id"],
             expected_revision=expected, body=body, metadata=metadata, source_refs=record["source_refs"],
             decision_source="owner_l1_edit", idempotency_key=idem, actor="owner", memory_state=memory["state"], recall_policy=memory["recall_policy"], l1_write_intent=True)
         return await self._receipt(memory_id, request_id, result, replayed=False)
+
+    async def save_program_edit(self, memory_id, payload, *, source_snapshots, source_bindings,
+                                source_reader, actor, decision_source, program_context):
+        """Internal accepted-plan writer; the public owner JSON route cannot add L0.
+
+        A new correction is bound to its actual immutable edit/current source,
+        never relabelled as the old L0. Follow-up model content retains its model
+        provenance and policy; this method does not approve a candidate.
+        """
+        allowed = {'expected_revision', 'request_id', 'document', 'edit_note', 'owner_relation_adoptions'}
+        if (not isinstance(payload, dict) or set(payload) - allowed
+                or not {'expected_revision', 'request_id', 'document'} <= set(payload)
+                or type(payload['expected_revision']) is not int or payload['expected_revision'] < 1
+                or not isinstance(payload['request_id'], str) or not payload['request_id'].strip()
+                or len(payload['request_id']) > 128):
+            raise L1OwnerError('invalid_program_revision_request')
+        required_context = {'origin', 'proposal_id', 'plan_sha256', 'source_ref'}
+        if (not isinstance(program_context, dict) or not required_context <= set(program_context)
+                or program_context['origin'] not in {'owner_l2', 'followup'}
+                or not isinstance(program_context['proposal_id'], str) or not program_context['proposal_id']
+                or not isinstance(program_context['plan_sha256'], str) or len(program_context['plan_sha256']) != 64):
+            raise L1OwnerError('accepted_program_context_required', field_path='program_context')
+        owner = program_context['origin'] == 'owner_l2'
+        if ((owner and (actor != 'owner' or decision_source != 'owner_l2_fact_sync'))
+                or (not owner and (actor == 'owner' or str(decision_source).startswith('owner')))):
+            raise L1OwnerError('program_actor_mismatch', field_path='actor')
+        if not isinstance(source_snapshots, list) or not isinstance(source_bindings, list) or not source_bindings or len(source_snapshots) != len(source_bindings):
+            raise L1OwnerError('program_sources_required', field_path='sources')
+        fingerprint = semantic_sha256({'payload': payload, 'program_context': program_context,
+            'source_bindings': source_bindings, 'source_snapshots': source_snapshots,
+            'actor': actor, 'decision_source': decision_source})
+        request_id = payload['request_id']
+        idem = 'program-l1:' + program_context['origin'] + ':' + memory_id + ':' + request_id
+        prior = self.authority.get_commit_by_idempotency(idem)
+        if prior:
+            metadata = prior['payload'].get('metadata', {})
+            if metadata.get('memory_l1_program_request', {}).get('request_sha256') != fingerprint:
+                raise IdempotencyConflict('program revision request changed')
+            if prior['status'] == 'committed':
+                receipt = await self._receipt(memory_id, request_id, prior['result'], replayed=True)
+                receipt['operation_id'] = prior['operation_id']
+                return receipt
+            if prior['status'] not in {'prepared', 'body_written'}:
+                raise L1OwnerError('original_operation_not_resumable', status=409)
+        memory = self.authority.get_memory(memory_id)
+        if not memory or memory['state'] == 'tombstoned':
+            raise L1OwnerError('memory_withdrawn', status=409)
+        if not prior and memory['active_revision'] != payload['expected_revision']:
+            raise RevisionConflict('program plan L1 revision changed')
+        if not owner:
+            from memory_l3_sync import validate_followup_adoption
+            validate_followup_adoption(self.authority, memory_id, payload, program_context,
+                actor=actor, decision_source=decision_source,
+                source_bindings=source_bindings, source_snapshots=source_snapshots)
+        from memory_l1_contract import verify_text_anchor
+        from memory_l0_sources import MemoryL0Sources
+        for snapshot, binding in zip(source_snapshots, source_bindings):
+            identity = {key: binding.get(key) for key in ('source_namespace', 'source_id', 'source_revision')}
+            if any(snapshot.get(key) != value for key, value in identity.items()):
+                raise L1OwnerError('program_source_identity_mismatch', field_path='sources')
+            if owner:
+                allowed_sources = [program_context['source_ref'], *program_context.get('owner_source_refs', [])]
+                if (identity['source_namespace'] != 'snapshot.ombre.owner_l2_edit'
+                        or identity not in allowed_sources or type(identity['source_revision']) is not int
+                        or identity['source_revision'] < 1
+                        or (identity == program_context['source_ref']
+                            and identity['source_revision'] != program_context.get('owner_source_revision'))):
+                    raise L1OwnerError('owner_correction_source_required', field_path='sources')
+            if hasattr(source_reader, 'locate'):
+                observed = await source_reader.locate(binding)
+                eligible = observed.get('eligible_source') is True
+            else:
+                observed = await source_reader.read(binding)
+                eligible = (observed.get('state') == 'available' and observed.get('eligible_source') is True
+                    and all(observed.get(key) == value for key, value in identity.items()))
+            if not eligible or observed.get('text') != snapshot.get('text'):
+                raise L1OwnerError('program_source_not_currently_readable', status=409, field_path='sources')
+            for anchor in binding.get('anchors', []):
+                verify_text_anchor(snapshot['text'], anchor, target_namespace='l0',
+                    target_id=binding['source_id'], target_revision=binding['source_revision'],
+                    text_view_id=snapshot['text_view_id'])
+            MemoryL0Sources(self.authority).retain_copy(snapshot)
+        if prior:
+            prepared = prior['payload']
+            result = await self.commit.commit_memory(**{key: prepared[key] for key in
+                ('memory_id', 'bucket_id', 'expected_revision', 'metadata', 'source_refs', 'decision_source',
+                 'actor', 'memory_state', 'recall_policy')}, body=payload['document']['narrative']['body'],
+                idempotency_key=idem, l1_write_intent=True)
+        else:
+            base = await self.detail(memory_id, payload['expected_revision'])
+            previous = base['l1']['document']
+            if not isinstance(previous, dict):
+                raise L1OwnerError('original_structure_unavailable', status=409)
+            current_bindings = copy.deepcopy(previous['evidence_bindings'])
+            by_id = {row['binding_id']: row for row in current_bindings}
+            for binding in source_bindings:
+                if binding['binding_id'] in by_id and by_id[binding['binding_id']] != binding:
+                    raise L1OwnerError('program_binding_identity_conflict', field_path='evidence_bindings')
+                if binding['binding_id'] not in by_id:
+                    current_bindings.append(copy.deepcopy(binding))
+            submitted = copy.deepcopy(payload['document'])
+            if submitted.get('evidence_bindings') not in (previous['evidence_bindings'], current_bindings):
+                raise L1OwnerError('managed_field_changed', field_path='document.evidence_bindings')
+            submitted['evidence_bindings'] = current_bindings
+            extended_previous = copy.deepcopy(previous)
+            extended_previous['evidence_bindings'] = current_bindings
+            catalog, catalog_revision = self.catalog_provider()
+            document = self._owner_document(submitted, extended_previous, memory_id=memory_id,
+                request_id=request_id, catalog=catalog, catalog_revision=catalog_revision,
+                revision=payload['expected_revision'] + 1)
+            if not owner:
+                generation = generation_template(document['generation']['catalog_snapshot'], catalog_revision, 'first_pass_model')
+                generation['actor'] = actor
+                document['generation'] = generation
+                previous_relations = {r['relation_id']: r for r in previous.get('relations', [])}
+                for relation in document['relations']:
+                    old = previous_relations.get(relation['relation_id'])
+                    if not old or any(old[key] != relation[key] for key in ('from', 'to', 'kind', 'evidence_refs')):
+                        relation.update(origin='model', confirmation_state='proposed')
+                for scene in document['scenes']:
+                    scene['generation'] = copy.deepcopy(generation)
+            body, semantic = split_document(document)
+            record = self.authority.get_memory_revision(memory_id, payload['expected_revision'])
+            metadata = copy.deepcopy(record['metadata'])
+            metadata.update(memory_l1=semantic, name=document['narrative']['title'],
+                memory_l1_program_context=copy.deepcopy(program_context),
+                memory_l1_program_request={'request_id': request_id, 'request_sha256': fingerprint})
+            from memory_relation_dependencies import owner_adoption_ids
+            if owner:
+                adopted = owner_adoption_ids(previous, document, payload.get('owner_relation_adoptions', []))
+                metadata['memory_l1_owner_request'] = {'request_id': request_id,
+                    'request_sha256': fingerprint, 'owner_relation_adoptions': adopted}
+            result = await self.commit.commit_memory(memory_id=memory_id, bucket_id=memory['bucket_id'],
+                expected_revision=payload['expected_revision'], body=body, metadata=metadata,
+                source_refs=record['source_refs'], decision_source=decision_source, idempotency_key=idem,
+                actor=actor, memory_state=memory['state'], recall_policy=memory['recall_policy'], l1_write_intent=True)
+        receipt = await self._receipt(memory_id, request_id, result, replayed=bool(prior))
+        actual = self.authority.get_memory_revision(memory_id, result['revision'])
+        receipt['operation_id'] = actual['operation_id']
+        return receipt
 
     async def _receipt(self, memory_id, request_id, result, *, replayed):
         return {"status": "ok", "request_id": request_id, "replayed": replayed,
