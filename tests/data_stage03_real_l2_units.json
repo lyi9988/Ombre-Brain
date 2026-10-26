@@ -1,0 +1,4378 @@
+{
+  "provenance": "Original 2026-10-26 real provider outputs; synthetic source material; replay only, not fresh source authorization",
+  "sources": {
+    "chat": {
+      "source_file": "staging\\context03-real-chain-20261026\\provider-results\\chat-l2.result.json",
+      "source_sha256": "73b9da2808ee3f860e5965d5c56ed75417375cd9bcd3ec7587b4e4f6a02e1ab5",
+      "memory_id": "chat_memory_ba4929a6e0e6b2968d4228f8c37de18b",
+      "document": {
+        "attributes": [],
+        "entities": [
+          {
+            "aliases": [
+              "宝宝",
+              "老婆",
+              "亲爱的",
+              "猪猪",
+              "她"
+            ],
+            "entity_id": "en_a595d68dc1f55fa6ab945a90ad7f8dee",
+            "entity_type": {
+              "evidence_refs": [
+                "source:1",
+                "source:3"
+              ],
+              "state": "known",
+              "value": "user"
+            },
+            "name": "润润"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_8b2b50b6a83958ab9d4411e8d884b3ca",
+            "entity_type": {
+              "evidence_refs": [
+                "source:2"
+              ],
+              "state": "known",
+              "value": "assistant"
+            },
+            "name": "顾衍"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_efa766273e6f59c08022f32232918488",
+            "entity_type": {
+              "evidence_refs": [
+                "source:1",
+                "source:3"
+              ],
+              "state": "known",
+              "value": "third_party"
+            },
+            "name": "林岚"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_b397d2243a47544bbe50ec49c31d926d",
+            "entity_type": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "state": "known",
+              "value": "third_party"
+            },
+            "name": "陈屿"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_ee6305bbfb2c522594ca7afd3dbd4058",
+            "entity_type": {
+              "evidence_refs": [
+                "source:1",
+                "source:3"
+              ],
+              "state": "known",
+              "value": "object"
+            },
+            "name": "蓝色摄影册"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_b4ca3b5ea9f4506587c88be1313eb3a2",
+            "entity_type": {
+              "evidence_refs": [
+                "source:1"
+              ],
+              "state": "known",
+              "value": "object"
+            },
+            "name": "北岸图书馆"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_c3debefd0a4753e4b81f3e83d633f57b",
+            "entity_type": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "state": "known",
+              "value": "object"
+            },
+            "name": "绿洲图书馆"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_580c290bf3ea54caa388c99211507dfd",
+            "entity_type": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "state": "known",
+              "value": "object"
+            },
+            "name": "海岬展馆"
+          }
+        ],
+        "entry": {
+          "derived_from_revision": null,
+          "document_group_id": null,
+          "form": "episode",
+          "parent_ref": null,
+          "scene_ref": null,
+          "shared_statement_refs": []
+        },
+        "evidence_bindings": [
+          {
+            "anchors": [
+              {
+                "coordinate_unit": "unicode_codepoint",
+                "end": 101,
+                "quote_sha256": "fe051d3e192cfa09ca9ab4405a6c7b3ed8b542a35ec33f7bd20dc18c64949633",
+                "start": 0,
+                "target_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-chat-u1\",\"profile_id\":\"jiajia-main\",\"role\":\"user\",\"system\":\"aizizhu\"}",
+                "target_namespace": "l0",
+                "target_revision": "source_sha256:b148cbd060b433845476ec4ca290e01bc6deb83e1b4e3c2844c0a0fe189be834",
+                "text_sha256": "fe051d3e192cfa09ca9ab4405a6c7b3ed8b542a35ec33f7bd20dc18c64949633",
+                "text_view_id": "memory.source.exact-v1"
+              }
+            ],
+            "author_ref": "participant:9bebdca0f18ac25be0a898b9:owner",
+            "binding_id": "source:1",
+            "source_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-chat-u1\",\"profile_id\":\"jiajia-main\",\"role\":\"user\",\"system\":\"aizizhu\"}",
+            "source_namespace": "snapshot.aiz.canonical_event",
+            "source_revision": "source_sha256:b148cbd060b433845476ec4ca290e01bc6deb83e1b4e3c2844c0a0fe189be834",
+            "speaker_ref": "participant:9bebdca0f18ac25be0a898b9:owner"
+          },
+          {
+            "anchors": [
+              {
+                "coordinate_unit": "unicode_codepoint",
+                "end": 41,
+                "quote_sha256": "c2c395d2dd37b6edf93627d100a80d7ee0347ab85d8913ca0ccb2cf2e10ca779",
+                "start": 0,
+                "target_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-chat-a1\",\"profile_id\":\"jiajia-main\",\"role\":\"assistant\",\"system\":\"aizizhu\"}",
+                "target_namespace": "l0",
+                "target_revision": "source_sha256:51fd65708165f5e71562b2f11552b38d8bc5063f5c5d262340aadf51891cad92",
+                "text_sha256": "c2c395d2dd37b6edf93627d100a80d7ee0347ab85d8913ca0ccb2cf2e10ca779",
+                "text_view_id": "memory.source.exact-v1"
+              }
+            ],
+            "author_ref": "participant:9bebdca0f18ac25be0a898b9:self",
+            "binding_id": "source:2",
+            "source_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-chat-a1\",\"profile_id\":\"jiajia-main\",\"role\":\"assistant\",\"system\":\"aizizhu\"}",
+            "source_namespace": "snapshot.aiz.canonical_event",
+            "source_revision": "source_sha256:51fd65708165f5e71562b2f11552b38d8bc5063f5c5d262340aadf51891cad92",
+            "speaker_ref": "participant:9bebdca0f18ac25be0a898b9:self"
+          },
+          {
+            "anchors": [
+              {
+                "coordinate_unit": "unicode_codepoint",
+                "end": 115,
+                "quote_sha256": "4f16248eac7d6dd9b7d443b8e5a8a9a0768ca93224f1afbfad7475b9208ffb0d",
+                "start": 0,
+                "target_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-chat-u2\",\"profile_id\":\"jiajia-main\",\"role\":\"user\",\"system\":\"aizizhu\"}",
+                "target_namespace": "l0",
+                "target_revision": "source_sha256:2ccb27ff0624643a05156d5510c3f852071a0473ea8167c9b5f24a229e89b535",
+                "text_sha256": "4f16248eac7d6dd9b7d443b8e5a8a9a0768ca93224f1afbfad7475b9208ffb0d",
+                "text_view_id": "memory.source.exact-v1"
+              }
+            ],
+            "author_ref": "participant:9bebdca0f18ac25be0a898b9:owner",
+            "binding_id": "source:3",
+            "source_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-chat-u2\",\"profile_id\":\"jiajia-main\",\"role\":\"user\",\"system\":\"aizizhu\"}",
+            "source_namespace": "snapshot.aiz.canonical_event",
+            "source_revision": "source_sha256:2ccb27ff0624643a05156d5510c3f852071a0473ea8167c9b5f24a229e89b535",
+            "speaker_ref": "participant:9bebdca0f18ac25be0a898b9:owner"
+          }
+        ],
+        "generation": {
+          "actor": "chat_memory_preparation",
+          "catalog_revision": "mc-fd9ea532a1a8c37caaca75ef2fe18d7683cd6fbdb477f8a088ec3961951f71db",
+          "catalog_snapshot": {
+            "attributes": [],
+            "bases": [
+              "direct_expression",
+              "record",
+              "reported",
+              "interpretation",
+              "hypothesis"
+            ],
+            "cognition_roles": [
+              "observation",
+              "question",
+              "hypothesis",
+              "insight",
+              "view",
+              "practice"
+            ],
+            "cognition_statuses": [
+              "tentative",
+              "supported",
+              "contested",
+              "revised",
+              "resolved"
+            ],
+            "definitions": [
+              {
+                "aliases": [],
+                "axis": "subjects",
+                "description": "陈述所涉及或其体验、属性、行为归属的主人；不因某处出现第一人称就自动判定。",
+                "examples": [],
+                "id": "user",
+                "label": "主人",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "subjects",
+                "description": "陈述所涉及的助手；说话者是助手不代表陈述主体必然是助手。",
+                "examples": [],
+                "id": "assistant",
+                "label": "助手",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "subjects",
+                "description": "陈述所涉及的其他人物或组织；与来源中的发言者分开判断。",
+                "examples": [],
+                "id": "third_party",
+                "label": "第三方",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "subjects",
+                "description": "陈述所涉及的非人物对象、地点或事物。",
+                "examples": [],
+                "id": "object",
+                "label": "对象",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "关于实际发生的事件、互动或经历；保留参与者、范围及有据的时间。",
+                "examples": [],
+                "id": "experience",
+                "label": "经历",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "关于某一时段内的情况或状态；没有时间证据时不默认为当前。",
+                "examples": [],
+                "id": "state",
+                "label": "状态",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "有来源依据的具体陈述；不要把推断或尚未确认的说法写成已核实事实。",
+                "examples": [],
+                "id": "fact",
+                "label": "事实",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "关于倾向或喜好的陈述；一次请求或一次接受本身不证明长期、反复偏好。",
+                "examples": [],
+                "id": "preference",
+                "label": "偏好",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "明确的限制或不可接受范围；保留适用条件和例外。",
+                "examples": [],
+                "id": "boundary",
+                "label": "边界",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "关于希望、打算或计划的陈述；不等同承诺，也不证明行动已经完成。",
+                "examples": [],
+                "id": "intention",
+                "label": "意向",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "由来源材料归纳出的理解；保留其推断性质，不冒充来源原话或已确认事实。",
+                "examples": [],
+                "id": "interpretation",
+                "label": "解释",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "关于可重复步骤或处理方式的陈述；一次发生不自动证明它是稳定流程。",
+                "examples": [],
+                "id": "procedure",
+                "label": "做法",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "entity_types",
+                "description": "目录中代表主人的实体类型；发言者身份与每条陈述的事实主体仍需分别判断。",
+                "examples": [],
+                "id": "user",
+                "label": "主人实体",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "entity_types",
+                "description": "目录中代表助手的实体类型；不能仅凭助手转述把陈述主体设为主人。",
+                "examples": [],
+                "id": "assistant",
+                "label": "助手实体",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "entity_types",
+                "description": "目录中代表其他人物或组织的实体类型。",
+                "examples": [],
+                "id": "third_party",
+                "label": "第三方实体",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "entity_types",
+                "description": "目录中代表非人物对象、地点或事物的实体类型。",
+                "examples": [],
+                "id": "object",
+                "label": "对象实体",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "两条陈述或场景指向同一事件；需有来源依据，不因主题相似就合并。",
+                "examples": [],
+                "id": "same_event",
+                "label": "同一事件",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "一项内容补充另一项而不替代它；保留各自来源和范围。",
+                "examples": [],
+                "id": "supplements",
+                "label": "补充",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "新证据修正先前陈述的部分内容；只更新有依据的部分并保留修订关系。",
+                "examples": [],
+                "id": "revises",
+                "label": "修订",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "一项内容缩小另一项内容的适用范围、条件或例外。",
+                "examples": [],
+                "id": "limits",
+                "label": "限定",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "有依据的新陈述取代旧陈述在明确重叠范围内的效力；不等于静默删除历史。",
+                "examples": [],
+                "id": "supersedes",
+                "label": "取代",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "两项内容可能不一致但尚未裁决；保留不确定性，不自动选边。",
+                "examples": [],
+                "id": "possible_conflict",
+                "label": "可能冲突",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "一项更具体陈述从原先合并内容拆出；保留其来源和拆分关系。",
+                "examples": [],
+                "id": "split_from",
+                "label": "拆分自",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "一项整理内容由多项来源陈述合并；不得丢失各自的来源和差异。",
+                "examples": [],
+                "id": "merged_from",
+                "label": "合并自",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "stabilities",
+                "description": "限于一次事件或短时状态。",
+                "examples": [],
+                "id": "episode",
+                "label": "单次",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "stabilities",
+                "description": "在明确阶段内持续。",
+                "examples": [],
+                "id": "phase",
+                "label": "阶段",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "stabilities",
+                "description": "跨阶段相对稳定，仍可修订。",
+                "examples": [],
+                "id": "stable",
+                "label": "相对稳定",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "表达一个主张或情况。",
+                "examples": [],
+                "id": "assertion",
+                "label": "陈述",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "向他人提出请求。",
+                "examples": [],
+                "id": "request",
+                "label": "请求",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "表达希望但未必计划执行。",
+                "examples": [],
+                "id": "wish",
+                "label": "愿望",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "表达拟采取的行动。",
+                "examples": [],
+                "id": "plan",
+                "label": "计划",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "表达承担履行义务。",
+                "examples": [],
+                "id": "commitment",
+                "label": "承诺",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "尚待确认的解释或推测。",
+                "examples": [],
+                "id": "hypothesis",
+                "label": "假设",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "提出问题或待确认事项。",
+                "examples": [],
+                "id": "question",
+                "label": "疑问",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "bases",
+                "description": "说明陈述为何有据，而非标记发言角色：当事人明确表达，或主人明确接受助手当时明确提出的内容。接受只支持当时明确提议的范围，须概述呈现，不能冒充主人逐字原话，也不覆盖助手之后补加的内容。",
+                "examples": [],
+                "id": "direct_expression",
+                "label": "直接表达/明确接受",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "bases",
+                "description": "陈述依据是来源直接记录的事件或行为；记录时间不自动等于事件发生时间。",
+                "examples": [],
+                "id": "record",
+                "label": "实际记录",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "bases",
+                "description": "陈述依据是来源对他人说法的转述；不等同于被转述者的直接表达或亲历记录。",
+                "examples": [],
+                "id": "reported",
+                "label": "转述",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "bases",
+                "description": "陈述依据是对现有材料的归纳或解释；保留推断性质，不当作来源原话或已确认事实。",
+                "examples": [],
+                "id": "interpretation",
+                "label": "理解",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "bases",
+                "description": "陈述依据仍不足、需要确认；这是成立依据轴，与modalities.hypothesis表达尚待确认的断言方式相互独立。",
+                "examples": [],
+                "id": "hypothesis",
+                "label": "依据不足的假设",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_roles",
+                "description": "注意到的情况，保留实际来源与范围。",
+                "examples": [],
+                "id": "observation",
+                "label": "观察",
+                "parent_id": null
+              },
+              {
+                "aliases": [
+                  "问题",
+                  "没想明白",
+                  "纠结"
+                ],
+                "axis": "cognition_roles",
+                "description": "仍未想明白的问题，不自动当作结论。",
+                "examples": [],
+                "id": "question",
+                "label": "疑问",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_roles",
+                "description": "可能的解释，保留反例与待验证性质。",
+                "examples": [],
+                "id": "hypothesis",
+                "label": "假设",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_roles",
+                "description": "基于经历形成的理解，仍可修订。",
+                "examples": [],
+                "id": "insight",
+                "label": "理解",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_roles",
+                "description": "某主体的看法，不等于客观事实。",
+                "examples": [],
+                "id": "view",
+                "label": "观点",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_roles",
+                "description": "形成或尝试的处理方式，保留条件与效果。",
+                "examples": [],
+                "id": "practice",
+                "label": "做法",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_statuses",
+                "description": "证据或理解尚不充分。",
+                "examples": [],
+                "id": "tentative",
+                "label": "暂定",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_statuses",
+                "description": "已有支持依据，不等于主人确认或绝对正确。",
+                "examples": [],
+                "id": "supported",
+                "label": "已有支持",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_statuses",
+                "description": "存在反例或未能消解的分歧。",
+                "examples": [],
+                "id": "contested",
+                "label": "有争议",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_statuses",
+                "description": "作为旧理解保留，并沿修订关系看当前版本。",
+                "examples": [],
+                "id": "revised",
+                "label": "已修订",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_statuses",
+                "description": "该问题已有阶段性处理，不自动证明外部事情已完成。",
+                "examples": [],
+                "id": "resolved",
+                "label": "已梳理",
+                "parent_id": null
+              }
+            ],
+            "entity_types": [
+              "user",
+              "assistant",
+              "third_party",
+              "object"
+            ],
+            "kinds": [
+              "experience",
+              "state",
+              "fact",
+              "preference",
+              "boundary",
+              "intention",
+              "interpretation",
+              "procedure"
+            ],
+            "modalities": [
+              "assertion",
+              "request",
+              "wish",
+              "plan",
+              "commitment",
+              "hypothesis",
+              "question"
+            ],
+            "relation_types": [
+              "same_event",
+              "supplements",
+              "revises",
+              "limits",
+              "supersedes",
+              "possible_conflict",
+              "split_from",
+              "merged_from"
+            ],
+            "stabilities": [
+              "episode",
+              "phase",
+              "stable"
+            ],
+            "subjects": [
+              "user",
+              "assistant",
+              "third_party",
+              "object"
+            ],
+            "topics": []
+          },
+          "model_route_revision": "route_sha256:739ee853b1f9ee3ade624dd094d0d044657dbd2661d79f0bf0c7cac6cdaeaea3",
+          "origin": "first_pass_model",
+          "prompt_revision": "prompt_sha256:7fb24c42663d320e2869845526f8e534fccdfb456d9a7cf5e28f3de16703372e",
+          "task_id": "chat_memory_ba4929a6e0e6b2968d4228f8c37de18b:1"
+        },
+        "narrative": {
+          "title": "虚构验收设定：林岚还书更正与陪同条件",
+          "body": "我记下这份明确标为虚构的验收设定，也记住了她的更正：还蓝色摄影册的是林岚，已从10月28日北岸图书馆改为10月30日下午四点的绿洲图书馆；她只有在当天不下雨且已下班时才陪同，没有答应替林岚还书。陈屿11月1日去海岬展馆取票是另一件事，她没有答应陪陈屿。"
+        },
+        "relations": [
+          {
+            "confirmation_state": "proposed",
+            "evidence_refs": [
+              "source:3"
+            ],
+            "from": {
+              "memory_id": "chat_memory_ba4929a6e0e6b2968d4228f8c37de18b",
+              "object_id": "st_01995814212259cf991c89895254b357",
+              "object_type": "statement",
+              "revision": 1
+            },
+            "kind": "same_event",
+            "origin": "model",
+            "relation_id": "rl_82d5e78317b05e3b8679eb60d8af4fd5",
+            "to": {
+              "memory_id": "chat_memory_ba4929a6e0e6b2968d4228f8c37de18b",
+              "object_id": "st_0726d3823cd25a099b517417f2fcf5c5",
+              "object_type": "statement",
+              "revision": 1
+            }
+          }
+        ],
+        "retrieval": {
+          "keywords": [
+            "林岚",
+            "蓝色摄影册",
+            "北岸图书馆",
+            "绿洲图书馆",
+            "海岬展馆",
+            "陈屿",
+            "验收设定",
+            "10月30日",
+            "不下雨",
+            "下班",
+            "陪同还书"
+          ],
+          "tags": [
+            "验收设定",
+            "条件更正"
+          ]
+        },
+        "scenes": [
+          {
+            "anchors": [],
+            "attributes": [],
+            "generation": {
+              "actor": "chat_memory_preparation",
+              "catalog_revision": "mc-fd9ea532a1a8c37caaca75ef2fe18d7683cd6fbdb477f8a088ec3961951f71db",
+              "catalog_snapshot": {
+                "attributes": [],
+                "bases": [
+                  "direct_expression",
+                  "record",
+                  "reported",
+                  "interpretation",
+                  "hypothesis"
+                ],
+                "cognition_roles": [
+                  "observation",
+                  "question",
+                  "hypothesis",
+                  "insight",
+                  "view",
+                  "practice"
+                ],
+                "cognition_statuses": [
+                  "tentative",
+                  "supported",
+                  "contested",
+                  "revised",
+                  "resolved"
+                ],
+                "definitions": [
+                  {
+                    "aliases": [],
+                    "axis": "subjects",
+                    "description": "陈述所涉及或其体验、属性、行为归属的主人；不因某处出现第一人称就自动判定。",
+                    "examples": [],
+                    "id": "user",
+                    "label": "主人",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "subjects",
+                    "description": "陈述所涉及的助手；说话者是助手不代表陈述主体必然是助手。",
+                    "examples": [],
+                    "id": "assistant",
+                    "label": "助手",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "subjects",
+                    "description": "陈述所涉及的其他人物或组织；与来源中的发言者分开判断。",
+                    "examples": [],
+                    "id": "third_party",
+                    "label": "第三方",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "subjects",
+                    "description": "陈述所涉及的非人物对象、地点或事物。",
+                    "examples": [],
+                    "id": "object",
+                    "label": "对象",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "关于实际发生的事件、互动或经历；保留参与者、范围及有据的时间。",
+                    "examples": [],
+                    "id": "experience",
+                    "label": "经历",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "关于某一时段内的情况或状态；没有时间证据时不默认为当前。",
+                    "examples": [],
+                    "id": "state",
+                    "label": "状态",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "有来源依据的具体陈述；不要把推断或尚未确认的说法写成已核实事实。",
+                    "examples": [],
+                    "id": "fact",
+                    "label": "事实",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "关于倾向或喜好的陈述；一次请求或一次接受本身不证明长期、反复偏好。",
+                    "examples": [],
+                    "id": "preference",
+                    "label": "偏好",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "明确的限制或不可接受范围；保留适用条件和例外。",
+                    "examples": [],
+                    "id": "boundary",
+                    "label": "边界",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "关于希望、打算或计划的陈述；不等同承诺，也不证明行动已经完成。",
+                    "examples": [],
+                    "id": "intention",
+                    "label": "意向",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "由来源材料归纳出的理解；保留其推断性质，不冒充来源原话或已确认事实。",
+                    "examples": [],
+                    "id": "interpretation",
+                    "label": "解释",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "关于可重复步骤或处理方式的陈述；一次发生不自动证明它是稳定流程。",
+                    "examples": [],
+                    "id": "procedure",
+                    "label": "做法",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "entity_types",
+                    "description": "目录中代表主人的实体类型；发言者身份与每条陈述的事实主体仍需分别判断。",
+                    "examples": [],
+                    "id": "user",
+                    "label": "主人实体",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "entity_types",
+                    "description": "目录中代表助手的实体类型；不能仅凭助手转述把陈述主体设为主人。",
+                    "examples": [],
+                    "id": "assistant",
+                    "label": "助手实体",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "entity_types",
+                    "description": "目录中代表其他人物或组织的实体类型。",
+                    "examples": [],
+                    "id": "third_party",
+                    "label": "第三方实体",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "entity_types",
+                    "description": "目录中代表非人物对象、地点或事物的实体类型。",
+                    "examples": [],
+                    "id": "object",
+                    "label": "对象实体",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "两条陈述或场景指向同一事件；需有来源依据，不因主题相似就合并。",
+                    "examples": [],
+                    "id": "same_event",
+                    "label": "同一事件",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "一项内容补充另一项而不替代它；保留各自来源和范围。",
+                    "examples": [],
+                    "id": "supplements",
+                    "label": "补充",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "新证据修正先前陈述的部分内容；只更新有依据的部分并保留修订关系。",
+                    "examples": [],
+                    "id": "revises",
+                    "label": "修订",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "一项内容缩小另一项内容的适用范围、条件或例外。",
+                    "examples": [],
+                    "id": "limits",
+                    "label": "限定",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "有依据的新陈述取代旧陈述在明确重叠范围内的效力；不等于静默删除历史。",
+                    "examples": [],
+                    "id": "supersedes",
+                    "label": "取代",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "两项内容可能不一致但尚未裁决；保留不确定性，不自动选边。",
+                    "examples": [],
+                    "id": "possible_conflict",
+                    "label": "可能冲突",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "一项更具体陈述从原先合并内容拆出；保留其来源和拆分关系。",
+                    "examples": [],
+                    "id": "split_from",
+                    "label": "拆分自",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "一项整理内容由多项来源陈述合并；不得丢失各自的来源和差异。",
+                    "examples": [],
+                    "id": "merged_from",
+                    "label": "合并自",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "stabilities",
+                    "description": "限于一次事件或短时状态。",
+                    "examples": [],
+                    "id": "episode",
+                    "label": "单次",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "stabilities",
+                    "description": "在明确阶段内持续。",
+                    "examples": [],
+                    "id": "phase",
+                    "label": "阶段",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "stabilities",
+                    "description": "跨阶段相对稳定，仍可修订。",
+                    "examples": [],
+                    "id": "stable",
+                    "label": "相对稳定",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "表达一个主张或情况。",
+                    "examples": [],
+                    "id": "assertion",
+                    "label": "陈述",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "向他人提出请求。",
+                    "examples": [],
+                    "id": "request",
+                    "label": "请求",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "表达希望但未必计划执行。",
+                    "examples": [],
+                    "id": "wish",
+                    "label": "愿望",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "表达拟采取的行动。",
+                    "examples": [],
+                    "id": "plan",
+                    "label": "计划",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "表达承担履行义务。",
+                    "examples": [],
+                    "id": "commitment",
+                    "label": "承诺",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "尚待确认的解释或推测。",
+                    "examples": [],
+                    "id": "hypothesis",
+                    "label": "假设",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "提出问题或待确认事项。",
+                    "examples": [],
+                    "id": "question",
+                    "label": "疑问",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "bases",
+                    "description": "说明陈述为何有据，而非标记发言角色：当事人明确表达，或主人明确接受助手当时明确提出的内容。接受只支持当时明确提议的范围，须概述呈现，不能冒充主人逐字原话，也不覆盖助手之后补加的内容。",
+                    "examples": [],
+                    "id": "direct_expression",
+                    "label": "直接表达/明确接受",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "bases",
+                    "description": "陈述依据是来源直接记录的事件或行为；记录时间不自动等于事件发生时间。",
+                    "examples": [],
+                    "id": "record",
+                    "label": "实际记录",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "bases",
+                    "description": "陈述依据是来源对他人说法的转述；不等同于被转述者的直接表达或亲历记录。",
+                    "examples": [],
+                    "id": "reported",
+                    "label": "转述",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "bases",
+                    "description": "陈述依据是对现有材料的归纳或解释；保留推断性质，不当作来源原话或已确认事实。",
+                    "examples": [],
+                    "id": "interpretation",
+                    "label": "理解",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "bases",
+                    "description": "陈述依据仍不足、需要确认；这是成立依据轴，与modalities.hypothesis表达尚待确认的断言方式相互独立。",
+                    "examples": [],
+                    "id": "hypothesis",
+                    "label": "依据不足的假设",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_roles",
+                    "description": "注意到的情况，保留实际来源与范围。",
+                    "examples": [],
+                    "id": "observation",
+                    "label": "观察",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [
+                      "问题",
+                      "没想明白",
+                      "纠结"
+                    ],
+                    "axis": "cognition_roles",
+                    "description": "仍未想明白的问题，不自动当作结论。",
+                    "examples": [],
+                    "id": "question",
+                    "label": "疑问",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_roles",
+                    "description": "可能的解释，保留反例与待验证性质。",
+                    "examples": [],
+                    "id": "hypothesis",
+                    "label": "假设",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_roles",
+                    "description": "基于经历形成的理解，仍可修订。",
+                    "examples": [],
+                    "id": "insight",
+                    "label": "理解",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_roles",
+                    "description": "某主体的看法，不等于客观事实。",
+                    "examples": [],
+                    "id": "view",
+                    "label": "观点",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_roles",
+                    "description": "形成或尝试的处理方式，保留条件与效果。",
+                    "examples": [],
+                    "id": "practice",
+                    "label": "做法",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_statuses",
+                    "description": "证据或理解尚不充分。",
+                    "examples": [],
+                    "id": "tentative",
+                    "label": "暂定",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_statuses",
+                    "description": "已有支持依据，不等于主人确认或绝对正确。",
+                    "examples": [],
+                    "id": "supported",
+                    "label": "已有支持",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_statuses",
+                    "description": "存在反例或未能消解的分歧。",
+                    "examples": [],
+                    "id": "contested",
+                    "label": "有争议",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_statuses",
+                    "description": "作为旧理解保留，并沿修订关系看当前版本。",
+                    "examples": [],
+                    "id": "revised",
+                    "label": "已修订",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_statuses",
+                    "description": "该问题已有阶段性处理，不自动证明外部事情已完成。",
+                    "examples": [],
+                    "id": "resolved",
+                    "label": "已梳理",
+                    "parent_id": null
+                  }
+                ],
+                "entity_types": [
+                  "user",
+                  "assistant",
+                  "third_party",
+                  "object"
+                ],
+                "kinds": [
+                  "experience",
+                  "state",
+                  "fact",
+                  "preference",
+                  "boundary",
+                  "intention",
+                  "interpretation",
+                  "procedure"
+                ],
+                "modalities": [
+                  "assertion",
+                  "request",
+                  "wish",
+                  "plan",
+                  "commitment",
+                  "hypothesis",
+                  "question"
+                ],
+                "relation_types": [
+                  "same_event",
+                  "supplements",
+                  "revises",
+                  "limits",
+                  "supersedes",
+                  "possible_conflict",
+                  "split_from",
+                  "merged_from"
+                ],
+                "stabilities": [
+                  "episode",
+                  "phase",
+                  "stable"
+                ],
+                "subjects": [
+                  "user",
+                  "assistant",
+                  "third_party",
+                  "object"
+                ],
+                "topics": []
+              },
+              "model_route_revision": "route_sha256:739ee853b1f9ee3ade624dd094d0d044657dbd2661d79f0bf0c7cac6cdaeaea3",
+              "origin": "first_pass_model",
+              "prompt_revision": "prompt_sha256:7fb24c42663d320e2869845526f8e534fccdfb456d9a7cf5e28f3de16703372e",
+              "task_id": "chat_memory_ba4929a6e0e6b2968d4228f8c37de18b:1"
+            },
+            "scene_id": "sc_53c607e2d4615c359dd32a4128888f32",
+            "scene_revision_id": "sr_e8330e3f2de7e65e92598f12ebead58e459d20d1dbf3bdcc19c315e3297929a7",
+            "statement_refs": [
+              "st_f96eaa4763845d988f8f9f8b21b5d3be",
+              "st_01995814212259cf991c89895254b357",
+              "st_df3daa91f4f656c9928c760ee28944ca",
+              "st_0726d3823cd25a099b517417f2fcf5c5",
+              "st_92701bf1829a5cfb891c75c24633db03",
+              "st_c335d1de7b0151a492e29c916963bf7d",
+              "st_e3eb7280da315e21b2e6be73687a750a",
+              "st_4d79cd56559a532da6b9a5fbe394ee4c",
+              "st_2ce36f52061f527bbc13d84b0dbdec6c"
+            ],
+            "title": "虚构验收设定中的还书安排与条件更正"
+          }
+        ],
+        "schema_version": "memory-l1-v1",
+        "statements": [
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "direct_expression"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "fact"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "assertion"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:1"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "not_stated",
+              "text": null
+            },
+            "content": "润润说明，这份合成验收设定明确标为虚构，作为验收材料，之后需要核问其中的人物、日期和条件。",
+            "evidence_refs": [
+              "source:1"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "detail"
+            },
+            "statement_id": "st_f96eaa4763845d988f8f9f8b21b5d3be",
+            "statement_revision_id": "sr_6678eff705357bc9a7646bdf30d7304eaa37c342da2e26ff77fba63df4cef700",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:1"
+              ],
+              "state": "known",
+              "value": "en_a595d68dc1f55fa6ab945a90ad7f8dee"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": "sc_53c607e2d4615c359dd32a4128888f32",
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "episode"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:1"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "instant",
+                "start": {
+                  "evidence_refs": [
+                    "source:1"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-21T09:00:00+08:00"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:1"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "reported"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "intention"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "plan"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:1"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "not_stated",
+              "text": null
+            },
+            "content": "林岚原定于2026年10月28日下午三点到北岸图书馆还蓝色摄影册。",
+            "evidence_refs": [
+              "source:1"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "detail"
+            },
+            "statement_id": "st_01995814212259cf991c89895254b357",
+            "statement_revision_id": "sr_b34b12f30a03cf5a80fbf790cf362b9ed046541fe13b11ff7d2d02d3ac6866d3",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:1"
+              ],
+              "state": "known",
+              "value": "en_efa766273e6f59c08022f32232918488"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": "sc_53c607e2d4615c359dd32a4128888f32",
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "episode"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:1"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "instant",
+                "start": {
+                  "evidence_refs": [
+                    "source:1"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-28T15:00:00+08:00"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:1"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "direct_expression"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "fact"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "assertion"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "not_stated",
+              "text": null
+            },
+            "content": "润润在2026年10月22日更正这份验收设定：把林岚还蓝色摄影册的安排改为2026年10月30日下午四点、地点改为绿洲图书馆；原定2026年10月28日下午三点到北岸图书馆的时间地点被这次更正取代。",
+            "evidence_refs": [
+              "source:3"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "core"
+            },
+            "statement_id": "st_df3daa91f4f656c9928c760ee28944ca",
+            "statement_revision_id": "sr_e85c967e7c5aefcb1dcc6f56b80313f58752e45ec3d1225a91a6a17a9bea884f",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "state": "known",
+              "value": "en_a595d68dc1f55fa6ab945a90ad7f8dee"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": "sc_53c607e2d4615c359dd32a4128888f32",
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "episode"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "instant",
+                "start": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-22T17:30:00+08:00"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "reported"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "intention"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "plan"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "not_stated",
+              "text": null
+            },
+            "content": "按更正后的设定，林岚于2026年10月30日下午四点去绿洲图书馆还蓝色摄影册。",
+            "evidence_refs": [
+              "source:3"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "core"
+            },
+            "statement_id": "st_0726d3823cd25a099b517417f2fcf5c5",
+            "statement_revision_id": "sr_842a0b72b7bc972e5c1e04b5ca4fcbf81f61499d486d500bb8b0150a081399ff",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "state": "known",
+              "value": "en_efa766273e6f59c08022f32232918488"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": "sc_53c607e2d4615c359dd32a4128888f32",
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "episode"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "instant",
+                "start": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-30T16:00:00+08:00"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:1",
+                  "source:2",
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "direct_expression"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:1",
+                  "source:2",
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "intention"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:1",
+                  "source:2",
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "commitment"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:1",
+                  "source:2",
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:1",
+                "source:3"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "known",
+              "text": "2026年10月30日当天不下雨，且润润已经下班；两个条件须同时满足"
+            },
+            "content": "润润只答应在2026年10月30日当天不下雨且自己已经下班时陪林岚去还摄影册，两个条件须同时满足；2026年10月22日更正时间地点后，这两个条件仍未取消。",
+            "evidence_refs": [
+              "source:1",
+              "source:2",
+              "source:3"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "core"
+            },
+            "statement_id": "st_92701bf1829a5cfb891c75c24633db03",
+            "statement_revision_id": "sr_dd221ff7a532665fde89112f04e7cb3ff48d22df5c5f2435c9315750c758e02b",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:1",
+                "source:2",
+                "source:3"
+              ],
+              "state": "known",
+              "value": "en_a595d68dc1f55fa6ab945a90ad7f8dee"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [
+                    "source:1",
+                    "source:2",
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-30T23:59:59+08:00"
+                },
+                "recurrence_text": null,
+                "scene_ref": "sc_53c607e2d4615c359dd32a4128888f32",
+                "start": {
+                  "evidence_refs": [
+                    "source:1",
+                    "source:2",
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-30T00:00:00+08:00"
+                },
+                "temporal_scope": "time_range"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:1",
+                    "source:2",
+                    "source:3"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "instant",
+                "start": {
+                  "evidence_refs": [
+                    "source:1",
+                    "source:2",
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-21T09:00:00+08:00"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:1",
+                    "source:2",
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "direct_expression"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "boundary"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "assertion"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:1"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "not_stated",
+              "text": null
+            },
+            "content": "润润没有答应替林岚还蓝色摄影册。",
+            "evidence_refs": [
+              "source:1"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "detail"
+            },
+            "statement_id": "st_c335d1de7b0151a492e29c916963bf7d",
+            "statement_revision_id": "sr_9c37ae8f52ed2850778123f7604bcf8be573d5db92fb596acdbe07f5dc76d6ba",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:1"
+              ],
+              "state": "known",
+              "value": "en_a595d68dc1f55fa6ab945a90ad7f8dee"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": null,
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "unknown"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "unknown",
+                "precision": "unknown",
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "timezone": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "reported"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "intention"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "plan"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "not_stated",
+              "text": null
+            },
+            "content": "陈屿在2026年11月1日上午十点去海岬展馆取票，这与林岚还摄影册是另一件事。",
+            "evidence_refs": [
+              "source:3"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "detail"
+            },
+            "statement_id": "st_e3eb7280da315e21b2e6be73687a750a",
+            "statement_revision_id": "sr_f07d38b5d0d72a61714020e189296c87dc38ec17c27bc2e39d9b21d3bb76dc44",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "state": "known",
+              "value": "en_b397d2243a47544bbe50ec49c31d926d"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": "sc_53c607e2d4615c359dd32a4128888f32",
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "episode"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "instant",
+                "start": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "2026-11-01T10:00:00+08:00"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "direct_expression"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "boundary"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "assertion"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "not_stated",
+              "text": null
+            },
+            "content": "润润没有答应陪陈屿去海岬展馆取票。",
+            "evidence_refs": [
+              "source:3"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "detail"
+            },
+            "statement_id": "st_4d79cd56559a532da6b9a5fbe394ee4c",
+            "statement_revision_id": "sr_a9940d0bd922f29292908efb58ce5c0d27732f1fcdef40ae927fe6a4117f94f4",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "state": "known",
+              "value": "en_a595d68dc1f55fa6ab945a90ad7f8dee"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": null,
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "unknown"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "unknown",
+                "precision": "unknown",
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "timezone": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:2"
+                ],
+                "state": "known",
+                "value": "direct_expression"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:2"
+                ],
+                "state": "known",
+                "value": "interpretation"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:2"
+                ],
+                "state": "known",
+                "value": "assertion"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:2"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "cognition": {
+              "about_refs": [
+                "en_efa766273e6f59c08022f32232918488",
+                "en_a595d68dc1f55fa6ab945a90ad7f8dee"
+              ],
+              "epistemic_status": {
+                "evidence_refs": [
+                  "source:2"
+                ],
+                "state": "known",
+                "value": "supported"
+              },
+              "open_questions": [],
+              "role": {
+                "evidence_refs": [
+                  "source:2"
+                ],
+                "state": "known",
+                "value": "insight"
+              }
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:2"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "not_stated",
+              "text": null
+            },
+            "content": "顾衍区分两件事：还摄影册的是林岚；润润只在不下雨并且已经下班两个条件同时满足时陪同。",
+            "evidence_refs": [
+              "source:2"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "detail"
+            },
+            "statement_id": "st_2ce36f52061f527bbc13d84b0dbdec6c",
+            "statement_revision_id": "sr_8872387ab0e85db84ca2a41e4e65c2999bca30d4568aba8aefd555eccb21bb0d",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:2"
+              ],
+              "state": "known",
+              "value": "en_8b2b50b6a83958ab9d4411e8d884b3ca"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": "sc_53c607e2d4615c359dd32a4128888f32",
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "episode"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:2"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "instant",
+                "start": {
+                  "evidence_refs": [
+                    "source:2"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-21T09:00:00+08:00"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:2"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "l2": {
+        "coherent_sections": [
+          {
+            "section_id": "sec_original_and_correction",
+            "statement_refs": [
+              "st_f96eaa4763845d988f8f9f8b21b5d3be",
+              "st_01995814212259cf991c89895254b357",
+              "st_df3daa91f4f656c9928c760ee28944ca",
+              "st_0726d3823cd25a099b517417f2fcf5c5"
+            ],
+            "text": "2026年10月21日，润润说明了一份明确标为虚构的合成验收设定，作为验收材料：林岚原定在2026年10月28日下午三点到北岸图书馆还蓝色摄影册。2026年10月22日，她更正了这份设定：林岚还蓝色摄影册的安排改为2026年10月30日下午四点，地点改为绿洲图书馆，原来10月28日下午三点到北岸图书馆的时间和地点被这次更正取代。她还说明，之后需要核问其中的人物、日期和条件。"
+          },
+          {
+            "section_id": "sec_conditions_and_boundaries",
+            "statement_refs": [
+              "st_92701bf1829a5cfb891c75c24633db03",
+              "st_c335d1de7b0151a492e29c916963bf7d",
+              "st_e3eb7280da315e21b2e6be73687a750a",
+              "st_4d79cd56559a532da6b9a5fbe394ee4c",
+              "st_2ce36f52061f527bbc13d84b0dbdec6c"
+            ],
+            "text": "润润只答应在2026年10月30日当天不下雨且她已经下班时陪林岚去还摄影册，两个条件必须同时满足；更正时间地点后，这两个条件都没有取消。她没有答应替林岚还书。陈屿是在2026年11月1日上午十点去海岬展馆取票，这是另一件事，润润没有答应陪陈屿。我对这两件事的区分是：还摄影册的是林岚；润润只在不下雨并且已经下班这两个条件同时满足时陪同。"
+          }
+        ],
+        "full_injection_text": "2026年10月21日，润润说明了一份明确标为虚构的合成验收设定，作为验收材料。按原来的设定，林岚原定在2026年10月28日下午三点到北岸图书馆还蓝色摄影册。润润只答应在当天不下雨且她已经下班时陪林岚去，两个条件必须同时满足；她没有答应替林岚还书。她还说明，之后需要核问其中的人物、日期和条件。我对这两件事的区分是：还摄影册的是林岚；润润只在不下雨并且已经下班这两个条件同时满足时陪同。\n\n2026年10月22日，润润更正了这份验收设定：林岚还蓝色摄影册的安排改为2026年10月30日下午四点，地点改为绿洲图书馆，原来10月28日下午三点到北岸图书馆的时间和地点被这次更正取代。她明确说，不下雨并且她已经下班这两个条件都没有取消。她还说明，陈屿是在2026年11月1日上午十点去海岬展馆取票，这是另一件事，她没有答应陪陈屿。至此，需要分清的是：林岚还摄影册的安排按更正后的时间地点为准，润润的陪同仍以两个条件同时满足为前提；陈屿取票是另一件事。",
+        "optional_use_variants": [],
+        "review": {
+          "reasons": [],
+          "required": false
+        }
+      }
+    },
+    "auto": {
+      "source_file": "staging\\context03-real-chain-20261026\\provider-results\\auto-l2.result.json",
+      "source_sha256": "984eb23d48bd0a9c349fefebd6bbfe641adc5c28ca9cd3a02ba363ede9056432",
+      "memory_id": "daily_chat_memory_20261024_2e4f34a681",
+      "document": {
+        "attributes": [],
+        "entities": [
+          {
+            "aliases": [
+              "宝宝",
+              "老婆",
+              "亲爱的",
+              "猪猪"
+            ],
+            "entity_id": "en_91ceb6689b635a67aea3489075d03d3e",
+            "entity_type": {
+              "evidence_refs": [
+                "source:1",
+                "source:3"
+              ],
+              "state": "known",
+              "value": "user"
+            },
+            "name": "润润"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_3f7c23fa969c5bf6a359997b3ccb42e2",
+            "entity_type": {
+              "evidence_refs": [
+                "source:2",
+                "source:4"
+              ],
+              "state": "known",
+              "value": "assistant"
+            },
+            "name": "顾衍"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_adf13b1c0b18570ab4cfca6447c5ee47",
+            "entity_type": {
+              "evidence_refs": [
+                "source:1",
+                "source:3"
+              ],
+              "state": "known",
+              "value": "third_party"
+            },
+            "name": "陈屿"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_79e546226b585322b6c7b08149978f54",
+            "entity_type": {
+              "evidence_refs": [
+                "source:1",
+                "source:3"
+              ],
+              "state": "known",
+              "value": "third_party"
+            },
+            "name": "林岚"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_a6573562883c53c5a3c01f0400a23cfa",
+            "entity_type": {
+              "evidence_refs": [
+                "source:1",
+                "source:3"
+              ],
+              "state": "known",
+              "value": "object"
+            },
+            "name": "晴川咖啡馆"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_f9b17038e4a55011977d7a11d5f49b35",
+            "entity_type": {
+              "evidence_refs": [
+                "source:1",
+                "source:3"
+              ],
+              "state": "known",
+              "value": "object"
+            },
+            "name": "银色录音笔"
+          },
+          {
+            "aliases": [],
+            "entity_id": "en_004d996d91fb5178ac7cdaa7f0a583ff",
+            "entity_type": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "state": "known",
+              "value": "object"
+            },
+            "name": "摄影册"
+          }
+        ],
+        "entry": {
+          "derived_from_revision": null,
+          "document_group_id": null,
+          "form": "episode",
+          "parent_ref": null,
+          "scene_ref": null,
+          "shared_statement_refs": []
+        },
+        "evidence_bindings": [
+          {
+            "anchors": [
+              {
+                "coordinate_unit": "unicode_codepoint",
+                "end": 94,
+                "quote_sha256": "31b916fe8810d38cfe2fb38e72946c5ba51cbf5299d1534a0b6e3ae177a57136",
+                "start": 0,
+                "target_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-auto-u1\",\"profile_id\":\"jiajia-main\",\"role\":\"user\",\"system\":\"aizizhu\"}",
+                "target_namespace": "l0",
+                "target_revision": "source_sha256:f9da70478653350fa34ee0a7713c599eb113e708d65024ce21601a2d3a9f7a7f",
+                "text_sha256": "31b916fe8810d38cfe2fb38e72946c5ba51cbf5299d1534a0b6e3ae177a57136",
+                "text_view_id": "memory.source.exact-v1"
+              }
+            ],
+            "author_ref": "participant:9bebdca0f18ac25be0a898b9:owner",
+            "binding_id": "source:1",
+            "source_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-auto-u1\",\"profile_id\":\"jiajia-main\",\"role\":\"user\",\"system\":\"aizizhu\"}",
+            "source_namespace": "snapshot.aiz.canonical_event",
+            "source_revision": "source_sha256:f9da70478653350fa34ee0a7713c599eb113e708d65024ce21601a2d3a9f7a7f",
+            "speaker_ref": "participant:9bebdca0f18ac25be0a898b9:owner"
+          },
+          {
+            "anchors": [
+              {
+                "coordinate_unit": "unicode_codepoint",
+                "end": 48,
+                "quote_sha256": "f97648385823a891a56a16ef86a82851905fe0ab3de9faeb8e855cb2e2fdcde0",
+                "start": 0,
+                "target_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-auto-a1\",\"profile_id\":\"jiajia-main\",\"role\":\"assistant\",\"system\":\"aizizhu\"}",
+                "target_namespace": "l0",
+                "target_revision": "source_sha256:12556706df432de355314747eb9497e7b1ccdc6fdc2b9c8245a1404d64b6e6d4",
+                "text_sha256": "f97648385823a891a56a16ef86a82851905fe0ab3de9faeb8e855cb2e2fdcde0",
+                "text_view_id": "memory.source.exact-v1"
+              }
+            ],
+            "author_ref": "participant:9bebdca0f18ac25be0a898b9:self",
+            "binding_id": "source:2",
+            "source_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-auto-a1\",\"profile_id\":\"jiajia-main\",\"role\":\"assistant\",\"system\":\"aizizhu\"}",
+            "source_namespace": "snapshot.aiz.canonical_event",
+            "source_revision": "source_sha256:12556706df432de355314747eb9497e7b1ccdc6fdc2b9c8245a1404d64b6e6d4",
+            "speaker_ref": "participant:9bebdca0f18ac25be0a898b9:self"
+          },
+          {
+            "anchors": [
+              {
+                "coordinate_unit": "unicode_codepoint",
+                "end": 85,
+                "quote_sha256": "eff48ea4364ef6fdd3e6c23d70dbbefcf04e1a6fe2f5c58eb8894ecfef361985",
+                "start": 0,
+                "target_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-auto-u2\",\"profile_id\":\"jiajia-main\",\"role\":\"user\",\"system\":\"aizizhu\"}",
+                "target_namespace": "l0",
+                "target_revision": "source_sha256:cd7720d8145ce2ce839dbc74b42a6f16ec5ec6efc2912159a983aa5cbca25767",
+                "text_sha256": "eff48ea4364ef6fdd3e6c23d70dbbefcf04e1a6fe2f5c58eb8894ecfef361985",
+                "text_view_id": "memory.source.exact-v1"
+              }
+            ],
+            "author_ref": "participant:9bebdca0f18ac25be0a898b9:owner",
+            "binding_id": "source:3",
+            "source_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-auto-u2\",\"profile_id\":\"jiajia-main\",\"role\":\"user\",\"system\":\"aizizhu\"}",
+            "source_namespace": "snapshot.aiz.canonical_event",
+            "source_revision": "source_sha256:cd7720d8145ce2ce839dbc74b42a6f16ec5ec6efc2912159a983aa5cbca25767",
+            "speaker_ref": "participant:9bebdca0f18ac25be0a898b9:owner"
+          },
+          {
+            "anchors": [
+              {
+                "coordinate_unit": "unicode_codepoint",
+                "end": 56,
+                "quote_sha256": "7489486d0ce72f4071a66438bc33804c65757d260d8f686904ee2edc877f181a",
+                "start": 0,
+                "target_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-auto-a2\",\"profile_id\":\"jiajia-main\",\"role\":\"assistant\",\"system\":\"aizizhu\"}",
+                "target_namespace": "l0",
+                "target_revision": "source_sha256:77425dccb5e45fbeed12a40c97820f47e2dc19b1588b86daeb4a536e6e34a856",
+                "text_sha256": "7489486d0ce72f4071a66438bc33804c65757d260d8f686904ee2edc877f181a",
+                "text_view_id": "memory.source.exact-v1"
+              }
+            ],
+            "author_ref": "participant:9bebdca0f18ac25be0a898b9:self",
+            "binding_id": "source:4",
+            "source_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-auto-a2\",\"profile_id\":\"jiajia-main\",\"role\":\"assistant\",\"system\":\"aizizhu\"}",
+            "source_namespace": "snapshot.aiz.canonical_event",
+            "source_revision": "source_sha256:77425dccb5e45fbeed12a40c97820f47e2dc19b1588b86daeb4a536e6e34a856",
+            "speaker_ref": "participant:9bebdca0f18ac25be0a898b9:self"
+          }
+        ],
+        "generation": {
+          "actor": "daily_chat_first_pass",
+          "catalog_revision": "mc-fd9ea532a1a8c37caaca75ef2fe18d7683cd6fbdb477f8a088ec3961951f71db",
+          "catalog_snapshot": {
+            "attributes": [],
+            "bases": [
+              "direct_expression",
+              "record",
+              "reported",
+              "interpretation",
+              "hypothesis"
+            ],
+            "cognition_roles": [
+              "observation",
+              "question",
+              "hypothesis",
+              "insight",
+              "view",
+              "practice"
+            ],
+            "cognition_statuses": [
+              "tentative",
+              "supported",
+              "contested",
+              "revised",
+              "resolved"
+            ],
+            "definitions": [
+              {
+                "aliases": [],
+                "axis": "subjects",
+                "description": "陈述所涉及或其体验、属性、行为归属的主人；不因某处出现第一人称就自动判定。",
+                "examples": [],
+                "id": "user",
+                "label": "主人",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "subjects",
+                "description": "陈述所涉及的助手；说话者是助手不代表陈述主体必然是助手。",
+                "examples": [],
+                "id": "assistant",
+                "label": "助手",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "subjects",
+                "description": "陈述所涉及的其他人物或组织；与来源中的发言者分开判断。",
+                "examples": [],
+                "id": "third_party",
+                "label": "第三方",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "subjects",
+                "description": "陈述所涉及的非人物对象、地点或事物。",
+                "examples": [],
+                "id": "object",
+                "label": "对象",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "关于实际发生的事件、互动或经历；保留参与者、范围及有据的时间。",
+                "examples": [],
+                "id": "experience",
+                "label": "经历",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "关于某一时段内的情况或状态；没有时间证据时不默认为当前。",
+                "examples": [],
+                "id": "state",
+                "label": "状态",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "有来源依据的具体陈述；不要把推断或尚未确认的说法写成已核实事实。",
+                "examples": [],
+                "id": "fact",
+                "label": "事实",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "关于倾向或喜好的陈述；一次请求或一次接受本身不证明长期、反复偏好。",
+                "examples": [],
+                "id": "preference",
+                "label": "偏好",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "明确的限制或不可接受范围；保留适用条件和例外。",
+                "examples": [],
+                "id": "boundary",
+                "label": "边界",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "关于希望、打算或计划的陈述；不等同承诺，也不证明行动已经完成。",
+                "examples": [],
+                "id": "intention",
+                "label": "意向",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "由来源材料归纳出的理解；保留其推断性质，不冒充来源原话或已确认事实。",
+                "examples": [],
+                "id": "interpretation",
+                "label": "解释",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "kinds",
+                "description": "关于可重复步骤或处理方式的陈述；一次发生不自动证明它是稳定流程。",
+                "examples": [],
+                "id": "procedure",
+                "label": "做法",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "entity_types",
+                "description": "目录中代表主人的实体类型；发言者身份与每条陈述的事实主体仍需分别判断。",
+                "examples": [],
+                "id": "user",
+                "label": "主人实体",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "entity_types",
+                "description": "目录中代表助手的实体类型；不能仅凭助手转述把陈述主体设为主人。",
+                "examples": [],
+                "id": "assistant",
+                "label": "助手实体",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "entity_types",
+                "description": "目录中代表其他人物或组织的实体类型。",
+                "examples": [],
+                "id": "third_party",
+                "label": "第三方实体",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "entity_types",
+                "description": "目录中代表非人物对象、地点或事物的实体类型。",
+                "examples": [],
+                "id": "object",
+                "label": "对象实体",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "两条陈述或场景指向同一事件；需有来源依据，不因主题相似就合并。",
+                "examples": [],
+                "id": "same_event",
+                "label": "同一事件",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "一项内容补充另一项而不替代它；保留各自来源和范围。",
+                "examples": [],
+                "id": "supplements",
+                "label": "补充",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "新证据修正先前陈述的部分内容；只更新有依据的部分并保留修订关系。",
+                "examples": [],
+                "id": "revises",
+                "label": "修订",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "一项内容缩小另一项内容的适用范围、条件或例外。",
+                "examples": [],
+                "id": "limits",
+                "label": "限定",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "有依据的新陈述取代旧陈述在明确重叠范围内的效力；不等于静默删除历史。",
+                "examples": [],
+                "id": "supersedes",
+                "label": "取代",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "两项内容可能不一致但尚未裁决；保留不确定性，不自动选边。",
+                "examples": [],
+                "id": "possible_conflict",
+                "label": "可能冲突",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "一项更具体陈述从原先合并内容拆出；保留其来源和拆分关系。",
+                "examples": [],
+                "id": "split_from",
+                "label": "拆分自",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "relation_types",
+                "description": "一项整理内容由多项来源陈述合并；不得丢失各自的来源和差异。",
+                "examples": [],
+                "id": "merged_from",
+                "label": "合并自",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "stabilities",
+                "description": "限于一次事件或短时状态。",
+                "examples": [],
+                "id": "episode",
+                "label": "单次",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "stabilities",
+                "description": "在明确阶段内持续。",
+                "examples": [],
+                "id": "phase",
+                "label": "阶段",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "stabilities",
+                "description": "跨阶段相对稳定，仍可修订。",
+                "examples": [],
+                "id": "stable",
+                "label": "相对稳定",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "表达一个主张或情况。",
+                "examples": [],
+                "id": "assertion",
+                "label": "陈述",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "向他人提出请求。",
+                "examples": [],
+                "id": "request",
+                "label": "请求",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "表达希望但未必计划执行。",
+                "examples": [],
+                "id": "wish",
+                "label": "愿望",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "表达拟采取的行动。",
+                "examples": [],
+                "id": "plan",
+                "label": "计划",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "表达承担履行义务。",
+                "examples": [],
+                "id": "commitment",
+                "label": "承诺",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "尚待确认的解释或推测。",
+                "examples": [],
+                "id": "hypothesis",
+                "label": "假设",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "modalities",
+                "description": "提出问题或待确认事项。",
+                "examples": [],
+                "id": "question",
+                "label": "疑问",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "bases",
+                "description": "说明陈述为何有据，而非标记发言角色：当事人明确表达，或主人明确接受助手当时明确提出的内容。接受只支持当时明确提议的范围，须概述呈现，不能冒充主人逐字原话，也不覆盖助手之后补加的内容。",
+                "examples": [],
+                "id": "direct_expression",
+                "label": "直接表达/明确接受",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "bases",
+                "description": "陈述依据是来源直接记录的事件或行为；记录时间不自动等于事件发生时间。",
+                "examples": [],
+                "id": "record",
+                "label": "实际记录",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "bases",
+                "description": "陈述依据是来源对他人说法的转述；不等同于被转述者的直接表达或亲历记录。",
+                "examples": [],
+                "id": "reported",
+                "label": "转述",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "bases",
+                "description": "陈述依据是对现有材料的归纳或解释；保留推断性质，不当作来源原话或已确认事实。",
+                "examples": [],
+                "id": "interpretation",
+                "label": "理解",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "bases",
+                "description": "陈述依据仍不足、需要确认；这是成立依据轴，与modalities.hypothesis表达尚待确认的断言方式相互独立。",
+                "examples": [],
+                "id": "hypothesis",
+                "label": "依据不足的假设",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_roles",
+                "description": "注意到的情况，保留实际来源与范围。",
+                "examples": [],
+                "id": "observation",
+                "label": "观察",
+                "parent_id": null
+              },
+              {
+                "aliases": [
+                  "问题",
+                  "没想明白",
+                  "纠结"
+                ],
+                "axis": "cognition_roles",
+                "description": "仍未想明白的问题，不自动当作结论。",
+                "examples": [],
+                "id": "question",
+                "label": "疑问",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_roles",
+                "description": "可能的解释，保留反例与待验证性质。",
+                "examples": [],
+                "id": "hypothesis",
+                "label": "假设",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_roles",
+                "description": "基于经历形成的理解，仍可修订。",
+                "examples": [],
+                "id": "insight",
+                "label": "理解",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_roles",
+                "description": "某主体的看法，不等于客观事实。",
+                "examples": [],
+                "id": "view",
+                "label": "观点",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_roles",
+                "description": "形成或尝试的处理方式，保留条件与效果。",
+                "examples": [],
+                "id": "practice",
+                "label": "做法",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_statuses",
+                "description": "证据或理解尚不充分。",
+                "examples": [],
+                "id": "tentative",
+                "label": "暂定",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_statuses",
+                "description": "已有支持依据，不等于主人确认或绝对正确。",
+                "examples": [],
+                "id": "supported",
+                "label": "已有支持",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_statuses",
+                "description": "存在反例或未能消解的分歧。",
+                "examples": [],
+                "id": "contested",
+                "label": "有争议",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_statuses",
+                "description": "作为旧理解保留，并沿修订关系看当前版本。",
+                "examples": [],
+                "id": "revised",
+                "label": "已修订",
+                "parent_id": null
+              },
+              {
+                "aliases": [],
+                "axis": "cognition_statuses",
+                "description": "该问题已有阶段性处理，不自动证明外部事情已完成。",
+                "examples": [],
+                "id": "resolved",
+                "label": "已梳理",
+                "parent_id": null
+              }
+            ],
+            "entity_types": [
+              "user",
+              "assistant",
+              "third_party",
+              "object"
+            ],
+            "kinds": [
+              "experience",
+              "state",
+              "fact",
+              "preference",
+              "boundary",
+              "intention",
+              "interpretation",
+              "procedure"
+            ],
+            "modalities": [
+              "assertion",
+              "request",
+              "wish",
+              "plan",
+              "commitment",
+              "hypothesis",
+              "question"
+            ],
+            "relation_types": [
+              "same_event",
+              "supplements",
+              "revises",
+              "limits",
+              "supersedes",
+              "possible_conflict",
+              "split_from",
+              "merged_from"
+            ],
+            "stabilities": [
+              "episode",
+              "phase",
+              "stable"
+            ],
+            "subjects": [
+              "user",
+              "assistant",
+              "third_party",
+              "object"
+            ],
+            "topics": []
+          },
+          "model_route_revision": "route_sha256:7ca6e9bf069b2b3116b9c207ae011462ae0ee7d16ca9453dac21105ec737a71e",
+          "origin": "first_pass_model",
+          "prompt_revision": "prompt_sha256:e1165afba57486bb48c3ea443ce51b8a2037f6f6289829c574ed521f3b1b54a8",
+          "task_id": "daily-task-5ece16f6dde0c6303e76f82678ef11ad4eaeabea"
+        },
+        "narrative": {
+          "title": "见陈屿的约定改期与条件保留",
+          "body": "2026年10月24日，润润先用一段合成验收约定告诉我：她答应2026年11月2日晚上七点在晴川咖啡馆见陈屿，但只限陈屿先归还银色录音笔、且她当天没有值班；林岚不参加这次约见。她说明这是需要长期保留的虚构设定，之后要核对条件有没有被漏掉。我回应会把归还录音笔和当天没有值班当作两个同时成立的条件，不推断条件已经满足，也不把林岚算进去。随后她更正：见陈屿改到2026年11月3日晚上八点，地点仍是晴川咖啡馆，两个条件都没有取消；林岚10月30日还摄影册是另一件事。改期后我表示按新时间、原地点和两个未取消的条件记住，并明确约定尚未发生，不能写成她已经赴约或陈屿已经还了录音笔。"
+        },
+        "relations": [],
+        "retrieval": {
+          "keywords": [
+            "润润",
+            "顾衍",
+            "陈屿",
+            "林岚",
+            "晴川咖啡馆",
+            "银色录音笔",
+            "约定改期",
+            "2026年11月3日",
+            "值班",
+            "摄影册"
+          ],
+          "tags": [
+            "约定",
+            "虚构设定",
+            "条件"
+          ]
+        },
+        "scenes": [
+          {
+            "anchors": [
+              {
+                "coordinate_unit": "unicode_codepoint",
+                "end": 94,
+                "quote_sha256": "31b916fe8810d38cfe2fb38e72946c5ba51cbf5299d1534a0b6e3ae177a57136",
+                "start": 0,
+                "target_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-auto-u1\",\"profile_id\":\"jiajia-main\",\"role\":\"user\",\"system\":\"aizizhu\"}",
+                "target_namespace": "l0",
+                "target_revision": "source_sha256:f9da70478653350fa34ee0a7713c599eb113e708d65024ce21601a2d3a9f7a7f",
+                "text_sha256": "31b916fe8810d38cfe2fb38e72946c5ba51cbf5299d1534a0b6e3ae177a57136",
+                "text_view_id": "memory.source.exact-v1"
+              },
+              {
+                "coordinate_unit": "unicode_codepoint",
+                "end": 48,
+                "quote_sha256": "f97648385823a891a56a16ef86a82851905fe0ab3de9faeb8e855cb2e2fdcde0",
+                "start": 0,
+                "target_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-auto-a1\",\"profile_id\":\"jiajia-main\",\"role\":\"assistant\",\"system\":\"aizizhu\"}",
+                "target_namespace": "l0",
+                "target_revision": "source_sha256:12556706df432de355314747eb9497e7b1ccdc6fdc2b9c8245a1404d64b6e6d4",
+                "text_sha256": "f97648385823a891a56a16ef86a82851905fe0ab3de9faeb8e855cb2e2fdcde0",
+                "text_view_id": "memory.source.exact-v1"
+              },
+              {
+                "coordinate_unit": "unicode_codepoint",
+                "end": 85,
+                "quote_sha256": "eff48ea4364ef6fdd3e6c23d70dbbefcf04e1a6fe2f5c58eb8894ecfef361985",
+                "start": 0,
+                "target_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-auto-u2\",\"profile_id\":\"jiajia-main\",\"role\":\"user\",\"system\":\"aizizhu\"}",
+                "target_namespace": "l0",
+                "target_revision": "source_sha256:cd7720d8145ce2ce839dbc74b42a6f16ec5ec6efc2912159a983aa5cbca25767",
+                "text_sha256": "eff48ea4364ef6fdd3e6c23d70dbbefcf04e1a6fe2f5c58eb8894ecfef361985",
+                "text_view_id": "memory.source.exact-v1"
+              },
+              {
+                "coordinate_unit": "unicode_codepoint",
+                "end": 56,
+                "quote_sha256": "7489486d0ce72f4071a66438bc33804c65757d260d8f686904ee2edc877f181a",
+                "start": 0,
+                "target_id": "{\"conversation_id\":\"conv-jiajia-main\",\"event_id\":\"validation-auto-a2\",\"profile_id\":\"jiajia-main\",\"role\":\"assistant\",\"system\":\"aizizhu\"}",
+                "target_namespace": "l0",
+                "target_revision": "source_sha256:77425dccb5e45fbeed12a40c97820f47e2dc19b1588b86daeb4a536e6e34a856",
+                "text_sha256": "7489486d0ce72f4071a66438bc33804c65757d260d8f686904ee2edc877f181a",
+                "text_view_id": "memory.source.exact-v1"
+              }
+            ],
+            "attributes": [],
+            "generation": {
+              "actor": "daily_chat_first_pass",
+              "catalog_revision": "mc-fd9ea532a1a8c37caaca75ef2fe18d7683cd6fbdb477f8a088ec3961951f71db",
+              "catalog_snapshot": {
+                "attributes": [],
+                "bases": [
+                  "direct_expression",
+                  "record",
+                  "reported",
+                  "interpretation",
+                  "hypothesis"
+                ],
+                "cognition_roles": [
+                  "observation",
+                  "question",
+                  "hypothesis",
+                  "insight",
+                  "view",
+                  "practice"
+                ],
+                "cognition_statuses": [
+                  "tentative",
+                  "supported",
+                  "contested",
+                  "revised",
+                  "resolved"
+                ],
+                "definitions": [
+                  {
+                    "aliases": [],
+                    "axis": "subjects",
+                    "description": "陈述所涉及或其体验、属性、行为归属的主人；不因某处出现第一人称就自动判定。",
+                    "examples": [],
+                    "id": "user",
+                    "label": "主人",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "subjects",
+                    "description": "陈述所涉及的助手；说话者是助手不代表陈述主体必然是助手。",
+                    "examples": [],
+                    "id": "assistant",
+                    "label": "助手",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "subjects",
+                    "description": "陈述所涉及的其他人物或组织；与来源中的发言者分开判断。",
+                    "examples": [],
+                    "id": "third_party",
+                    "label": "第三方",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "subjects",
+                    "description": "陈述所涉及的非人物对象、地点或事物。",
+                    "examples": [],
+                    "id": "object",
+                    "label": "对象",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "关于实际发生的事件、互动或经历；保留参与者、范围及有据的时间。",
+                    "examples": [],
+                    "id": "experience",
+                    "label": "经历",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "关于某一时段内的情况或状态；没有时间证据时不默认为当前。",
+                    "examples": [],
+                    "id": "state",
+                    "label": "状态",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "有来源依据的具体陈述；不要把推断或尚未确认的说法写成已核实事实。",
+                    "examples": [],
+                    "id": "fact",
+                    "label": "事实",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "关于倾向或喜好的陈述；一次请求或一次接受本身不证明长期、反复偏好。",
+                    "examples": [],
+                    "id": "preference",
+                    "label": "偏好",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "明确的限制或不可接受范围；保留适用条件和例外。",
+                    "examples": [],
+                    "id": "boundary",
+                    "label": "边界",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "关于希望、打算或计划的陈述；不等同承诺，也不证明行动已经完成。",
+                    "examples": [],
+                    "id": "intention",
+                    "label": "意向",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "由来源材料归纳出的理解；保留其推断性质，不冒充来源原话或已确认事实。",
+                    "examples": [],
+                    "id": "interpretation",
+                    "label": "解释",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "kinds",
+                    "description": "关于可重复步骤或处理方式的陈述；一次发生不自动证明它是稳定流程。",
+                    "examples": [],
+                    "id": "procedure",
+                    "label": "做法",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "entity_types",
+                    "description": "目录中代表主人的实体类型；发言者身份与每条陈述的事实主体仍需分别判断。",
+                    "examples": [],
+                    "id": "user",
+                    "label": "主人实体",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "entity_types",
+                    "description": "目录中代表助手的实体类型；不能仅凭助手转述把陈述主体设为主人。",
+                    "examples": [],
+                    "id": "assistant",
+                    "label": "助手实体",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "entity_types",
+                    "description": "目录中代表其他人物或组织的实体类型。",
+                    "examples": [],
+                    "id": "third_party",
+                    "label": "第三方实体",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "entity_types",
+                    "description": "目录中代表非人物对象、地点或事物的实体类型。",
+                    "examples": [],
+                    "id": "object",
+                    "label": "对象实体",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "两条陈述或场景指向同一事件；需有来源依据，不因主题相似就合并。",
+                    "examples": [],
+                    "id": "same_event",
+                    "label": "同一事件",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "一项内容补充另一项而不替代它；保留各自来源和范围。",
+                    "examples": [],
+                    "id": "supplements",
+                    "label": "补充",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "新证据修正先前陈述的部分内容；只更新有依据的部分并保留修订关系。",
+                    "examples": [],
+                    "id": "revises",
+                    "label": "修订",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "一项内容缩小另一项内容的适用范围、条件或例外。",
+                    "examples": [],
+                    "id": "limits",
+                    "label": "限定",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "有依据的新陈述取代旧陈述在明确重叠范围内的效力；不等于静默删除历史。",
+                    "examples": [],
+                    "id": "supersedes",
+                    "label": "取代",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "两项内容可能不一致但尚未裁决；保留不确定性，不自动选边。",
+                    "examples": [],
+                    "id": "possible_conflict",
+                    "label": "可能冲突",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "一项更具体陈述从原先合并内容拆出；保留其来源和拆分关系。",
+                    "examples": [],
+                    "id": "split_from",
+                    "label": "拆分自",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "relation_types",
+                    "description": "一项整理内容由多项来源陈述合并；不得丢失各自的来源和差异。",
+                    "examples": [],
+                    "id": "merged_from",
+                    "label": "合并自",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "stabilities",
+                    "description": "限于一次事件或短时状态。",
+                    "examples": [],
+                    "id": "episode",
+                    "label": "单次",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "stabilities",
+                    "description": "在明确阶段内持续。",
+                    "examples": [],
+                    "id": "phase",
+                    "label": "阶段",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "stabilities",
+                    "description": "跨阶段相对稳定，仍可修订。",
+                    "examples": [],
+                    "id": "stable",
+                    "label": "相对稳定",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "表达一个主张或情况。",
+                    "examples": [],
+                    "id": "assertion",
+                    "label": "陈述",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "向他人提出请求。",
+                    "examples": [],
+                    "id": "request",
+                    "label": "请求",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "表达希望但未必计划执行。",
+                    "examples": [],
+                    "id": "wish",
+                    "label": "愿望",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "表达拟采取的行动。",
+                    "examples": [],
+                    "id": "plan",
+                    "label": "计划",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "表达承担履行义务。",
+                    "examples": [],
+                    "id": "commitment",
+                    "label": "承诺",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "尚待确认的解释或推测。",
+                    "examples": [],
+                    "id": "hypothesis",
+                    "label": "假设",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "modalities",
+                    "description": "提出问题或待确认事项。",
+                    "examples": [],
+                    "id": "question",
+                    "label": "疑问",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "bases",
+                    "description": "说明陈述为何有据，而非标记发言角色：当事人明确表达，或主人明确接受助手当时明确提出的内容。接受只支持当时明确提议的范围，须概述呈现，不能冒充主人逐字原话，也不覆盖助手之后补加的内容。",
+                    "examples": [],
+                    "id": "direct_expression",
+                    "label": "直接表达/明确接受",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "bases",
+                    "description": "陈述依据是来源直接记录的事件或行为；记录时间不自动等于事件发生时间。",
+                    "examples": [],
+                    "id": "record",
+                    "label": "实际记录",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "bases",
+                    "description": "陈述依据是来源对他人说法的转述；不等同于被转述者的直接表达或亲历记录。",
+                    "examples": [],
+                    "id": "reported",
+                    "label": "转述",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "bases",
+                    "description": "陈述依据是对现有材料的归纳或解释；保留推断性质，不当作来源原话或已确认事实。",
+                    "examples": [],
+                    "id": "interpretation",
+                    "label": "理解",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "bases",
+                    "description": "陈述依据仍不足、需要确认；这是成立依据轴，与modalities.hypothesis表达尚待确认的断言方式相互独立。",
+                    "examples": [],
+                    "id": "hypothesis",
+                    "label": "依据不足的假设",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_roles",
+                    "description": "注意到的情况，保留实际来源与范围。",
+                    "examples": [],
+                    "id": "observation",
+                    "label": "观察",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [
+                      "问题",
+                      "没想明白",
+                      "纠结"
+                    ],
+                    "axis": "cognition_roles",
+                    "description": "仍未想明白的问题，不自动当作结论。",
+                    "examples": [],
+                    "id": "question",
+                    "label": "疑问",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_roles",
+                    "description": "可能的解释，保留反例与待验证性质。",
+                    "examples": [],
+                    "id": "hypothesis",
+                    "label": "假设",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_roles",
+                    "description": "基于经历形成的理解，仍可修订。",
+                    "examples": [],
+                    "id": "insight",
+                    "label": "理解",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_roles",
+                    "description": "某主体的看法，不等于客观事实。",
+                    "examples": [],
+                    "id": "view",
+                    "label": "观点",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_roles",
+                    "description": "形成或尝试的处理方式，保留条件与效果。",
+                    "examples": [],
+                    "id": "practice",
+                    "label": "做法",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_statuses",
+                    "description": "证据或理解尚不充分。",
+                    "examples": [],
+                    "id": "tentative",
+                    "label": "暂定",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_statuses",
+                    "description": "已有支持依据，不等于主人确认或绝对正确。",
+                    "examples": [],
+                    "id": "supported",
+                    "label": "已有支持",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_statuses",
+                    "description": "存在反例或未能消解的分歧。",
+                    "examples": [],
+                    "id": "contested",
+                    "label": "有争议",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_statuses",
+                    "description": "作为旧理解保留，并沿修订关系看当前版本。",
+                    "examples": [],
+                    "id": "revised",
+                    "label": "已修订",
+                    "parent_id": null
+                  },
+                  {
+                    "aliases": [],
+                    "axis": "cognition_statuses",
+                    "description": "该问题已有阶段性处理，不自动证明外部事情已完成。",
+                    "examples": [],
+                    "id": "resolved",
+                    "label": "已梳理",
+                    "parent_id": null
+                  }
+                ],
+                "entity_types": [
+                  "user",
+                  "assistant",
+                  "third_party",
+                  "object"
+                ],
+                "kinds": [
+                  "experience",
+                  "state",
+                  "fact",
+                  "preference",
+                  "boundary",
+                  "intention",
+                  "interpretation",
+                  "procedure"
+                ],
+                "modalities": [
+                  "assertion",
+                  "request",
+                  "wish",
+                  "plan",
+                  "commitment",
+                  "hypothesis",
+                  "question"
+                ],
+                "relation_types": [
+                  "same_event",
+                  "supplements",
+                  "revises",
+                  "limits",
+                  "supersedes",
+                  "possible_conflict",
+                  "split_from",
+                  "merged_from"
+                ],
+                "stabilities": [
+                  "episode",
+                  "phase",
+                  "stable"
+                ],
+                "subjects": [
+                  "user",
+                  "assistant",
+                  "third_party",
+                  "object"
+                ],
+                "topics": []
+              },
+              "model_route_revision": "route_sha256:7ca6e9bf069b2b3116b9c207ae011462ae0ee7d16ca9453dac21105ec737a71e",
+              "origin": "first_pass_model",
+              "prompt_revision": "prompt_sha256:e1165afba57486bb48c3ea443ce51b8a2037f6f6289829c574ed521f3b1b54a8",
+              "task_id": "daily-task-5ece16f6dde0c6303e76f82678ef11ad4eaeabea"
+            },
+            "scene_id": "sc_76b45d60bc715b8d9bf16c9b28855a6d",
+            "scene_revision_id": "sr_a0a1b00918fda212ecd874d55ef91884747981ed1226414ed249d008a1a0c8b6",
+            "statement_refs": [
+              "st_c48c6930dec15af7b743ea494dbf4225",
+              "st_a9cfd139d0d0578ab9bf654bd8571f20",
+              "st_11e67d4425735335b9a0972f6400c9e6",
+              "st_9a98db81b3b45fe48a05b1b3a1c61063",
+              "st_ab6369b0353d59ef96aafc0a2e87fcc6",
+              "st_e79b14a6a93050c2a2a310db0b2b22af"
+            ],
+            "title": "见陈屿的约定改期与两个条件"
+          }
+        ],
+        "schema_version": "memory-l1-v1",
+        "statements": [
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "direct_expression"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "intention"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "request"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "phase"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:1"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "not_stated",
+              "text": null
+            },
+            "content": "润润说明这份约见设定是合成验收约定/虚构设定，要求顾衍长期保留，之后核对条件是否被漏掉。",
+            "evidence_refs": [
+              "source:1"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "core"
+            },
+            "statement_id": "st_c48c6930dec15af7b743ea494dbf4225",
+            "statement_revision_id": "sr_2bdf2c1076f79ca1caf5f4b80e5889778f7208f4af06b904336a8cf3bb0cc47d",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:1"
+              ],
+              "state": "known",
+              "value": "en_91ceb6689b635a67aea3489075d03d3e"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": null,
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "unknown"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:1"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "instant",
+                "start": {
+                  "evidence_refs": [
+                    "source:1"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-24T08:00:00+08:00"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:1"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "direct_expression"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "intention"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "commitment"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:1"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:1"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "known",
+              "text": "陈屿先归还银色录音笔；润润当天没有值班"
+            },
+            "content": "润润于2026年10月24日约定2026年11月2日晚上七点在晴川咖啡馆见陈屿；该约定以陈屿先归还银色录音笔、且润润当天没有值班为同时成立的条件，林岚不参加这次约见。",
+            "evidence_refs": [
+              "source:1"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "core"
+            },
+            "statement_id": "st_a9cfd139d0d0578ab9bf654bd8571f20",
+            "statement_revision_id": "sr_3e91a2c2885b7e18377480c99a8795359a02103f1c94f5d5a89bcdf6f268d3ba",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:1"
+              ],
+              "state": "known",
+              "value": "en_91ceb6689b635a67aea3489075d03d3e"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": null,
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "unknown"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:1"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "instant",
+                "start": {
+                  "evidence_refs": [
+                    "source:1"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-24T08:00:00+08:00"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:1"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "direct_expression"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "intention"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "commitment"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "known",
+              "text": "陈屿先归还银色录音笔；润润当天没有值班；两个条件均未取消"
+            },
+            "content": "润润随后更正上述约定：见陈屿改为2026年11月3日晚上八点，地点仍是晴川咖啡馆；归还银色录音笔和润润当天没有值班这两个条件均未取消。",
+            "evidence_refs": [
+              "source:3"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "core"
+            },
+            "statement_id": "st_11e67d4425735335b9a0972f6400c9e6",
+            "statement_revision_id": "sr_08ccec8588df6ff453d52f0552eefa1787adead8dcad537bc375ae7b8ea1f7c6",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "state": "known",
+              "value": "en_91ceb6689b635a67aea3489075d03d3e"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": null,
+                "start": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "2026-11-03T20:00:00+08:00"
+                },
+                "temporal_scope": "time_range"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "instant",
+                "start": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-24T08:10:00+08:00"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "reported"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "intention"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "plan"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:3"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "not_stated",
+              "text": null
+            },
+            "content": "润润称林岚将于2026年10月30日归还摄影册，并说明这是与见陈屿无关的另一件事；林岚不参加11月3日的约见。",
+            "evidence_refs": [
+              "source:3"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "detail"
+            },
+            "statement_id": "st_9a98db81b3b45fe48a05b1b3a1c61063",
+            "statement_revision_id": "sr_3ea7d104b4dcbab0d6d17901220c799d6a5a1415c27877b952bbe08a90d5d450",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:3"
+              ],
+              "state": "known",
+              "value": "en_79e546226b585322b6c7b08149978f54"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": null,
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "unknown"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "day",
+                "start": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-30"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:3"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:2"
+                ],
+                "state": "known",
+                "value": "direct_expression"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:2"
+                ],
+                "state": "known",
+                "value": "procedure"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:2"
+                ],
+                "state": "known",
+                "value": "commitment"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:2"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:2"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "known",
+              "text": "陈屿归还银色录音笔且润润当天没有值班同时成立"
+            },
+            "content": "顾衍回应会把陈屿归还银色录音笔和润润当天没有值班作为两个同时成立的条件，不推断条件已经满足，也不把林岚算进约见。",
+            "evidence_refs": [
+              "source:2"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "detail"
+            },
+            "statement_id": "st_ab6369b0353d59ef96aafc0a2e87fcc6",
+            "statement_revision_id": "sr_0e646792640296cb3e6edc4614164d17c4cf25784d559fc84be477ac62933728",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:2"
+              ],
+              "state": "known",
+              "value": "en_3f7c23fa969c5bf6a359997b3ccb42e2"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": null,
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "unknown"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:2"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "instant",
+                "start": {
+                  "evidence_refs": [
+                    "source:2"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-24T08:00:00+08:00"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:2"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          },
+          {
+            "attributes": [],
+            "classification": {
+              "basis": {
+                "evidence_refs": [
+                  "source:4"
+                ],
+                "state": "known",
+                "value": "direct_expression"
+              },
+              "kind": {
+                "evidence_refs": [
+                  "source:4"
+                ],
+                "state": "known",
+                "value": "interpretation"
+              },
+              "modality": {
+                "evidence_refs": [
+                  "source:4"
+                ],
+                "state": "known",
+                "value": "assertion"
+              },
+              "stability": {
+                "evidence_refs": [
+                  "source:4"
+                ],
+                "state": "known",
+                "value": "episode"
+              },
+              "topics": []
+            },
+            "cognition": {
+              "about_refs": [
+                "en_91ceb6689b635a67aea3489075d03d3e",
+                "en_adf13b1c0b18570ab4cfca6447c5ee47"
+              ],
+              "epistemic_status": {
+                "evidence_refs": [
+                  "source:4"
+                ],
+                "state": "known",
+                "value": "supported"
+              },
+              "open_questions": [],
+              "role": {
+                "evidence_refs": [
+                  "source:4"
+                ],
+                "state": "known",
+                "value": "insight"
+              }
+            },
+            "conditions": {
+              "evidence_refs": [
+                "source:4"
+              ],
+              "exceptions": [],
+              "predicate": null,
+              "state": "known",
+              "text": "陈屿先归还银色录音笔；润润当天没有值班；两个条件未取消"
+            },
+            "content": "顾衍在改期后表示按2026年11月3日晚上八点、晴川咖啡馆和两个未取消的条件记住；并明确约定尚未发生，不能写成润润已经赴约，也不能说陈屿已经归还录音笔。",
+            "evidence_refs": [
+              "source:4"
+            ],
+            "property": null,
+            "role_hint": {
+              "evidence_refs": [],
+              "state": "known",
+              "value": "detail"
+            },
+            "statement_id": "st_e79b14a6a93050c2a2a310db0b2b22af",
+            "statement_revision_id": "sr_1d8c71cbcee9af503c332b625bfb2dfda4f82e30e2c432fcf1c6eea559eae3f6",
+            "subject_ref": {
+              "evidence_refs": [
+                "source:4"
+              ],
+              "state": "known",
+              "value": "en_3f7c23fa969c5bf6a359997b3ccb42e2"
+            },
+            "time": {
+              "applicability": {
+                "end": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "recurrence_text": null,
+                "scene_ref": null,
+                "start": {
+                  "evidence_refs": [],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "temporal_scope": "unknown"
+              },
+              "event": {
+                "end": {
+                  "evidence_refs": [
+                    "source:4"
+                  ],
+                  "state": "not_stated",
+                  "value": null
+                },
+                "interpretation": "instant",
+                "precision": "instant",
+                "start": {
+                  "evidence_refs": [
+                    "source:4"
+                  ],
+                  "state": "known",
+                  "value": "2026-10-24T08:10:00+08:00"
+                },
+                "timezone": {
+                  "evidence_refs": [
+                    "source:4"
+                  ],
+                  "state": "known",
+                  "value": "+08:00"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "l2": {
+        "coherent_sections": [
+          {
+            "section_id": "sec_initial_arrangement",
+            "statement_refs": [
+              "st_c48c6930dec15af7b743ea494dbf4225",
+              "st_a9cfd139d0d0578ab9bf654bd8571f20",
+              "st_ab6369b0353d59ef96aafc0a2e87fcc6"
+            ],
+            "text": "润润先告诉我一份合成验收约定，说这是需要长期保留的虚构设定，之后要核对条件有没有被漏掉。她说自己答应在2026年11月2日晚上七点到晴川咖啡馆见陈屿，但前提是陈屿先归还银色录音笔，并且她当天没有值班，两个条件要同时成立；林岚不参加这次约见。我当时回应，会把归还录音笔和她当天没有值班当作两个同时成立的条件，不推断条件已经满足，也不把林岚算进约见。"
+          },
+          {
+            "section_id": "sec_correction",
+            "statement_refs": [
+              "st_11e67d4425735335b9a0972f6400c9e6",
+              "st_9a98db81b3b45fe48a05b1b3a1c61063",
+              "st_e79b14a6a93050c2a2a310db0b2b22af"
+            ],
+            "text": "随后润润更正了约定：见陈屿改到2026年11月3日晚上八点，地点仍是晴川咖啡馆，归还银色录音笔和她当天没有值班这两个条件都没有取消。她还说明，林岚10月30日归还摄影册是另一件事，林岚不参加这次约见。我回应说会按新的时间、原地点和两个未取消的条件记住；那次约定当时尚未发生，不能写成她已经赴约，也不能写成陈屿已经归还了录音笔。"
+          }
+        ],
+        "full_injection_text": "润润先告诉我一份合成验收约定，说这是需要长期保留的虚构设定，之后要核对条件有没有被漏掉。她说自己答应在2026年11月2日晚上七点到晴川咖啡馆见陈屿，但前提是陈屿先归还银色录音笔，并且她当天没有值班，两个条件要同时成立；林岚不参加这次约见。我当时回应，会把归还录音笔和她当天没有值班当作两个同时成立的条件，不推断条件已经满足，也不把林岚算进约见。\n随后润润更正了约定：见陈屿改到2026年11月3日晚上八点，地点仍是晴川咖啡馆，归还银色录音笔和她当天没有值班这两个条件都没有取消。她还说明，林岚10月30日归还摄影册是另一件事，林岚不参加这次约见。我回应说会按新的时间、原地点和两个未取消的条件记住；那次约定当时尚未发生，不能写成她已经赴约，也不能写成陈屿已经归还了录音笔。",
+        "optional_use_variants": [],
+        "review": {
+          "reasons": [],
+          "required": false
+        }
+      }
+    }
+  },
+  "questions": [
+    "这是合成验收设定核问。请分别告诉我：林岚现在应在哪一天几点、去哪家图书馆还什么，谁负责还、我答应的是什么以及全部条件；陈屿取票与我见陈屿分别是哪天几点、在哪，见面须同时满足什么；研究阅览室与普通展厅各哪天开放，研究阅览室须同时具备哪些资格，材料里林岚和陈屿现在能进吗？请分清人物和每一件事，保留未知，不把外部阅读规则当成我的经历。",
+    "继续核对这份合成设定：所以10月28日15点我会替林岚在北岸还摄影册，11月2日19点见陈屿，对吗？现在只知道10月30日不下雨、林岚有研究证，却不知道我下班时间和她是否预约；也不知道录音笔是否已还、我11月3日是否值班。能据此确认我一定陪同、一定见面，以及林岚已能进研究阅览室吗？请按已更正安排说明，未知不要补成已满足。"
+  ]
+}

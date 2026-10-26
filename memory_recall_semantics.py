@@ -158,6 +158,35 @@ def applicability(statement, context):
     return True if lower_known and upper_known else None
 
 
+def statement_context(statement, context, document):
+    """Bind a part date through one evidenced identity, never a date alone."""
+    parts = context.get("query_part_contexts") or []
+    if not parts or context.get("statement_time_binding"):
+        return context
+    entities = {row.get("entity_id"): row for row in document.get("entities") or []}
+    def names(entity):
+        return [name for name in [entity.get("name"), *(entity.get("aliases") or [])]
+                if isinstance(name, str) and len(name.strip()) > 1
+                and name.strip().casefold() not in {"主人", "用户", "助手", "本人", "assistant", "user", "owner", "the user"}]
+    def occurs(name, text):
+        return (bool(re.search(r"(?<![a-z0-9_])" + re.escape(name.casefold()) + r"(?![a-z0-9_])", text.casefold()))
+                if name.isascii() else name in text)
+    subject = entities.get(known(statement.get("subject_ref"))) or {}
+    candidates = [part for part in parts if any(occurs(name, part["query"]) for name in names(subject))]
+    if not candidates:
+        text = str(statement.get("content") or "") + " " + str((statement.get("conditions") or {}).get("text") or "")
+        mentioned = [entity for entity in entities.values()
+            if known(entity.get("entity_type")) in {"third_party", "person"}
+            and any(occurs(name, text) for name in names(entity))]
+        # Several named participants or shared identities cannot establish
+        # which independent question supplies this owner/assistant claim's date.
+        if len(mentioned) == 1:
+            candidates = [part for part in parts if any(occurs(name, part["query"]) for name in names(mentioned[0]))]
+    if len(candidates) != 1:
+        return {**context, "target_time": None, "statement_time_binding": "ambiguous"}
+    return {**context, **candidates[0], "statement_time_binding": "evidenced_question_subject"}
+
+
 def resolve_statement(statement, context, profiles=(), *, source_state="unverified",
                       superseded=False, conflict=False):
     """Resolve permitted use, independently of retrieval score or source trust."""
@@ -170,6 +199,10 @@ def resolve_statement(statement, context, profiles=(), *, source_state="unverifi
     purpose = context.get("purpose", "current")
     cognition = statement.get("cognition")
     cognitive_status = known((cognition or {}).get("epistemic_status"))
+    future_start = interval(((statement.get("time") or {}).get("applicability") or {}).get("start"), context["now"].tzinfo)
+    future_expression = (modality in {"plan", "commitment"} and not cognition and time["review_due"] is not True
+        and basis in {"direct_expression", "record", "reported"}
+        and future_start and future_start[0] > (context.get("target_time") or context["now"]))
     reasons = []
     if source_state in ("revoked", "unavailable"):
         use, reasons = "excluded", ["source_" + source_state]
@@ -177,6 +210,8 @@ def resolve_statement(statement, context, profiles=(), *, source_state="unverifi
         use, reasons = "unresolved_evidence", ["source_" + source_state]
     elif conflict:
         use, reasons = "unresolved_evidence", ["conflict_unresolved"]
+    elif not superseded and scope is False and purpose != "history" and future_expression:
+        use, reasons = "relationship_reference", ["future_plan_reference_not_execution"]
     elif superseded or scope is False:
         use = "historical_evidence"
         reasons = ["superseded_for_current_use" if superseded else "outside_applicability"]
@@ -197,6 +232,8 @@ def resolve_statement(statement, context, profiles=(), *, source_state="unverifi
     elif kind in ("preference", "boundary", "procedure") and stability == "stable":
         use = "conditional_basis" if condition is True else "relationship_reference"
         reasons = ["stable_explicit_reference", "condition_met" if condition is True else "condition_unknown"]
+    elif modality in ("plan", "commitment") and time["review_due"] is not True:
+        use, reasons = "relationship_reference", ["expression_not_execution_or_completion"]
     elif stability == "episode" or ((statement.get("time") or {}).get("applicability") or {}).get("temporal_scope") == "episode":
         use, reasons = "historical_evidence", ["episode_does_not_establish_present"]
     elif time["review_due"] is True:
@@ -272,7 +309,7 @@ def resolve_document(document, context, profiles=(), *, source_states=None,
         state = ("available" if "available" in states else "revoked" if states and all(s == "revoked" for s in states)
                  else "unavailable" if states and all(s in {"revoked", "unavailable"} for s in states)
                  else "changed" if "changed" in states else "unverified")
-        result.append(resolve_statement(statement, context, profiles, source_state=state,
+        result.append(resolve_statement(statement, statement_context(statement, context, document), profiles, source_state=state,
                       superseded=statement.get("statement_id") in superseded,
                       conflict=statement.get("statement_id") in conflicts))
     return result
@@ -286,14 +323,19 @@ counterpart or a merely proposed relation remains visible as unresolved use.
 No permanent truth is written and a relation outside this query's scope does
 not erase the historical claim.
 """
-    endpoints, relations, replacements = {}, [], []
+    endpoints, relations, replacements, subjects, use_contexts = {}, [], [], {}, {}
     for bid, row in records.items():
         if row.get("state") != "l1" or bid not in usages or usages[bid]["state"] != "l1":
             continue
         document = row["document"]
+        entity_types = {entity['entity_id']: known(entity.get('entity_type')) for entity in document.get('entities', [])}
         parent = (document.get("entry") or {}).get("parent_ref")
         host = (parent["memory_id"], parent["revision"]) if parent else (row["memory_id"], row["revision"])
         for use in usages[bid].get("items", []):
+            use_contexts[id(use)] = statement_context(use, context, document)
+            ref = known(use.get('subject_ref'))
+            subjects[id(use)] = (('role', entity_types[ref]) if entity_types.get(ref) in {'user', 'assistant'}
+                else ('entity', ref) if ref else None)
             key = (*host, "statement", use["statement_id"])
             endpoints.setdefault(key, []).append(use)
             endpoints.setdefault((*host, "memory", host[0]), []).append(use)
@@ -302,7 +344,7 @@ not erase the historical claim.
             endpoints.setdefault((*host, "scene", scene["scene_id"]), []).extend(
                 use for use in usages[bid].get("items", []) if use["statement_id"] in refs)
         for relation in document.get("relations", []):
-            relations.append((host, relation, usages[bid].get("source_states") or {}))
+            relations.append((host, relation, usages[bid].get("source_states") or {}, row.get('relation_adoptions') or {}))
     def find(host, endpoint):
         memory = endpoint.get("memory_id") or host[0]
         rev = host[1] if endpoint.get("revision") == "this_revision" else endpoint.get("revision")
@@ -310,7 +352,8 @@ not erase the historical claim.
         return endpoints.get((memory, rev, endpoint.get("object_type"), obj), [])
     def scope(use):
         statement = {"time": use.get("time"), "conditions": use.get("conditions")}
-        a, b = applicability(statement, context), conditions(statement["conditions"], context.get("facts") or {})
+        local_context = use_contexts.get(id(use), context)
+        a, b = applicability(statement, local_context), conditions(statement["conditions"], local_context.get("facts") or {})
         return False if a is False or b is False else True if a is True and b is True else None
     def mark(use, usage, reason):
         if use["usage"] == "excluded":
@@ -321,9 +364,13 @@ not erase the historical claim.
         use["usage"] = usage
         if reason not in use["reason_codes"]:
             use["reason_codes"].append(reason)
-    for host, relation, sources in relations:
+    for host, relation, sources, adoptions in relations:
         kind, confirmation = relation.get("kind"), relation.get("confirmation_state")
         if kind not in {"supersedes", "revises", "limits", "possible_conflict"} or confirmation == "rejected":
+            continue
+        from memory_l1_contract import semantic_sha256
+        relation_sha = semantic_sha256(relation)
+        if (relation['relation_id'], relation_sha) in context.get('relation_out_of_scope', []):
             continue
         left, right = find(host, relation["from"]), find(host, relation["to"])
         affected = [use for use in [*left, *right] if scope(use) is not False]
@@ -337,13 +384,18 @@ not erase the historical claim.
             continue
         verified = (all(use.get("source_state") == "available" for use in [*left, *right])
                     and all(sources.get(ref) == "available" for ref in relation.get("evidence_refs") or []))
-        trusted = confirmation == "confirmed" and relation.get("origin") in {"owner", "program"}
-        if kind == "supersedes" and verified and trusted and all(scope(use) is True for use in [*left, *right]):
+        proof = adoptions.get(relation['relation_id']) or {}
+        trusted = (confirmation == 'confirmed' and proof.get('state') == 'adopted'
+            and proof.get('relation_sha256') == relation_sha)
+        subject_values = [subjects.get(id(use)) for use in [*left, *right]]
+        same_subject = bool(subject_values) and all(value is not None for value in subject_values) and len(set(subject_values)) == 1
+        if kind == "supersedes" and verified and trusted and same_subject and all(scope(use) is True for use in [*left, *right]):
             replacements.extend((source, target) for source in left for target in right)
         else:
-            reason = ("conflict_unresolved" if kind == "possible_conflict" else
+            reason = ("related_subject_requires_confirmation" if trusted and not same_subject else
+                      "conflict_unresolved" if kind == "possible_conflict" else
                       "related_scope_requires_confirmation" if trusted else "proposed_relation_unconfirmed")
-            for use in affected:
+            for use in (right if trusted and kind != 'possible_conflict' else affected):
                 mark(use, "unresolved_evidence", reason)
     # Mutually replacing claims have no consistent current winner. Keep the
     # conflicting scope unresolved instead of aging every side into history.
@@ -422,15 +474,17 @@ adjustment. Formula errors retain the base with reasons, never a guessed input.
         local_document = {**document, "statements": [statement], "retrieval": {
             key: [term for term in retrieval.get(key) or [] if str(term).casefold() in content]
             for key in ("keywords", "tags")}}
+        local_context = statement_context(statement, context, document)
         features = {**common, **lexical_features(context.get("query", ""), local_document, values["catalog"]),
-                    **temporal_features(statement, context, profiles)}
+                    **temporal_features(statement, local_context, profiles)}
+        features["query_purpose"] = local_context.get("purpose", "current")
         features["statement_match"] = (selection.get("matches", {}).get(sid) or {}).get("score")
         features["statement_match_kind"] = "direct" if sid in direct else "support" if sid in support else "unmatched"
         classification = statement.get("classification") or {}
         for name in ("kind", "stability", "modality", "basis"):
             features[name] = known(classification.get(name))
-        features["condition_match"] = conditions(statement.get("conditions"), context.get("facts") or {})
-        features["scope_match"] = applicability(statement, context)
+        features["condition_match"] = conditions(statement.get("conditions"), local_context.get("facts") or {})
+        features["scope_match"] = applicability(statement, local_context)
         features["role_hint"] = known(statement.get("role_hint"))
         cognition = statement.get("cognition")
         features["cognition_role"] = known((cognition or {}).get("role"))

@@ -157,6 +157,10 @@ class Projection:
                 snapshot["recall"][name] = [self.definition(row, names, path) for row in rows if isinstance(row, dict)]
             elif name == "local_match_weights":
                 snapshot["recall"][name] = self.mapping(recall[name], path)
+            elif name == "inner_state_affinity":
+                policy = recall[name] if isinstance(recall[name], dict) else {}
+                snapshot["recall"][name] = self.fields(policy, ("enabled", "max_bonus"), path)
+                snapshot["recall"][name]["weights"] = self.mapping(policy.get("weights", {}), path + ".weights")
             else:
                 snapshot["recall"][name] = self.scalar(recall[name], path,
                     string=name in {"mode", "formula_id", "hierarchy_mode", "recent_context_mode", "affinity_aggregation"})
@@ -180,6 +184,50 @@ class Projection:
                 formulas[name] = self.fields(row, ("value", "state"), path + ".output", strings=("state",))
         return {"inputs": features, "formulas": formulas}
 
+    def affinity(self, row, path):
+        """Keep completeness diagnostics without copying source text or refs."""
+        result = self.fields(row, ("aggregation",), path, strings=("aggregation",))
+        rules = row.get("matched_rules") or []
+        result["matched_rules"] = [self.identifier(rule, path + ".rule") for rule in rules[:32]]
+        result["matched_rules_truncated"] = max(0, len(rules) - 32)
+        result["targets"] = {}
+        for target in ("interest_affinity", "drive_affinity", "goal_alignment"):
+            source = (row.get("targets") or {}).get(target)
+            if not isinstance(source, dict):
+                continue
+            target_path = path + "." + target
+            projected = self.fields(source, ("value", "state", "complete", "reason"),
+                                    target_path, strings=("state", "reason"))
+            projected["coverage"] = self.fields(source.get("coverage"),
+                ("known", "unknown", "matched", "ratio"), target_path + ".coverage")
+            contributions = source.get("contributions") or []
+            projected["contributions"] = [self.fields(item,
+                ("signal_id", "state", "reason", "intensity", "topic_affinity", "value"),
+                target_path + ".contribution", strings=("signal_id", "state", "reason"))
+                for item in contributions[:32]]
+            projected["contributions_truncated"] = max(0, len(contributions) - 32)
+            result["targets"][target] = projected
+        return result
+
+    def inner_affinity(self, row, path):
+        result = self.fields(row, ("state", "source_state", "bonus", "reason", "aggregation", "applied_bonus",
+            "base_score", "final_score", "applied_at", "ranking_reason"), path,
+            strings=("state", "source_state", "reason", "aggregation", "applied_at", "ranking_reason"))
+        statements = row.get("statements") or []
+        result["statements"] = []
+        for statement in statements[:STATEMENT_LIMIT]:
+            projected = self.fields(statement, ("statement_id", "state", "bonus", "reason"),
+                path + ".statement", strings=("statement_id", "state", "reason"))
+            projected["matched_by"] = [self.identifier(value, path + ".matched_by")
+                                       for value in (statement.get("matched_by") or [])[:8]]
+            projected["contributions"] = [self.fields(item,
+                ("dimension", "state", "intensity", "weight", "contribution", "reason"),
+                path + ".contribution", strings=("dimension", "state", "reason"))
+                for item in (statement.get("contributions") or [])[:35]]
+            result["statements"].append(projected)
+        result["statements_truncated"] = max(0, len(statements) - STATEMENT_LIMIT)
+        return result
+
     def computation(self, row, path, feature_ids):
         if not isinstance(row, dict):
             self.unknown.add(path)
@@ -192,6 +240,8 @@ class Projection:
                                                for sid in (row.get("aggregation_statement_ids") or [])[:STATEMENT_LIMIT]]
         result["aggregation_ids_truncated"] = max(0, len(row.get("aggregation_statement_ids") or []) - STATEMENT_LIMIT)
         result["calculation"] = self.calculation(row.get("calculation"), path + ".global", feature_ids) if "calculation" in row else None
+        result["inner_state_affinity"] = (self.inner_affinity(row["inner_state_affinity"], path + ".inner_state_affinity")
+            if isinstance(row.get("inner_state_affinity"), dict) else {"state": "not_provided", "bonus": 0})
         statements = row.get("statements") or []
         # Preserve the winner and participating claims before unselected context.
         statements = sorted(statements, key=lambda s: (s.get("statement_id") != row.get("winning_statement_id"),
@@ -212,6 +262,8 @@ class Projection:
             projected["reason_codes"] = [self.identifier(reason, path + ".reason_codes")
                                           for reason in (statement.get("reason_codes") or [])[:16]]
             projected["reason_codes_truncated"] = max(0, len(statement.get("reason_codes") or []) - 16)
+            if isinstance(statement.get("affinity"), dict):
+                projected["affinity"] = self.affinity(statement["affinity"], path + ".affinity")
             result["statements"].append(projected)
         return result
 

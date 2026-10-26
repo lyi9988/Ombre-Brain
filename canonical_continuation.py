@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -61,8 +62,11 @@ class CanonicalContinuationAdapter:
                 """CREATE TABLE IF NOT EXISTS canonical_outbox (
                 source_event_id TEXT PRIMARY KEY, role TEXT NOT NULL, content TEXT NOT NULL,
                 correlation_id TEXT NOT NULL DEFAULT "", attempts INTEGER NOT NULL DEFAULT 0,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
                 last_error TEXT NOT NULL DEFAULT "", created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"""
             )
+            if 'metadata_json' not in {row[1] for row in conn.execute('PRAGMA table_info(canonical_outbox)')}:
+                conn.execute("ALTER TABLE canonical_outbox ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
 
     def _channel(self, channel_id: str | None = None) -> str:
         """Resolve the effective channel; defaults to the configured one."""
@@ -224,14 +228,14 @@ class CanonicalContinuationAdapter:
             return result + insertion
         return result[:current_user] + insertion + result[current_user:]
 
-    def queue_outbox(self, *, source_event_id: str, role: str, content: str, correlation_id: str = "") -> None:
+    def queue_outbox(self, *, source_event_id: str, role: str, content: str, correlation_id: str = "", metadata: dict | None = None) -> None:
         if not self.enabled:
             return
         with self._connect() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO canonical_outbox
-                (source_event_id,role,content,correlation_id) VALUES(?,?,?,?)""",
-                (source_event_id, role, content, correlation_id),
+                (source_event_id,role,content,correlation_id,metadata_json) VALUES(?,?,?,?,?)""",
+                (source_event_id, role, content, correlation_id, json.dumps(metadata or {})),
             )
 
     def outbox_size(self) -> int:
@@ -249,7 +253,7 @@ class CanonicalContinuationAdapter:
                 # front of fresh cross-client events forever.  Keep those
                 # rows in the derived outbox for inspection, but stop retrying
                 # them after a bounded number of attempts.
-                "SELECT source_event_id,role,content,correlation_id,attempts "
+                "SELECT source_event_id,role,content,correlation_id,attempts,metadata_json "
                 # Newest events are prioritised so a historical poison row
                 # cannot delay the owner's next cross-client continuation.
                 "FROM canonical_outbox WHERE attempts < ? "
@@ -263,6 +267,7 @@ class CanonicalContinuationAdapter:
                 await self.ingest(
                     source_event_id=row["source_event_id"], role=row["role"],
                     content=row["content"], correlation_id=row["correlation_id"],
+                    metadata=json.loads(row['metadata_json']) or None,
                 )
             except Exception as exc:
                 with self._connect() as conn:
@@ -281,18 +286,18 @@ class CanonicalContinuationAdapter:
             delivered += 1
         return {"delivered": delivered, "pending": self.outbox_size()}
 
-    async def ingest_or_queue(self, *, source_event_id: str, role: str, content: str, correlation_id: str = "") -> dict[str, Any]:
+    async def ingest_or_queue(self, *, source_event_id: str, role: str, content: str, correlation_id: str = "", metadata: dict | None = None) -> dict[str, Any]:
         try:
             return await self.ingest(
-                source_event_id=source_event_id, role=role, content=content, correlation_id=correlation_id,
+                source_event_id=source_event_id, role=role, content=content, correlation_id=correlation_id, metadata=metadata,
             )
         except Exception as exc:
             self.queue_outbox(
-                source_event_id=source_event_id, role=role, content=content, correlation_id=correlation_id,
+                source_event_id=source_event_id, role=role, content=content, correlation_id=correlation_id, metadata=metadata,
             )
             return {"created": False, "queued": True, "error_type": type(exc).__name__}
 
-    async def ingest(self, *, source_event_id: str, role: str, content: str, correlation_id: str = "") -> dict[str, Any]:
+    async def ingest(self, *, source_event_id: str, role: str, content: str, correlation_id: str = "", metadata: dict | None = None) -> dict[str, Any]:
         if not self.enabled:
             return {"enabled": False, "created": False}
         if role not in {"user", "assistant"}:
@@ -300,6 +305,8 @@ class CanonicalContinuationAdapter:
         body = {"source_event_id": source_event_id, "role": role, "content": content}
         if correlation_id:
             body["correlation_id"] = correlation_id
+        if metadata:
+            body['metadata'] = metadata
         response = await self.http_client.post(
             self.base_url + "/bridge/v1/events", json=body, headers=self._headers()
         )

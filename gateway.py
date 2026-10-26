@@ -680,6 +680,8 @@ class GatewayService:
         self.state_store = state_store or GatewayStateStore(
             os.path.join(config["buckets_dir"], "gateway_state.db")
         )
+        from memory_delivery import MemoryDeliveryStore
+        self.memory_delivery = MemoryDeliveryStore(self.state_store.db_path)
         self.attachment_adoption = AdoptionReceipts()
         self.model_request_trace = ModelRequestTraceStore(
             self.gateway_cfg.get("model_request_trace_path")
@@ -3229,6 +3231,9 @@ class GatewayService:
     ) -> None:
         if not isinstance(state, dict) or not state.get("enabled"):
             return
+        if isinstance(assistant_message, dict) and assistant_message.get('tool_calls'):
+            state['assistant_write_status'] = 'skipped_tool_continuation'
+            return
         if not state.get("bridge_write_enabled", True):
             state["assistant_write_status"] = "skipped_origin_owned"
             through_seq = max(0, int(state.get("through_seq") or 0))
@@ -3258,6 +3263,7 @@ class GatewayService:
                 or f"{channel_id}:{request_id}:assistant"
             ),
             role="assistant", content=assistant_text,
+            **({'metadata': {'memory_delivery': state['memory_delivery']}} if state.get('memory_delivery') else {}),
             correlation_id=str(
                 state.get("bridge_user_source_event_id")
                 or state.get("user_source_event_id") or ""
@@ -4196,7 +4202,9 @@ class GatewayService:
         key = bool(include_archive)
         now = time.monotonic()
         cached = self._bucket_list_cache.get(key)
-        if ttl > 0 and cached and now < float(cached.get("expires_at", 0.0)):
+        ledger_path = getattr(getattr(self.bucket_mgr, 'activation_ledger', None), 'path', '')
+        activation_stamp = self._path_stamp(ledger_path) if ledger_path else None
+        if ttl > 0 and cached and cached.get('activation_stamp') == activation_stamp and now < float(cached.get("expires_at", 0.0)):
             return cached["buckets"]
 
         buckets = await self.bucket_mgr.list_all(include_archive=include_archive)
@@ -4205,6 +4213,7 @@ class GatewayService:
                 "buckets": buckets,
                 "expires_at": now + ttl,
                 "loaded_at": now,
+                "activation_stamp": activation_stamp,
             }
         return buckets
 
@@ -4798,7 +4807,8 @@ class GatewayService:
         # Authentication/canonical origin validation precedes this boundary.
         # Reset in finally even on timeout; concurrent turns cannot share clocks.
         scope = (payload.get("_ombre_trace_context") or {}).get("runtime_scope", "chat")
-        with use_clock(request, enabled=scope == "chat") as clock:
+        from memory_delivery import capture_carriers
+        with use_clock(request, enabled=scope == "chat") as clock, capture_carriers():
             result = await self._prepare_payload_with_clock(
                 payload, session_id, include_favorite_memory=include_favorite_memory,
                 include_debug=include_debug, debug_detail=debug_detail,
@@ -5128,7 +5138,7 @@ class GatewayService:
                     # A direct client has no upstream producer. Replace its
                     # state signals as one checkpoint, never mix in local B1.
                     natural_input["_signal_snapshots"] = [row for row in natural_input["_signal_snapshots"]
-                        if isinstance(row, dict) and row.get("producer") not in {"aiz.needs", "ombre.persona"}]
+                        if isinstance(row, dict) and row.get("producer") not in {"aiz.needs", "ombre.persona", "guyan.inner_state"}]
                     natural_input["_signal_snapshots"].extend(unified["signals"])
                     if self._should_inject_interval(session_id, self.current_inner_state_interval_rounds):
                         persona_block = unified["text"]
@@ -5495,6 +5505,21 @@ class GatewayService:
             memory_sentinel_debug=memory_sentinel_debug,
             natural_input=natural_input,
         )
+        from memory_delivery import CARRIER_SPANS, candidates, sha
+        carrier_spans = list(CARRIER_SPANS.get() or [])
+        memory_recall_projection['carrier_memory_spans'] = carrier_spans
+        carrier_ids = [row['bucket_id'] for row in carrier_spans]
+        reader = getattr(getattr(self, 'memory_authority_view', None), 'memory_l1_recall_map', None)
+        records = {**{bucket['id']: {'memory_id': bucket['id'], 'state': 'legacy',
+                    'body_sha256': sha(str(bucket.get('content') or ''))} for bucket in all_buckets if bucket.get('id')},
+            **(natural_input.get('_semantic_records') or {}),
+            **(reader(carrier_ids) if callable(reader) and carrier_ids else {})}
+        bucket_by_id = {bucket.get('id'): bucket for bucket in all_buckets}
+        for span in [*(memory_recall_projection.get('rendered_memory_spans') or []), *carrier_spans]:
+            bucket = bucket_by_id.get(span['bucket_id'])
+            if bucket:
+                span['legacy_body_sha256'] = sha(str(bucket.get('content') or ''))
+        memory_recall_projection['delivery_candidates'] = candidates(memory_recall_projection, records)
         recall_status = memory_recall_projection.get("recall_status", {})
         recall_status["automatic_recall_enabled"] = getattr(self, "automatic_recall_enabled", True)
         context_args = {
@@ -5520,6 +5545,13 @@ class GatewayService:
         # the same editable status into their existing direct-recall carrier;
         # do not mutate the preset, its role/order, or its component toggles.
         self._project_legacy_recall_status(prompt_plan, context_args, recall_status)
+        if prompt_plan and prompt_plan.get('fallback_legacy') and prompt_plan.get('requested_identity'):
+            # We cannot know which Memory carriers the owner's unverified plan
+            # disabled. Do not revive any of them through legacy fallback.
+            for name in ('core_memory', 'portrait_memory', 'favorite_memory', 'date_recall',
+                         'date_persona_trace', 'dream_context', 'recent_context', 'recalled_memory',
+                         'targeted_memory_detail', 'related_memory'):
+                context_args[name] = ''
         composed_messages = None
         if prompt_plan is None or prompt_plan.get("fallback_legacy"):
             stable_context, dynamic_context = (
@@ -6046,6 +6078,8 @@ class GatewayService:
             "attachment_adoption": parse_adoption_header(request.headers.get("X-Guyan-Attachment-Adoption", "")),
             "context_capacity_contract": read_capacity_header(request.headers.get(CAPACITY_HEADER)),
             "runtime_scope": self._runtime_scope_for_request(request),
+            "user_source_event_id": str(request.headers.get(CANONICAL_SOURCE_EVENT_ID_HEADER) or ""),
+            "assistant_source_event_id": str(request.headers.get(CANONICAL_ASSISTANT_SOURCE_EVENT_ID_HEADER) or ""),
             "prompt_plan_identity": {
                 "preset_id": str(request.headers.get(
                     PROMPT_PRESET_HEADER) or "")[:200],
@@ -6193,6 +6227,7 @@ class GatewayService:
 
     def _record_logical_trace(self, payload: dict[str, Any], injection_debug: dict[str, Any] | None,
                               client_id: str) -> None:
+        self._prepare_memory_delivery(payload, injection_debug)
         try:
             trace = self._trace_from_payload(payload)
             debug = injection_debug if isinstance(injection_debug, dict) else {}
@@ -6467,6 +6502,95 @@ class GatewayService:
             logger.warning("Memory presentation transport failed: %s", type(exc).__name__)
             return JSONResponse({"error": {"code": "memory_presentation_unavailable"}},
                                 status_code=503, headers=headers)
+
+    async def handle_memory_owner_extensions(self, request: Request) -> JSONResponse:
+        """Owner-only fixed L2 sync/L3 records routes; no arbitrary proxy path/fields."""
+        auth = self._authorize(request.headers.get('Authorization', ''))
+        if auth is not None:
+            return auth
+        from urllib.parse import quote
+        headers = {'Cache-Control': 'no-store', 'Pragma': 'no-cache'}
+        mid = str(request.path_params.get('memory_id') or '')
+        base_path = '/api/memory-authority/memories/' + quote(mid, safe='')
+        is_sync = '/presentation/sync-proposals' in request.url.path
+        is_followup = '/evolution/followups/' in request.url.path
+        is_retract = request.url.path.endswith('/retract')
+        payload = None
+        try:
+            if not mid:
+                raise ValueError('memory_id_required')
+            if is_sync:
+                path = base_path + '/presentation/sync-proposals'
+                if request.method == 'POST':
+                    action = request.path_params.get('sync_action')
+                    revision = request.path_params.get('presentation_revision')
+                    if action not in {'prepare', 'apply', 'retry'} or type(revision) is not int or revision < 1:
+                        raise ValueError('invalid_sync_action')
+                    path += '/' + str(revision) + '/' + action
+            else:
+                path = base_path + '/evolution'
+                if request.method == 'POST':
+                    if is_followup:
+                        task_id = str(request.path_params.get('task_id') or '')
+                        if not task_id:
+                            raise ValueError('task_id_required')
+                        path += '/followups/' + quote(task_id, safe='') + '/retry'
+                    else:
+                        path += '/notes'
+                    if is_retract and not is_followup:
+                        ring_id = str(request.path_params.get('ring_id') or '')
+                        if not ring_id:
+                            raise ValueError('ring_id_required')
+                        path += '/' + quote(ring_id, safe='') + '/retract'
+            if request.method == 'GET':
+                allowed_query = set() if is_sync else {'offset', 'limit'}
+                if set(request.query_params) - allowed_query or any(len(request.query_params.getlist(key)) > 1 for key in request.query_params):
+                    raise ValueError('invalid_memory_query')
+                for key, value in request.query_params.items():
+                    if not value.isascii() or not value.isdigit() or (key == 'limit' and int(value) < 1):
+                        raise ValueError('invalid_memory_page')
+                if request.url.query:
+                    path += '?' + request.url.query
+            elif request.method == 'POST':
+                if request.url.query:
+                    raise ValueError('invalid_memory_query')
+                raw = await request.body()
+                if len(raw) > 524288:
+                    return JSONResponse({'error': {'code': 'request_too_large'}}, status_code=413, headers=headers)
+                payload = json.loads(raw)
+                required = {'expected_revision', 'request_id'}
+                optional = set()
+                if not is_sync and not is_followup:
+                    required.add('expected_content_sha256' if is_retract else 'content')
+                    if not is_retract:
+                        optional |= {'replaces_ring_id', 'expected_content_sha256'}
+                if not isinstance(payload, dict) or not required <= set(payload) or set(payload) - required - optional:
+                    raise ValueError('invalid_memory_request_fields')
+                if type(payload['expected_revision']) is not int or payload['expected_revision'] < 1:
+                    raise ValueError('invalid_memory_revision')
+                if not isinstance(payload['request_id'], str) or not payload['request_id'].strip() or len(payload['request_id']) > 128:
+                    raise ValueError('invalid_memory_request_id')
+                for key in ('content', 'replaces_ring_id'):
+                    if key in payload and (not isinstance(payload[key], str) or not payload[key].strip()):
+                        raise ValueError('invalid_' + key)
+                if 'expected_content_sha256' in payload and not re.fullmatch(r'[a-f0-9]{64}', str(payload['expected_content_sha256'])):
+                    raise ValueError('invalid_memory_content_hash')
+            else:
+                raise ValueError('method_not_allowed')
+        except (ValueError, TypeError, UnicodeError):
+            return JSONResponse({'error': {'code': 'invalid_memory_owner_request'}}, status_code=400, headers=headers)
+        base = os.environ.get('OMBRE_MEMORY_INDEX_ADMIN_URL', 'http://ombre-brain:8000').rstrip('/')
+        token = os.environ.get('OMBRE_MEMORY_WRITE_TOKEN') or self.gateway_token
+        try:
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+                response = await client.request(request.method, base + path,
+                    json=payload if request.method == 'POST' else None, headers={'Authorization': 'Bearer ' + token})
+            body = response.json()
+            if response.status_code not in {200, 201, 202, 400, 401, 403, 404, 409, 413, 422, 503} or not isinstance(body, dict):
+                raise ValueError('invalid_memory_owner_response')
+            return JSONResponse(body, status_code=response.status_code, headers=headers)
+        except (httpx.HTTPError, ValueError, TypeError):
+            return JSONResponse({'error': {'code': 'memory_owner_service_unavailable'}}, status_code=503, headers=headers)
 
     async def handle_memory_source_tasks(self, request: Request) -> JSONResponse:
         """Transport source IDs/task receipts; Brain remains the only writer."""
@@ -6850,6 +6974,158 @@ class GatewayService:
         return JSONResponse(self.attachment_adoption.lookup(query),
                             headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
+    def _prepare_memory_delivery(self, payload, debug):
+        if not getattr(self, 'memory_delivery', None) or not isinstance(debug, dict):
+            return
+        from memory_delivery import scope_from, compiled_candidates
+        trace = self._trace_from_payload(payload)
+        if trace.get('runtime_scope', 'chat') != 'chat':
+            return
+        state = debug.get('canonical_continuation') or {}
+        try:
+            scope = scope_from({
+                'conversation_id': trace.get('conversation_id') or getattr(getattr(self, 'canonical_adapter', None), 'conversation_id', ''),
+                'user_source_event_id': trace.get('user_source_event_id') or state.get('bridge_user_source_event_id'),
+                'assistant_source_event_id': trace.get('assistant_source_event_id') or state.get('bridge_assistant_source_event_id')})
+        except ValueError:
+            return
+        projection = debug.get('memory_recall_projection') or {}
+        frozen = compiled_candidates(projection, projection.get('delivery_candidates') or [])
+        ref = {'scope': scope, 'trace_id': trace.get('trace_id', '')}
+        trace['memory_delivery_manifest'] = {'scope': scope, 'fragments': frozen, 'request': ref}
+        payload['_ombre_trace_context'] = trace
+        debug['_memory_delivery_request'] = ref
+
+    def _begin_memory_delivery(self, payload, provider_payload):
+        store = getattr(self, 'memory_delivery', None)
+        manifest = self._trace_from_payload(payload).get('memory_delivery_manifest')
+        if not store or not manifest:
+            return
+        from memory_delivery import final_fragments, digest
+        trace = self._trace_from_payload(payload)
+        attempt = store.begin(manifest['scope'], trace.get('trace_id', ''),
+            final_fragments(manifest['fragments'], provider_payload), request={
+                'logical_request_id': trace.get('logical_request_id'), 'request_id': trace.get('request_id'),
+                'request_ordinal': trace.get('request_ordinal'), 'provider_payload_sha256': digest(provider_payload)})
+        manifest['request']['attempt_id'] = attempt
+
+    def _succeed_memory_delivery(self, payload):
+        store = getattr(self, 'memory_delivery', None)
+        manifest = self._trace_from_payload(payload).get('memory_delivery_manifest')
+        attempt = ((manifest or {}).get('request') or {}).get('attempt_id')
+        if store and attempt:
+            store.succeed(attempt)
+
+    async def _validate_memory_delivery(self, context):
+        """Current per-fragment source eligibility, outside the immutable receipt."""
+        from memory_delivery import sha
+        fragments = context['fragments']
+        states = {f['fragment_id']: {'fragment_id': f['fragment_id'], 'state': 'available'} for f in fragments}
+        def reject(fragment, state, reason):
+            states[fragment['fragment_id']].update(state=state, reason=reason)
+        modern = [f for f in fragments if type(f.get('l1_revision')) is int and f['l1_revision'] > 0]
+        legacy = [f for f in fragments if f not in modern]
+        view = getattr(self, 'memory_authority_view', None)
+        reader = getattr(view, 'memory_index_metadata_map', None)
+        current = reader([f['bucket_id'] for f in legacy]) if callable(reader) else {}
+        authority_enabled = bool(getattr(self, 'memory_authority_enabled', False) or getattr(view, 'enabled', False))
+        for fragment in legacy:
+            try:
+                bucket = await self.bucket_mgr.get(fragment['bucket_id'])
+                if not bucket:
+                    reject(fragment, 'withdrawn', 'legacy_memory_not_available')
+                    continue
+                meta = bucket.get('metadata') or {}
+                if meta.get('type') == 'archived' or meta.get('resolved') or meta.get('recall_policy') == 'disabled':
+                    reject(fragment, 'withdrawn', 'legacy_memory_not_eligible')
+                    continue
+                row = current.get(fragment['bucket_id'])
+                revision = fragment['coverage'].get('legacy_authority_revision')
+                body_sha = fragment.get('legacy_body_sha256')
+                if authority_enabled and not row:
+                    reject(fragment, 'withdrawn', 'legacy_authority_not_active')
+                elif revision is not None and (not row or row['revision'] != revision or row['memory_id'] != fragment['memory_id']):
+                    reject(fragment, 'changed', 'legacy_authority_revision_changed')
+                elif not body_sha:
+                    reject(fragment, 'unavailable', 'legacy_body_version_unknown')
+                elif (row.get('body_sha256') if row else sha(str(bucket.get('content') or ''))) != body_sha:
+                    reject(fragment, 'changed', 'legacy_body_changed')
+                elif fragment['coverage'].get('legacy_projection_body_sha256') and sha(str(bucket.get('content') or '')) != fragment['coverage']['legacy_projection_body_sha256']:
+                    reject(fragment, 'changed', 'legacy_projection_changed')
+            except Exception:
+                reject(fragment, 'unavailable', 'legacy_validation_unavailable')
+        if not modern:
+            return list(states.values())
+        items = list({(f['memory_id'], f['l1_revision']): {'memory_id': f['memory_id'],
+            'revision': f['l1_revision'], 'binding_ids': [r['binding_id'] for r in f['source_refs']]}
+            for f in modern}.values())
+        try:
+            request = {}
+            result = await memory_use.read_batch(self, request, 'delivery_source_validation',
+                '/api/memory-authority/recall-sources', {'items': items})
+            rows = {(row['memory_id'], row['revision']): row for row in result['items']}
+            for fragment in modern:
+                row = rows.get((fragment['memory_id'], fragment['l1_revision']))
+                if not row or row.get('state') != 'ok':
+                    state = 'withdrawn' if row and row.get('state') == 'memory_not_current_or_eligible' else 'changed'
+                    reject(fragment, state, 'memory_source_no_longer_current')
+                    continue
+                for ref in fragment['source_refs']:
+                    source = (row.get('sources') or {}).get(ref['binding_id'])
+                    if not source or source.get('eligible_source') is not True:
+                        reject(fragment, 'withdrawn' if source and source.get('state') in {'withdrawn', 'revoked'} else 'changed',
+                            'memory_source_no_longer_eligible')
+            from memory_recall_semantics import USAGES
+            l2_items = [{'memory_id': f['memory_id'], 'revision': f['l1_revision'],
+                'statement_ids': f['coverage']['statement_ids'], 'allowed_uses': sorted(USAGES - {'excluded'}),
+                'statement_uses': {}, 'narrative_allowed': True} for f in modern
+                if f.get('l2_revision') is not None and states[f['fragment_id']]['state'] == 'available']
+            if l2_items:
+                result = await memory_use.read_batch(self, request, 'delivery_l2_validation',
+                    '/api/memory-authority/presentations/resolve', {'items': l2_items})
+                rows = {row['memory_id']: row for row in result['items']}
+                for fragment in modern:
+                    if fragment.get('l2_revision') is None or states[fragment['fragment_id']]['state'] != 'available':
+                        continue
+                    row = rows.get(fragment['memory_id']) or {}
+                    if row.get('state') != 'ready' or row.get('presentation_revision') != fragment['l2_revision']:
+                        reject(fragment, 'changed', 'memory_presentation_no_longer_current')
+        except (httpx.HTTPError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
+            for fragment in modern:
+                if states[fragment['fragment_id']]['state'] == 'available':
+                    reject(fragment, 'unavailable', 'memory_source_validation_unavailable')
+        return list(states.values())
+
+    async def handle_memory_delivery(self, request: Request) -> JSONResponse:
+        auth = self._authorize(request.headers.get('Authorization', ''))
+        if auth is not None:
+            return auth
+        headers = {'Cache-Control': 'no-store', 'Pragma': 'no-cache'}
+        try:
+            query = await request.json()
+            if not isinstance(query, dict):
+                raise ValueError('invalid_query')
+            if request.url.path.endswith('/activate'):
+                recorded = self.memory_delivery.activation_result(query)
+                if recorded is not None:
+                    return JSONResponse(recorded, headers=headers)
+            result = self.memory_delivery.lookup(query)
+            if result['state'] != 'available':
+                return JSONResponse(result, headers=headers)
+            context = result['context']
+            fragment_states = await self._validate_memory_delivery(context)
+            result['fragment_states'] = fragment_states
+            if request.url.path.endswith('/activate'):
+                if any(query.get(key) != context[key] for key in ('delivery_receipt_id', 'delivery_sha256')):
+                    raise ValueError('delivery_identity_required')
+                result = await self.memory_delivery.activate(query, context, self.bucket_mgr, fragment_states=fragment_states)
+            return JSONResponse(result, headers=headers)
+        except ValueError as exc:
+            return JSONResponse({'state': 'unavailable', 'reason': str(exc)},
+                status_code=409 if 'conflict' in str(exc) else 400, headers=headers)
+        except RuntimeError as exc:
+            return JSONResponse({'state': 'unavailable', 'reason': str(exc)}, status_code=503, headers=headers)
+
     async def handle_model_request_trace_clear(self, request: Request) -> JSONResponse:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
@@ -6964,6 +7240,7 @@ class GatewayService:
             )
             # Verify the serialized request body that is actually dispatched.
             provider_payload = json.loads(outbound_request.content)
+            self._begin_memory_delivery(payload, provider_payload)
             started_at = time.perf_counter()
             trace = self._trace_from_payload(payload)
             attempt_id = self.model_request_trace.record_attempt(
@@ -7029,6 +7306,7 @@ class GatewayService:
             )
             if 200 <= response.status_code < 300:
                 self._clear_upstream_key_cooldown(upstream, key_entry)
+                self._succeed_memory_delivery(payload)
                 self.attachment_adoption.response(adoption_attempt, response, "openai")
                 return response
             if not self._should_retry_upstream_status(response.status_code):
@@ -7079,6 +7357,7 @@ class GatewayService:
             )
             # Verify the serialized request body that is actually dispatched.
             provider_payload = json.loads(outbound_request.content)
+            self._begin_memory_delivery(payload, provider_payload)
             started_at = time.perf_counter()
             trace = self._trace_from_payload(payload)
             attempt_id = self.model_request_trace.record_attempt(
@@ -7144,6 +7423,7 @@ class GatewayService:
             )
             if 200 <= response.status_code < 300:
                 self._clear_upstream_key_cooldown(upstream, key_entry)
+                self._succeed_memory_delivery(payload)
                 self.attachment_adoption.response(adoption_attempt, response, "anthropic")
                 return response
             if not self._should_retry_upstream_status(response.status_code):
@@ -7193,6 +7473,7 @@ class GatewayService:
             )
             # Verify the serialized request body that is actually dispatched.
             provider_payload = json.loads(request.content)
+            self._begin_memory_delivery(payload, provider_payload)
             started_at = time.perf_counter()
             trace = self._trace_from_payload(payload)
             attempt_id = self.model_request_trace.record_attempt(
@@ -7314,6 +7595,7 @@ class GatewayService:
             )
             # Verify the serialized request body that is actually dispatched.
             provider_payload = json.loads(request.content)
+            self._begin_memory_delivery(payload, provider_payload)
             started_at = time.perf_counter()
             trace = self._trace_from_payload(payload)
             attempt_id = self.model_request_trace.record_attempt(
@@ -7663,6 +7945,15 @@ class GatewayService:
             injection_debug.get("canonical_continuation")
             if isinstance(injection_debug, dict) else None
         )
+        delivery_ref = (injection_debug or {}).get('_memory_delivery_request') or {}
+        delivery_store = getattr(self, 'memory_delivery', None)
+        if delivery_store and delivery_ref.get('attempt_id'):
+            delivery_store.succeed(delivery_ref['attempt_id'])
+            if not (assistant_message or {}).get('tool_calls'):
+                delivery = delivery_store.complete(delivery_ref['scope'])
+                if delivery and isinstance(canonical_state, dict):
+                    canonical_state['memory_delivery'] = {key: delivery[key] for key in
+                        ('delivery_receipt_id', 'delivery_sha256', 'scope')}
         try:
             await self._finalize_canonical_turn(canonical_state, assistant_message)
         except Exception as exc:
@@ -7739,8 +8030,6 @@ class GatewayService:
                     round_id,
                     exc,
                 )
-        for bucket_id in recalled_ids:
-            await self.bucket_mgr.touch(bucket_id)
         logger.info(
             "Gateway round completed | session=%s round=%s recalled=%s",
             session_id,
@@ -11638,9 +11927,10 @@ class GatewayService:
         retired session affect. No local B1 snapshot is consulted.
         """
         self._b1_persona_authority_active()
-        from memory_affinity import INNER_AFFECT, resolve_signals, _unit
+        from memory_affinity import INNER_DIMENSIONS, resolve_signals, _unit
         resolved = resolve_signals({"recall": {"signal_bindings": [
-            {"id": key, "producer": "ombre.persona", "key": key} for key in INNER_AFFECT]}},
+            {"id": key, "producer": "ombre.persona", "key": key}
+            for key, (_, kind) in INNER_DIMENSIONS.items() if kind == "affect"]}},
             signal_snapshots, datetime.now(timezone.utc))
         state = {"affect": {key: row["value"] for key, row in resolved.items()}, "relationship": {}}
         path = (self.config.get("b1") or {}).get("legacy_db_path") or getattr(self.persona_engine, "db_path", None)
@@ -12230,7 +12520,10 @@ class GatewayService:
         if buckets:
             lines.append("memory_buckets:")
             for bucket in buckets:
-                lines.append(self._format_date_recall_bucket_line(bucket))
+                line = self._format_date_recall_bucket_line(bucket)
+                lines.append(line)
+                from memory_delivery import record_carrier
+                record_carrier(bucket, line, 'date')
 
         text = self._trim_text("\n".join(lines), self.date_recall_budget)
         if not text.strip():
@@ -12795,7 +13088,10 @@ class GatewayService:
                 strip_wikilinks(str(daily_bucket.get("content") or ""))
             ).strip()
             if daily_text:
-                lines.append(f"daily_impression: {self._clip_text(daily_text, 150)}")
+                line = f"daily_impression: {self._clip_text(daily_text, 150)}"
+                lines.append(line)
+                from memory_delivery import record_carrier
+                record_carrier(daily_bucket, line, 'date_persona')
 
         selected_events = self._persona_events_for_date(date_key)
         if selected_events:
@@ -13049,6 +13345,8 @@ class GatewayService:
                 tokens = count_tokens_approx(summary)
             parts.append(f"- {summary}")
             selected_ids.append(bucket["id"])
+            from memory_delivery import record_carrier
+            record_carrier(bucket, f'- {summary}', 'favorite')
             remaining -= tokens
             if remaining <= 0:
                 break
@@ -17909,6 +18207,7 @@ class GatewayService:
         )
         admitted_before_hierarchy = {str(item["bucket"]["id"]) for item in accepted}
         accepted = memory_use.hierarchy_pool(self, recall_input, accepted)
+        accepted = memory_use.apply_inner_ranking(self, recall_input, query, accepted)
         if any(item.get("_configured_score", {}).get("window_score") is not None for item in accepted):
             accepted.sort(key=lambda item: item["score"], reverse=True)
         selection_diagnostics = {}
@@ -24401,6 +24700,8 @@ class GatewayService:
             if summary_tokens <= 0:
                 continue
             parts.append(f"- {summary}")
+            from memory_delivery import record_carrier
+            record_carrier(bucket, f'- {summary}', 'core')
             remaining -= summary_tokens
             if remaining <= 0:
                 break
@@ -24530,7 +24831,10 @@ class GatewayService:
             if not bucket:
                 continue
             summary = await self._summarize_bucket(bucket)
-            source_lines.append(f"- [bucket_id:{bucket_id}] {self._clip_text(summary, 260)}")
+            line = f"- [bucket_id:{bucket_id}] {self._clip_text(summary, 260)}"
+            source_lines.append(line)
+            from memory_delivery import record_carrier
+            record_carrier(bucket, line, 'dream')
         if source_lines:
             status["source_bucket_ids"] = source_bucket_ids
             text += "\n\nDream source memory:\n" + "\n".join(source_lines)
@@ -24566,8 +24870,10 @@ class GatewayService:
         memory_sources = {"Recalled Memory": "ombre.recalled_memory",
                           "Targeted Memory Detail": "ombre.targeted_memory_detail",
                           "Diffused Memory": "ombre.diffused_memory",
-                          "Recent Context": "ombre.recent_context"}
+                          "Recent Context": "ombre.recent_context", "Date Recall": "ombre.date_recall",
+                          "Date Persona Trace": "ombre.date_persona_trace", "Dream Context": "ombre.dream_context"}
         memory_offsets = []
+        stable_offsets = []
         has_dynamic_context = any(
             section.strip()
             for section in [
@@ -24611,6 +24917,9 @@ class GatewayService:
             def add_stable_section(title: str, content: str) -> None:
                 if content.strip():
                     stable_sections.extend(["", title, content])
+                    start = sum(len(value) + 1 for value in stable_sections[:-1])
+                    stable_offsets.append(('ombre.core_memory' if title == 'Core Memory' else 'ombre.portrait_memory',
+                        start, start + len(content)))
 
             add_stable_section("Core Memory", core_memory)
             add_stable_section("Portrait Memory", portrait_memory)
@@ -24624,10 +24933,11 @@ class GatewayService:
                 if content.strip():
                     if title in {"Recalled Memory", "Targeted Memory Detail", "Diffused Memory", "Recent Context"}:
                         dynamic_sections.extend(["", content])
-                        start = sum(len(value) + 1 for value in dynamic_sections[:-1])
-                        memory_offsets.append((memory_sources[title], start, start + len(content)))
                     else:
                         dynamic_sections.extend(["", title, content])
+                    if title in memory_sources:
+                        start = sum(len(value) + 1 for value in dynamic_sections[:-1])
+                        memory_offsets.append((memory_sources[title], start, start + len(content)))
 
             add_section("Just Now Chat Context", just_now_context)
             add_section("Date Recall", date_recall)
@@ -24659,10 +24969,13 @@ class GatewayService:
                 if favorite_title_name and favorite_title_name not in {"AI", "assistant"}
                 else "Favorite Memory"
             )
+            memory_sources[favorite_title] = 'ombre.favorite_memory'
             add_section(favorite_title, favorite_memory)
             add_section("Dream Context", dream_context)
 
-        stable_context = "\n".join(stable_sections).strip()
+        raw_stable = "\n".join(stable_sections)
+        stable_leading = len(raw_stable) - len(raw_stable.lstrip())
+        stable_context = raw_stable.strip()
         raw_dynamic = "\n".join(dynamic_sections)
         leading = len(raw_dynamic) - len(raw_dynamic.lstrip())
         dynamic_context = raw_dynamic.strip()
@@ -24670,16 +24983,28 @@ class GatewayService:
             if memory_recall_projection is not None:
                 memory_recall_projection['compiled_memory_blocks'] = [
                     {'source_id': source, 'content': dynamic[max(0, start-leading):max(0, end-leading)]}
-                    for source, start, end in memory_offsets if start-leading < len(dynamic)]
+                    for source, start, end in memory_offsets if start-leading < len(dynamic)] + [
+                    {'source_id': source, 'content': stable[max(0, start-stable_leading):max(0, end-stable_leading)]}
+                    for source, start, end in stable_offsets if start-stable_leading < len(stable)]
             return stable, dynamic
+        def trim_atomic_memory(text, budget, offsets, text_leading):
+            trimmed = self._trim_text(text, budget)
+            # A final global cap must not sever a complete L1/L2 claim from
+            # its subject, date, correction, or conditions. Other legacy text
+            # keeps the existing prefix policy and relative ordering.
+            for _source, start, end in offsets:
+                start, end = max(0, start - text_leading), max(0, end - text_leading)
+                if start < len(trimmed) < end:
+                    trimmed = trimmed[:start].rstrip()
+            return trimmed
         stable_tokens = count_tokens_approx(stable_context)
         dynamic_tokens = count_tokens_approx(dynamic_context)
         if stable_tokens + dynamic_tokens <= self.inject_total_budget:
             return finish(stable_context, dynamic_context)
         if stable_tokens >= self.inject_total_budget:
-            return finish(self._trim_text(stable_context, self.inject_total_budget), "")
+            return finish(trim_atomic_memory(stable_context, self.inject_total_budget, stable_offsets, stable_leading), "")
         remaining = max(0, self.inject_total_budget - stable_tokens)
-        return finish(stable_context, self._trim_text(dynamic_context, remaining))
+        return finish(stable_context, trim_atomic_memory(dynamic_context, remaining, memory_offsets, leading))
 
     def _build_memory_recall_projection(
         self,
@@ -24813,7 +25138,7 @@ class GatewayService:
         reason_codes = self._debug_str_list(
             (memory_sentinel_debug or {}).get("route_reason_codes")
         )
-        return {
+        projection = {
             "source_id": "ombre.memory_recall",
             "configuration_revision": (configuration_use or {}).get("revision"),
             "recall_status": natural_status,
@@ -24836,6 +25161,10 @@ class GatewayService:
             "component_sha256": component_hashes,
             "token_estimate": count_tokens_approx(body),
         }
+        from memory_delivery import candidates
+        projection['delivery_candidates'] = candidates(projection,
+            (natural_input or {}).get('_semantic_records') or {})
+        return projection
 
     def _project_legacy_recall_status(self, gateway_plan: dict | None, context_args: dict,
                                       status: dict) -> None:
@@ -24857,8 +25186,12 @@ class GatewayService:
             status["legacy_compatibility_projection"] = True
 
     def _composer_live_recall_enabled(self, gateway_plan: dict | None) -> bool:
-        if not gateway_plan or gateway_plan.get("fallback_legacy"):
+        if not gateway_plan:
             return True
+        if gateway_plan.get("fallback_legacy"):
+            # A requested owner plan that cannot be verified must not revive
+            # Memory through the unrelated legacy injection path.
+            return not bool(gateway_plan.get('requested_identity'))
         gateway_slice = gateway_plan.get("gateway_slice") or {}
         scope = str(gateway_plan.get("scope") or "talk.initial")
         chain = self._prompt_scope_chain(gateway_slice, scope)
@@ -25177,7 +25510,9 @@ class GatewayService:
                 continue
             remaining_budget -= cost
             if source_id in {'ombre.memory_recall', 'ombre.recalled_memory', 'ombre.targeted_memory_detail',
-                             'ombre.diffused_memory', 'ombre.recent_context'}:
+                             'ombre.diffused_memory', 'ombre.recent_context', 'ombre.core_memory',
+                             'ombre.portrait_memory', 'ombre.favorite_memory', 'ombre.date_recall',
+                             'ombre.date_persona_trace', 'ombre.dream_context', 'ombre.dream_wrapper_prompt'}:
                 compiled_memory_blocks.append({'source_id': source_id, 'content': section})
             placement_messages.append({
                 'block_id':block.get('block_id'), 'source_id':source_id,
@@ -28503,6 +28838,9 @@ def create_gateway_app(
     async def attachment_adoption_lookup(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_attachment_adoption_lookup(request)
 
+    async def memory_delivery_route(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_memory_delivery(request)
+
     async def model_request_trace(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_model_request_trace(request)
 
@@ -28545,6 +28883,9 @@ def create_gateway_app(
     async def memory_presentation_route(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_memory_presentation(request)
 
+    async def memory_owner_extensions_route(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_memory_owner_extensions(request)
+
     async def memory_source_tasks_route(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_memory_source_tasks(request)
 
@@ -28565,6 +28906,8 @@ def create_gateway_app(
             Route("/api/debug/recall-eval", recall_eval_debug, methods=["GET"]),
             Route("/api/debug/upstream-usage", upstream_usage_debug, methods=["GET"]),
             Route("/internal/attachment-adoption/lookup", attachment_adoption_lookup, methods=["POST"]),
+            Route("/internal/memory-delivery/lookup", memory_delivery_route, methods=["POST"]),
+            Route("/internal/memory-delivery/activate", memory_delivery_route, methods=["POST"]),
             Route("/api/debug/model-requests", model_request_trace_list, methods=["GET"]),
             Route("/api/debug/model-requests/events", model_request_trace_events, methods=["GET"]),
             Route("/api/debug/model-requests/settings", model_request_trace_settings, methods=["GET", "PUT"]),
@@ -28590,6 +28933,18 @@ def create_gateway_app(
                   memory_presentation_route, methods=["GET"], name="memory-presentation-read"),
             Route("/api/memory-authority/memories/{memory_id}/presentation/{action:str}",
                   memory_presentation_route, methods=["POST"], name="memory-presentation-action"),
+            Route('/api/memory-authority/memories/{memory_id}/presentation/sync-proposals',
+                  memory_owner_extensions_route, methods=['GET']),
+            Route('/api/memory-authority/memories/{memory_id}/presentation/sync-proposals/{presentation_revision:int}/{sync_action}',
+                  memory_owner_extensions_route, methods=['POST']),
+            Route('/api/memory-authority/memories/{memory_id}/evolution',
+                  memory_owner_extensions_route, methods=['GET']),
+            Route('/api/memory-authority/memories/{memory_id}/evolution/notes',
+                  memory_owner_extensions_route, methods=['POST']),
+            Route('/api/memory-authority/memories/{memory_id}/evolution/notes/{ring_id}/retract',
+                  memory_owner_extensions_route, methods=['POST']),
+            Route('/api/memory-authority/memories/{memory_id}/evolution/followups/{task_id}/retry',
+                  memory_owner_extensions_route, methods=['POST']),
             Route("/api/memory-authority/memories/{memory_id}/statements", memory_l1_parts_route, methods=["GET"], name="memory-l1-statements"),
             Route("/api/memory-authority/memories/{memory_id}/scenes", memory_l1_parts_route, methods=["GET"], name="memory-l1-scenes"),
             Route("/api/memory-authority/memories/{memory_id}/scenes/{object_id}", memory_l1_parts_route, methods=["GET"], name="memory-l1-scene"),

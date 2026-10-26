@@ -71,6 +71,39 @@ def test_bucket_semantic_without_attributed_statement_records_global_formula():
     assert row["reason_codes"] == ["no_attributable_statement_match"]
 
 
+def test_partial_affinity_is_visible_in_actual_score_evidence_without_source_prose():
+    values, computation = example()
+    values["catalog"]["topics"] = ["care"]
+    values["recall"]["affinity_mappings"] = [
+        {"id": "care_known", "selector": {"topic": "care"}, "signal_id": "known",
+         "target": "drive_affinity", "weight": .8},
+        {"id": "care_unknown", "selector": {"topic": "care"}, "signal_id": "missing",
+         "target": "drive_affinity", "weight": .5},
+    ]
+    document = document_template("PRIVATE_BODY_NOT_FOR_METADATA")
+    statement = statement_template()
+    statement.update(statement_id="state-1", content="PRIVATE_BODY_NOT_FOR_METADATA")
+    statement["classification"]["topics"] = ["care"]
+    document["statements"] = [statement]
+    calculation = score_document(document, values, {"now": datetime(2026, 10, 20, tzinfo=timezone.utc),
+        "purpose": "current", "query": "", "facts": {}, "signals": {
+        "known": {"state": "known", "value": .5, "reason": None,
+                  "evidence_refs": ["PRIVATE_SOURCE_REFERENCE"]},
+        "missing": {"state": "unknown", "value": None, "reason": "signal_unknown"},
+    }}, {"relevance": .8, "statement_selection": {
+        "direct_ids": ["state-1"], "support_ids": [], "matches": {}}})
+    computation["candidate_scores"][0]["computation"] = calculation
+    evidence = score_evidence({"revision": "mc-partial", "values": values}, computation)
+    row = evidence["candidates"][0]["computation"]["statements"][0]
+    target = row["affinity"]["targets"]["drive_affinity"]
+    assert target["state"] == "partial" and target["complete"] is False
+    assert target["value"] == pytest.approx(.4)
+    assert target["coverage"] == {"known": 1, "unknown": 1, "matched": 2, "ratio": .5}
+    assert target["contributions"][1]["value"] is None
+    assert target["contributions"][1]["reason"] == "signal_unknown"
+    assert "PRIVATE" not in json.dumps(evidence)
+
+
 def test_missing_or_oversized_configuration_never_claims_replayable_inputs():
     values, computation = example()
     values["formulas"] = [{"id": f"formula_{i}", "expression": "relevance + " * 100 + "relevance",

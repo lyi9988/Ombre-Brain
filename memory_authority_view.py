@@ -470,6 +470,8 @@ class MemoryAuthorityRecallView:
                     f"OR m.memory_id IN ({placeholders}))",
                     [*chunk, *chunk],
                 ).fetchall())
+            from memory_relation_dependencies import cache_versions
+            dependency_versions = cache_versions(conn, [str(row[0]) for row in rows])
         except sqlite3.Error:
             return {}
         finally:
@@ -496,6 +498,7 @@ class MemoryAuthorityRecallView:
                 "memory_id": str(row[0]),
                 "revision": int(row[2] or 0),
                 "body_sha256": str(row[3] or ""),
+                'dependency_token': dependency_versions.get(str(row[0])),
             }
             if row[4]:
                 from memory_retrieval_text import TEXT_PROJECTION_VERSION
@@ -512,6 +515,7 @@ database during chat. Source readability is verified separately, per binding.
         if not ids or not self.available():
             return {}
         conn = self._connect()
+        conn.row_factory = sqlite3.Row
         result = {}
         try:
             conn.execute("BEGIN")
@@ -563,6 +567,9 @@ database during chat. Source readability is verified separately, per binding.
                         # Multiple authorities cannot silently select a winner.
                         result[bid] = {"state": "ambiguous", "document": None}
                     else:
+                        from memory_relation_dependencies import pending_sync_scope
+                        sync = pending_sync_scope(conn, memory_id)
+                        row.update(l1_sync_required=sync is not None, sync_scope=sync)
                         result[bid] = row
         except (sqlite3.Error, ValueError, TypeError):
             return {}
@@ -570,7 +577,32 @@ database during chat. Source readability is verified separately, per binding.
             conn.close()
         return result
 
-    def cognition_chain(self, seeds, *, depth, limit):
+    def relation_context(self, memory_ids):
+        """Incoming and outgoing adopted dependencies, not another retriever."""
+        if not self.available():
+            return {'relations': [], 'guards': [], 'nodes': [], 'state': 'unavailable'}
+        from memory_relation_dependencies import relation_context
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute('BEGIN')
+            result = relation_context(conn, memory_ids)
+        except (sqlite3.Error, ValueError, TypeError):
+            return {'relations': [], 'guards': [], 'nodes': [], 'state': 'unavailable'}
+        finally:
+            conn.close()
+        refs = set()
+        for relation in result['relations']:
+            refs.add((relation['host_memory_id'], relation['host_revision']))
+            for side in ('from', 'to'):
+                refs.add((relation[side + '_memory_id'], relation[side + '_revision']))
+        graph = self.cognition_chain(sorted(refs), depth=1, limit=len(refs), require_cognitive_seeds=False) if refs else {'nodes': [], 'issues': []}
+        allowed_refs = set(refs)
+        result.update(nodes=[row for row in graph['nodes'] if (row['memory_id'], row['revision']) in allowed_refs],
+            state='available', issues=graph.get('issues', []))
+        return result
+
+    def cognition_chain(self, seeds, *, depth, limit, require_cognitive_seeds=True):
         """Bounded explicit revision/relationship traversal, no model or writes.
 
 Historical versions remain history. Every returned binding still needs the
@@ -630,7 +662,7 @@ same current-source check on Brain before any claim is shown to chat.
                     continue
                 document = record["document"]
                 cognitive = any(s.get("cognition") for s in document.get("statements", []))
-                if level == 0 and not cognitive:
+                if level == 0 and not cognitive and require_cognitive_seeds:
                     continue
                 node = {**record, "depth": level, "via": via, "via_paths": [via] if via else []}
                 nodes.append(node)

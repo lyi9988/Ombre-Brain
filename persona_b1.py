@@ -242,7 +242,7 @@ def decision_check(d):
         if r['type']=='correction' and (r['actor']!='owner' or r['target']!='assistant' or roles!={'user','assistant'}):raise ValueError('correction dual source required')
         if r['type']=='soothing' and (r['actor']!='owner' or r['target']!='assistant' or 'user' not in roles):raise ValueError('soothing owner source required')
         if r['observation_id'] not in seen:result['accepted'].append(deepcopy(r));seen.add(r['observation_id'])
-    reasons={'not_direct_interaction','not_asserted_occurrence','uncertain_interpretation','different_or_unknown_participants','actor_source_role_mismatch','operation_result_required_not_chat_claim','correction_dual_source_required','soothing_owner_source_required'}
+    reasons={'not_direct_interaction','not_asserted_occurrence','uncertain_interpretation','different_or_unknown_participants','actor_source_role_mismatch','operation_result_required_not_chat_claim','correction_dual_source_required','soothing_owner_source_required','correction_occurrence_unproven'}
     if not isinstance(d['rejected'],list) or len(d['rejected'])>16:raise ValueError('bounded rejected decisions required')
     rejected_seen=set()
     for r in d['rejected']:

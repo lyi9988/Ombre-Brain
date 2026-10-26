@@ -32,6 +32,8 @@ import re
 import shutil
 import json
 import tempfile
+import hashlib
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,6 +71,8 @@ class BucketManager:
         self.config = config
         # --- Read storage paths from config / 从配置中读取存储路径 ---
         self.base_dir = config["buckets_dir"]
+        from memory_activation import BucketActivationLedger
+        self.activation_ledger = BucketActivationLedger(self.base_dir)
         self.permanent_dir = os.path.join(self.base_dir, "permanent")
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
@@ -143,7 +147,9 @@ class BucketManager:
 
     @classmethod
     def _write_post_atomic(cls, file_path: str, post) -> None:
-        cls._atomic_write_text(file_path, frontmatter.dumps(post))
+        from memory_activation import base_metadata
+        raw = frontmatter.Post(post.content, **base_metadata(post.metadata))
+        cls._atomic_write_text(file_path, frontmatter.dumps(raw))
 
     @classmethod
     def _write_json_atomic(cls, file_path: str, payload: dict) -> None:
@@ -417,10 +423,10 @@ class BucketManager:
                     continue
                 post[str(key)] = value
 
-        # --- Auto-refresh content update time and activation time ---
-        # --- 自动刷新内容更新时间与激活时间 ---
+        # Editing is not activation or evidence that the remembered event recurred.
         post["updated_at"] = kwargs.get("updated_at") or now_iso()
-        post["last_active"] = kwargs.get("last_active") or now_iso()
+        if kwargs.get("last_active"):
+            post["last_active"] = kwargs["last_active"]
 
         try:
             self._write_post_atomic(file_path, post)
@@ -518,12 +524,6 @@ class BucketManager:
         except OSError as e:
             logger.error(f"Failed to write bucket comment / 写入桶评论失败: {file_path}: {e}")
             return None
-
-        if touch:
-            current_time = self._parse_iso_datetime(post.get("created", post.get("last_active", "")))
-            if current_time is None:
-                current_time = datetime.now(timezone.utc).replace(tzinfo=None)
-            await self._time_ripple(bucket_id, current_time)
 
         logger.info(f"Added bucket comment / 已追加年轮: {bucket_id}#{entry['id']}")
         return entry
@@ -657,79 +657,30 @@ class BucketManager:
     # ---------------------------------------------------------
     # Touch bucket (refresh activation time + increment count)
     # 触碰桶（刷新激活时间 + 累加激活次数）
-    # Called on every recall hit; affects decay score.
-    # 每次检索命中时调用，影响衰减得分。
+    # Called only for evidenced use; affects the existing decay score.
+    # 仅有依据的有效使用调用，保留原衰减计分。
     # ---------------------------------------------------------
-    async def touch(self, bucket_id: str) -> None:
-        """
-        Update a bucket's last activation time and count.
-        Also triggers time ripple: nearby memories get a slight activation boost.
-        更新桶的最后激活时间和激活次数。
-        同时触发时间涟漪：时间上相邻的记忆轻微唤醒。
+    async def touch(self, bucket_id: str, *, activation_id: str | None = None,
+                    expected_body_sha256: str | None = None) -> bool:
+        """Activate evidenced use once; delivery/retrieval alone never calls this.
+
+        Keep historical counts and the existing decay inputs. An explicit
+        activation receipt is stored beside the shared buckets. It cannot
+        overwrite a concurrent owner edit because it never writes Markdown.
+        Temporal neighbours receive no implicit activation.
         """
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
-            return
-
+            return False
         try:
             post = frontmatter.load(file_path)
-            post["last_active"] = now_iso()
-            post["activation_count"] = post.get("activation_count", 0) + 1
-
-            self._write_post_atomic(file_path, post)
-
-            # --- Time ripple: boost nearby memories within ±48h ---
-            # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
-            current_time = self._parse_iso_datetime(post.get("created", post.get("last_active", "")))
-            if current_time is None:
-                current_time = datetime.now(timezone.utc).replace(tzinfo=None)
-            await self._time_ripple(bucket_id, current_time)
-        except Exception as e:
-            logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
-
-    async def _time_ripple(self, source_id: str, reference_time: datetime, hours: float = 48.0) -> None:
-        """
-        Slightly boost activation_count of buckets created/activated near the reference time.
-        轻微提升时间相邻桶的激活次数（+0.3），不改 last_active 避免递归唤醒。
-        Max 5 buckets rippled per touch to bound I/O.
-        """
-        try:
-            all_buckets = await self.list_all(include_archive=False)
-        except Exception:
-            return
-
-        rippled = 0
-        max_ripple = 5
-        for bucket in all_buckets:
-            if rippled >= max_ripple:
-                break
-            if bucket["id"] == source_id:
-                continue
-            meta = bucket.get("metadata", {})
-            # Skip pinned/permanent/feel
-            if meta.get("pinned") or meta.get("protected") or meta.get("type") in ("permanent", "feel"):
-                continue
-
-            created_str = meta.get("created", meta.get("last_active", ""))
-            created = self._parse_iso_datetime(created_str)
-            if created is None:
-                continue
-            delta_hours = abs((reference_time - created).total_seconds()) / 3600
-
-            if delta_hours <= hours:
-                # Boost activation_count by 0.3 (fractional), don't change last_active
-                file_path = self._find_bucket_file(bucket["id"])
-                if not file_path:
-                    continue
-                try:
-                    post = frontmatter.load(file_path)
-                    current_count = post.get("activation_count", 1)
-                    # Store as float for fractional increments; calculate_score handles it
-                    post["activation_count"] = round(current_count + 0.3, 1)
-                    self._write_post_atomic(file_path, post)
-                    rippled += 1
-                except Exception:
-                    continue
+            if expected_body_sha256 and hashlib.sha256(post.content.encode('utf-8')).hexdigest() != expected_body_sha256:
+                return False
+            self.activation_ledger.record(bucket_id, activation_id or 'activation_' + uuid.uuid4().hex, now_iso())
+            return True
+        except Exception as exc:
+            logger.warning("Failed to activate bucket %s: %s", bucket_id, type(exc).__name__)
+            return False
 
     # ---------------------------------------------------------
     # Multi-dimensional search (core feature)
@@ -1483,9 +1434,10 @@ class BucketManager:
         try:
             raw = Path(file_path).read_text(encoding="utf-8")
             post = frontmatter.load(file_path)
+            bucket_id = post.get("id", Path(file_path).stem)
             return {
-                "id": post.get("id", Path(file_path).stem),
-                "metadata": dict(post.metadata),
+                "id": bucket_id,
+                "metadata": self.activation_ledger.effective(bucket_id, post.metadata),
                 "content": post.content,
                 "path": file_path,
                 "content_start_line": _markdown_body_start_line(raw),

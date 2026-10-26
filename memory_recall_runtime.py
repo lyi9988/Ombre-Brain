@@ -11,8 +11,9 @@ import time
 import httpx
 
 from memory_recall_semantics import (apply_relations, known, lexical_features, resolve_document,
-                                     score_document, temporal_features)
+                                     score_document, temporal_features, statement_context)
 from memory_system_config import REQUEST_CONFIGURATION, values_from_config
+from memory_inner_affinity import (build_inner_context, document_inner_affinity, local_inner_candidates)
 from memory_affinity import resolve_signals
 from memory_query_evidence import query_purpose, match_statements, correction_matches, semantic_source_refs
 
@@ -45,7 +46,7 @@ async def snapshot_sources_current(service, entry, request):
     if not guard["complete"]:
         return False
     stamp = authority_stamp(service)
-    if getattr(view, "enabled", False) and (stamp is None or stamp != guard["authority_stamp"]):
+    if getattr(view, "enabled", False) and stamp is None:
         return False
     ids = list(guard["records"])
     if not ids:
@@ -55,6 +56,7 @@ async def snapshot_sources_current(service, entry, request):
     if any(not metadata.get(bid) or metadata[bid].get("revision") != old["revision"]
            or metadata[bid].get("memory_id") != old["memory_id"]
            or metadata[bid].get("body_sha256") != old["body_sha256"]
+           or metadata[bid].get('dependency_token') != old.get('dependency_token')
            for bid, old in guard["records"].items()):
         return False
     sub = {"_semantic_records": records, "_deadline": deadline(service, request),
@@ -69,12 +71,16 @@ async def snapshot_sources_current(service, entry, request):
         # Replaying an old whole narrative after losing only one source is
         # unsafe even if another claim keeps the same bucket eligible.
         if usage["state"] == "l1":
-            if not usage.get("narrative_allowed"):
+            if usage.get('narrative_allowed') != old.get('narrative_allowed', True):
                 return False
             current = {use["statement_id"]: use["usage"] for use in usage["items"]}
             if any(current.get(sid) != use for sid, use in old["statement_uses"].items()):
                 return False
-    return stamp == authority_stamp(service)
+    if sub.get('_relation_guard_token') != guard.get('relation_guard_token'):
+        return False
+    # Final per-memory versions and live source checks remain mandatory. A
+    # write to an unrelated Memory does not invalidate this cached projection.
+    return metadata == view.memory_index_metadata_map(ids)
 
 
 def snapshot_guard(service, request, *, complete):
@@ -88,10 +94,12 @@ def snapshot_guard(service, request, *, complete):
         if not row:
             complete = False
             continue
-        records[bid] = {key: row.get(key) for key in ("memory_id", "revision", "body_sha256")}
+        records[bid] = {key: row.get(key) for key in ("memory_id", "revision", "body_sha256", 'dependency_token')}
+        records[bid]['narrative_allowed'] = request.get('usage_by_bucket', {}).get(bid, {}).get('narrative_allowed', True)
         records[bid]["statement_uses"] = {use["statement_id"]: use["usage"] for use in
             request.get("usage_by_bucket", {}).get(bid, {}).get("items", [])}
     return {"complete": complete, "authority_stamp": authority_stamp(service),
+            'relation_guard_token': request.get('_relation_guard_token'),
             "query": request.get("q_current", ""), "records": records}
 
 
@@ -164,6 +172,42 @@ def option(service, name, fallback=None):
     return fallback if value is None else value
 
 
+def query_temporal_contexts(service, request, query, now):
+    """Existing explicit question parts, never one first date for all claims."""
+    from recall_rerank_window import explicit_query_parts
+    current = str(request.get("q_current") or query)
+    parts = request.get("_query_parts") or explicit_query_parts(current)
+    from utils import parse_human_date_reference
+    def dates(text):
+        remaining, found = text, {}
+        while remaining:
+            hint = parse_human_date_reference(remaining, now=now, tz=now.tzinfo)
+            if not hint or not hint.get("date"):
+                break
+            found[hint["date"]] = hint
+            label = hint.get("label")
+            if not isinstance(label, str) or not label or label not in remaining:
+                break
+            remaining = remaining.replace(label, " ")
+        return found
+    all_dates = dates(current)
+    part_contexts = []
+    if len(parts) > 1:
+        for index, part in enumerate(parts):
+            found = dates(part)
+            target = (datetime.fromisoformat(next(iter(found))).replace(tzinfo=now.tzinfo)
+                      if len(found) == 1 else None)
+            part_contexts.append({"query": part, "query_part_index": index,
+                **query_purpose(part, target_time=target, now=now),
+                "date_binding": "single_part_date" if target else "ambiguous" if found else "not_specified"})
+    target = (datetime.fromisoformat(next(iter(all_dates))).replace(tzinfo=now.tzinfo)
+              if len(parts) == 1 and len(all_dates) == 1 else None)
+    temporal = query_purpose(current, target_time=target, now=now)
+    if len(all_dates) > 1 or len(parts) > 1:
+        temporal["temporal_reference"] = "per_question" if part_contexts else "ambiguous_multiple_dates"
+    return temporal, part_contexts
+
+
 def context(service, request, query):
     if "_use_context" not in request:
         from turn_clock import reference_now
@@ -171,11 +215,9 @@ def context(service, request, query):
         date_hint = service._query_date_recall_hint(query) if hasattr(service, "gateway_tz") else None
         planner = getattr(service.recall_policy, "plan_query", None)
         plan = planner(query) if callable(planner) else None
-        target = (datetime.fromisoformat(date_hint["date"]).replace(tzinfo=now.tzinfo)
-                  if date_hint and date_hint.get("date") else None)
-        temporal_intent = query_purpose(query, target_time=target, now=now)
+        temporal_intent, part_contexts = query_temporal_contexts(service, request, query, now)
         request["_use_context"] = {
-            "now": now, "target_time": target, "query": query,
+            "now": now, "query": query, "query_part_contexts": part_contexts,
             **temporal_intent,
             "overview": bool(date_hint and getattr(plan, "auto_too_vague", False)),
             "facts": {"hour": {"state": "known", "value": now.hour},
@@ -183,6 +225,12 @@ def context(service, request, query):
             "signals": resolve_signals(values(service), request.get("_signal_snapshots", []),
                                        request.get("_signal_sampled_at") or datetime.now(timezone.utc)),
         }
+    if "inner_state_affinity" not in request["_use_context"]:
+        request["_use_context"]["inner_state_affinity"] = build_inner_context(
+            values(service), request.get("_signal_snapshots", []),
+            request.get("_signal_sampled_at") or datetime.now(timezone.utc), query,
+            scope={key: request[key] for key in ("conversation_id", "source_event_id", "profile_id")
+                   if request.get(key)})
     return request["_use_context"]
 
 
@@ -223,6 +271,12 @@ def add_local_candidates(service, request, query, pool):
             pool.append({"bucket": request["_semantic_buckets"][bid], "score": strength,
                          "keyword_score": 0.0, "semantic_score": 0.0,
                          "l1_local_match": signals})
+    capacity = min(settings.get("limits", {}).get("semantic_candidate_top_k", 50),
+                   settings.get("limits", {}).get("rerank_candidate_limit", 20))
+    additions = local_inner_candidates(request.get("_semantic_records", {}),
+        request.get("_semantic_buckets", {}), context(service, request, query)["inner_state_affinity"],
+        settings, {str(item["bucket"]["id"]) for item in pool}, limit=max(0, capacity - len(pool)))
+    pool.extend(additions)
     return pool
 
 
@@ -269,6 +323,12 @@ def score_pool(service, request, query, pool, *, after_rerank=False):
                              for reason in calculation["reason_codes"])
         calculation["window_score"] = (calculation["score"] if not formula_failed
             and (custom_formula or time_applied or item.get("l1_local_match")) else None)
+        calculation["inner_state_affinity"] = document_inner_affinity(document,
+            use_context["inner_state_affinity"], usage=request.get("usage_by_bucket", {}).get(bid),
+            selection=item.get("_statement_selection") or calculation.get("statement_selection"),
+            calculation=calculation, settings=settings)
+        # Both scoring passes retain the original relevance/formula result.
+        # This component is adopted once, after ordinary admission/hierarchy.
         item["_configured_score"] = calculation
         if not after_rerank:
             item["_configured_score_before_rerank"] = calculation
@@ -277,6 +337,143 @@ def score_pool(service, request, query, pool, *, after_rerank=False):
             if after_rerank:
                 item["combined_score"] = item["score"]
     return pool
+
+
+
+def apply_inner_ranking(service, request, query, pool):
+    """Adopt the independent component once after source/admission decisions."""
+    changed = False
+    for item in pool:
+        calculation = item.get("_configured_score") or {}
+        component = calculation.get("inner_state_affinity") or {}
+        base = calculation.get("score", item.get("_inner_ranking_base", item.get("score")))
+        item["_inner_ranking_base"] = base
+        bonus = component.get("bonus", 0)
+        if type(base) not in (int, float) or type(bonus) not in (int, float):
+            continue
+        item["_admission_score"] = base
+        # Card confidence thresholds also retain their original baseline.
+        reliable = getattr(service, "_dynamic_bucket_item_has_reliable_recall_signal", None)
+        baseline_eligible = (base >= getattr(service, "first_card_min_score", 0)
+            or callable(reliable) and reliable(query, item))
+        if not baseline_eligible:
+            bonus = 0
+            component["ranking_reason"] = "original_card_confidence_not_met"
+        item["score"] = base + bonus
+        component.update(applied_bonus=bonus, base_score=base, final_score=item["score"],
+                         applied_at="after_admission")
+        if "combined_score" in item:
+            item["combined_score"] = item["score"]
+        if bonus > 0:
+            # Preserve score/window_score as the formula evidence, separately
+            # expose final ranking adoption without overwriting owner formulas.
+            calculation["ranking_score"] = item["score"]
+            changed = True
+    if changed:
+        pool.sort(key=lambda item: item.get("score", 0), reverse=True)
+    return pool
+
+def _apply_sync_scope(usage, scope, purpose):
+    if not scope or purpose == 'history':
+        return
+    affected = set(scope.get('statement_ids') or [])
+    for use in usage.get('items', []):
+        if scope.get('unknown_scope') is not False or use['statement_id'] in affected:
+            use['usage'] = 'excluded'
+            if 'l1_sync_required' not in use['reason_codes']:
+                use['reason_codes'].append('l1_sync_required')
+            usage['narrative_allowed'] = False
+    if usage.get('state') == 'legacy' or (usage.get('items') and all(u['usage'] == 'excluded' for u in usage['items'])):
+        usage.update(state='excluded', narrative_allowed=False)
+
+
+async def _relation_dependencies(service, request, query, records, usages, use_context, fresh_keys):
+    """Locate adopted incoming/outgoing counterparts and verify their own L0."""
+    request['_relation_material'] = {}
+    request.pop('_relation_guard_token', None)
+    request['_relation_out_of_scope'] = []
+    use_context['relation_out_of_scope'] = []
+    if request.get('_relation_projection') or use_context.get('purpose') == 'history':
+        return
+    view = getattr(service, 'memory_authority_view', None)
+    reader = getattr(view, 'relation_context', None)
+    if not callable(reader):
+        return
+    for key in [key for key in records if key.startswith('@relation:')]:
+        records.pop(key, None)
+        usages.pop(key, None)
+    ids = [r['memory_id'] for bid, r in records.items() if bid in fresh_keys and r.get('memory_id')]
+    graph = reader(ids)
+    request['_relation_context'] = graph
+    if graph.get('state') != 'available':
+        request.setdefault('incomplete_reasons', []).append('relation_context_unavailable')
+        return
+    adoptions, endpoints = {}, {}
+    for relation in graph['relations']:
+        adoptions.setdefault((relation['host_memory_id'], relation['host_revision']), {})[relation['relation_id']] = relation['adoption']
+        for side in ('from', 'to'):
+            endpoints.setdefault((relation[side + '_memory_id'], relation[side + '_revision']), []).append(
+                {'object_type': relation[side + '_type'], 'object_id': relation[side + '_id']})
+    existing = {(r.get('memory_id'), r.get('revision')) for bid, r in records.items() if bid in fresh_keys}
+    sub_records = {}
+    for node in graph.get('nodes', []):
+        identity = (node['memory_id'], node['revision'])
+        if identity in existing:
+            continue
+        key = '@relation:' + node['memory_id'] + '@' + str(node['revision'])
+        sub_records[key] = {**node, 'state': 'l1', 'relation_adoptions': adoptions.get(identity, {})}
+    sub = {'_semantic_records': sub_records, '_use_context': use_context, '_relation_projection': True,
+        '_chain_projection': True, '_deadline': deadline(service, request),
+        '_recall_reads': request.setdefault('_recall_reads', {}), 'recall_io': request.setdefault('recall_io', {})}
+    allowed = await verify_sources(service, sub, query,
+        [{'bucket': {'id': key}, 'score': 0.0} for key in sub_records], refresh=True) if sub_records else []
+    related = {}
+    out_of_scope = set()
+    from memory_recall_semantics import applicability, conditions
+    for key, node in sub_records.items():
+        all_uses = sub.get('usage_by_bucket', {}).get(key, {}).get('all_items', [])
+        paths = endpoints.get((node['memory_id'], node['revision']), [])
+        ids = {p['object_id'] for p in paths if p['object_type'] == 'statement'}
+        whole = any(p['object_type'] == 'memory' for p in paths)
+        for path in paths:
+            if path['object_type'] == 'scene':
+                scene = next((s for s in node['document'].get('scenes', []) if s['scene_id'] == path['object_id']), None)
+                if scene:
+                    ids.update(scene['statement_refs'])
+        relevant = [u for u in all_uses if whole or u['statement_id'] in ids]
+        if relevant and all(u.get('source_state') == 'available' and (
+                applicability(u, statement_context(u, use_context, node['document'])) is False
+                or conditions(u['conditions'], statement_context(u, use_context, node['document']).get('facts') or {}) is False) for u in relevant):
+            out_of_scope.add((node['memory_id'], node['revision']))
+    outside_relations = [(r['relation_id'], r['relation_sha256']) for r in graph['relations']
+        if (r['from_memory_id'], r['from_revision']) in out_of_scope]
+    request['_relation_out_of_scope'] = outside_relations
+    use_context['relation_out_of_scope'] = outside_relations
+    for item in allowed:
+        key = item['bucket']['id']
+        node, usage = sub_records[key], sub['usage_by_bucket'][key]
+        refs, whole = set(), False
+        for endpoint in endpoints.get((node['memory_id'], node['revision']), []):
+            whole |= endpoint['object_type'] == 'memory'
+            if endpoint['object_type'] == 'statement':
+                refs.add(endpoint['object_id'])
+            elif endpoint['object_type'] == 'scene':
+                scene = next((s for s in node['document'].get('scenes', []) if s['scene_id'] == endpoint['object_id']), None)
+                if scene:
+                    refs.update(scene['statement_refs'])
+        if not whole:
+            usage['items'] = [u for u in usage['items'] if u['statement_id'] in refs]
+        usage['narrative_allowed'] = False
+        related[key] = usage
+    records.update(sub_records)
+    usages.update(related)
+    for bid, record in records.items():
+        record['relation_adoptions'] = adoptions.get((record.get('memory_id'), record.get('revision')), record.get('relation_adoptions', {}))
+    request['_relation_material'] = related
+    from memory_l1_contract import semantic_sha256
+    request['_relation_guard_token'] = semantic_sha256({'relations': graph['relations'], 'guards': graph['guards'],
+        'qualified': {key: [[u['statement_id'], u['usage'], u.get('source_state')] for u in usage['items']]
+                      for key, usage in sorted(related.items())}})
 
 
 async def verify_sources(service, request, query, items, *, refresh=False):
@@ -369,6 +566,10 @@ async def verify_sources(service, request, query, items, *, refresh=False):
         document = (record or {}).get("document")
         if not document:
             usage_by_bucket[bid] = {"state": "legacy", "items": [], "narrative_allowed": True}
+            _apply_sync_scope(usage_by_bucket[bid], (record or {}).get('sync_scope'), use_context['purpose'])
+            if usage_by_bucket[bid]['state'] == 'excluded':
+                item['admission_reason'] = 'l1_sync_required'
+                continue
             result.append(item)
             continue
         check = checked.get(cache_keys.get((record["memory_id"], record["revision"])))
@@ -385,13 +586,44 @@ async def verify_sources(service, request, query, items, *, refresh=False):
         allowed = [use for use in uses if use["usage"] != "excluded"]
         narrative_allowed = all(source_states.get(key) == "available" for key in bindings_by_bucket.get(bid, []))
         if (uses and not allowed) or (not uses and not narrative_allowed):
+            usage_by_bucket[bid].update(all_items=uses)
             item["admission_reason"] = "l0_source_not_eligible"
             continue
         usage_by_bucket[bid] = {"state": "l1", "items": allowed,
+                               'all_items': uses,
                                "narrative_allowed": narrative_allowed, "record": record,
-                               "source_states": source_states, "query_purpose": use_context["purpose"]}
+                               "source_states": source_states, "query_purpose": use_context["purpose"],
+                               'relation_guards': (check or {}).get('relation_guards', [])}
+        _apply_sync_scope(usage_by_bucket[bid], (check or {}).get('sync_scope') or record.get('sync_scope'), use_context['purpose'])
         result.append(item)
-    apply_relations(records, usage_by_bucket, use_context)
+    if refresh:
+        await _relation_dependencies(service, request, query, records, usage_by_bucket, use_context,
+            {str(item['bucket']['id']) for item in result})
+    qualified_keys = {str(item['bucket']['id']) for item in result} | set(request.get('_relation_material') or {})
+    request['_relation_fresh_keys'] = sorted(qualified_keys)
+    apply_relations({key: records[key] for key in qualified_keys if key in records},
+        {key: usage_by_bucket[key] for key in qualified_keys if key in usage_by_bucket}, use_context)
+    if use_context.get('purpose') != 'history':
+        guards = [*(request.get('_relation_context') or {}).get('guards', []),
+            *(guard for key in qualified_keys for guard in usage_by_bucket.get(key, {}).get('relation_guards', []))]
+        for bid, usage in usage_by_bucket.items():
+            record = records.get(bid) or {}
+            for guard in guards:
+                if guard['target_memory_id'] != record.get('memory_id'):
+                    continue
+                if (guard['relation_id'], guard['relation_sha256']) in request.get('_relation_out_of_scope', []):
+                    continue
+                scope = guard.get('scope') or {'unknown_scope': True, 'statement_ids': []}
+                if scope.get('historical_only'):
+                    continue
+                for use in usage.get('items', []):
+                    if use['usage'] not in {'excluded', 'historical_evidence'} and (
+                            scope.get('unknown_scope') or use['statement_id'] in scope['statement_ids']):
+                        use['usage'] = 'unresolved_evidence'
+                        if 'adopted_relation_requires_current_counterpart' not in use['reason_codes']:
+                            use['reason_codes'].append('adopted_relation_requires_current_counterpart')
+                    if scope.get('unknown_scope') or use['statement_id'] in scope['statement_ids']:
+                        usage['narrative_allowed'] = False
     for item in result:
         bid = str(item["bucket"]["id"])
         usage = usage_by_bucket[bid]
@@ -460,6 +692,69 @@ def usage_lines(usage):
     return "\n".join(rows)
 
 
+def _relation_render_support(service, request, query, bid, main_text, original, budget, trace):
+    """Give an adopted correction priority within the same existing card budget."""
+    if context(service, request, query)['purpose'] == 'history':
+        return main_text, main_text, []
+    from utils import count_tokens_approx
+    graph = request.get('_relation_context') or {}
+    records, usages = request.get('_semantic_records', {}), request.get('usage_by_bucket', {})
+    host = records.get(bid) or {}
+    target = host.get('memory_id')
+    guards = [g for g in graph.get('guards', []) if g['target_memory_id'] == target
+              and not (g.get('scope') or {}).get('historical_only')
+              and (g['relation_id'], g['relation_sha256']) not in request.get('_relation_out_of_scope', [])]
+    if not guards:
+        return main_text, main_text, []
+    needed, matched_guards = set(), set()
+    for relation in graph.get('relations', []):
+        if relation['to_memory_id'] == target and relation['kind'] in {'supersedes', 'revises', 'limits', 'possible_conflict'}:
+            source = (relation['from_memory_id'], relation['from_revision'])
+            if source != (host.get('memory_id'), host.get('revision')):
+                needed.add(source)
+            matched_guards.add((relation['relation_id'], relation['relation_sha256']))
+    missing = bool(trace.get('relation_context_unavailable')) or any(
+        (g['relation_id'], g['relation_sha256']) not in matched_guards for g in guards)
+    found, parts, spans = set(), [], []
+    left = budget
+    for key in request.get('_relation_fresh_keys', []):
+        record = records.get(key) or {}
+        identity = (record.get('memory_id'), record.get('revision'))
+        usage = usages.get(key) or {}
+        if (trace.get('relation_context_unavailable') or identity not in needed
+                or identity in found or usage.get('state') != 'l1'):
+            continue
+        support_trace = {'memory_id': record['memory_id'], 'l1_revision': record['revision'],
+            'presentation_revision': None, 'source': 'l1', 'reason': 'adopted_relation_dependency',
+            'injected_statement_ids': [u['statement_id'] for u in usage.get('items', []) if u['usage'] != 'excluded']}
+        text = render(service, {**usage, 'narrative_allowed': False, 'scope_to_query': False}, '', '', left,
+            trace=support_trace)
+        if not text:
+            continue
+        found.add(identity)
+        parts.append(text)
+        left = max(0, left - count_tokens_approx(text + '\n\n'))
+        spans.append({'bucket_id': record.get('bucket_id') or key, 'record_key': key,
+            'text': text, 'source_trace': support_trace, 'relation_dependency': True})
+    if missing or not needed <= found:
+        # A missing counterpart cannot revive the old fact. Unrelated claims
+        # in this same Memory remain available through their original scopes.
+        scope_ids = {sid for g in guards for sid in (g.get('scope') or {}).get('statement_ids', [])}
+        unknown = any((g.get('scope') or {}).get('unknown_scope', True) for g in guards)
+        usage = usages[bid]
+        items = [] if unknown else [u for u in usage.get('items', []) if u['statement_id'] not in scope_ids]
+        main_text = render(service, {**usage, 'items': items, 'narrative_allowed': False,
+            'scope_to_query': False}, '', '', left, trace=trace) if items else ''
+        trace['relation_context_incomplete'] = True
+    elif count_tokens_approx('\n\n'.join([*parts, main_text])) > budget:
+        main_text = render(service, {**usages[bid], 'narrative_allowed': False,
+            'scope_to_query': False}, '', original, left, trace=trace)
+    if not main_text:
+        trace['source'] = 'none'
+        trace['render_reason'] = 'required_relation_context_preferred_or_unavailable'
+    return '\n\n'.join(part for part in [*parts, main_text] if part), main_text, spans
+
+
 def render(service, usage, header, original, budget, *, trace=None):
     """A source-faithful interim L1 view, not the future persisted L2."""
     if usage["state"] == "excluded":
@@ -496,7 +791,38 @@ def render(service, usage, header, original, budget, *, trace=None):
     return fit_units(units, budget, wrap=wrap)
 
 
-def render_presentation(service, usage, header, presentation, budget):
+def required_presentation_statements(usage):
+    """Keep dependencies and corrections; a lexical hit is not an atomic group.
+
+    The model's complete qualified sections remain the units of selection.
+    Matching an optional aside must not require every section in the memory.
+    Explicit history/comparison requests still retain their matched before/after.
+    """
+    import re
+    selection = usage.get("statement_selection") or {}
+    required = set(usage.get("correction_statement_ids") or [])
+    required.update(selection.get("required_support_ids", selection.get("support_ids") or []))
+    direct = set(selection.get("direct_ids") or [])
+    if usage.get("query_purpose") in {"history", "mixed"}:
+        required.update(direct)
+    else:
+        # This is quoted source evidence that a change was stated, not an
+        # automatic adoption of a model-proposed cross-memory relationship.
+        # A whole section carrying the correction cannot be replaced by its
+        # shorter, earlier positive premise simply because that premise fits.
+        for item in usage.get("items") or []:
+            if item.get("statement_id") not in direct or item.get("source_state") != "available":
+                continue
+            boundary = known((item.get("classification") or {}).get("kind")) == "boundary"
+            changed = re.search(r"更正|修正|改为|改到|改成|改期|撤回|作废|"
+                r"\b(?:corrected|correction|rescheduled|revised|retracted|superseded|changed to|cancelled|canceled)\b",
+                str(item.get("content") or ""), re.IGNORECASE)
+            if boundary or changed:
+                required.add(item["statement_id"])
+    return required
+
+
+def render_presentation(service, usage, header, presentation, budget, *, trace=None):
     """Render Brain's already-qualified persisted L2 through the existing card."""
     if usage["state"] == "excluded":
         return "", "usage_excluded", [], False
@@ -532,9 +858,17 @@ def render_presentation(service, usage, header, presentation, budget):
         units.append({"unit_id": unit_id, "text": unit_text,
                       "statement_refs": list(unit.get("statement_refs") or [])})
     unit_ids = [unit["unit_id"] for unit in units]
-    required = set(usage.get("correction_statement_ids") or [])
-    required.update((usage.get("statement_selection") or {}).get("support_ids") or [])
-    required.update((usage.get("statement_selection") or {}).get("direct_ids") or [])
+    required = required_presentation_statements(usage)
+    if trace is not None:
+        trace["l2_budget"] = {
+            "available_tokens": max(0, budget),
+            "full_text_tokens": count_tokens_approx(text),
+            "required_statement_ids": sorted(required),
+            "matched_statement_ids": list((usage.get("statement_selection") or {}).get("direct_ids") or []),
+            "complete_units": [{"unit_id": unit["unit_id"],
+                "tokens": count_tokens_approx(wrap(unit["text"])),
+                "statement_ids": unit["statement_refs"]} for unit in units],
+        }
     coverage = presentation.get("coverage")
     if coverage is not None and not required <= set(coverage.get("used_statement_ids") or []):
         return "", "required_l2_context_missing", [], False
@@ -707,6 +1041,13 @@ async def resolve_presentations(service, candidates, *, request=None):
             state = str(row.get("state") or "unknown")
             reason = str(row.get("reason") or "").strip()
             common["resolver_state"] = state
+            for key in ('relation_issues', 'relation_guards'):
+                if isinstance(row.get(key), list):
+                    common[key] = row[key]
+            if reason == 'related_memory_dependency_unavailable':
+                common['relation_context_unavailable'] = True
+            if row.get('sync_scope') is not None or reason == 'l1_sync_required':
+                common['sync_scope'] = row.get('sync_scope') or {'statement_ids': [], 'unknown_scope': True}
             diagnostic = source_diagnostic_trace(row.get("source_diagnostic"))
             if diagnostic is not None:
                 common["source_diagnostic"] = diagnostic
@@ -964,6 +1305,19 @@ async def _project_sections(service, request, query, buckets, sections):
 
     presentations, resolved_trace = await resolve_presentations(service, l2_candidates, request=request)
     trace_by_bucket.update(resolved_trace)
+    if any(row.get('relation_context_unavailable') for row in resolved_trace.values()):
+        request.setdefault('incomplete_reasons', []).append('related_memory_dependency_unavailable')
+    invalid_related = {issue['memory_id'] for row in resolved_trace.values() for issue in row.get('relation_issues', [])
+                       if isinstance(issue, dict) and isinstance(issue.get('memory_id'), str)}
+    for bid in list(allowed):
+        if (records.get(bid) or {}).get('memory_id') in invalid_related:
+            allowed.discard(bid)
+            uses[bid] = {'state': 'excluded', 'items': [], 'narrative_allowed': False}
+    if invalid_related:
+        request['_relation_fresh_keys'] = [key for key in request.get('_relation_fresh_keys', [])
+            if (records.get(key) or {}).get('memory_id') not in invalid_related]
+        render_ids_by_section = {key: [bid for bid in ids if bid in allowed]
+                                 for key, ids in render_ids_by_section.items()}
     # Authority/permission may change while either batch is in flight. This
     # local metadata read is not another L0/provider round trip.
     if getattr(view, "enabled", False) and callable(metadata_reader):
@@ -1013,7 +1367,7 @@ async def _project_sections(service, request, query, buckets, sections):
                 presentation = presentations.get(bid)
                 if presentation:
                     text, render_reason, selected_unit_ids, partial_presentation = render_presentation(
-                        service, uses[bid], header, presentation, remaining,
+                        service, uses[bid], header, presentation, remaining, trace=row,
                     )
                     if text:
                         row["source"] = "l2"
@@ -1046,10 +1400,17 @@ async def _project_sections(service, request, query, buckets, sections):
                                 row["source"] = "l1"
                             else:
                                 row["source"] = "none"
-                                row.setdefault("render_reason", "usage_card_prompt_unavailable")
+                                row.setdefault("render_reason", render_reason)
                         else:
                             row["source"] = "none"
                             row["render_reason"] = render_reason
+                elif row.get('fallback_reason') == 'l1_sync_required':
+                    _apply_sync_scope(uses[bid], row.get('sync_scope') or {'statement_ids': [], 'unknown_scope': True},
+                        context(service, request, query)['purpose'])
+                    text = (render(service, {**uses[bid], 'scope_to_query': key != 'targeted'}, header,
+                        original, remaining, trace=row) if uses[bid]['state'] != 'excluded' else '')
+                    row['source'] = 'l1' if text else 'none'
+                    row['render_reason'] = 'l1_sync_required'
                 elif row.get("fallback_reason") in {"source_dependency_changed", "memory_not_found",
                         "memory_not_eligible", "l1_revision_mismatch", "l1_dependency_changed",
                         "l1_parent_dependency_changed", "scene_dependency_mismatch"}:
@@ -1067,9 +1428,18 @@ async def _project_sections(service, request, query, buckets, sections):
                     else:
                         row["source"] = "none"
                         row.setdefault("render_reason", "usage_card_prompt_unavailable")
+                text, main_text, support_spans = _relation_render_support(service, request, query,
+                    bid, text, original, remaining, row)
                 if text:
                     parts.append(text)
-                    spans.append({"bucket_id": bid, "section": key, "text": text})
+                    if main_text:
+                        spans.append({'bucket_id': bid, 'record_key': bid, 'section': key,
+                            'text': main_text, 'source_trace': dict(row)})
+                    for span in support_spans:
+                        span['section'] = key
+                        spans.append(span)
+                        request.setdefault('relation_context_bucket_ids', []).append(span['bucket_id'])
+                        request['presentation_trace'].append({'bucket_id': span['bucket_id'], **span['source_trace']})
                     # The existing Gateway owns token accounting and budgets.
                     from utils import count_tokens_approx
                     remaining -= count_tokens_approx(text)
@@ -1115,7 +1485,7 @@ async def _project_sections(service, request, query, buckets, sections):
                                       "issues": [{"reason": "no_budget_after_main_memory"}], "truncated": True}
     request["rendered_memory_spans"] = spans
     request["requested_usage_bucket_ids"] = list(dict.fromkeys(
-        bid for ids in ids_by_section.values() for bid in ids))
+        [*(bid for ids in ids_by_section.values() for bid in ids), *request.get('relation_context_bucket_ids', [])]))
     request["injected_usage_bucket_ids"] = list(dict.fromkeys(
-        span["bucket_id"] for span in spans if span["bucket_id"] in allowed))
+        span["bucket_id"] for span in spans if span["bucket_id"] in allowed or span.get('relation_dependency')))
     return rendered

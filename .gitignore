@@ -1,5 +1,11 @@
 __pycache__/
-tests/
+tests/*
+!tests/test_stage03_memory_delivery.py
+!tests/test_stage03_recall_composer_delivery.py
+!tests/test_stage03_relation_wire.py
+!tests/test_stage03_owner_extension_proxy.py
+!tests/test_stage03_inner_affinity_config_api.py
+!tests/test_stage03_inner_affinity.py
 .pytest-tmp/
 *.pyc
 *.pyo
@@ -24,3 +30,7 @@ backup_*/
 *.sqlite3
 import_state.json
 .codex
+
+!tests/test_stage03_l2_budget_groups.py
+
+!tests/data_stage03_real_l2_units.json

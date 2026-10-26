@@ -10,25 +10,16 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import zlib
+
+from recall_signal_protocol import (
+    PRODUCER as INNER_PRODUCER, INNER_NEEDS, INNER_AFFECT, INNER_DIMENSIONS,
+    snapshot_from_inner, validate_unified, decode_transport, active_evidence,
+)
 
 TARGETS = ("interest_affinity", "drive_affinity", "goal_alignment")
 AIZ_PRODUCERS = {"aiz.needs", "aiz.goals", "aiz.interests"}
-TRANSPORT_PRODUCERS = AIZ_PRODUCERS | {"ombre.persona"}
-# These are projections for existing bindings, never separate state authorities.
-INNER_NEEDS = ("energy", "rest", "curiosity", "novelty", "expression",
-               "creativity", "autonomy", "competence", "solitude")
-INNER_AFFECT = ("valence", "arousal", "tenderness", "possessiveness",
-                "longing", "security", "protective_drive")
-INNER_DIMENSIONS = {
-    "energy": ("aiz", "resource"),
-    **{key: ("aiz", "need") for key in (*INNER_NEEDS[1:], "boredom", "duty", "reflection")},
-    **{key: ("brain", "affect") for key in (*INNER_AFFECT, "libido", "grieve", "anger",
-        "favored", "session_defensiveness", "cling")},
-    "fatigue": ("brain", "resource"),
-    **{key: ("brain", "slow") for key in ("slow_security", "slow_confidence", "slow_mood")},
-    **{key: ("brain", "tendency") for key in ("exploration_affinity", "social_recovery_rate",
-        "connection_initiative", "creative_satisfaction", "challenge_tolerance", "reflection_preference")},
-}
+TRANSPORT_PRODUCERS = AIZ_PRODUCERS | {"ombre.persona", INNER_PRODUCER}
 
 
 def _unit(value):
@@ -47,58 +38,8 @@ def _date(value):
 
 
 def inner_state_snapshots(snapshot):
-    """Validate one full checkpoint and project the existing recall bindings.
-
-    No unit conversion, default affect, clock advance or private source prose is
-    used. Both wire producer names bind to the same complete checkpoint digest.
-    """
-    if not isinstance(snapshot, dict) or snapshot.get("schema") != "inner-state-v1":
-        raise ValueError("unified_snapshot_required")
-    if snapshot.get("availability") == "unavailable":
-        return [{"producer": producer, "state": "unavailable", "revision": None,
-            "as_of": None, "signals": {key: {"state": "unknown", "value": None, "evidence_refs": []}
-                for key in keys}, "reason": "inner_state_unavailable"}
-            for producer, keys in (("aiz.needs", INNER_NEEDS), ("ombre.persona", INNER_AFFECT))]
-    if snapshot.get("availability") not in ("complete", "stale"):
-        raise ValueError("settled_unified_snapshot_required")
-    if any(not isinstance(snapshot.get(key), str) or not snapshot[key].strip()
-           for key in ("subject_id", "checkpoint_id", "rules_version")) or not _date(snapshot.get("settled_at")):
-        raise ValueError("unified_checkpoint_identity_required")
-    revision = snapshot.get("revision")
-    if (not isinstance(revision, dict) or set(revision) != {"aiz", "brain"}
-            or any(type(value) is not int or value < 0 for value in revision.values())):
-        raise ValueError("both_owner_revisions_required")
-    dimensions = snapshot.get("dimensions")
-    if not isinstance(dimensions, dict) or set(dimensions) != set(INNER_DIMENSIONS):
-        raise ValueError("complete_unified_dimensions_required")
-    for key, row in dimensions.items():
-        if (not isinstance(row, dict) or set(row) != {"value", "unit", "owner", "kind", "status", "reason"}
-                or row.get("unit") != "0..1" or (row.get("owner"), row.get("kind")) != INNER_DIMENSIONS[key]):
-            raise ValueError("normalized_dimension_required")
-        if row["status"] == "known":
-            if not _unit(row["value"]) or row["reason"] is not None:
-                raise ValueError("known_dimension_invalid")
-        elif (row["status"] != "unknown" or row["value"] is not None
-              or not isinstance(row["reason"], str) or not row["reason"].strip()):
-            raise ValueError("unknown_dimension_invalid")
-    material = {key: snapshot[key] for key in
-        ("schema", "subject_id", "checkpoint_id", "revision", "rules_version", "settled_at")}
-    material.update(unit="0..1", values={key: row["value"] for key, row in dimensions.items()})
-    reference = "inner-" + hashlib.sha256(json.dumps(material, ensure_ascii=True,
-        sort_keys=True, separators=(",", ":"), allow_nan=False).encode("ascii")).hexdigest()
-    result = []
-    for producer, keys in (("aiz.needs", INNER_NEEDS), ("ombre.persona", INNER_AFFECT)):
-        signals = {key: {"state": "unknown", "value": None, "evidence_refs": []} for key in keys}
-        for key in keys:
-            if dimensions[key]["status"] == "known":
-                signals[key] = {"state": "known", "value": dimensions[key]["value"],
-                    "as_of": snapshot["settled_at"],
-                    "evidence_refs": [f"{producer}@{reference}:dimensions.{key}"]}
-        result.append({"producer": producer, "revision": reference, "as_of": snapshot["settled_at"],
-            "state": "available", "signals": signals, "checkpoint": {"schema": "inner-state-v1",
-                "unit": "0..1", "reference": reference, "revision": copy.deepcopy(revision),
-                "availability": snapshot["availability"]}})
-    return result
+    """One canonical checkpoint; old bindings are resolved as read views."""
+    return [snapshot_from_inner(snapshot)]
 
 
 def read_transport(raw, *, conversation_id, turn_id, source_event_id):
@@ -110,10 +51,8 @@ def read_transport(raw, *, conversation_id, turn_id, source_event_id):
     if not raw:
         return {"state": "unavailable", "reason": "not_supplied", "snapshots": []}
     try:
-        if not isinstance(raw, str) or len(raw.encode("utf-8")) > 8192:
-            raise ValueError("size")
-        value = json.loads(raw)
-        if not isinstance(value, dict) or value.get("schema_version") != "recall-signals-v1":
+        value = decode_transport(raw)
+        if not isinstance(value, dict) or value.get("schema_version") not in ("recall-signals-v1", "recall-signals-v2"):
             raise ValueError("schema")
         scope = value.get("scope")
         expected = dict(conversation_id=conversation_id, turn_id=turn_id, source_event_id=source_event_id)
@@ -125,6 +64,13 @@ def read_transport(raw, *, conversation_id, turn_id, source_event_id):
         producers = [item.get("producer") for item in snapshots if isinstance(item, dict)]
         if len(producers) != len(snapshots) or len(set(producers)) != len(producers) or set(producers) - TRANSPORT_PRODUCERS:
             raise ValueError("producer")
+        if value["schema_version"] == "recall-signals-v2":
+            if (set(producers) - {INNER_PRODUCER, "aiz.goals", "aiz.interests"}
+                    or INNER_PRODUCER not in producers):
+                raise ValueError("single_unified_producer_required")
+            validate_unified(snapshots[producers.index(INNER_PRODUCER)])
+        elif INNER_PRODUCER in producers:
+            raise ValueError("v2_required")
         if "ombre.persona" in producers:
             persona = snapshots[producers.index("ombre.persona")]
             if persona.get("state") == "available":
@@ -143,7 +89,7 @@ def read_transport(raw, *, conversation_id, turn_id, source_event_id):
                         or set(needs.get("signals") or {}) != set(INNER_NEEDS)):
                     raise ValueError("unified_checkpoint_mismatch")
         return {"state": "received", "scope": scope, "snapshots": copy.deepcopy(snapshots)}
-    except (ValueError, TypeError, UnicodeError, RecursionError):
+    except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError, KeyError, zlib.error):
         return {"state": "unavailable", "reason": "invalid_transport", "snapshots": []}
 
 
@@ -175,29 +121,43 @@ def sample_persona(affect, *, profile_id, session_id, updated_at):
 
 
 def resolve_signals(settings, snapshots, now):
-    """Freeze named bindings once. Age and unknown status remain inspectable."""
+    """Resolve compatibility names from one complete checkpoint, never a copy."""
     by_producer = {}
     for snapshot in snapshots:
         if isinstance(snapshot, dict) and isinstance(snapshot.get("producer"), str):
-            by_producer.setdefault(snapshot.get("producer"), []).append(snapshot)
+            by_producer.setdefault(snapshot["producer"], []).append(snapshot)
     result = {}
     now = _date(now)
+    unified = by_producer.get(INNER_PRODUCER, [])
     for binding in settings.get("recall", {}).get("signal_bindings", []):
         producer, key = binding["producer"], binding["key"]
-        row = {"producer": producer, "key": key, "state": "unknown", "value": None,
-               "revision": None, "as_of": None, "age_seconds": None, "evidence_refs": []}
-        candidates = by_producer.get(producer, [])
+        compatible = (producer == INNER_PRODUCER or
+            producer == "aiz.needs" and key in INNER_DIMENSIONS and INNER_DIMENSIONS[key][0] == "aiz" or
+            producer == "ombre.persona" and key in INNER_DIMENSIONS and INNER_DIMENSIONS[key][0] == "brain")
+        canonical = bool(unified) and compatible
+        candidates = unified if canonical else by_producer.get(producer, [])
         snapshot = candidates[0] if len(candidates) == 1 else {}
+        invalid = False
+        if canonical:
+            try:
+                validate_unified(snapshot)
+            except (ValueError, TypeError, OverflowError, KeyError, RecursionError):
+                invalid = True
         signal = (snapshot.get("signals") or {}).get(key) if isinstance(snapshot.get("signals"), dict) else None
         signal = signal if isinstance(signal, dict) else {}
-        row.update(revision=snapshot.get("revision"),
-                   as_of=signal["as_of"] if "as_of" in signal else snapshot.get("as_of"))
+        row = {"producer": INNER_PRODUCER if canonical else producer, "binding_producer": producer,
+               "key": key, "state": "unknown", "value": None,
+               "revision": snapshot.get("revision"),
+               "as_of": signal["as_of"] if "as_of" in signal else snapshot.get("as_of"),
+               "age_seconds": None, "evidence_refs": [], "source_refs": []}
         stamp = _date(row["as_of"])
         age = (now - stamp).total_seconds() if now and stamp else None
         row["age_seconds"] = age
         number = signal.get("value")
         if len(candidates) > 1:
             reason = "ambiguous_producer"
+        elif invalid:
+            reason = "invalid_unified_snapshot"
         elif snapshot.get("state") != "available":
             reason = "producer_" + str(snapshot.get("state") or "unavailable")
         elif not isinstance(row["revision"], str) or not row["revision"]:
@@ -206,6 +166,8 @@ def resolve_signals(settings, snapshots, now):
             reason = "time_unknown"
         elif age < 0:
             reason = "future_snapshot"
+        elif canonical and (snapshot.get("checkpoint") or {}).get("availability") == "stale":
+            reason = "stale_checkpoint"
         elif binding.get("max_age_seconds") is not None and age > binding["max_age_seconds"]:
             reason = "stale"
         elif signal.get("state") != "known":
@@ -215,9 +177,18 @@ def resolve_signals(settings, snapshots, now):
         else:
             reason = None
             row.update(state="known", value=number)
-        refs = signal.get("evidence_refs")
-        if isinstance(refs, list) and all(isinstance(ref, str) for ref in refs):
-            row["evidence_refs"] = list(refs)
+        if canonical and not invalid:
+            row["checkpoint"] = copy.deepcopy(snapshot.get("checkpoint"))
+            row["dimension_owner"] = signal.get("owner")
+            row["dimension_kind"] = signal.get("kind")
+            row["unknown_reason"] = signal.get("reason")
+            if reason is None:
+                row["evidence_refs"] = [snapshot["revision"] + ":dimensions." + key]
+                row["source_refs"], row["snapshot_evidence"] = active_evidence(snapshot, key, now)
+        elif not canonical:
+            refs = signal.get("evidence_refs")
+            if isinstance(refs, list) and all(isinstance(ref, str) for ref in refs):
+                row["evidence_refs"] = list(refs)
         row["reason"] = reason
         row["producer_reason"] = snapshot.get("reason")
         result[binding["id"]] = row
@@ -237,8 +208,8 @@ def statement_affinity(statement, settings, signals, *, domain=None):
     """Compute separate affinities; no matching rule means unknown, not zero.
 
     Multiple topics using one signal contribute once at their largest declared
-    weight. Missing matching evidence makes the aggregate unknown rather than
-    presenting a partial lower bound as the full score.
+    weight. Only known matching evidence contributes to this optional reward;
+    missing evidence stays unknown and makes the aggregate explicitly partial.
     """
     policy = settings.get("recall") or {}
     topics = _topics(statement, settings.get("catalog") or {})
@@ -253,25 +224,43 @@ def statement_affinity(statement, settings, signals, *, domain=None):
         target, ident, weight = rule["target"], rule["signal_id"], rule["weight"]
         groups[target][ident] = max(weight, groups[target].get(ident, 0))
         matched.append(rule["id"])
-    features = {"signal_" + ident: row.get("value") for ident, row in signals.items()}
+    def usable(source):
+        return (isinstance(source, dict) and source.get("state") == "known"
+                and source.get("reason") is None and _unit(source.get("value")))
+
+    features = {"signal_" + ident: row["value"] if usable(row) else None
+                for ident, row in signals.items()}
     diagnostics = {}
     for target, weights in groups.items():
         contributions = []
         for ident, weight in weights.items():
-            source = signals.get(ident) or {"state": "unknown", "value": None, "reason": "binding_unknown"}
-            # A configured zero multiplier is deterministically zero, even if
-            # that optional producer is unavailable.
-            value = weight * source["value"] if source.get("state") == "known" else (0 if weight == 0 else None)
+            source = signals.get(ident)
+            source = source if isinstance(source, dict) else {}
+            is_known = usable(source)
+            reason = None if is_known else (source.get("reason") or
+                ("invalid_signal_value" if source.get("state") == "known" else
+                 "signal_unknown" if source else "binding_unknown"))
+            intensity = source["value"] if is_known else None
+            # A zero mapping weight cannot manufacture known source evidence.
+            value = weight * intensity if is_known else None
             contributions.append({"signal_id": ident, "topic_affinity": weight,
-                                  "intensity": source.get("value"), "value": value,
-                                  "state": source.get("state"), "reason": source.get("reason"),
+                                  "intensity": intensity, "value": value,
+                                  "state": "known" if is_known else "unknown", "reason": reason,
                                   "producer": source.get("producer"), "revision": source.get("revision"),
                                   "as_of": source.get("as_of"), "age_seconds": source.get("age_seconds"),
                                   "evidence_refs": source.get("evidence_refs", [])})
-        numbers = [row["value"] for row in contributions]
-        reason = "not_mapped" if not numbers else ("signal_unknown" if None in numbers else None)
-        value = None if reason else (sum(numbers) / len(numbers) if policy.get("affinity_aggregation") == "mean" else max(numbers))
+        numbers = [row["value"] for row in contributions if row["state"] == "known"]
+        unknown_count = len(contributions) - len(numbers)
+        reason = ("not_mapped" if not contributions else "signal_unknown" if not numbers else
+                  "partial_signal_unknown" if unknown_count else None)
+        value = (sum(numbers) / len(numbers) if policy.get("affinity_aggregation") == "mean"
+                 else max(numbers)) if numbers else None
         features[target] = value
-        diagnostics[target] = {"value": value, "reason": reason, "contributions": contributions}
+        diagnostics[target] = {"value": value, "reason": reason,
+            "state": "unknown" if not numbers else "partial" if unknown_count else "computed",
+            "complete": bool(contributions) and not unknown_count,
+            "coverage": {"known": len(numbers), "unknown": unknown_count, "matched": len(contributions),
+                         "ratio": len(numbers) / len(contributions) if contributions else None},
+            "contributions": contributions}
     return features, {"matched_rules": matched, "aggregation": policy.get("affinity_aggregation", "max"),
                       "targets": diagnostics}

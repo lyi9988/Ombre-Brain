@@ -71,15 +71,128 @@ def test_unusable_source_is_unknown_not_zero(change, expected):
     assert signals['care']['reason'] == expected
 
 
-def test_one_unknown_matching_source_cannot_be_hidden_by_another_known_source():
+@pytest.mark.parametrize('aggregation', ['max', 'mean'])
+def test_unknown_matching_source_is_visible_while_known_reward_remains_effective(aggregation):
     values = settings()
+    values['recall']['affinity_aggregation'] = aggregation
     values['recall']['affinity_mappings'].append({
         'id': 'unknown_care', 'selector': {'topic': 'health'}, 'signal_id': 'curiosity',
         'target': 'drive_affinity', 'weight': .5})
     signals = resolve_signals(values, [snapshot()], NOW)
-    assert statement_affinity(statement(['health']), values, signals)[0]['drive_affinity'] is None
+    features, trace = statement_affinity(statement(['health']), values, signals)
+    target = trace['targets']['drive_affinity']
+    assert features['drive_affinity'] == pytest.approx(.4)
+    assert features['signal_curiosity'] is None
+    assert trace['aggregation'] == aggregation
+    assert target['state'] == 'partial' and target['complete'] is False
+    assert target['reason'] == 'partial_signal_unknown'
+    assert target['coverage'] == {'known': 1, 'unknown': 1, 'matched': 2, 'ratio': .5}
+    unknown = target['contributions'][1]
+    assert unknown['state'] == 'unknown' and unknown['value'] is None and unknown['intensity'] is None
+    assert unknown['reason'] == 'producer_unavailable'
     values['recall']['affinity_mappings'][-1]['weight'] = 0
-    assert statement_affinity(statement(['health']), values, signals)[0]['drive_affinity'] == pytest.approx(.4)
+    features, trace = statement_affinity(statement(['health']), values, signals)
+    assert features['drive_affinity'] == pytest.approx(.4)
+    assert trace['targets']['drive_affinity']['contributions'][1]['value'] is None
+    assert trace['targets']['drive_affinity']['state'] == 'partial'
+
+
+@pytest.mark.parametrize('aggregation,expected', [('max', .4), ('mean', .35)])
+def test_multiple_known_signals_use_configured_aggregation_without_duplicate_topics(aggregation, expected):
+    values = settings()
+    values['recall']['affinity_aggregation'] = aggregation
+    values['recall']['affinity_mappings'].append({
+        'id': 'curious_health', 'selector': {'topic': 'health'}, 'signal_id': 'curiosity',
+        'target': 'drive_affinity', 'weight': .5})
+    signals = resolve_signals(values, [snapshot(), snapshot(.6, producer='aiz.needs', key='curiosity')], NOW)
+    features, trace = statement_affinity(statement(['health', 'care', 'health']), values, signals)
+    target = trace['targets']['drive_affinity']
+    assert features['drive_affinity'] == pytest.approx(expected)
+    assert target['state'] == 'computed' and target['complete'] is True
+    assert target['reason'] is None
+    assert target['coverage'] == {'known': 2, 'unknown': 0, 'matched': 2, 'ratio': 1}
+    assert [row['value'] for row in target['contributions']] == pytest.approx([.4, .3])
+
+
+@pytest.mark.parametrize('aggregation,expected', [('max', .4), ('mean', .2)])
+def test_partial_aggregation_uses_multiple_known_contributions_including_known_zero(aggregation, expected):
+    values = settings()
+    values['recall']['affinity_aggregation'] = aggregation
+    values['recall']['affinity_mappings'].extend([
+        {'id': 'curious_health', 'selector': {'topic': 'health'}, 'signal_id': 'curiosity',
+         'target': 'drive_affinity', 'weight': .5},
+        {'id': 'unknown_health', 'selector': {'topic': 'health'}, 'signal_id': 'unavailable',
+         'target': 'drive_affinity', 'weight': .9}])
+    signals = resolve_signals(values, [snapshot(), snapshot(0, producer='aiz.needs', key='curiosity')], NOW)
+    features, trace = statement_affinity(statement(['health']), values, signals)
+    target = trace['targets']['drive_affinity']
+    assert features['drive_affinity'] == pytest.approx(expected)
+    assert target['state'] == 'partial' and target['coverage']['known'] == 2
+    assert target['contributions'][1]['state'] == 'known'
+    assert target['contributions'][1]['value'] == 0
+    assert target['contributions'][2]['reason'] == 'binding_unknown'
+
+
+@pytest.mark.parametrize('weight', [0, .8])
+def test_all_unknown_stays_unknown_even_with_zero_mapping_weight(weight):
+    values = settings()
+    values['recall']['affinity_mappings'][0]['weight'] = weight
+    features, trace = statement_affinity(statement(['health']), values, {})
+    target = trace['targets']['drive_affinity']
+    assert features['drive_affinity'] is None
+    assert target['value'] is None and target['state'] == 'unknown' and target['complete'] is False
+    assert target['reason'] == 'signal_unknown'
+    assert target['coverage'] == {'known': 0, 'unknown': 1, 'matched': 1, 'ratio': 0}
+    assert target['contributions'][0]['value'] is None
+
+
+def test_known_zero_is_an_effective_partial_value_and_zero_weight_known_stays_known():
+    values = settings()
+    values['recall']['affinity_mappings'].append({
+        'id': 'unknown_health', 'selector': {'topic': 'health'}, 'signal_id': 'curiosity',
+        'target': 'drive_affinity', 'weight': .5})
+    signals = resolve_signals(values, [snapshot(0)], NOW)
+    features, trace = statement_affinity(statement(['health']), values, signals)
+    assert features['drive_affinity'] == 0
+    assert trace['targets']['drive_affinity']['state'] == 'partial'
+    values['recall']['affinity_mappings'][0]['weight'] = 0
+    signals = resolve_signals(values, [snapshot(.8)], NOW)
+    _, trace = statement_affinity(statement(['health']), values, signals)
+    assert trace['targets']['drive_affinity']['contributions'][0]['state'] == 'known'
+    assert trace['targets']['drive_affinity']['contributions'][0]['value'] == 0
+
+
+def test_no_mapping_has_no_reward_or_fictitious_coverage():
+    features, trace = statement_affinity(statement([]), settings(), {})
+    assert all(features[target] is None for target in ('drive_affinity', 'interest_affinity', 'goal_alignment'))
+    assert trace['matched_rules'] == []
+    assert trace['targets']['drive_affinity'] == {
+        'value': None, 'reason': 'not_mapped', 'state': 'unknown', 'complete': False,
+        'coverage': {'known': 0, 'unknown': 0, 'matched': 0, 'ratio': None}, 'contributions': []}
+
+
+@pytest.mark.parametrize('invalid', [None, float('nan'), float('inf'), -float('inf'), True, '0.5', -.1, 1.1, 10 ** 1000])
+def test_invalid_direct_signal_cannot_become_known_or_leak_as_formula_input(invalid):
+    features, trace = statement_affinity(statement(['health']), settings(), {
+        'care': {'state': 'known', 'value': invalid, 'reason': None}})
+    assert features['signal_care'] is None and features['drive_affinity'] is None
+    contribution = trace['targets']['drive_affinity']['contributions'][0]
+    assert contribution['state'] == 'unknown' and contribution['value'] is None
+    assert contribution['reason'] == 'invalid_signal_value'
+    json.dumps(trace, allow_nan=False)
+
+
+@pytest.mark.parametrize('source', [
+    {'state': 'unknown', 'value': .9, 'reason': 'scope_mismatch'},
+    {'state': 'known', 'value': .9, 'reason': 'stale'},
+    'corrupt', None])
+def test_unknown_or_corrupt_direct_sources_cannot_be_relabelled_known(source):
+    features, trace = statement_affinity(statement(['health']), settings(), {'care': source})
+    contribution = trace['targets']['drive_affinity']['contributions'][0]
+    assert features['signal_care'] is None and features['drive_affinity'] is None
+    assert contribution['state'] == 'unknown' and contribution['intensity'] is None
+    if isinstance(source, dict):
+        assert contribution['reason'] == source['reason']
 
 
 def test_domain_is_explicit_and_combined_selector_is_and():
@@ -120,6 +233,80 @@ def test_preview_and_runtime_use_identical_affinity_math_without_model_or_write(
     assert preview['pipeline']['score'] == runtime['score'] == pytest.approx(.7)
     assert preview['pipeline']['context']['simulation'] is True
     assert preview['provider_requests'] == 0 and preview['saved'] is False
+
+
+def test_partial_reward_reaches_existing_scoring_formula_only_when_selected():
+    values = settings()
+    values['recall']['affinity_mappings'].append({
+        'id': 'unknown_health', 'selector': {'topic': 'health'}, 'signal_id': 'curiosity',
+        'target': 'drive_affinity', 'weight': .5})
+    signals = resolve_signals(values, [snapshot()], NOW)
+
+    def score(topics, base, *, bound=signals):
+        document = document_template('synthetic memory', catalog=values['catalog'])
+        document['statements'] = [statement(topics)]
+        sid = document['statements'][0]['statement_id']
+        return score_document(document, values, {'now': NOW, 'signals': bound}, {
+            'relevance': base, 'statement_selection': {
+                'direct_ids': [sid], 'support_ids': [], 'matches': {}}})
+
+    rewarded = score(['health'], .5)
+    other = score(['code'], .6)
+    assert rewarded['score'] == pytest.approx(.7)
+    assert rewarded['score'] > other['score']
+    assert rewarded['statements'][0]['affinity']['targets']['drive_affinity']['state'] == 'partial'
+    assert rewarded['statements'][0]['calculation']['features']['drive'] == pytest.approx(.4)
+
+    # The optional affinity changes no default formula or base ordering.
+    values['recall']['formula_id'] = 'final'
+    assert score(['health'], .5)['score'] == .5 < score(['code'], .6)['score']
+    values['recall']['formula_id'] = 'affinity_score'
+    assert score(['health'], .5, bound={})['score'] == .5 < score(['code'], .6, bound={})['score']
+    values['recall']['affinity_mappings'] = []
+    assert score(['health'], .5)['score'] == .5 < score(['code'], .6)['score']
+
+
+@pytest.mark.parametrize('aggregation', ['max', 'mean'])
+def test_partial_preview_and_runtime_have_same_reward_and_incomplete_diagnostics(aggregation):
+    values = settings()
+    values['recall']['affinity_aggregation'] = aggregation
+    values['recall']['affinity_mappings'].append({
+        'id': 'unknown_health', 'selector': {'topic': 'health'}, 'signal_id': 'curiosity',
+        'target': 'drive_affinity', 'weight': .5})
+    preview = preview_pipeline(values, {'relevance': .5}, {
+        'now': NOW.isoformat(), 'topics': ['health'], 'signal_snapshots': [snapshot()]})
+    row = preview['pipeline']['statements'][0]
+    assert row['score'] == pytest.approx(.7)
+    assert row['features']['drive_affinity'] == pytest.approx(.4)
+    assert row['affinity']['aggregation'] == aggregation
+    assert row['affinity']['targets']['drive_affinity']['complete'] is False
+    assert row['affinity']['targets']['drive_affinity']['contributions'][1]['value'] is None
+    assert preview['provider_requests'] == 0 and preview['saved'] is False
+
+
+def test_partial_reward_is_used_by_attributed_runtime_candidate_before_and_after_rerank():
+    from types import SimpleNamespace
+    from memory_recall_runtime import score_pool
+
+    values = settings()
+    values['recall']['affinity_mappings'].append({
+        'id': 'unknown_health', 'selector': {'topic': 'health'}, 'signal_id': 'curiosity',
+        'target': 'drive_affinity', 'weight': .5})
+    service = SimpleNamespace(config={'memory_system': values}, recall_policy=SimpleNamespace(),
+                              memory_authority_view=None)
+    document = document_template('synthetic memory', catalog=values['catalog'])
+    document['statements'] = [statement(['health'])]
+    request = {'_signal_snapshots': [snapshot()], '_signal_sampled_at': NOW,
+               'allow_semantic': False, '_semantic_records': {'m1': {'document': document}}}
+    query = document['statements'][0]['content']
+    candidate = {'bucket': {'id': 'm1'}, 'score': .5, 'keyword_score': .5}
+    score_pool(service, request, query, [candidate])
+    assert candidate['score'] == pytest.approx(.7)
+    target = candidate['_configured_score']['statements'][0]['affinity']['targets']['drive_affinity']
+    assert target['state'] == 'partial' and target['coverage']['unknown'] == 1
+    candidate['_raw_fused_score'] = .4
+    score_pool(service, request, query, [candidate], after_rerank=True)
+    assert candidate['score'] == pytest.approx(.56)
 
 
 def test_header_scope_is_exact_and_other_producers_cannot_be_forged():

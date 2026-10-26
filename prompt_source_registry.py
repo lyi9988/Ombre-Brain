@@ -12,6 +12,12 @@ from dataclasses import dataclass
 from typing import Any
 
 
+_MEMORY_L3_SYNC_PROMPT = """比较真实来源、当前完整L1和这一次修订材料，提出范围明确的L1处理计划，不自由重写整桶。
+owner_l2表示主人已直接编辑第二遍事实：原L1本来正确而仅第二遍错误时选l1_already_correct，不为凑流程制造L1新版本；只有本次明确更正对应的L1内容才作局部修订。owner correction source中的实际changed_passages和owner_edit_note是本次主人证据，未改旧模型文字只是对照，不因此成为主人原话。followup是有来源的新理解提案，不是主人确认，不改变原Auto/Review。
+仅按output_contract返回JSON。decision为l1_already_correct、revise_l1或ambiguous；有来源或范围歧义就明确ambiguous并说明，不能代填事实或强制同步。patch只改必要的稳定成员字段，未涉正文、陈述、时间、条件、认知与关系完整保留；narrative.body仅提供精确唯一旧片段的replace_text，不返回整篇新稿。不要修改generation、身份、来源绑定、entry或跨桶关系。
+已有陈述用稳定statement_id定位。新增陈述使用完整semantic-v1语义字段，classification的kind/stability/modality/basis、time、conditions、subject_ref与evidence_refs均必须明确；未知保留。新推断或疑问须保留cognition的理解/未解决类别，不能升级为客观已发生事实。证据只用实际source_evidence binding或当前L1原有效依据；原依据被本次主人更正时为相关陈述明确更新evidence_refs，不能把新结论伪挂到不支持它的旧原话上。只输出计划，不自称已经提交、采用或完成同步。"""
+
+
 @dataclass(frozen=True)
 class FixedPromptSource:
     source_id: str
@@ -94,6 +100,8 @@ FIXED_PROMPT_SOURCES = {
         _spec("ombre.memory_l2_generation_prompt", "memory.reflection",
               "prompt_source_registry:_MEMORY_L2_GENERATION_PROMPT",
               revision="factory-memory-l2-generation-v5-scoped-readable-writing"),
+        _spec("ombre.memory_l3_sync_prompt", "memory.reflection",
+              "prompt_source_registry:_MEMORY_L3_SYNC_PROMPT", revision="factory-memory-l3-scoped-sync-v1"),
         _spec("ombre.daily_chat_summary_prompt", "memory.daily_chat_review",
               "reflection_engine:DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE", render="identity",
               revision="factory-chat-narrative-v1"),

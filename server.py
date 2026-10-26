@@ -7703,7 +7703,6 @@ async def breath(
             entry_tokens = count_tokens_approx(entry)
             if token_used + entry_tokens > max_tokens:
                 break
-            await bucket_mgr.touch(bucket_id)
             direct_results.append(entry)
             returned_moments.append(moment)
             displayed_moment_ids.append(str(moment.get("moment_id") or ""))
@@ -7889,7 +7888,6 @@ async def breath(
             entry_tokens = count_tokens_approx(entry)
             if token_used + entry_tokens > max_tokens:
                 break
-            await bucket_mgr.touch(bucket_id)
             displayed_bucket_ids.add(bucket_id)
             displayed_moment_ids.append(str(moment.get("moment_id") or ""))
             direct_results.append(entry)
