@@ -76,20 +76,20 @@ def hash_value(value):
     return value
 
 
-def evidence_spans(spans):
+def evidence_spans(spans, *, roles=('user', 'assistant')):
     if not isinstance(spans, list) or not spans:
         raise ValueError('nonempty evidence spans required')
     keys = []
     for span in spans:
         if not isinstance(span, dict) or set(span) != {'role', 'start', 'end', 'evidence_hash'}:
             raise ValueError('complete evidence span required')
-        if span['role'] not in ('user', 'assistant'):
+        if span['role'] not in roles:
             raise ValueError('source role required')
         if (any(isinstance(span[k], bool) or not isinstance(span[k], int) for k in ('start', 'end'))
                 or not 0 <= span['start'] < span['end']):
             raise ValueError('bounded evidence span required')
         hash_value(span['evidence_hash'])
-        keys.append((0 if span['role'] == 'user' else 1, span['start'], span['end']))
+        keys.append((roles.index(span['role']), span['start'], span['end']))
     if keys != sorted(set(keys)):
         raise ValueError('canonical sorted unique evidence spans required')
     return deepcopy(spans)

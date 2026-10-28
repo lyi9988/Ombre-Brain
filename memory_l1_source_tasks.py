@@ -24,6 +24,56 @@ def _stamp(): return datetime.now(timezone.utc).isoformat(timespec='seconds')
 class MemoryL1SourceTasks:
     def __init__(self, authority): self.authority = authority
 
+    def get(self, task_id):
+        db = self.authority._connect()
+        try:
+            row = db.execute('SELECT value FROM authority_meta WHERE key=?', (PREFIX + task_id,)).fetchone()
+            return json.loads(row['value']) if row else None
+        finally: db.close()
+
+    async def retain_action(self, task_id, reader, *, profile_id, captured_source=None):
+        """A program read plus committed L0 copy; queueing alone proves neither."""
+        from memory_l0_sources import MemoryL0Sources
+        from memory_l1_ingestion import bind_sources
+        task = self.get(task_id)
+        if task is None: raise L1OwnerError('task_not_found', status=404, field_path='task_id')
+        source = captured_source if captured_source is not None else await reader.capture(task['action_id'], task['artifact_id'])
+        if (source.get('state') != 'available' or source.get('eligible_source') is not True
+                or source.get('source_id') != task['action_id']
+                or source.get('source_revision') != task['artifact_id']
+                or not isinstance(source.get('text'), str) or not source['text'].strip()):
+            return {'retained': False, 'state': source.get('state', 'unavailable'),
+                'reason': source.get('reason', 'action_source_not_available')}
+        raw = {'namespace': 'action_receipt', 'system': 'aizizhu',
+            'conversation_id': reader.options.get('conversation_id', 'conv-jiajia-main'),
+            'profile_id': profile_id, 'event_id': task['action_id'], 'version_id': task['artifact_id'],
+            'role': 'tool', 'text': source['text'], 'recorded_at': source.get('recorded_at')}
+        snapshots, _ = bind_sources([raw])
+        store = MemoryL0Sources(self.authority)
+        store.retain_copy(snapshots[0])
+        if store.copy(snapshots[0]) != snapshots[0]:
+            raise L1OwnerError('retained_source_readback_failed', status=503, field_path='source')
+        receipt = {'schema': 'action-source-retention-v1', 'retained': True,
+            'source_namespace': 'snapshot.aiz.action_receipt', 'source_id': task['action_id'],
+            'source_revision': task['artifact_id'],
+            'content_sha256': hashlib.sha256(source['text'].encode('utf-8')).hexdigest(),
+            'l0_source_id': snapshots[0]['source_id'], 'l0_source_revision': snapshots[0]['source_revision'],
+            'adopted': False}
+        db = self.authority._connect()
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            current = json.loads(db.execute('SELECT value FROM authority_meta WHERE key=?', (PREFIX + task_id,)).fetchone()['value'])
+            prior = current.get('retention')
+            if prior and prior != receipt:
+                raise IdempotencyConflict('retained action source changed')
+            current['retention'] = receipt
+            db.execute('UPDATE authority_meta SET value=? WHERE key=?', (canonical_json(current), PREFIX + task_id))
+            db.commit()
+        except Exception:
+            db.rollback(); raise
+        finally: db.close()
+        return receipt
+
     def enqueue_action(self, payload):
         if not isinstance(payload, dict) or set(payload) != {'action_id', 'artifact_id', 'request_id'}:
             raise L1OwnerError('invalid_action_source_request', field_path='source_task')

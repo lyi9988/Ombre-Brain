@@ -133,6 +133,8 @@ class MemoryL1Runtime:
                     source = await reader.capture(task['action_id'], task['artifact_id'])
                     if source.get('state') != 'available' or source.get('eligible_source') is not True:
                         raise L1OwnerError('action_source_not_available', status=409, field_path='source')
+                    await tasks.retain_action(task['task_id'], reader,
+                        profile_id=self.memory_semantic_profile_id, captured_source=source)
                     raw_source = {'namespace': 'action_receipt', 'system': 'aizizhu',
                         'conversation_id': reader.options.get('conversation_id', 'conv-jiajia-main'),
                         'profile_id': self.memory_semantic_profile_id, 'event_id': task['action_id'],

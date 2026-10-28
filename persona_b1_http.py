@@ -18,7 +18,28 @@ def _source_unavailable(exc):
         'source_kind':exc.source_kind,'coordinate':exc.coordinate,
         'interval_start':exc.interval_start,'interval_end':exc.interval_end},status_code=503)
 
-def register_candidate_route(mcp,engine_getter,authorized_internal,*,memory_context_resolver=None):
+def register_candidate_route(mcp,engine_getter,authorized_internal,*,memory_context_resolver=None, autonomy_source_reader=None):
+    @mcp.custom_route('/internal/persona/b1/autonomy-memory', methods=['POST'])
+    async def autonomy_memory(request):
+        if not authorized_internal(request): return JSONResponse({'error': 'unauthorized'}, status_code=401)
+        adapter = getattr(engine_getter(), 'b1_candidate', None)
+        if adapter is None or not callable(autonomy_source_reader) or not callable(memory_context_resolver):
+            return JSONResponse({'error': 'autonomy_memory_not_configured'}, status_code=503)
+        try:
+            raw = await request.body()
+            if len(raw) > MAX_CANDIDATE_BODY: return JSONResponse({'error': 'request_too_large'}, status_code=413)
+            data = json.loads(raw)
+            if not isinstance(data, dict) or set(data) != {'envelope', 'source'}:
+                raise ValueError('native source and envelope required')
+            result = await adapter.settle_autonomy_memory(data['envelope'], data['source'],
+                source_reader=autonomy_source_reader, resolver=memory_context_resolver)
+            return JSONResponse({'status': 'candidate_applied', 'b1_receipt': result['b1_receipt']})
+        except ModulationSourceUnavailable as exc: return _source_unavailable(exc)
+        except Conflict: return JSONResponse({'error': 'b1_identity_or_revision_conflict'}, status_code=409)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            return JSONResponse({'error': 'invalid_autonomy_memory_source'}, status_code=400)
+        except Exception:
+            return JSONResponse({'error': 'autonomy_memory_source_or_storage_unavailable'}, status_code=503)
     @mcp.custom_route('/internal/persona/b1/candidate',methods=['POST'])
     async def ingest(request):
         if not authorized_internal(request):return JSONResponse({'error':'unauthorized'},status_code=401)

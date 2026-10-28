@@ -497,7 +497,13 @@ class PersonaB1Store:
         with closing(self._connect(True)) as db:
             r=db.execute('SELECT receipt FROM b1_events WHERE scope=? AND event_id=?',(ident(scope),ident(event_id))).fetchone();return json.loads(r[0]) if r else None
     def settle(self,envelope,*,expected_revision,memory_validation=None):
-        if set(envelope)-{'nuances','tone','phase','operation_result','empathy_details','light_details','interaction_modes','feeling_sources','conversation_observed_at','correction_details','growth_frames','pressure_frames','phase_source_kind','memory_context','memory_reactions'}!={'namespace','scope','event_id','occurred_at','policy_revision','decision','labels'} or envelope['namespace']!='b1-completed-turn-v2':raise ValueError('internal v2 completed-turn envelope required')
+        native = envelope.get('namespace') == 'b1-autonomy-memory-v1'
+        if native:
+            if (set(envelope) - {'interaction_modes'} != {'namespace','scope','event_id','occurred_at','policy_revision','decision','labels','memory_context','memory_reactions'}
+                    or envelope['decision'].get('accepted') or envelope['decision'].get('rejected') or envelope['labels']
+                    or envelope['memory_context'].get('scope', {}).get('consumer_kind') != 'autonomy'):
+                raise ValueError('native memory-only event required')
+        elif set(envelope)-{'nuances','tone','phase','operation_result','empathy_details','light_details','interaction_modes','feeling_sources','conversation_observed_at','correction_details','growth_frames','pressure_frames','phase_source_kind','memory_context','memory_reactions'}!={'namespace','scope','event_id','occurred_at','policy_revision','decision','labels'} or envelope['namespace']!='b1-completed-turn-v2':raise ValueError('internal v2 completed-turn envelope required')
         e=deepcopy(envelope);e['scope']=ident(e['scope']);e['event_id']=ident(e['event_id']);e['occurred_at']=at(e['occurred_at']);e['decision']=decision_check(e['decision'])
         memory_rows=[]
         if 'memory_context' in e or 'memory_reactions' in e:
@@ -852,7 +858,7 @@ class PersonaB1Store:
                 from persona_memory_reaction_context import settle_reactions
                 event_before=_coordinates(s)
                 memory_results=settle_reactions(s,p,memory_rows,e['memory_context'],memory_validation,e['occurred_at'],interaction_directions)
-                trace(event_before,'memory_reaction',[source_ref('conversation',e['event_id'],e['occurred_at'])])
+                trace(event_before,'memory_reaction',[source_ref('operation' if native else 'conversation',e['event_id'],e['occurred_at'])])
             if p['subtype_policy']:
                 for key in list(s['subtypes']):
                     if s['values'][key] is not None and s['values'][key]<p['subtype_policy']['clear_below']:del s['subtypes'][key]
@@ -897,6 +903,7 @@ class PersonaB1Store:
                 receipt['memory_reactions']={'schema':'memory-reaction-receipt-v1','rules_version':RULES_VERSION,
                     'delivery_receipt_id':e['memory_context']['delivery_receipt_id'],
                     'delivery_sha256':e['memory_context']['delivery_sha256'],'observations':memory_results}
+                if native: receipt['source_kind'] = 'autonomy'
             state_after=_coordinates(s);recent=[]
             clock_ref={'kind':'clock','event_id':e['event_id'],'occurred_at':e['occurred_at']}
             for key,value in state_before.items():
@@ -1016,6 +1023,26 @@ class PersonaB1Adapter:
         if 'helped' in raw:envelope['operation_result']['helped']=deepcopy(raw['helped'])
         result=self.store.settle(envelope,expected_revision=self.store.read(self.scope)['revision'])
         return {**self.snapshot(),'b1_receipt':result}
+    async def settle_autonomy_memory(self, envelope, source, *, source_reader, resolver):
+        from autonomy_memory import source_hash
+        from persona_memory_reaction_context import validate_reactions
+        if (envelope.get('namespace') != 'b1-autonomy-memory-v1' or envelope.get('scope') != self.scope
+                or envelope.get('event_id') != 'autonomy-memory:' + source['scope']['cycle_id']
+                or envelope.get('memory_context', {}).get('scope') != source['scope']
+                or envelope.get('decision', {}).get('source_hash') != source_hash(source)):
+            raise Conflict('autonomy source binding mismatch')
+        checked = decision_check(envelope['decision'])
+        if checked['accepted'] or checked['rejected']: raise ValueError('autonomy memory is not an owner interaction')
+        actual = await source_reader(source['scope'])
+        if actual != source: raise Conflict('autonomy source changed')
+        validate_reactions(envelope.get('memory_reactions'), envelope['memory_context'], actual, [])
+        validation = await resolver(envelope['memory_context'], actual)
+        if validation.get('state') != 'available':
+            raise ValueError('autonomy memory delivery unavailable')
+        result = self.store.settle(envelope, expected_revision=self.store.read(self.scope)['revision'],
+            memory_validation=validation)
+        return {**self.snapshot(), 'b1_receipt': result}
+
     def _validated_turn(self,envelope,turn):
         if 'phase' in envelope or 'phase_source_kind' in envelope or 'operation_result' in envelope:raise ValueError('lifecycle/result cannot be claimed by chat evaluator')
         if not isinstance(turn,dict) or set(turn)!={'conversation_id','user_event','assistant_event'}:raise ValueError('original completed turn required in memory')

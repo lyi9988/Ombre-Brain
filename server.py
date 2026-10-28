@@ -1098,9 +1098,15 @@ async def _resolve_memory_reaction_context(context, turn):
     return await resolver(context, turn)
 
 
+async def _read_autonomy_memory_source(scope):
+    from autonomy_memory import read_source
+    return await read_source(config, scope)
+
+
 _b1_candidate_ingest = register_candidate_route(
     mcp, lambda: persona_engine, _authorized_memory_write,
     memory_context_resolver=_resolve_memory_reaction_context,
+    autonomy_source_reader=_read_autonomy_memory_source,
 )
 
 @mcp.custom_route('/internal/memory-followups', methods=['POST'])
@@ -12879,6 +12885,10 @@ async def api_memory_l1_source_tasks(request):
             result = chat_tasks.edit(str(task_id), json.loads(raw))
             return JSONResponse(result, headers=headers)
         if request.method == "GET":
+            if task_id:
+                task = tasks.get(str(task_id))
+                if task is None: raise L1OwnerError('task_not_found', status=404, field_path='task_id')
+                return JSONResponse({'status': 'ok', 'task': task, 'adoption_is_separate': True}, headers=headers)
             if set(request.query_params) - {"limit", "offset"} or any(len(request.query_params.getlist(key)) > 1 for key in ('limit', 'offset')):
                 raise L1OwnerError("invalid_task_query", field_path="query")
             value = request.query_params.get("limit", "100")
@@ -12914,7 +12924,16 @@ async def api_memory_l1_source_tasks(request):
             row = tasks.transition(str(task_id), payload["expected_phase"], "queued")
             if row is None: raise L1OwnerError("task_phase_changed", status=409, field_path="expected_phase")
             return JSONResponse({"status": "queued", "task": row, "action_reexecuted": False}, headers=headers)
-        return JSONResponse(tasks.enqueue_action(payload), status_code=202, headers=headers)
+        result = tasks.enqueue_action(payload)
+        from memory_l1_source_readers import AizActionSourceReader
+        try:
+            result['retention'] = await tasks.retain_action(result['task_id'],
+                AizActionSourceReader(config), profile_id=reflection_engine.memory_semantic_profile_id)
+        except Exception as exc:
+            # The original queue receipt remains recoverable; never execute the action again.
+            result['retention'] = {'retained': False, 'state': 'unavailable',
+                'reason': getattr(exc, 'code', type(exc).__name__)}
+        return JSONResponse(result, status_code=202, headers=headers)
     except IdempotencyConflict:
         return JSONResponse({"error": "idempotency_conflict"}, status_code=409, headers=headers)
     except L1OwnerError as exc:

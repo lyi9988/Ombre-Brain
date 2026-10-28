@@ -28,11 +28,16 @@ def memory_ref(fragment):
 def validate_context(context):
     if (not isinstance(context, dict) or set(context) != {'schema', 'scope', 'delivery_receipt_id', 'delivery_sha256', 'fragments'}
             or context['schema'] != 'memory-context-v1' or not isinstance(context['scope'], dict)
-            or set(context['scope']) != {'conversation_id', 'user_source_event_id', 'assistant_source_event_id'}
+            or (context['scope'].get('consumer_kind') != 'autonomy' and
+                set(context['scope']) != {'conversation_id', 'user_source_event_id', 'assistant_source_event_id'})
             or not isinstance(context['fragments'], list)):
         raise ValueError('exact delivered memory context required')
-    for key, value in context['scope'].items():
-        identity(value, key)
+    native = context['scope'].get('consumer_kind') == 'autonomy'
+    if native:
+        from autonomy_memory import validate_scope
+        validate_scope(context['scope'])
+    else:
+        for key, value in context['scope'].items(): identity(value, key)
     identity(context['delivery_receipt_id'], 'delivery_receipt_id')
     hash_value(context['delivery_sha256'])
     if digest({key: context[key] for key in ('schema', 'scope', 'fragments')}) != context['delivery_sha256']:
@@ -88,7 +93,8 @@ def validate_reactions(payload, context, source, accepted):
                 or row['effect'] not in {'evoke', 'ease'} or row['direction'] not in {'increase', 'decrease', 'unknown'}
                 or row['strength'] not in {'light', 'clear', 'strong', 'unknown'}):
             raise ValueError('approved memory reaction semantics required')
-        spans = evidence_spans(row['evidence_spans'])
+        native = context['scope'].get('consumer_kind') == 'autonomy'
+        spans = evidence_spans(row['evidence_spans'], roles=('planning_output', 'step_outcome') if native else ('user', 'assistant'))
         if isinstance(source, dict):
             for span in spans:
                 text = source[span['role']]
@@ -115,10 +121,11 @@ class MemoryReactionResolver:
 
     async def __call__(self, context, turn):
         context = validate_context(context)
-        expected = {'conversation_id': turn['conversation_id'],
+        native = context['scope'].get('consumer_kind') == 'autonomy'
+        expected = turn['scope'] if native else {'conversation_id': turn['conversation_id'],
             'user_source_event_id': turn['user_event'].get('source_event_id'),
             'assistant_source_event_id': turn['assistant_event'].get('source_event_id')}
-        if context['scope'] != expected or any(not isinstance(value, str) or not value for value in expected.values()):
+        if context['scope'] != expected or (not native and any(not isinstance(value, str) or not value for value in expected.values())):
             return {'state': 'unavailable', 'eligible_fragment_ids': [], 'reason': 'canonical_delivery_pair_mismatch'}
         admin_url, token = self.credentials()
         if not admin_url or not token:
