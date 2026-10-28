@@ -47,6 +47,9 @@ def digest(value):
 
 
 def scope_from(query):
+    if query.get('consumer_kind') == 'autonomy':
+        from autonomy_memory import scope_from as autonomy_scope
+        return autonomy_scope(query)
     scope = {key: query.get(key) for key in
         ('conversation_id', 'user_source_event_id', 'assistant_source_event_id')}
     if any(not isinstance(v, str) or not v.strip() or len(v) > 400 for v in scope.values()):
@@ -189,6 +192,9 @@ class MemoryDeliveryStore:
                   PRIMARY KEY(receipt_id,group_id));
                 CREATE TABLE IF NOT EXISTS memory_activation_assessments (
                   receipt_id TEXT PRIMARY KEY, payload_sha256 TEXT NOT NULL, result_json TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS memory_autonomy_preparations (
+                  recall_id TEXT PRIMARY KEY, scope_json TEXT NOT NULL,
+                  fragments_json TEXT NOT NULL, messages_json TEXT NOT NULL);
             ''')
             if 'request_json' not in {row[1] for row in db.execute('PRAGMA table_info(memory_delivery_attempts)')}:
                 db.execute("ALTER TABLE memory_delivery_attempts ADD COLUMN request_json TEXT NOT NULL DEFAULT '{}'")
@@ -212,6 +218,21 @@ class MemoryDeliveryStore:
                 (attempt, digest(scope), trace_id, canonical(scope), canonical(fragments), 0,
                  datetime.now(timezone.utc).isoformat(), canonical(request or {})))
         return attempt
+
+    def prepare_autonomy(self, scope, fragments, messages):
+        scope = scope_from(scope)
+        if scope.get('consumer_kind') != 'autonomy': raise ValueError('autonomy_scope_required')
+        recall_id = 'autonomy_recall_' + uuid.uuid4().hex
+        with self._connect() as db:
+            db.execute('INSERT INTO memory_autonomy_preparations VALUES(?,?,?,?)',
+                (recall_id, canonical(scope), canonical(fragments), canonical(messages)))
+        return recall_id
+
+    def autonomy_preparation(self, recall_id):
+        with self._connect() as db:
+            row = db.execute('SELECT * FROM memory_autonomy_preparations WHERE recall_id=?', (recall_id,)).fetchone()
+        return ({'scope': json.loads(row['scope_json']), 'fragments': json.loads(row['fragments_json']),
+            'memory_messages': json.loads(row['messages_json'])} if row else None)
 
     def succeed(self, attempt):
         with self._connect() as db:
@@ -282,7 +303,9 @@ class MemoryDeliveryStore:
         uses = query.get('uses')
         if not isinstance(uses, list):
             raise ValueError('uses_required')
-        pair = {query.get('user_event_id'), query.get('assistant_event_id')} - {None, ''}
+        native = context['scope'].get('consumer_kind') == 'autonomy'
+        pair = (set((query.get('source_events') or {}).values()) if native else
+            {query.get('user_event_id'), query.get('assistant_event_id')} - {None, ''})
         def evidence(refs):
             return bool(refs) and isinstance(refs, list) and all(isinstance(ref, dict)
                 and ref.get('event_id') in pair and type(ref.get('start')) is int and ref['start'] >= 0
@@ -303,8 +326,11 @@ class MemoryDeliveryStore:
             old_batch = self._activation_result(db, query)
             if old_batch is not None:
                 return old_batch
+            # Autonomy and chat keep separate continuity cursors; both touch the
+            # same original memory activation authority and source groups.
+            continuity_scope = ('autonomy:' + context['scope']['conversation_id'] if native else context['scope']['conversation_id'])
             previous = db.execute('SELECT * FROM memory_activation_groups WHERE conversation_id=?',
-                (context['scope']['conversation_id'],)).fetchone()
+                (continuity_scope,)).fetchone()
             prior_groups = json.loads(previous['groups_json']) if previous else {}
             unavailable_groups = {fragment['source_group_id'] for fragment in context['fragments']
                 if eligibility.get(fragment['fragment_id'], {}).get('state') == 'unavailable'}
@@ -372,7 +398,7 @@ class MemoryDeliveryStore:
                 results.append(result)
             if not late and (not previous or previous['receipt_id'] != context['delivery_receipt_id']):
                 db.execute('INSERT OR REPLACE INTO memory_activation_groups VALUES(?,?,?)',
-                    (context['scope']['conversation_id'], context['delivery_receipt_id'], canonical(active)))
+                    (continuity_scope, context['delivery_receipt_id'], canonical(active)))
             result = {'state': 'recorded', 'results': results}
             db.execute('INSERT INTO memory_activation_assessments VALUES(?,?,?)',
                 (context['delivery_receipt_id'], digest(query), canonical(result)))

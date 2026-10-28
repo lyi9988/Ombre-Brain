@@ -4803,6 +4803,7 @@ class GatewayService:
         debug_detail: str = "full", continuation_phase: bool = False,
         prompt_plan: dict[str, Any] | None = None, request: Request | None = None,
         snapshot_identity: dict[str, Any] | None = None,
+        autonomy_context: dict[str, Any] | None = None,
     ):
         # Authentication/canonical origin validation precedes this boundary.
         # Reset in finally even on timeout; concurrent turns cannot share clocks.
@@ -4813,7 +4814,7 @@ class GatewayService:
                 payload, session_id, include_favorite_memory=include_favorite_memory,
                 include_debug=include_debug, debug_detail=debug_detail,
                 continuation_phase=continuation_phase, prompt_plan=prompt_plan,
-                request=request, snapshot_identity=snapshot_identity)
+                request=request, snapshot_identity=snapshot_identity, autonomy_context=autonomy_context)
             if include_debug and len(result) == 3:
                 result[2]["time_context"] = clock_metadata(result[0].get("messages") or [])
             return result
@@ -4830,6 +4831,7 @@ class GatewayService:
         prompt_plan: dict[str, Any] | None = None,
         request: Request | None = None,
         snapshot_identity: dict[str, Any] | None = None,
+        autonomy_context: dict[str, Any] | None = None,
     ) -> tuple[dict, list[str] | None] | tuple[dict, list[str] | None, dict[str, Any]]:
         self._maybe_reload_runtime_overlay()
         prepare_started_at = time.perf_counter()
@@ -4850,10 +4852,13 @@ class GatewayService:
         self._get_upstream_for_model(model)
         mark_step("resolve_model", stage_started_at)
         runtime_scope = str((payload.get("_ombre_trace_context") or {}).get("runtime_scope") or "chat")
-        if runtime_scope != "chat":
+        if runtime_scope != "chat" and autonomy_context is None:
             debug = {"runtime_scope": runtime_scope, "internal_scope": True,
                      "recall_status": {"status": "disabled", "route": "local",
                                        "injected_count": 0, "incomplete_reasons": []}}
+            if (payload.get('_ombre_trace_context') or {}).get('autonomy_memory_recall_id'):
+                from autonomy_memory import attach
+                await attach(self, payload, debug)
             return (dict(payload), None, debug) if include_debug else (dict(payload), None)
 
         recall_budget_request = {}
@@ -4900,7 +4905,9 @@ class GatewayService:
                     cache.pop(snapshot_key, None)
 
         stage_started_at = time.perf_counter()
-        if continuation_phase:
+        if autonomy_context is not None:
+            current_user_query = autonomy_context['query']
+        elif continuation_phase:
             # Scheme P: a legal continuation request is a current user turn --
             # the backward scan skips tool results / assistant tool_calls /
             # injected system+developer entries and lands on the real user.
@@ -4909,13 +4916,17 @@ class GatewayService:
             current_user_query = self._extract_current_turn_user_query(messages)
         is_new_user_turn = bool(current_user_query)
         from recall_input import build_recall_input
-        natural_input = build_recall_input(
-            messages, current_query=current_user_query,
-            text_extractor=self._coerce_message_text,
-            cleaner=self._strip_external_context_from_user_text,
-            recent_turns=getattr(self, "recall_recent_turns", 4),
-            trace_context=payload.get("_ombre_trace_context") or {},
-        )
+        if autonomy_context is not None:
+            from autonomy_memory import recall_input as build_activity_recall_input
+            natural_input = build_activity_recall_input(autonomy_context)
+        else:
+            natural_input = build_recall_input(
+                messages, current_query=current_user_query,
+                text_extractor=self._coerce_message_text,
+                cleaner=self._strip_external_context_from_user_text,
+                recent_turns=getattr(self, "recall_recent_turns", 4),
+                trace_context=payload.get("_ombre_trace_context") or {},
+            )
         if "_deadline" in recall_budget_request:
             natural_input["_deadline"] = recall_budget_request["_deadline"]
         natural_input["recall_io"] = recall_budget_request.get("recall_io", {})
@@ -6078,6 +6089,7 @@ class GatewayService:
             "attachment_adoption": parse_adoption_header(request.headers.get("X-Guyan-Attachment-Adoption", "")),
             "context_capacity_contract": read_capacity_header(request.headers.get(CAPACITY_HEADER)),
             "runtime_scope": self._runtime_scope_for_request(request),
+            "autonomy_memory_recall_id": str(request.headers.get('X-Guyan-Autonomy-Memory-Recall') or '')[:200],
             "user_source_event_id": str(request.headers.get(CANONICAL_SOURCE_EVENT_ID_HEADER) or ""),
             "assistant_source_event_id": str(request.headers.get(CANONICAL_ASSISTANT_SOURCE_EVENT_ID_HEADER) or ""),
             "prompt_plan_identity": {
@@ -7015,6 +7027,10 @@ class GatewayService:
         attempt = ((manifest or {}).get('request') or {}).get('attempt_id')
         if store and attempt:
             store.succeed(attempt)
+            if manifest['scope'].get('consumer_kind') == 'autonomy':
+                # Internal planning has no canonical chat finalizer. Complete
+                # only after the upstream response succeeds on this wire.
+                store.complete(manifest['scope'])
 
     async def _validate_memory_delivery(self, context):
         """Current per-fragment source eligibility, outside the immutable receipt."""
@@ -7113,6 +7129,10 @@ class GatewayService:
             if result['state'] != 'available':
                 return JSONResponse(result, headers=headers)
             context = result['context']
+            if context['scope'].get('consumer_kind') == 'autonomy':
+                from autonomy_memory import read_context, validate_usage_source
+                actual = await read_context(self, context['scope'])
+                if request.url.path.endswith('/activate'): validate_usage_source(query, actual)
             fragment_states = await self._validate_memory_delivery(context)
             result['fragment_states'] = fragment_states
             if request.url.path.endswith('/activate'):
@@ -7125,6 +7145,21 @@ class GatewayService:
                 status_code=409 if 'conflict' in str(exc) else 400, headers=headers)
         except RuntimeError as exc:
             return JSONResponse({'state': 'unavailable', 'reason': str(exc)}, status_code=503, headers=headers)
+
+    async def handle_autonomy_memory_recall(self, request: Request) -> JSONResponse:
+        auth = self._authorize(request.headers.get('Authorization', ''))
+        if auth is not None: return auth
+        try:
+            from autonomy_memory import scope_from, prepare
+            query = await request.json()
+            if not isinstance(query, dict) or set(query) != {'scope', 'model'}:
+                raise ValueError('autonomy_scope_and_model_required')
+            result = await prepare(self, scope_from(query['scope']), model=query['model'])
+            return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+        except (ValueError, TypeError, KeyError) as exc:
+            return JSONResponse({'state': 'unavailable', 'reason': str(exc)}, status_code=400)
+        except (httpx.HTTPError, asyncio.TimeoutError):
+            return JSONResponse({'state': 'unavailable', 'reason': 'autonomy_source_read_failed'}, status_code=503)
 
     async def handle_model_request_trace_clear(self, request: Request) -> JSONResponse:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
@@ -7954,6 +7989,9 @@ class GatewayService:
                 if delivery and isinstance(canonical_state, dict):
                     canonical_state['memory_delivery'] = {key: delivery[key] for key in
                         ('delivery_receipt_id', 'delivery_sha256', 'scope')}
+        if delivery_ref.get('scope', {}).get('consumer_kind') == 'autonomy':
+            # A planning response is not a chat round or a canonical message.
+            return
         try:
             await self._finalize_canonical_turn(canonical_state, assistant_message)
         except Exception as exc:
@@ -28841,6 +28879,9 @@ def create_gateway_app(
     async def memory_delivery_route(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_memory_delivery(request)
 
+    async def autonomy_memory_recall_route(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_autonomy_memory_recall(request)
+
     async def model_request_trace(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_model_request_trace(request)
 
@@ -28907,6 +28948,7 @@ def create_gateway_app(
             Route("/api/debug/upstream-usage", upstream_usage_debug, methods=["GET"]),
             Route("/internal/attachment-adoption/lookup", attachment_adoption_lookup, methods=["POST"]),
             Route("/internal/memory-delivery/lookup", memory_delivery_route, methods=["POST"]),
+            Route("/internal/autonomy/memory-recall", autonomy_memory_recall_route, methods=["POST"]),
             Route("/internal/memory-delivery/activate", memory_delivery_route, methods=["POST"]),
             Route("/api/debug/model-requests", model_request_trace_list, methods=["GET"]),
             Route("/api/debug/model-requests/events", model_request_trace_events, methods=["GET"]),
