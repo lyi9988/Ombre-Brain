@@ -1901,25 +1901,8 @@ async def _build_handoff_breath(max_tokens: int = 1200, session_id: str = "", de
 
 
 def _format_handoff_darkroom_door() -> str:
-    try:
-        status = darkroom_store.status()
-    except Exception as exc:
-        logger.warning("Handoff darkroom status failed / handoff 暗房状态失败: %s", exc)
-        return ""
-    count = int(status.get("count") or 0)
-    last_entered = str(status.get("last_entered_at") or "").strip()
-    lines = [
-        str(status.get("door") or "暗房存在。门口只显示状态，不显示未显影正文。"),
-        "darkroom_enter opens a new room by default; use new_room=false only when explicitly continuing the current active room. Unreleased draft text stays private until darkroom_view allows it.",
-    ]
-    if count:
-        detail = f"entries={count}"
-        if last_entered:
-            detail += f", last_entered={last_entered}"
-        lines.append(detail)
-    else:
-        lines.append("entries=0")
-    return "\n".join(lines)
+    """Retired: no door prompt and no access to historical drafts."""
+    return ""
 
 
 def _format_handoff_profile_facts(all_buckets: list[dict], limit: int = 6) -> str:
@@ -8936,36 +8919,12 @@ async def hold(
 
 
 # =============================================================
-# Tool 2.5: darkroom — Private unfinished reflection
-# 工具 2.5：darkroom — 暗房，存放未显影的内在反思
+# Retired darkroom compatibility entry points (not registered as MCP tools)
 # =============================================================
-_DARKROOM_LATEST_IDS = {"", "latest"}
+def _darkroom_retired() -> dict:
+    return {"status": "retired", "error_code": "retired", "error": "暗房已下线"}
 
 
-def _darkroom_error(code: str, message: str, **extra) -> dict:
-    """Stable whitelisted error envelope for darkroom MCP tools.
-
-    Never carries tokens, file paths, state_dir, bucket/session/profile ids,
-    prompts or hidden reasoning. Codes: no_active_room / room_not_found /
-    invalid_state / already_released / permission_denied / internal_error.
-    """
-    payload = {"status": "error", "error_code": code, "error": message}
-    payload.update(extra)
-    return payload
-
-
-def _darkroom_is_latest(entry_id: str) -> bool:
-    return str(entry_id or "latest").strip() in _DARKROOM_LATEST_IDS
-
-
-def _darkroom_has_active_room() -> bool:
-    try:
-        return int(darkroom_store.status().get("count") or 0) > 0
-    except Exception:
-        return False
-
-
-@mcp.tool()
 async def darkroom_enter(
     note: str,
     mode: str = "continue",
@@ -8976,73 +8935,28 @@ async def darkroom_enter(
     lock_for: str = "",
     new_room: bool = True,
 ) -> dict:
-    """写入一段未显影的私密反思；默认第一人称，不用第三人称自述；默认新开房间，new_room=false 才续写当前 active 房间；写错要撤回已有房间时传 new_room=false + visibility="retracted"；不回显 note 正文。"""
-    try:
-        return darkroom_store.enter(
-            note,
-            mood=mood,
-            tags=tags,
-            source=source,
-            mode=mode,
-            visibility=visibility,
-            lock_for=lock_for,
-            new_room=new_room,
-        )
-    except ValueError as exc:
-        return _darkroom_error("invalid_state", str(exc))
+    """Retired compatibility entry point; never accesses stored drafts."""
+    return _darkroom_retired()
 
 
-@mcp.tool()
 async def darkroom_rooms(limit: int = 20, visibility: str = "active") -> dict:
-    """只读列出暗房门牌，不返回正文；默认列 active 房间，可传 visibility="all" 看全部门牌，用 room_id 再调用 darkroom_view。"""
-    try:
-        return darkroom_store.rooms(limit=limit, visibility=visibility)
-    except ValueError as exc:
-        return _darkroom_error("invalid_state", str(exc))
+    """Retired compatibility entry point; never accesses stored drafts."""
+    return _darkroom_retired()
 
 
-@mcp.tool()
 async def darkroom_view(entry_id: str = "latest") -> dict:
-    """只读查看一条已解锁的暗房内容；未到锁门时间不返回正文。"""
-    try:
-        return darkroom_store.view(entry_id=entry_id)
-    except KeyError:
-        if _darkroom_is_latest(entry_id) and not _darkroom_has_active_room():
-            return _darkroom_error("no_active_room", "没有活动暗房房间")
-        return _darkroom_error("room_not_found", "暗房条目不存在")
+    """Retired compatibility entry point; never accesses stored drafts."""
+    return _darkroom_retired()
 
 
-@mcp.tool()
 async def darkroom_status() -> dict:
-    """查看暗房门口状态。不返回任何暗房正文。"""
-    try:
-        return darkroom_store.status()
-    except Exception as exc:
-        logger.warning("darkroom status failed / 暗房状态失败: %s", exc)
-        return _darkroom_error("internal_error", "暗房状态不可用")
+    """Retired compatibility entry point; never accesses stored drafts."""
+    return _darkroom_retired()
 
 
-@mcp.tool()
 async def darkroom_release(entry_id: str = "latest", reason: str = "") -> dict:
-    """把一条暗房内容显影并带出来。重复释放安全返回 already_released；锁定期内返回 permission_denied。"""
-    try:
-        result = darkroom_store.release(entry_id=entry_id, reason=reason)
-    except KeyError:
-        if _darkroom_is_latest(entry_id) and not _darkroom_has_active_room():
-            return _darkroom_error("no_active_room", "没有活动暗房房间")
-        return _darkroom_error("room_not_found", "暗房条目不存在")
-    except Exception as exc:
-        logger.warning("darkroom release failed / 暗房释放失败: %s", exc)
-        return _darkroom_error("internal_error", "暗房释放内部错误")
-    if result.get("status") == "locked":
-        return _darkroom_error(
-            "permission_denied",
-            "暗房条目锁定中，未到解锁时间",
-            entry_id=result.get("entry_id", ""),
-            room_id=result.get("room_id", ""),
-            unlock_at=result.get("unlock_at", ""),
-        )
-    return result
+    """Retired compatibility entry point; never accesses stored drafts."""
+    return _darkroom_retired()
 
 
 # =============================================================
@@ -11899,12 +11813,12 @@ async def api_bucket_update(request):
 
 @mcp.custom_route("/api/darkroom/status", methods=["GET"])
 async def api_darkroom_status(request):
-    """Return public darkroom door status. Never returns private notes."""
+    """Authenticated retirement response; never accesses historical drafts."""
     from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
-    return JSONResponse(darkroom_store.status())
+    return JSONResponse(_darkroom_retired(), status_code=410)
 
 
 @mcp.custom_route("/api/search", methods=["GET"])
