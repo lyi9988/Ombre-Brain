@@ -12631,6 +12631,7 @@ async def _chat_memory_preparation_loop():
             try:
                 if bucket_mgr:
                     async with runtime.batch(config) as worker_engine:
+                        worker_engine.memory_followup_resolver = _resolve_memory_reaction_context
                         await prepare_memory_tasks(worker_engine, bucket_mgr)
             except Exception as exc:
                 logger.warning('Chat Memory preparation loop: %s', type(exc).__name__)
@@ -14382,6 +14383,7 @@ async def api_config_update(request):
         if "model" in r and reflection_cfg.get("model"):
             os.environ["OMBRE_REFLECTION_MODEL"] = reflection_cfg["model"]
         reflection_engine = ReflectionEngine(config, prompt_plan_mirror)
+        reflection_engine.memory_followup_resolver = _resolve_memory_reaction_context
         memory_authority_store = reflection_engine.memory_authority_store
         memory_commit_service = (
             MemoryCommitService(
