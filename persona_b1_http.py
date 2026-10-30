@@ -19,6 +19,57 @@ def _source_unavailable(exc):
         'interval_start':exc.interval_start,'interval_end':exc.interval_end},status_code=503)
 
 def register_candidate_route(mcp,engine_getter,authorized_internal,*,memory_context_resolver=None, autonomy_source_reader=None):
+    @mcp.custom_route('/internal/persona/b1/tendencies/receipt', methods=['GET'])
+    async def tendency_receipt(request):
+        if not authorized_internal(request):
+            return JSONResponse({'error': 'unauthorized'}, status_code=401)
+        adapter = getattr(engine_getter(), 'b1_candidate', None)
+        if adapter is None:
+            return JSONResponse({'error': 'b1_candidate_not_configured'}, status_code=503)
+        try:
+            from persona_b1 import ident
+            if (set(request.query_params) != {'scope', 'event_id'}
+                    or request.query_params['scope'] != adapter.scope):
+                raise ValueError('exact tendency receipt identity required')
+            event_id = 'tendency:' + ident(request.query_params['event_id'])
+            receipt = adapter.store.receipt(adapter.scope, event_id)
+            return JSONResponse({'status': 'available' if receipt else 'not_found', 'receipt': receipt})
+        except (ValueError, TypeError, KeyError):
+            return JSONResponse({'error': 'invalid_b1_tendency_input'}, status_code=400)
+        except sqlite3.OperationalError:
+            return JSONResponse({'error': 'b1_candidate_storage_unavailable'}, status_code=503)
+    @mcp.custom_route('/internal/persona/b1/tendencies', methods=['POST'])
+    async def tendencies(request):
+        if not authorized_internal(request):
+            return JSONResponse({'error': 'unauthorized'}, status_code=401)
+        adapter = getattr(engine_getter(), 'b1_candidate', None)
+        if adapter is None:
+            return JSONResponse({'error': 'b1_candidate_not_configured'}, status_code=503)
+        chunks, size = [], 0
+        async for part in request.stream():
+            size += len(part)
+            if size > MAX_BODY:
+                return JSONResponse({'error': 'request_too_large'}, status_code=413)
+            chunks.append(part)
+        try:
+            data = json.loads(b''.join(chunks))
+            if (not isinstance(data, dict) or set(data) != {'scope', 'event_id', 'changes', 'sources',
+                    'expected_revision', 'occurred_at'} or data['scope'] != adapter.scope):
+                raise ValueError('explicit reviewed tendency checkpoint required')
+            result = adapter.update_tendencies(data['event_id'], data['changes'], data['sources'],
+                expected_revision=data['expected_revision'], occurred_at=data['occurred_at'])
+            # Internal authenticated receipt: preserve exact original values,
+            # sources and replay identity for unknown-outcome reconciliation.
+            return JSONResponse({'status': 'candidate_applied',
+                'tendency_receipt': result['tendency_receipt'], 'projection': safe_persona_projection(result)})
+        except Conflict:
+            return JSONResponse({'error': 'b1_identity_or_revision_conflict'}, status_code=409)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            return JSONResponse({'error': 'invalid_b1_tendency_input'}, status_code=400)
+        except sqlite3.OperationalError:
+            return JSONResponse({'error': 'b1_candidate_storage_unavailable'}, status_code=503)
+        except Exception:
+            return JSONResponse({'error': 'b1_tendency_failed'}, status_code=500)
     @mcp.custom_route('/internal/persona/b1/autonomy-memory', methods=['POST'])
     async def autonomy_memory(request):
         if not authorized_internal(request): return JSONResponse({'error': 'unauthorized'}, status_code=401)

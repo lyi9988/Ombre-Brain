@@ -21,6 +21,9 @@ VALUES = {'explicit_owner_correction', 'explicit_remember', 'specific_future_use
 
 
 def validate_submission(payload):
+    if isinstance(payload, dict) and payload.get('schema') == 'self-review-followup-v1':
+        from memory_self_review_source import validate_native_submission
+        return validate_native_submission(payload)
     from persona_memory_reaction_context import validate_context, memory_ref
     from persona_inner_state import evidence_spans
     if not isinstance(payload, dict) or set(payload) != {'context', 'turn', 'updates', 'sources'}:
@@ -156,8 +159,10 @@ class FollowupTasks(ChatMemoryPreparation):
 
 
 class MemoryFollowups:
-    def __init__(self, engine, bucket_mgr, resolver=None):
-        self.engine, self.bucket_mgr, self.resolver = engine, bucket_mgr, resolver
+    def __init__(self, engine, bucket_mgr, resolver=None, *, review_source_reader=None):
+        self.engine, self.bucket_mgr = engine, bucket_mgr
+        self.resolver = resolver or getattr(engine, 'memory_followup_resolver', None)
+        self.review_source_reader = review_source_reader or getattr(engine, 'memory_review_source_reader', None)
         self.authority = engine.memory_authority_store
         self.tasks = FollowupTasks(self.authority)
         self.revisions = engine._memory_l1_revisions(bucket_mgr)
@@ -168,13 +173,18 @@ class MemoryFollowups:
         # recorded submissions return their receipt; they are not new readings.
         missing = [u for u in updates if self.tasks.get('followup_' + u['update_id'].split(':', 1)[1]) is None]
         qualified = set()
+        native = payload.get('schema') == 'self-review-followup-v1'
+        native_qualified = set()
         if missing:
             if self.resolver is None:
                 raise L1OwnerError('memory_delivery_lookup_unconfigured', status=503)
-            validation = await self.resolver(payload['context'], payload['turn'])
+            validation = await self.resolver(payload['context'], {'scope': payload['context']['scope']} if native else payload['turn'])
             if validation.get('state') != 'available':
                 raise L1OwnerError(validation.get('reason', 'memory_delivery_unavailable'), status=503)
             qualified = set(validation.get('eligible_fragment_ids', []))
+            if native:
+                from memory_self_review_source import check_native_sources
+                native_qualified = await check_native_sources(payload, self.engine.config, self.review_source_reader)
             for update in missing:
                 fid = update['memory_ref']['fragment_id']
                 reason = validation.get('reasons', {}).get(fid, '')
@@ -185,10 +195,12 @@ class MemoryFollowups:
         receipts, unavailable = [], []
         for update in updates:
             task_id = 'followup_' + update['update_id'].split(':', 1)[1]
-            if self.tasks.get(task_id) is None and update['memory_ref']['fragment_id'] not in qualified:
+            if self.tasks.get(task_id) is None and (update['memory_ref']['fragment_id'] not in qualified
+                    or native and update['update_id'] not in native_qualified):
                 unavailable.append(update['update_id'])
                 stored = self.tasks.enqueue_update(payload, update)
-                reason = validation.get('reasons', {}).get(update['memory_ref']['fragment_id'])
+                reason = ('review_or_feedback_source_changed' if native and update['update_id'] not in native_qualified else
+                          validation.get('reasons', {}).get(update['memory_ref']['fragment_id']))
                 def unavailable_task(current):
                     current.update(phase='source_changed', issue={'code': reason})
                     return current
@@ -199,6 +211,9 @@ class MemoryFollowups:
         return {'status': 'recorded', 'tasks': receipts, 'unavailable_updates': unavailable}
 
     async def sources(self, task):
+        if task['envelope'].get('schema') == 'self-review-followup-v1':
+            from memory_self_review_source import native_sources
+            return await native_sources(self, task)
         from memory_source_provenance import canonical_source
         from memory_l1_ingestion import bind_sources
         envelope, update = task['envelope'], task['envelope']['updates'][0]
@@ -220,6 +235,18 @@ class MemoryFollowups:
             evidence.append({'source': source, 'binding': binding})
         return sources, evidence, reader
 
+    async def _check_native_delivery(self, task):
+        payload = task['envelope']
+        if payload.get('schema') != 'self-review-followup-v1':
+            return
+        if self.resolver is None:
+            raise L1OwnerError('memory_delivery_lookup_unconfigured', status=503)
+        validation = await self.resolver(payload['context'], {'scope': payload['context']['scope']})
+        fragment = payload['updates'][0]['memory_ref']['fragment_id']
+        if validation.get('state') != 'available' or fragment not in validation.get('eligible_fragment_ids', []):
+            raise L1OwnerError(validation.get('reasons', {}).get(fragment) or validation.get('reason')
+                               or 'followup_memory_not_currently_delivered', status=409)
+
     async def prepare(self, claimed):
         from memory_l3_sync import prepare_plan, compile_plan
         from memory_semantics import build_annotations, attach_source_links, binding_source_keys
@@ -228,6 +255,7 @@ class MemoryFollowups:
             update['content'] = claimed['draft_content']
         if self.engine.memory_ingestion_policy.source_modes.get('daily_chat_memory', self.engine.daily_chat_memory_mode) == 'off':
             return {'phase': 'disabled', 'issue': {'code': 'REJECT_SOURCE_DISABLED'}}
+        await self._check_native_delivery(claimed)
         mid = claimed['memory_id']
         detail = await self.revisions.detail(mid)
         expected = update['memory_ref']['l1_revision']
@@ -286,7 +314,7 @@ class MemoryFollowups:
         legacy.update({k: deepcopy(v) for k, v in draft_fields.items() if k != 'content'})
         proposal = MemoryProposal.from_mapping({'proposal_id': claimed['task_id'], 'source_type': 'daily_chat_memory',
             'proposed_body': update['content'], 'original_excerpt': '\n'.join(s['text'] for s in sources).replace('<', '‹').replace('>', '›'),
-            'source_refs': ['canonical_event:' + s['event_id'] + '@' + s['version_id'] for s in sources],
+            'source_refs': [s['namespace'] + ':' + s['event_id'] + '@' + s['version_id'] for s in sources],
             'source_status': 'verified', 'memory_type': memory_type,
             'confidence': draft_fields.get('confidence', plan.get('confidence')), 'requested_mode': self.engine.daily_chat_memory_mode,
             'owner_explicit': False, 'metadata': {'semantic_annotations': annotations,
@@ -333,6 +361,12 @@ class MemoryFollowups:
         queued = self.tasks.get(meta['task_id'])
         if meta.get('preparation_state') == 'queued' or (queued and queued.get('draft_content') is not None):
             return {'id': cid, 'status': 'preparing', 'memory_id': meta['memory_id'], 'task_id': queued['task_id']}
+        if queued and queued['envelope'].get('schema') == 'self-review-followup-v1':
+            await self._check_native_delivery(queued)
+            from memory_self_review_source import check_native_sources
+            allowed = await check_native_sources(queued['envelope'], self.engine.config, self.review_source_reader)
+            if queued['envelope']['updates'][0]['update_id'] not in allowed:
+                raise L1OwnerError('followup_source_not_currently_readable', status=409, field_path='sources')
         if owner and row['status'] in {'pending', 'deferred', 'commit_failed'}:
             row = self.authority.decide_candidate(cid, action='accept', expected_revision=row['revision'],
                 request_id=request_id + ':accept', actor='owner', reason_codes=['OWNER_ACCEPTED'])

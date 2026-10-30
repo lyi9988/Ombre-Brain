@@ -277,6 +277,8 @@ def configured_source_readers(config, authority=None):
     canonical = CanonicalMemorySourceReader(config)
     action = AizActionSourceReader(config)
     browse = [AizBrowseSourceReader(config, view) for view in ('article', 'reading')]
+    from memory_self_review_source import AizReviewSourceReader
+    reviews = [AizReviewSourceReader(config, kind) for kind in ('daily_review', 'reply_feedback')]
     if authority:
         from memory_owner_l2_source import OwnerL2EditSourceReader
         readers.append(OwnerL2EditSourceReader(authority))
@@ -288,8 +290,11 @@ def configured_source_readers(config, authority=None):
         action.upstream_version = version
         for reader in browse:
             reader.upstream_version = version
+        for reader in reviews:
+            reader.upstream_version = version
     readers.append(canonical)
     readers.extend(browse)
+    readers.extend(reviews)
     readers.append(AizAttachmentTextSourceReader(config))
     from memory_daily_attachments import AdoptedAttachmentReader
     readers.append(AdoptedAttachmentReader(config))

@@ -1098,6 +1098,12 @@ async def _resolve_memory_reaction_context(context, turn):
     return await resolver(context, turn)
 
 
+if reflection_engine is not None:
+    # The same original delivery/L1/L2 qualification is available to resumed
+    # native L3 workers and final adoption, including after a service restart.
+    reflection_engine.memory_followup_resolver = _resolve_memory_reaction_context
+
+
 async def _read_autonomy_memory_source(scope):
     from autonomy_memory import read_source
     return await read_source(config, scope)
