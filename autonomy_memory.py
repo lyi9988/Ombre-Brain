@@ -59,6 +59,54 @@ async def read_context(service, scope):
     return result
 
 
+async def historical_input_states(service, context):
+    """Qualify immutable delivered inputs, not permission to revise a target.
+
+    L1/L2 may have advanced since this completed review. Its original L1
+    bindings must still exist and pass the existing live source reader. A
+    withdrawn memory, disabled recall policy or revoked original source still
+    fails. No historical presentation body is reconstructed or returned here.
+    """
+    import asyncio
+    import httpx
+    import memory_recall_runtime as memory_use
+    modern = [f for f in context['fragments'] if type(f.get('l1_revision')) is int and f['l1_revision'] > 0]
+    legacy = [f for f in context['fragments'] if f not in modern]
+    states = {f['fragment_id']: {'fragment_id': f['fragment_id'], 'state': 'unavailable',
+        'reason': 'historical_source_validation_unavailable'} for f in modern}
+    if legacy:
+        for row in await service._validate_memory_delivery({'fragments': legacy}):
+            states[row['fragment_id']] = row
+    if not modern:
+        return list(states.values())
+    items = {}
+    for fragment in modern:
+        key = (fragment['memory_id'], fragment['l1_revision'])
+        item = items.setdefault(key, {'memory_id': key[0], 'revision': key[1],
+            'binding_ids': [], 'allow_historical': True})
+        item['binding_ids'] = sorted(set(item['binding_ids']) | {ref['binding_id'] for ref in fragment['source_refs']})
+    try:
+        result = await memory_use.read_batch(service, {}, 'historical_delivery_source_validation',
+            '/api/memory-authority/recall-sources', {'items': list(items.values())})
+        rows = {(row['memory_id'], row['revision']): row for row in result['items']}
+        for fragment in modern:
+            row = rows.get((fragment['memory_id'], fragment['l1_revision'])) or {}
+            state = states[fragment['fragment_id']]
+            if row.get('state') != 'ok':
+                state.update(state='withdrawn' if row.get('state') == 'memory_not_current_or_eligible' else 'changed',
+                    reason='historical_memory_source_not_eligible')
+                continue
+            refs = fragment['source_refs']
+            if refs and all((row.get('sources') or {}).get(ref['binding_id'], {}).get('eligible_source') is True for ref in refs):
+                state.clear()
+                state.update(fragment_id=fragment['fragment_id'], state='available')
+            else:
+                state.update(state='withdrawn', reason='historical_memory_source_no_longer_eligible')
+    except (httpx.HTTPError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
+        pass  # Unknown source availability remains explicitly unavailable.
+    return list(states.values())
+
+
 async def prepare(service, scope, *, model):
     context = await read_context(service, scope)
     if context.get('status') != 'prepared' or not isinstance(context.get('query'), str) or not context['query'].strip():

@@ -7129,11 +7129,24 @@ class GatewayService:
             if result['state'] != 'available':
                 return JSONResponse(result, headers=headers)
             context = result['context']
+            historical_input = query.get('source_qualification') == 'historical_input'
+            if 'source_qualification' in query and not historical_input:
+                raise ValueError('unknown_source_qualification')
+            if historical_input and (not request.url.path.endswith('/lookup')
+                    or context['scope'].get('consumer_kind') != 'autonomy'):
+                raise ValueError('historical_input_requires_completed_autonomy_lookup')
             if context['scope'].get('consumer_kind') == 'autonomy':
                 from autonomy_memory import read_context, validate_usage_source
                 actual = await read_context(self, context['scope'])
                 if request.url.path.endswith('/activate'): validate_usage_source(query, actual)
-            fragment_states = await self._validate_memory_delivery(context)
+                if historical_input and actual.get('status') != 'completed':
+                    raise ValueError('historical_input_requires_completed_autonomy_lookup')
+            if historical_input:
+                from autonomy_memory import historical_input_states
+                fragment_states = await historical_input_states(self, context)
+                result['source_qualification'] = 'historical_input'
+            else:
+                fragment_states = await self._validate_memory_delivery(context)
             result['fragment_states'] = fragment_states
             if request.url.path.endswith('/activate'):
                 if any(query.get(key) != context[key] for key in ('delivery_receipt_id', 'delivery_sha256')):

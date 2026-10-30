@@ -398,6 +398,57 @@ def test_authenticated_lookup_keeps_exact_receipt_and_validates_mixed_sources_se
     run(scenario())
 
 
+def test_completed_review_history_keeps_original_bindings_without_relaxing_current_lookup(tmp_path, monkeypatch):
+    service, _ = gateway_service(lambda _: httpx.Response(200, json={}))
+    service.memory_delivery = MemoryDeliveryStore(tmp_path / 'gateway.sqlite')
+    scope = {'consumer_kind': 'autonomy', 'conversation_id': 'conversation-1', 'identity_id': 'identity-1',
+        'activity_id': None, 'activity_revision': None, 'source_scope': '["identity-1","conversation-1"]',
+        'cycle_id': 'real-review-cycle', 'operation_id': 'real-review-operation'}
+    _, frozen, wire = source_fixture()
+    attempt = service.memory_delivery.begin(scope, 'review-wire', final_fragments(frozen, wire))
+    service.memory_delivery.succeed(attempt)
+    context = service.memory_delivery.complete(scope)
+    async def read_context(_service, requested):
+        assert requested == scope
+        return {'state': 'available', 'status': 'completed', 'scope': scope}
+    monkeypatch.setattr('autonomy_memory.read_context', read_context)
+    live, calls = ['available'], []
+    async def read_batch(_service, _request, stage, path, payload):
+        calls.append((stage, path, copy.deepcopy(payload)))
+        assert path == '/api/memory-authority/recall-sources'  # No L2 re-rendering.
+        item = payload['items'][0]
+        historical = item.get('allow_historical') is True
+        row = {'memory_id': item['memory_id'], 'revision': item['revision'],
+            'state': 'ok' if historical and live[0] != 'memory_withdrawn' else 'memory_not_current_or_eligible',
+            'sources': {'binding-1': {'state': live[0], 'eligible_source': live[0] == 'available'}}}
+        return {'items': [row]}
+    monkeypatch.setattr('memory_recall_runtime.read_batch', read_batch)
+    app = create_gateway_app(config={'gateway': {}}, service=service)
+    app.state.gateway_service = service
+    async def scenario():
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://local.test') as client:
+                path = '/internal/memory-delivery/lookup'
+                query = {**scope, 'source_qualification': 'historical_input'}
+                assert (await client.post(path, json=query)).status_code == 401
+                headers = {'Authorization': 'Bearer gateway-test-token'}
+                normal = (await client.post(path, json=scope, headers=headers)).json()
+                assert normal['fragment_states'][0]['state'] == 'withdrawn'
+                historical = (await client.post(path, json=query, headers=headers)).json()
+                assert historical['context'] == normal['context'] == context
+                assert historical['source_qualification'] == 'historical_input'
+                assert historical['fragment_states'][0]['state'] == 'available'
+                assert calls[-1][2]['items'][0]['binding_ids'] == ['binding-1']
+                assert (await client.post('/internal/memory-delivery/activate', json=query, headers=headers)).status_code == 400
+                for state in ('withdrawn', 'memory_withdrawn'):
+                    live[0] = state  # Existing reader also maps recall_policy off to not eligible.
+                    unavailable = (await client.post(path, json=query, headers=headers)).json()
+                    assert unavailable['context'] == context and unavailable['fragment_states'][0]['state'] == 'withdrawn'
+        finally:
+            await service.http_client.aclose()
+    run(scenario())
+
+
 def test_core_and_favorite_collect_exact_generated_summary_not_fresh_model_call():
     service = GatewayService.__new__(GatewayService)
     service._summarize_bucket = lambda _: asyncio.sleep(0, result='the already-generated summary')
