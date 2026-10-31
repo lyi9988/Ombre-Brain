@@ -612,6 +612,7 @@
     var grid = makeElement('div', 'mtm-grid');
     STAGES.forEach(function (stage) {
       var card = makeElement('article', 'mtm-stage');
+      card.id = 'memory-task-' + stage.id;
       card.appendChild(makeElement('h4', '', stage.label));
       var fields = makeElement('div', 'mtm-fields mtm-primary-fields');
       var connection = createField(stage.id, 'connection', '连接', 'select', CONNECTIONS);
@@ -1468,10 +1469,25 @@
     if (arguments.length > 0 && isObject(config)) {
       state.readSequence += 1;
       applyConfig(config);
+      locateLinkedTask();
       return;
     }
     if (!state.loaded) void loadConfig();
   }
 
   window.renderMemoryTaskModels = renderMemoryTaskModels;
+  function locateLinkedTask() {
+    var fragment = window.location && window.location.hash || '';
+    var target = STAGES.find(function(stage) { return fragment === '#memory-task-' + stage.id; });
+    if (!target) return;
+    var tab = document.querySelector('.tab[data-tab="model-config"]');
+    if (tab && !tab.classList.contains('active')) tab.click();
+    if (!buildInterface()) return;
+    var card = document.getElementById('memory-task-' + target.id);
+    if (card && card.scrollIntoView) card.scrollIntoView({block:'center'});
+    var input = getInput(target.id, 'model');
+    if (input && input.focus) input.focus({preventScroll:true});
+  }
+  if (window.addEventListener) window.addEventListener('hashchange', locateLinkedTask);
+  if (window.location && window.location.hash && window.setTimeout) window.setTimeout(locateLinkedTask, 0);
 })(window);

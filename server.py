@@ -1196,6 +1196,13 @@ def _require_owner_or_internal_memory_read(request):
     return _require_dashboard_auth(request)
 
 
+@mcp.custom_route('/internal/memory-task-models', methods=['GET'])
+async def api_memory_task_models07(request):
+    """Read resolved connection/model metadata without broadening config auth."""
+    from model_task_view07 import owner_response
+    return owner_response(request, reflection_engine, _require_owner_or_internal_memory_read)
+
+
 def _string_list(value, default: list[str]) -> list[str]:
     if value is None:
         return default
