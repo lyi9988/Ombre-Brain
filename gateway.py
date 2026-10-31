@@ -6673,6 +6673,9 @@ class GatewayService:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
             return auth_result
+        if request.path_params.get('resource') == 'model-task-models':
+            from model_task_view07_proxy import read_model_task_metadata
+            return await read_model_task_metadata(self, request)
         headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
         view = getattr(self, "memory_authority_view", None)
         if view is None or not view.available():
