@@ -1153,297 +1153,13 @@ class ReflectionEngine(MemoryL1Runtime):
         conversation_turn_store=None,
         daily_chat_memory_candidates: list[dict] | None = None,
     ) -> dict:
-        if not self.enabled:
-            return {
-                "status": "disabled",
-                "period": period,
-                "diary": {"found": False},
-                "diary_memory": {"status": "not_applicable", "reason": "reflection_disabled"},
-            }
+        # Owner retired Ombre daily/weekly relationship impressions on
+        # 2026-11-02. History stays readable; old direct/force requests do
+        # no model work or writes. Diary L1 has its own run_due slot.
         period = self._normalize_period(period)
-        if period == "daily" and not self.daily_enabled:
-            return {
-                "status": "skipped",
-                "reason": "daily_disabled",
-                "period": period,
-                "diary": {"found": False},
-                "diary_memory": {"status": "not_applicable", "reason": "daily_disabled"},
-            }
-        if period == "weekly" and not self.weekly_enabled:
-            return {
-                "status": "skipped",
-                "reason": "weekly_disabled",
-                "period": period,
-                "diary": {"found": False},
-                "diary_memory": {"status": "not_applicable", "reason": "weekly_disabled"},
-            }
-        now_local = self._local_now(now)
-        key = self._period_key(period, now_local)
-        bucket_id = f"reflection_{period}_{key}"
-        existing = await bucket_mgr.get(bucket_id)
-        if existing and not force:
-            diary_memory = {"status": "skipped", "reason": "reflection_exists"}
-            if period == "daily" and self.memory_authority_enabled and self.memory_authority_store:
-                diary_memory = await self._maybe_extract_diary_memory(period, key, now_local, {}, bucket_mgr, embedding_engine)
-            return {
-                "status": "exists",
-                "period": period,
-                "id": bucket_id,
-                "diary": {"found": False},
-                "diary_memory": diary_memory,
-            }
-
-        materials = await self._reflection_materials(
-            period,
-            now_local,
-            bucket_mgr,
-            persona_engine,
-            conversation_turn_store=conversation_turn_store,
-            daily_chat_memory_candidates=daily_chat_memory_candidates,
-        )
-        min_daily_buckets = self.daily_min_memory_items
-        if (
-            period == "daily"
-            and min_daily_buckets > 0
-            and len(materials["buckets"]) < min_daily_buckets
-            and not materials.get("daily_chat_memories")
-        ):
-            diary_memory = await self._maybe_extract_diary_memory(
-                period,
-                key,
-                now_local,
-                materials,
-                bucket_mgr,
-                embedding_engine,
-            )
-            return {
-                "status": "skipped",
-                "reason": "insufficient_daily_memory",
-                "period": period,
-                "id": bucket_id,
-                "date": key,
-                "diary": {
-                    "found": bool(materials.get("diary")),
-                    "diary_id": materials.get("diary", {}).get("id") if materials.get("diary") else None,
-                },
-                "diary_memory": diary_memory,
-                "materials": {
-                    "buckets": len(materials["buckets"]),
-                    "daily_impressions": len(materials["daily_impressions"]),
-                    "daily_chat_memories": len(materials["daily_chat_memories"]),
-                    "persona_events": len(materials["persona_events"]),
-                    "conversation_turns": len(materials["conversation_turns"]),
-                    "commitments": len(materials["commitments"]),
-                    "min_buckets": min_daily_buckets,
-                },
-            }
-        if (
-            not materials["buckets"]
-            and not materials["daily_impressions"]
-            and not materials["daily_chat_memories"]
-            and not materials["persona_events"]
-            and not materials["conversation_turns"]
-            and not materials["diary"]
-            and not force
-        ):
-            return {
-                "status": "empty",
-                "period": period,
-                "id": bucket_id,
-                "diary": {"found": False},
-                "diary_memory": await self._maybe_extract_diary_memory(period, key, now_local, materials, bucket_mgr, embedding_engine)
-                    if self.memory_authority_enabled and self.memory_authority_store else {"status": "skipped", "reason": "no_materials"},
-            }
-
-        reflect_client, _, _ = self._reflect_model_client()
-        if reflect_client:
-            result = await self._api_reflect(period, key, materials)
-        else:
-            result = self._fallback_reflection(period, key, materials)
-
-        title = str(result.get("title") or f"{key} {'日印象' if period == 'daily' else '周印象'}")[:40]
-        content = str(result.get("content") or "").strip()
-        if not content:
-            content = self._fallback_reflection(period, key, materials)["content"]
-        if self.relationship_weather_affect_anchor_enabled:
-            content = self._append_affect_anchor(
-                content,
-                self._normalize_affect_anchor(result.get("affect_anchor"))
-                or self._fallback_reflection(period, key, materials).get("affect_anchor", {}),
-            )
-        tags = list(
-            dict.fromkeys(
-                [
-                    "relationship_weather",
-                    f"{period}_impression",
-                    *self._string_list(result.get("tags"), limit=8),
-                ]
-            )
-        )
-        valence = self._clamp(result.get("valence", 0.55))
-        arousal = self._clamp(result.get("arousal", 0.32))
-        confidence = self._clamp(result.get("confidence", 0.65))
-        created = now_local.isoformat(timespec="seconds")
-        source_bucket_ids = [
-            str(item.get("id") or "")
-            for item in materials.get("buckets", []) + materials.get("daily_impressions", [])
-            if item.get("id")
-        ]
-        source_persona_event_ids = [
-            int(event.get("id"))
-            for event in materials.get("persona_events", [])
-            if event.get("id")
-        ]
-        source_conversation_turn_ids = [
-            int(turn.get("id"))
-            for turn in materials.get("conversation_turns", [])
-            if turn.get("id")
-        ]
-        source_metadata = {
-            "source_bucket_ids": source_bucket_ids[:40],
-            "source_persona_event_ids": source_persona_event_ids[:40],
-            "source_conversation_turn_ids": source_conversation_turn_ids[:80],
-            "source_daily_chat_memory_candidate_ids": [
-                str(item.get("id") or "")
-                for item in materials.get("daily_chat_memories", [])
-                if item.get("id")
-            ][:40],
-        }
-
-        reflection_metadata = {
-            "tags": tags,
-            "importance": 6 if period == "daily" else 7,
-            "domain": ["自省", "恋爱"],
-            "valence": valence,
-            "arousal": arousal,
-            "bucket_type": "feel",
-            "name": title,
-            "source": "reflection",
-            "created": created,
-            "last_active": (
-                existing.get("metadata", {}).get("last_active")
-                or existing.get("metadata", {}).get("created")
-                or created
-            ) if existing else created,
-            "updated_at": created,
-            "confidence": confidence,
-            "period": period,
-            "date": key,
-            **source_metadata,
-        }
-        reflection_source_refs = [
-            *[f"bucket:{value}" for value in source_bucket_ids],
-            *[f"persona_event:{value}" for value in source_persona_event_ids],
-            *[f"conversation_turn:{value}" for value in source_conversation_turn_ids],
-            *[
-                f"candidate:{item.get('id')}"
-                for item in materials.get("daily_chat_memories", [])
-                if item.get("id")
-            ],
-        ]
-
-        if self.memory_authority_enabled:
-            committed = await self._commit_background_memory(
-                bucket_mgr=bucket_mgr,
-                memory_id=bucket_id,
-                body=content,
-                metadata=reflection_metadata,
-                source_type="reflection",
-                memory_type="daily_impression" if period == "daily" else "reflection",
-                source_refs=reflection_source_refs,
-                recall_policy="manual_only",
-            )
-            status = str(committed.get("status") or "failed")
-        elif existing:
-            await bucket_mgr.update(
-                bucket_id,
-                content=content,
-                tags=tags,
-                importance=6 if period == "daily" else 7,
-                domain=["自省", "恋爱"],
-                valence=valence,
-                arousal=arousal,
-                name=title,
-                confidence=confidence,
-                period=period,
-                date=key,
-                source="reflection",
-                **source_metadata,
-                last_active=existing.get("metadata", {}).get("last_active") or existing.get("metadata", {}).get("created"),
-            )
-            status = "updated"
-        else:
-            await bucket_mgr.create(
-                bucket_id=bucket_id,
-                content=content,
-                tags=tags,
-                importance=6 if period == "daily" else 7,
-                domain=["自省", "恋爱"],
-                valence=valence,
-                arousal=arousal,
-                bucket_type="feel",
-                name=title,
-                source="reflection",
-                created=created,
-                last_active=created,
-                updated_at=created,
-                confidence=confidence,
-                period=period,
-                date=key,
-                extra_metadata=source_metadata,
-            )
-            status = "created"
-
-        if (
-            not self.memory_authority_enabled
-            and embedding_engine
-            and getattr(embedding_engine, "enabled", False)
-        ):
-            try:
-                bucket = await bucket_mgr.get(bucket_id)
-                if bucket:
-                    await embedding_engine.generate_and_store(
-                        bucket_id,
-                        bucket_text_for_embedding(bucket),
-                    )
-            except Exception as exc:
-                logger.warning("Reflection embedding failed for %s: %s", bucket_id, exc)
-
-        diary_memory = await self._maybe_extract_diary_memory(
-            period,
-            key,
-            now_local,
-            materials,
-            bucket_mgr,
-            embedding_engine,
-        )
-
-        return {
-            "status": status,
-            "period": period,
-            "id": bucket_id,
-            "date": key,
-            "diary": {
-                "found": bool(materials.get("diary")),
-                "diary_id": materials.get("diary", {}).get("id") if materials.get("diary") else None,
-            },
-            "diary_memory": diary_memory,
-            "daily_impression": {
-                "id": bucket_id,
-                "content": content,
-                "confidence": confidence,
-                "date": key,
-            },
-            "materials": {
-                "buckets": len(materials["buckets"]),
-                "daily_impressions": len(materials["daily_impressions"]),
-                "daily_chat_memories": len(materials["daily_chat_memories"]),
-                "persona_events": len(materials["persona_events"]),
-                "conversation_turns": len(materials["conversation_turns"]),
-                "commitments": len(materials["commitments"]),
-                "min_buckets": min_daily_buckets,
-            },
-        }
+        return {"status": "retired", "reason": "relationship_impressions_retired",
+                "period": period, "diary": {"found": False},
+                "diary_memory": {"status": "not_applicable", "reason": "separate_diary_task"}}
 
     async def run_due(
         self,
@@ -1521,26 +1237,22 @@ class ReflectionEngine(MemoryL1Runtime):
                 item for item in (chat_result.get("candidates") or []) if isinstance(item, dict)
                 and str(item.get("date") or chat_result.get("date") or chat_date.isoformat()) == yesterday
             ]
-        if self.daily_enabled and now_local.hour >= self.daily_hour:
+        # Daily impression generation is retired. Preserve the existing
+        # diary source task, time and its own enablement/review policy.
+        if (self.diary_memory_extract_enabled and self.diary_memory_extract_max_per_day > 0
+                and now_local.hour >= self.daily_hour):
             daily_date = (now_local - timedelta(days=1)).date()
             daily_target = datetime.combine(daily_date, time.max, tzinfo=self.tz)
-            results.append(
-                await self.reflect(
-                    "daily",
-                    bucket_mgr,
-                    persona_engine,
-                    embedding_engine,
-                    force=False,
-                    now=daily_target,
-                    conversation_turn_store=conversation_turn_store,
-                    daily_chat_memory_candidates=chat_candidates,
-                )
-            )
-        if self.weekly_enabled and now_local.weekday() == self.weekly_day and now_local.hour >= self.weekly_hour:
-            weekly_target = now_local - timedelta(days=1)
-            results.append(
-                await self.reflect("weekly", bucket_mgr, persona_engine, embedding_engine, force=False, now=weekly_target)
-            )
+            materials = {}
+            if not (self.memory_authority_enabled and self.memory_authority_store):
+                materials = await self._reflection_materials("daily", daily_target,
+                    bucket_mgr, persona_engine, conversation_turn_store=conversation_turn_store,
+                    daily_chat_memory_candidates=chat_candidates)
+            diary_memory = await self._maybe_extract_diary_memory("daily", daily_date.isoformat(),
+                daily_target, materials, bucket_mgr, embedding_engine)
+            results.append({"status": diary_memory.get("status", "unknown"), "kind": "diary_memory",
+                            "date": daily_date.isoformat(), "diary_memory": diary_memory})
+        # The former weekly impression call is retired, not a second review.
         return results
 
     async def _candidate_buckets(self, bucket: dict, bucket_mgr, embedding_engine=None, limit: int | None = None) -> list[dict]:

@@ -1742,11 +1742,14 @@ class DailyPortraitMaintainer:
         }
 
     def _build_handoff_recent_summaries(self, materials: dict, patch: dict, date_key: str) -> dict[str, str]:
+        from relationship_impressions import is_retired_impression
         recent_dates = self._recent_date_keys(date_key)
         by_date: dict[str, dict[str, list[str] | str]] = {}
 
         for bucket in materials.get("buckets", []) or []:
             if not isinstance(bucket, dict):
+                continue
+            if is_retired_impression(bucket):
                 continue
             source_date = str(bucket.get("source_date") or "").strip()
             if source_date not in recent_dates:
@@ -2621,6 +2624,9 @@ class DailyPortraitMaintainer:
     def _material_allowed_scopes(self, bucket: dict) -> list[str]:
         if self._is_self_anchor_material(bucket):
             return ["persona"]
+        from relationship_impressions import is_retired_impression
+        if is_retired_impression(bucket):
+            return []
         meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
         tags = {str(tag or "").strip().lower() for tag in meta.get("tags", []) or []}
         if tags & {"relationship_weather", "daily_impression", "weekly_impression"}:
@@ -2630,6 +2636,9 @@ class DailyPortraitMaintainer:
         return []
 
     def _is_material_bucket(self, bucket: dict) -> bool:
+        from relationship_impressions import is_retired_impression
+        if is_retired_impression(bucket):
+            return False
         if not isinstance(bucket, dict):
             return False
         meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}

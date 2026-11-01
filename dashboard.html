@@ -3183,7 +3183,7 @@
   <div class="tab active" data-tab="list">记忆桶</div>
   <div class="tab" data-tab="todos">照顾备忘</div>
   <div class="tab" data-tab="breath">Breath 模拟</div>
-  <div class="tab" data-tab="reflection">日印象</div>
+  <div class="tab" data-tab="reflection">日印象历史</div>
   <div class="tab" data-tab="chat-memory">自动记忆</div>
   <div class="tab" data-tab="dreams">梦境</div>
   <div class="tab" data-tab="persona">Persona</div>
@@ -4042,27 +4042,13 @@
         <label>整理引擎</label>
         <select id="cfg-reflection-enabled"><option value="true">开启</option><option value="false">关闭</option></select>
       </div>
-      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">总开关；关闭后此区域的关系整理、日印象、自动记忆都不运行</div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">总开关；关闭后此区域的关系整理与自动记忆都不运行</div>
       <div class="config-row">
         <label>自动整理</label>
         <select id="cfg-reflection-auto"><option value="true">开启</option><option value="false">关闭</option></select>
       </div>
-      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">后台定时任务；开启后跑零点自动记忆、日印象，并给已有记忆补 tags、affect_anchor、边关系</div>
-      <div class="config-row">
-        <label>日印象</label>
-        <select id="cfg-reflection-daily"><option value="true">开启</option><option value="false">关闭</option></select>
-      </div>
-      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">关闭后不再自动生成 daily relationship_weather</div>
-      <div class="config-row">
-        <label>最少记忆数</label>
-        <input type="number" id="cfg-reflection-daily-min-memory" min="0" max="100" />
-      </div>
-      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">默认 5；只数当天普通记忆/更新项，persona events 不计入门槛</div>
-      <div class="config-row">
-        <label>读取对话轮次</label>
-        <input type="number" id="cfg-reflection-daily-turns" min="0" max="80" />
-      </div>
-      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">默认 12；读取少量当天短期对话原文作为日印象材料</div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">后台定时任务；自动记忆、日记记忆整理及已有记忆补充各按原设置运行</div>
+      <div style="margin-bottom:12px;color:var(--text-light);">日印象和周印象已废弃，不再生成或维护；旧内容保留供回看。自动记忆与日记L1仍按各自设置运行。</div>
       <div class="config-row">
         <label>自动记忆</label>
         <select id="cfg-reflection-chat-memory-mode">
@@ -4156,11 +4142,6 @@
         <select id="cfg-reflection-memory-anchor"><option value="true">开启</option><option value="false">关闭</option></select>
       </div>
       <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">关闭后普通 bucket 不再自动追加 affect_anchor</div>
-      <div class="config-row">
-        <label>日印象和弦</label>
-        <select id="cfg-reflection-weather-anchor"><option value="true">开启</option><option value="false">关闭</option></select>
-      </div>
-      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">控制日印象/关系天气正文里的 affect_anchor</div>
     </div>
 
     <div class="config-section">
@@ -4279,10 +4260,9 @@ let reflectionGenerationParameterBounds = {};
 let memoryConfigurationRevision = null;
 let memoryConfigConflict = false;
 const reflectionConfigFormIds = [
-  'cfg-reflection-enabled', 'cfg-reflection-auto', 'cfg-reflection-daily',
-  'cfg-reflection-daily-min-memory', 'cfg-reflection-daily-turns',
+  'cfg-reflection-enabled', 'cfg-reflection-auto',
   'cfg-reflection-chat-memory-mode', 'cfg-reflection-chat-memory-turns',
-  'cfg-reflection-memory-anchor', 'cfg-reflection-weather-anchor',
+  'cfg-reflection-memory-anchor',
   'cfg-reflection-diary-l1-input-window-chars', 'cfg-reflection-diary-l1-max-windows',
   'cfg-reflection-diary-l1-scene-limit', 'cfg-reflection-diary-l1-max-tokens',
   'cfg-reflection-diary-l1-scene-min-value',
@@ -8890,20 +8870,12 @@ async function loadConfig(explicitMemoryConflictReload) {
       (cfg.reflection && cfg.reflection.enabled) === false ? 'false' : 'true';
     document.getElementById('cfg-reflection-auto').value =
       (cfg.reflection && cfg.reflection.auto_enabled) === false ? 'false' : 'true';
-    document.getElementById('cfg-reflection-daily').value =
-      (cfg.reflection && cfg.reflection.daily_enabled) === false ? 'false' : 'true';
-    document.getElementById('cfg-reflection-daily-min-memory').value =
-      (cfg.reflection && cfg.reflection.daily_min_memory_items) ?? 5;
-    document.getElementById('cfg-reflection-daily-turns').value =
-      (cfg.reflection && cfg.reflection.daily_conversation_turn_limit) ?? 12;
     document.getElementById('cfg-reflection-chat-memory-mode').value =
       (cfg.reflection && cfg.reflection.daily_chat_memory_mode) || 'review';
     document.getElementById('cfg-reflection-chat-memory-turns').value =
       (cfg.reflection && cfg.reflection.daily_chat_memory_turn_limit) ?? 0;
     document.getElementById('cfg-reflection-memory-anchor').value =
       (cfg.reflection && cfg.reflection.memory_affect_anchor_enabled) === false ? 'false' : 'true';
-    document.getElementById('cfg-reflection-weather-anchor').value =
-      (cfg.reflection && cfg.reflection.relationship_weather_affect_anchor_enabled) === false ? 'false' : 'true';
     var reflectionConfigServerValues = {};
     var reflectionConfigFields = {
       'cfg-reflection-diary-l1-input-window-chars': 'diary_l1_input_window_chars',
@@ -8976,7 +8948,7 @@ async function loadConfig(explicitMemoryConflictReload) {
       'Buckets dir: <strong>' + esc(cfg.buckets_dir) + '</strong><br>' +
       'Gateway upstreams: <strong>' + upstreamCount + ' providers / ' + upstreamModelCount + ' models</strong><br>' +
       'Persona API: <strong>' + ((cfg.persona && cfg.persona.api_ready) ? '已设置' : '未设置') + '</strong><br>' +
-      '日印象 API: <strong>' + ((cfg.reflection && cfg.reflection.api_ready) ? '已设置' : '未设置') + '</strong><br>' +
+      '反思与记忆连接: <strong>' + ((cfg.reflection && cfg.reflection.api_ready) ? '已设置' : '未设置') + '</strong><br>' +
       'Portrait API: <strong>' + ((cfg.portrait && cfg.portrait.api_ready) ? '已设置' : '未设置') + '</strong><br>' +
       'Portrait state: <strong>' + esc((cfg.portrait && cfg.portrait.state_path) || '默认') + '</strong><br>' +
       'Dream API: <strong>' + (cfg.dream.api_ready ? '已设置' : '未设置') + '</strong><br>' +
@@ -9252,9 +9224,6 @@ async function saveConfig(persist, persistEnv) {
     candidate.reflection = {
       enabled: document.getElementById('cfg-reflection-enabled').value === 'true',
       auto_enabled: document.getElementById('cfg-reflection-auto').value === 'true',
-      daily_enabled: document.getElementById('cfg-reflection-daily').value === 'true',
-      daily_min_memory_items: numberValue('cfg-reflection-daily-min-memory', 5),
-      daily_conversation_turn_limit: numberValue('cfg-reflection-daily-turns', 12),
       daily_chat_memory_mode: document.getElementById('cfg-reflection-chat-memory-mode').value || 'review',
       daily_chat_memory_turn_limit: numberValue('cfg-reflection-chat-memory-turns', 0),
       diary_l1_input_window_chars: generationConfig.diary_l1_input_window_chars,
@@ -9272,7 +9241,6 @@ async function saveConfig(persist, persistEnv) {
       daily_chat_memory_max_per_day: generationConfig.daily_chat_memory_max_per_day,
       daily_chat_memory_review_max_per_day: generationConfig.daily_chat_memory_review_max_per_day,
       memory_affect_anchor_enabled: document.getElementById('cfg-reflection-memory-anchor').value === 'true',
-      relationship_weather_affect_anchor_enabled: document.getElementById('cfg-reflection-weather-anchor').value === 'true',
     };
     candidate.portrait = {
       enabled: document.getElementById('cfg-portrait-enabled').value === 'true',

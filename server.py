@@ -2062,9 +2062,12 @@ def _breath_query_requests_pending_followups(query: str) -> bool:
 
 
 def _format_handoff_personal_recent_continuity(all_buckets: list[dict], limit: int = 3) -> str:
+    from relationship_impressions import is_retired_impression
     rows = []
     recent_dates = _handoff_recent_date_keys()
     for bucket in all_buckets:
+        if is_retired_impression(bucket):
+            continue
         if is_self_anchor_bucket(bucket):
             continue
         meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
@@ -10092,12 +10095,10 @@ async def dream() -> str:
 
 
 # =============================================================
-# Tool 6: reflect — daily relationship weather
-# 工具 6：reflect — 生成日印象
+# Legacy reflect entry; relationship impressions retired, history retained.
 # =============================================================
 async def reflect(period: str = "daily", force: bool = False) -> dict:
-    """生成 daily relationship_weather 类型的 feel,记录当天关系天气,正文会带 affect_anchor 和弦。weekly 默认关闭,需 reflection.weekly_enabled=true 才会生成; force=True 会重写同周期结果。它不会替代 hold/grow 写具体 bucket。"""
-    await decay_engine.ensure_started()
+    """日/周印象已废弃；旧请求只返回retired，不调用模型或改写历史。"""
     return await reflection_engine.reflect(
         period=period,
         bucket_mgr=bucket_mgr,
@@ -12356,7 +12357,7 @@ async def api_gateway_injections(request):
 
 @mcp.custom_route("/api/reflection/run", methods=["POST"])
 async def api_reflection_run(request):
-    """Run daily reflection from dashboard or trusted local callers; weekly obeys reflection.weekly_enabled."""
+    """Legacy daily/weekly requests report retirement without model or writes."""
     from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
@@ -12408,7 +12409,6 @@ async def api_daily_chat_memory_run(request):
         )
         try:
             activity_date = str(body.get("date") or result.get("date") or "")
-            daily_impression = await _daily_impression_material_for_date(activity_date)
             activity_result = await reflection_engine.run_daily_activity_summary(
                 conversation_turn_store=gateway_state_store,
                 raw_event_store=raw_event_store,
@@ -12416,7 +12416,7 @@ async def api_daily_chat_memory_run(request):
                 daily_chat_memory_candidates=[
                     item for item in (result.get("candidates") or []) if isinstance(item, dict)
                 ],
-                daily_impressions=[daily_impression] if daily_impression else [],
+                daily_impressions=[],  # Retired relationship impressions are history only.
                 key=str(body.get("date") or ""),
                 force=_bool_value(body.get("force"), False),
             )
@@ -12496,12 +12496,11 @@ async def api_daily_activity_summary_run(request):
         body = {}
     try:
         activity_date = str(body.get("date") or "")
-        daily_impression = await _daily_impression_material_for_date(activity_date)
         result = await reflection_engine.run_daily_activity_summary(
             conversation_turn_store=gateway_state_store,
             raw_event_store=raw_event_store,
             persona_engine=persona_engine,
-            daily_impressions=[daily_impression] if daily_impression else [],
+            daily_impressions=[],
             key=str(body.get("date") or ""),
             force=_bool_value(body.get("force"), False),
         )
@@ -15363,22 +15362,15 @@ if __name__ == "__main__":
                                     source="daily_activity_summary",
                                     timeline_id=timeline_id,
                                 ):
-                                    activity_candidates, activity_daily_impressions = (
+                                    activity_candidates, _ = (
                                         _daily_activity_materials_from_reflection_results(results)
                                     )
-                                    if not activity_daily_impressions:
-                                        existing_daily_impression = await _daily_impression_material_for_date(
-                                            activity_date,
-                                            local_bucket_mgr,
-                                        )
-                                        if existing_daily_impression:
-                                            activity_daily_impressions.append(existing_daily_impression)
                                     activity_result = await local_reflection_engine.run_daily_activity_summary(
                                         conversation_turn_store=local_gateway_state_store,
                                         raw_event_store=raw_event_store,
                                         persona_engine=local_persona_engine,
                                         daily_chat_memory_candidates=activity_candidates,
-                                        daily_impressions=activity_daily_impressions,
+                                        daily_impressions=[],
                                         key=activity_date,
                                     )
                                     stored_activity = _store_daily_activity_summary_result(
