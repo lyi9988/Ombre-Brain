@@ -4978,7 +4978,6 @@ class GatewayService:
         # clock-only request with no such consumer can avoid the full bucket read.
         clock_needs_buckets = pure_clock and (
             self._should_inject_interval(session_id, self.core_memory_interval_rounds)
-            or self._should_inject_interval(session_id, self.relationship_weather_interval_rounds)
             or self._should_inject_interval(session_id, self.favorite_memory_interval_rounds)
             or include_favorite_memory
         )
@@ -5311,10 +5310,7 @@ class GatewayService:
                     all_buckets,
                 )
                 mark_step("date_persona_trace", stage_started_at)
-            if self._should_inject_interval(session_id, self.relationship_weather_interval_rounds):
-                stage_started_at = time.perf_counter()
-                relationship_weather = await self._build_relationship_weather_block(all_buckets)
-                mark_step("relationship_weather", stage_started_at)
+            # Retired daily/weekly impressions no longer provide chat weather.
             if (
                 include_favorite_memory
                 or self._query_requests_favorite_memory(current_user_query)
@@ -13135,18 +13131,8 @@ class GatewayService:
             "Prefer direct memory facts when present; use this only as same-day tone and original-turn context.",
         ]
 
-        daily_bucket = self._daily_impression_bucket_for_date(all_buckets, date_key)
-        if self.date_persona_trace_include_daily and daily_bucket:
-            debug["daily_bucket_id"] = str(daily_bucket.get("id") or "")
-            daily_text = strip_display_temperature_sections(
-                strip_wikilinks(str(daily_bucket.get("content") or ""))
-            ).strip()
-            if daily_text:
-                line = f"daily_impression: {self._clip_text(daily_text, 150)}"
-                lines.append(line)
-                from memory_delivery import record_carrier
-                record_carrier(daily_bucket, line, 'date_persona')
-
+        # Daily/weekly relationship impressions are retired. Actual persona
+        # event traces continue below without a second relationship summary.
         selected_events = self._persona_events_for_date(date_key)
         if selected_events:
             lines.append("turns:")
@@ -13204,21 +13190,6 @@ class GatewayService:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(self.gateway_tz)
 
-    def _daily_impression_bucket_for_date(self, all_buckets: list[dict], date_key: str) -> dict | None:
-        fallback = None
-        expected_id = f"reflection_daily_{date_key}"
-        for bucket in all_buckets:
-            meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-            tags = {str(tag) for tag in meta.get("tags", [])}
-            if meta.get("type") != "feel":
-                continue
-            if not ({"relationship_weather", "daily_impression"} & tags):
-                continue
-            if str(bucket.get("id") or "") == expected_id:
-                return bucket
-            if str(meta.get("date") or "") == date_key:
-                fallback = bucket
-        return fallback
 
     @staticmethod
     def _query_requests_recent_context(query: str) -> bool:
@@ -13295,52 +13266,6 @@ class GatewayService:
         )
         return any(marker in text for marker in bridge_markers)
 
-    async def _build_relationship_weather_block(self, all_buckets: list[dict]) -> str:
-        if self.relationship_weather_budget <= 0:
-            return ""
-        weather_buckets = []
-        for bucket in all_buckets:
-            meta = bucket.get("metadata", {})
-            if meta.get("type") != "feel":
-                continue
-            tags = {str(tag) for tag in meta.get("tags", [])}
-            if not ({"relationship_weather", "daily_impression", "weekly_impression"} & tags):
-                continue
-            weather_buckets.append(bucket)
-        if not weather_buckets:
-            return ""
-
-        daily = [
-            bucket for bucket in weather_buckets
-            if "daily_impression" in {str(tag) for tag in bucket.get("metadata", {}).get("tags", [])}
-        ]
-        daily.sort(key=lambda bucket: bucket.get("metadata", {}).get("created", ""), reverse=True)
-        selected = daily[:7]
-        if self.relationship_weather_include_weekly:
-            weekly = [
-                bucket for bucket in weather_buckets
-                if "weekly_impression" in {str(tag) for tag in bucket.get("metadata", {}).get("tags", [])}
-            ]
-            weekly.sort(key=lambda bucket: bucket.get("metadata", {}).get("created", ""), reverse=True)
-            selected = weekly[:1] + selected
-
-        remaining = self.relationship_weather_budget
-        parts = []
-        for bucket in selected:
-            meta = bucket.get("metadata", {})
-            text = strip_wikilinks(bucket.get("content", "")).strip()
-            if not text:
-                continue
-            prefix = meta.get("date") or meta.get("created", "")[:10]
-            line = f"- [{prefix}] {self._trim_text(text, 80)}"
-            tokens = count_tokens_approx(line)
-            if tokens > remaining and parts:
-                break
-            parts.append(line)
-            remaining -= tokens
-            if remaining <= 0:
-                break
-        return "\n".join(parts)
 
     async def _build_favorite_memory_block(
         self,
@@ -25528,6 +25453,8 @@ class GatewayService:
                 continue
             source_id = str(block.get("source_id") or "")
             title, live_body = sources.get(source_id, (None, ""))
+            if source_id == "ombre.relationship_weather":
+                continue  # Includes an old frozen/override copy of the retired source.
             mode = str(block.get("mode") or "live_source")
             spec = fixed_prompt_source(source_id)
             runtime_values = {}
