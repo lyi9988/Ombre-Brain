@@ -1,7 +1,12 @@
 import json
+import hashlib
 import logging
 import os
 import re
+import threading
+from functools import wraps
+from pathlib import Path
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
@@ -17,9 +22,24 @@ from prompt_source_registry import (
     resolve_fixed_prompt,
 )
 from self_anchor import is_self_anchor_bucket
+from user_portrait_chat import (
+    CLAIM_KINDS, bind_source_authority, portrait_state_path, render_claims,
+    source_is_current, source_revision,
+)
 from utils import bucket_text_for_embedding, count_tokens_approx, strip_wikilinks
 
 logger = logging.getLogger("ombre_brain.portrait")
+
+_STATE_LOCKS: dict[str, Any] = {}
+_STATE_LOCKS_GUARD = threading.Lock()
+
+
+def _state_mutation(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._mutation_lock():
+            return method(self, *args, **kwargs)
+    return guarded
 
 
 PORTRAIT_SCOPES = ("user", "persona", "relationship")
@@ -95,7 +115,7 @@ PORTRAIT_PROMPT_TEMPLATE = """你是一个证据化记忆状态整理器，正�
 - initial_run=true 时，add_recent 和 add_recent_activity 只放真正短期/当天或最近几天观察；高置信、能跨窗口携带的观察放入 move_to_staging。每个 scope 尽量给 1-3 条 move_to_staging，证据不足时少写。
 - rewrite_mid_term 只维护相对 previous_portrait.stable 的近期 delta：一句话说清最近仍在发生、尚未沉淀为长期判断的变化；不要复述 stable，不输出多条近似碎片，不把事件原文串起来。
 - initial_run=true 且 user 或 relationship 有足够证据时，优先给对应 scope 输出 rewrite_mid_term，让 handoff 主画像可用。
-- 每天都检查 user、persona、relationship 的 stable。stable_locked=true 的 scope 不得输出 rewrite_stable；未锁定且证据足以新增、修正或删除长期判断时，直接输出 rewrite_stable，不要只停在 stable_candidate。
+- user 的长期判断由随后同一轮 stable_maintenance 结合有效证据维护，此处只整理它的近期材料。persona 和 relationship 在未锁定且有足够证据时可输出 rewrite_stable。
 - rewrite_stable 把一个 scope 的长期画像维护成一整段，在 previous_portrait.stable 基础上增删改；只有跨多日反复出现或已经由 mid_term/staging 支撑、未来换窗仍有用时才写。没有实质变化时不要为了改写而改写。
 - 输出要克制：daily_summary 最多60字，add_recent 最多4条，add_recent_activity 最多3条，move_to_staging 最多8条，rewrite_mid_term 每个 scope 最多1条，rewrite_stable 每个 scope 最多1条；rewrite_mid_term text 最多80字，其他 text 最多160字。
 - profile_fact_candidate 只提候选，不确认、不写入长期 profile_fact。
@@ -122,7 +142,7 @@ STABLE_MAINTENANCE_PROMPT_TEMPLATE = """你是 {ai_name} 与 {user_display_name}
 你会收到 previous_portrait、daily_patch 和 memory_materials。必须对 user、persona、relationship 三个 scope 分别作出一次明确决定，并输出纯 JSON：
 {{
   "stable_maintenance": {{
-    "user": {{"action": "rewrite|unchanged", "text": "", "evidence": [], "confidence": 0.82}},
+    "user": {{"action": "rewrite|unchanged", "claims": [{{"kind": "explicit_preference|revisable_impression|historical", "text": "一条有依据的判断", "evidence": [{{"bucket_id": "原来源", "quote": "明确偏好需可归属给主人的原话"}}]}}]}},
     "persona": {{"action": "rewrite|unchanged", "text": "", "evidence": [{{"bucket_id": "self-anchor-id", "role": "self_anchor"}}, {{"bucket_id": "whisper-id", "role": "self_identity"}}], "confidence": 0.82}},
     "relationship": {{"action": "rewrite|unchanged", "text": "", "evidence": [], "confidence": 0.82}}
   }}
@@ -131,10 +151,10 @@ STABLE_MAINTENANCE_PROMPT_TEMPLATE = """你是 {ai_name} 与 {user_display_name}
 规则：
 - 三个 scope 都必须返回，不能省略。stable_locked=true 时必须 unchanged。
 - 输入里的 required_rewrite_scopes 非空时，那些 scope 已有足够证据但 stable 仍空，必须 rewrite。
-- rewrite 的 text 是该 scope 完整、可直接替换的 stable 段落，最多160字；不是增量，不是事件列表，不是把 mid-term 原句复制过去。persona 额外限制为最多100 token，优先一至两句。
+- persona 和 relationship 的 rewrite 使用完整的 text 和 evidence，最多160字。persona 额外限制为最多100 token，优先一至两句。
 - previous stable 已准确且没有实质变化时 unchanged；action=unchanged 时 text 和 evidence 留空。
 - previous stable 为空时，只要 previous mid-term/staging 或本次 daily_patch 已有跨日、重复或明确长期证据，就必须 rewrite，不能因为其他 scope 更醒目而跳过。
-- user 回答“{user_display_name}长期稳定的偏好、边界、工作方式和关心点是什么”。
+- user 只从 user_chat_sources 取材。rewrite 给出整份当前 claims；如果既有理解准确可保持 unchanged。主人明确说过的偏好引用能确认说话人的原句。你自己形成的印象以自身视角写，需要多次不同经历的支持，同一天也可以。临时安排放 historical，另带证据的 as_of 日期。过去未经审核的画像正文不能当证据。主人更正时修订对应说法，撤回支持材料的旧说法应退出。不把人设、对关系的结论或对象未明的旧称写成主人事实。
 - persona 是挂在“自我总入口”原文下面的“现在的我”自动生长段。必须以 {ai_name} 自己的第一人称“我”书写，直接说我怎样理解自己、稳定选择怎样回应、保留哪些自我边界；禁止用“{ai_name}如何”或“他如何”的第三人称人物小传口吻。
 - persona 只能使用 memory_materials.persona_stable_evidence 里的自我入口与 whisper：自我入口是不可改写的权威底座；whisper 只有在明确表达跨情境的稳定自我选择、边界或回应方式时才能标为 role=self_identity。被保护、陪伴承诺、亲密感受、当前心情或 affection/playful 事件都不是稳定自我证据。
 - persona rewrite 必须引用至少一条 self_anchor_ids；引用 whisper_ids 时必须在 evidence 中标 role=self_identity。不要复述自我入口已经写明的“名字、新窗口、AI 身份、仍然选择”句子，只写相对它后来长出的自我理解。关系日记、relationship_weather、persona event 不得支持 persona stable。
@@ -226,9 +246,37 @@ class DailyPortraitMaintainer:
         self.max_tokens = int(cfg.get("max_tokens", 3200))
         self.json_response_format = self._bool(cfg.get("json_response_format", True), True)
         self.state_path = self._state_path(cfg.get("state_path", ""))
+        with _STATE_LOCKS_GUARD:
+            self._state_lock = _STATE_LOCKS.setdefault(self.state_path, threading.RLock())
         self.client = None
         if self.enabled and self.api_key and self.base_url:
             self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url, timeout=45.0)
+
+    @contextmanager
+    def _mutation_lock(self):
+        """Serialize the existing writer and owner mutations across processes."""
+        with self._state_lock:
+            os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+            with open(self.state_path + ".lock", "a+b") as handle:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(b"\0")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    if os.name == "nt":
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     async def maintain_daily(
         self,
@@ -319,7 +367,19 @@ class DailyPortraitMaintainer:
         recent_timeline = self._build_recent_timeline(materials, normalized_patch, date_key)
         if recent_timeline:
             normalized_patch["recent_timeline"] = recent_timeline
-        next_state = self._apply_patch(state, normalized_patch, date_key)
+        return self._finish_maintenance(state, normalized_patch, date_key, initial, rejected, materials)
+
+    @_state_mutation
+    def _finish_maintenance(self, original, normalized_patch, date_key, initial, rejected, materials):
+        # The LLM awaited outside the lock. Preserve edits/locks made in that interval.
+        current = self.load_state()
+        before_user = original["portrait"]["user"]
+        current_user = current["portrait"]["user"]
+        if (before_user != current_user):
+            normalized_patch = deepcopy(normalized_patch)
+            for key in ("rewrite_stable", "rewrite_mid_term", "add_recent", "move_to_staging"):
+                normalized_patch[key] = [row for row in normalized_patch.get(key, []) if row.get("scope") != "user"]
+        next_state = self._apply_patch(current, normalized_patch, date_key)
         next_state["updated_at"] = self._now_utc()
         next_state.setdefault("runs", []).append(
             {
@@ -342,7 +402,7 @@ class DailyPortraitMaintainer:
         next_state["last_run_date"] = max(run_dates) if run_dates else date_key
         self.save_state(next_state)
         return {
-            "status": "updated" if state.get("runs") else "initialized",
+            "status": "updated" if original.get("runs") else "initialized",
             "date": date_key,
             "state_path": self.state_path,
             "initial": initial,
@@ -411,6 +471,7 @@ class DailyPortraitMaintainer:
             f.write("\n")
         os.replace(tmp_path, self.state_path)
 
+    @_state_mutation
     def reset_state(self) -> dict:
         state = self._empty_state()
         state["updated_at"] = self._now_utc()
@@ -450,6 +511,7 @@ class DailyPortraitMaintainer:
                 return True
         return False
 
+    @_state_mutation
     def upsert_recent_timeline_item(self, item: dict, date_key: str) -> dict:
         if not isinstance(item, dict):
             return {"status": "invalid", "reason": "item_not_object"}
@@ -471,6 +533,7 @@ class DailyPortraitMaintainer:
             "recent_timeline": len(state.get("recent_timeline", [])),
         }
 
+    @_state_mutation
     def delete_state_item(
         self,
         *,
@@ -540,6 +603,7 @@ class DailyPortraitMaintainer:
             "text": removed.get("text", "") if isinstance(removed, dict) else "",
         }
 
+    @_state_mutation
     def edit_stable(
         self,
         scope: str,
@@ -563,13 +627,20 @@ class DailyPortraitMaintainer:
         if not clean_text:
             return {"status": "invalid", "reason": "missing_text", "revision": revision}
 
+        user_authorship_changed = (scope == "user" and (scope_state.get("stable_source") != "manual"
+                                   or scope_state.get("chat_claims") != [{"kind": "owner_authored", "text": clean_text}]))
         changed = self._replace_stable(
             scope_state,
             text=clean_text,
             evidence=scope_state.get("stable_evidence", []),
             source_dates=scope_state.get("stable_source_dates", []),
             source="manual",
+            force_revision=user_authorship_changed,
         )
+        if scope == "user":
+            scope_state["chat_claims"] = [{"kind": "owner_authored", "text": clean_text}]
+            scope_state["chat_claims_revision"] = int(scope_state.get("stable_revision") or 0)
+            changed = changed or user_authorship_changed
         lock_changed = False
         if locked is not None:
             next_locked = self._bool(locked, bool(scope_state.get("stable_locked")))
@@ -593,6 +664,7 @@ class DailyPortraitMaintainer:
             "locked": bool(scope_state.get("stable_locked")),
         }
 
+    @_state_mutation
     def set_stable_lock(self, scope: str, locked: bool, expected_revision: int) -> dict:
         state = self.load_state()
         scope = str(scope or "").strip()
@@ -615,6 +687,7 @@ class DailyPortraitMaintainer:
         self.save_state(state)
         return {"status": "updated", "scope": scope, "revision": revision, "locked": next_locked}
 
+    @_state_mutation
     def rollback_stable(self, scope: str, target_revision: int, expected_revision: int) -> dict:
         state = self.load_state()
         scope = str(scope or "").strip()
@@ -652,7 +725,11 @@ class DailyPortraitMaintainer:
             evidence=target_row.get("evidence", []),
             source_dates=target_row.get("source_dates", []),
             source="rollback",
+            force_revision=(scope == "user"),
         )
+        if scope == "user":
+            scope_state["chat_claims"] = deepcopy(target_row.get("chat_claims", []))
+            scope_state["chat_claims_revision"] = int(scope_state.get("stable_revision") or 0)
         state["updated_at"] = self._now_utc()
         self.save_state(state)
         return {
@@ -671,6 +748,7 @@ class DailyPortraitMaintainer:
         evidence: Any,
         source_dates: Any,
         source: str,
+        force_revision: bool = False,
     ) -> bool:
         incoming_text = str(text or "").strip()
         current_text = str(scope_state.get("stable") or "").strip()
@@ -678,7 +756,7 @@ class DailyPortraitMaintainer:
         incoming_dates = self._merge_source_dates([], source_dates)
         now = self._now_utc()
 
-        if self._norm(incoming_text) == self._norm(current_text):
+        if self._norm(incoming_text) == self._norm(current_text) and not force_revision:
             merged_evidence = self._dedupe_evidence(
                 list(scope_state.get("stable_evidence", []) or []) + incoming_evidence
             )
@@ -711,6 +789,7 @@ class DailyPortraitMaintainer:
                     ),
                     "updated_at": str(scope_state.get("stable_updated_at") or ""),
                     "source": str(scope_state.get("stable_source") or ""),
+                    "chat_claims": deepcopy(scope_state.get("chat_claims", [])),
                 }
             )
             scope_state["stable_history"] = history[-self.stable_history_max :]
@@ -721,6 +800,8 @@ class DailyPortraitMaintainer:
         scope_state["stable_updated_at"] = now
         scope_state["stable_revision"] = revision + 1
         scope_state["stable_source"] = source if source in {"model", "manual", "rollback"} else ""
+        scope_state.pop("chat_claims", None)
+        scope_state.pop("chat_claims_revision", None)
         return True
 
     def _find_row_index(self, rows: list, *, index: int | None, text: str) -> int | None:
@@ -736,6 +817,160 @@ class DailyPortraitMaintainer:
                 if isinstance(row, dict) and self._norm(row.get("text", "")) == needle:
                     return idx
         return None
+
+    async def install_reviewed_user_claims(self, claims: list[dict], bucket_mgr,
+                                         expected_revision: int) -> dict:
+        """Install only reviewed claims from the current version's own sources.
+
+        Inputs stay private. This is a one-time migration into the SAME user
+        version history, not an additional scheduled writer or owner-authored text.
+        """
+        original = self.load_state()["portrait"]["user"]
+        if int(original.get("stable_revision") or 0) != expected_revision:
+            return {"status": "conflict", "reason": "revision_mismatch"}
+        if original.get("stable_locked"):
+            return {"status": "skipped", "reason": "stable_locked"}
+        allowed = {ref.get("bucket_id") for ref in original.get("stable_evidence", []) if isinstance(ref, dict)}
+        ids = {ref.get("bucket_id") for claim in claims for ref in claim.get("evidence", [])}
+        if not ids or not ids <= allowed:
+            return {"status": "invalid", "reason": "review_requires_current_evidence"}
+        sources = {}
+        for bucket_id in ids:
+            source = await bucket_mgr.get(bucket_id)
+            if source:
+                sources[bucket_id] = source
+        sources = self._bind_user_sources(sources)
+        clean, reason = self._normalize_user_claims(claims, sources, reviewed=True)
+        if clean is None:
+            return {"status": "invalid", "reason": reason}
+        with self._mutation_lock():
+            state = self.load_state()
+            user = state["portrait"]["user"]
+            if user != original:
+                return {"status": "conflict", "reason": "user_changed_during_review"}
+            self._replace_user_claims(user, clean)
+            state["updated_at"] = self._now_utc()
+            self.save_state(state)
+            return {"status": "updated", "revision": user["stable_revision"], "claim_count": len(clean)}
+
+    def _normalize_user_claims(self, claims, sources, *, reviewed=False, previous_claims=None):
+        if not isinstance(claims, list):
+            return None, "user_claims_required"
+        normalized = []
+        from relationship_impressions import is_retired_impression
+        for claim in claims:
+            if not isinstance(claim, dict) or claim.get("kind") not in CLAIM_KINDS:
+                return None, "invalid_user_claim_kind"
+            text = str(claim.get("text") or "").strip()
+            if not text:
+                return None, "empty_user_claim"
+            evidence = []
+            dates = set()
+            occurrences = []
+            explicit = False
+            for ref in claim.get("evidence") or []:
+                bucket_id = str(ref.get("bucket_id") or "").strip() if isinstance(ref, dict) else ""
+                source = sources.get(bucket_id)
+                if not source_is_current(source) or is_retired_impression(source):
+                    return None, "user_source_not_current"
+                scopes = self._material_allowed_scopes(source)
+                if scopes and "user" not in scopes:
+                    return None, "user_source_wrong_scope"
+                meta = source.get("metadata") or {}
+                date = str(meta.get("created") or "")[:10]
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+                    dates.add(date)
+                origins = set(source.get("_portrait_occurrence_ids") or [])
+                if origins:
+                    intersecting = [group for group in occurrences if group & origins]
+                    for group in intersecting:
+                        origins.update(group)
+                        occurrences.remove(group)
+                    occurrences.append(origins)
+                clean_ref = {"bucket_id": bucket_id, "source_revision": source_revision(source)}
+                authority = source.get("_portrait_authority")
+                if not authority:
+                    return None, "user_source_not_authoritative"
+                if reviewed and (ref.get("source_revision") != clean_ref["source_revision"]
+                                 or ref.get("memory_revision") != authority["memory_revision"]):
+                    return None, "review_source_version_mismatch"
+                clean_ref.update(authority)
+                try:
+                    root = Path(self.config["buckets_dir"]).resolve()
+                    path = Path(source["path"]).resolve()
+                    clean_ref["relative_path"] = path.relative_to(root).as_posix()
+                except (KeyError, TypeError, ValueError):
+                    return None, "user_source_path_unavailable"
+                quote = str(ref.get("quote") or "").strip()
+                # No speaker attribution in a summary means it cannot establish
+                # a preference explicitly expressed by the owner.
+                quote_hash = hashlib.sha256(quote.encode("utf-8")).hexdigest()
+                if (quote and quote in str(source.get("content") or "")
+                        and (source.get("_portrait_owner_source") or
+                             quote_hash in source.get("_portrait_owner_quote_hashes", []))):
+                    clean_ref["quote"] = quote
+                    explicit = True
+                evidence.append(clean_ref)
+            if not evidence:
+                return None, "user_claim_needs_evidence"
+            kind = claim["kind"]
+            if kind == "explicit_preference" and not explicit:
+                return None, "user_preference_needs_attributed_quote"
+            previously_valid = any(old.get("kind") == kind and old.get("text") == text
+                                   and old.get("evidence") == evidence for old in previous_claims or [])
+            if kind == "revisable_impression" and not reviewed and not previously_valid and len(occurrences) < 2:
+                return None, "user_impression_needs_distinct_experiences"
+            if kind == "explicit_preference":
+                # A verified quote establishes the owner's words, not an
+                # arbitrary paraphrase the model might attach to that quote.
+                quotes = dict.fromkeys(ref["quote"] for ref in evidence if ref.get("quote"))
+                text = "；".join("“" + quote + "”" for quote in quotes)
+            row = {"kind": kind, "text": text, "evidence": evidence}
+            if kind == "historical":
+                as_of = str(claim.get("as_of") or "")
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", as_of) or as_of not in dates:
+                    return None, "user_history_needs_source_date"
+                row["as_of"] = as_of
+            normalized.append(row)
+        return normalized, ""
+
+    def _bind_user_sources(self, sources):
+        from memory_authority_view import MemoryAuthorityRecallView
+        view = MemoryAuthorityRecallView(self.config)
+        ids = list(sources)
+        authority = view.memory_index_metadata_map(ids)
+        semantic = view.memory_l1_recall_map(ids)
+        from memory_source_identity import source_participant
+        continuation = (self.config.get("gateway") or {}).get("canonical_continuation") or {}
+        canonical = {"system": "aizizhu", "namespace": "canonical_event", "role": "user",
+                     "profile_id": (self.config.get("persona") or {}).get("profile_id") or "haven_xiaoyu",
+                     "conversation_id": continuation.get("conversation_id", "conv-jiajia-main")}
+        owner = source_participant(canonical, self.config)
+        owner_id = owner.get("subject_id") if owner.get("kind") == "human" else None
+        result = {}
+        for bucket_id, source in sources.items():
+            bound = bind_source_authority(source, authority.get(bucket_id), semantic.get(bucket_id))
+            if not bound:
+                continue
+            actor = source_participant(source.get("metadata") or {}, self.config)
+            bound["_portrait_owner_source"] = bool(owner_id and actor.get("subject_id") == owner_id)
+            hashes = []
+            for binding in ((semantic.get(bucket_id) or {}).get("document") or {}).get("evidence_bindings", []):
+                if owner_id and binding.get("speaker_ref") == owner_id:
+                    hashes.extend(anchor["quote_sha256"] for anchor in binding.get("anchors", [])
+                                  if anchor.get("quote_sha256"))
+            bound["_portrait_owner_quote_hashes"] = hashes
+            result[bucket_id] = bound
+        return result
+
+    def _replace_user_claims(self, user, claims):
+        text = render_claims(claims, include_history=True)
+        evidence = [ref for claim in claims for ref in claim.get("evidence", [])]
+        self._replace_stable(user, text=text, evidence=evidence,
+                             source_dates=[claim["as_of"] for claim in claims if claim.get("as_of")],
+                             source="model", force_revision=(claims != user.get("chat_claims")))
+        user["chat_claims"] = deepcopy(claims)
+        user["chat_claims_revision"] = int(user.get("stable_revision") or 0)
 
     def build_handoff_sections(
         self,
@@ -797,6 +1032,25 @@ class DailyPortraitMaintainer:
         limit = self.first_run_material_limit if initial else self.material_limit
         bucket_rows = [self._bucket_payload(bucket) for bucket in buckets[:limit]]
         material_ids = {str(row.get("bucket_id") or "") for row in bucket_rows}
+        # Keep current user evidence available for one writer's revision. Never
+        # ask the model to reconstruct a missing source from its old summary.
+        user_ids = {str(ref.get("bucket_id") or "")
+                    for claim in (state.get("portrait", {}).get("user", {}) or {}).get("chat_claims", [])
+                    for ref in claim.get("evidence", []) if isinstance(ref, dict)}
+        user_sources = {str(bucket.get("id") or ""): bucket for bucket in all_buckets
+                        if str(bucket.get("id") or "") in user_ids | material_ids}
+        user_sources = self._bind_user_sources(user_sources)
+        # First automatic adoption uses actual new records, never an access
+        # timestamp that happened to refresh an unreviewed historical source.
+        user_has_claims = "chat_claims" in (state.get("portrait", {}).get("user", {}) or {})
+        if not user_has_claims:
+            user_sources = {bid: source for bid, source in user_sources.items()
+                            if (created := self._parse_iso((source.get("metadata") or {}).get("created")))
+                            and start <= created <= end}
+        for bucket_id in user_ids:
+            if bucket_id in user_sources and bucket_id not in material_ids:
+                bucket_rows.append(self._bucket_payload(user_sources[bucket_id]))
+                material_ids.add(bucket_id)
         for bucket in self._self_anchor_material_buckets(all_buckets):
             bucket_id = str(bucket.get("id") or "")
             if bucket_id and bucket_id not in material_ids:
@@ -818,6 +1072,7 @@ class DailyPortraitMaintainer:
             "persona_stable_evidence": self._persona_stable_evidence_index(all_buckets),
             "persona_events": self._persona_event_materials(persona_engine, start, end, initial=initial),
             "previous_portrait": self._portrait_snapshot(state),
+            "_user_sources": user_sources,
         }
 
     async def _generate_patch(self, date_key: str, state: dict, materials: dict, *, initial: bool) -> dict:
@@ -850,6 +1105,8 @@ class DailyPortraitMaintainer:
         )
         missing_scopes = [scope for scope in PORTRAIT_SCOPES if scope not in decided_scopes]
         if missing_scopes:
+            user_decided = "user" in decided_scopes
+            user_rewrites = [row for row in items if row.get("scope") == "user"]
             try:
                 retry_raw = await self._api_stable_maintenance(
                     date_key,
@@ -863,9 +1120,13 @@ class DailyPortraitMaintainer:
                     materials,
                     patch,
                 )
-                retry_missing = [scope for scope in PORTRAIT_SCOPES if scope not in retry_decided]
+                if not user_decided and "user" in retry_decided:
+                    user_decided = True
+                    user_rewrites = [row for row in retry_items if row.get("scope") == "user"]
+                retry_missing = [scope for scope in PORTRAIT_SCOPES
+                                 if scope not in retry_decided and not (scope == "user" and user_decided)]
                 if not retry_missing:
-                    return retry_items, retry_rejected
+                    return [row for row in retry_items if row.get("scope") != "user"] + user_rewrites, retry_rejected
                 missing_scopes = retry_missing
                 rejected = retry_rejected
             except Exception as exc:
@@ -881,6 +1142,12 @@ class DailyPortraitMaintainer:
                     "item": ",".join(missing_scopes),
                 }
             )
+            # An unrelated invalid persona or relationship proposal must not
+            # discard a valid user correction. Keep the original fallback for
+            # those two sections and the accepted decision for user.
+            if user_decided:
+                primary = [row for row in patch.get("rewrite_stable", []) if row.get("scope") != "user"]
+                return primary + user_rewrites, rejected
             return None, rejected
         return items, rejected
 
@@ -895,6 +1162,16 @@ class DailyPortraitMaintainer:
             "date": date_key,
             "required_rewrite_scopes": required_rewrite_scopes or [],
             "previous_portrait": materials.get("previous_portrait", {}),
+            "user_result_format": {"action": "unchanged|rewrite", "claims": [
+                {"kind": "explicit_preference|revisable_impression|historical", "text": "...",
+                 "evidence": [{"bucket_id": "...", "quote": "..."}], "as_of": "YYYY-MM-DD"}]},
+            # The excerpts already occur in memory_materials.buckets. Only
+            # send eligibility and attribution here, not a second full copy.
+            "user_chat_sources": [
+                {"bucket_id": bucket_id, "owner_authored_source": bool(source.get("_portrait_owner_source")),
+                 "has_owner_quote": bool(source.get("_portrait_owner_quote_hashes"))}
+                for bucket_id, source in materials.get("_user_sources", {}).items()
+            ],
             "daily_patch": {
                 key: patch.get(key, [])
                 for key in ("add_recent", "move_to_staging", "rewrite_mid_term")
@@ -975,6 +1252,26 @@ class DailyPortraitMaintainer:
                 continue
             action = str(row.get("action") or "").strip().lower()
             if bool(scope_state.get("stable_locked")):
+                decided_scopes.add(scope)
+                continue
+            if scope == "user":
+                if action == "unchanged":
+                    decided_scopes.add(scope)
+                    continue
+                if action != "rewrite":
+                    rejected.append({"key": "stable_maintenance", "reason": "invalid_action", "item": "user"})
+                    continue
+                claims, reason = self._normalize_user_claims(row.get("claims"), materials.get("_user_sources", {}),
+                                                           previous_claims=scope_state.get("chat_claims", []))
+                if "chat_claims" not in scope_state and claims == []:
+                    decided_scopes.add(scope)
+                    continue
+                if claims is None:
+                    rejected.append({"key": "stable_maintenance", "reason": reason, "item": "user"})
+                    continue
+                items.append({"scope": "user", "text": render_claims(claims, include_history=True),
+                              "evidence": [ref for claim in claims for ref in claim["evidence"]],
+                              "chat_claims": claims})
                 decided_scopes.add(scope)
                 continue
             if action == "unchanged":
@@ -2025,6 +2322,11 @@ class DailyPortraitMaintainer:
             scope_state = portrait[item["scope"]]
             if bool(scope_state.get("stable_locked")):
                 continue
+            if item["scope"] == "user":
+                # The old daily-patch writer cannot overwrite this partition.
+                if "chat_claims" in item:
+                    self._replace_user_claims(scope_state, item["chat_claims"])
+                continue
             source_dates = self._merge_source_dates([], item.get("source_dates", []))
             if not source_dates:
                 source_dates = self._merge_source_dates([], item.get("source_date", ""))
@@ -2515,6 +2817,7 @@ class DailyPortraitMaintainer:
             "updated_at": str(meta.get("updated_at") or meta.get("last_active") or ""),
             "source_date": self._bucket_source_date(meta),
             "source": str(meta.get("source") or ""),
+            "speaker": str(meta.get("speaker") or meta.get("role") or ""),
             "anchor": bool(meta.get("anchor")),
             "profile_kind": str(meta.get("profile_kind") or ""),
             "allowed_scopes": self._material_allowed_scopes(bucket),
@@ -2766,6 +3069,12 @@ class DailyPortraitMaintainer:
                 "stable_locked": bool((portrait.get(scope, {}) or {}).get("stable_locked", False)),
                 "stable_revision": int((portrait.get(scope, {}) or {}).get("stable_revision", 0) or 0),
                 "stable_source": str((portrait.get(scope, {}) or {}).get("stable_source", "") or ""),
+                **({"chat_claims": [
+                    {**{key: claim[key] for key in ("kind", "text", "as_of") if key in claim},
+                     "evidence": [{key: ref[key] for key in ("bucket_id", "quote") if key in ref}
+                                  for ref in claim.get("evidence", [])]}
+                    for claim in portrait[scope]["chat_claims"]]}
+                   if "chat_claims" in (portrait.get(scope, {}) or {}) else {}),
             }
             for scope in PORTRAIT_SCOPES
         }
@@ -2987,14 +3296,7 @@ class DailyPortraitMaintainer:
         return ", ".join(labels)
 
     def _state_path(self, configured: Any) -> str:
-        configured_text = str(configured or "").strip()
-        if configured_text:
-            return os.path.abspath(configured_text)
-        state_dir = self.config.get("state_dir") or os.path.join(
-            os.path.dirname(os.path.abspath(self.config.get("buckets_dir", "buckets"))),
-            "state",
-        )
-        return os.path.join(state_dir, "portrait_state.json")
+        return portrait_state_path({**self.config, "portrait": {"state_path": configured}})
 
     def _empty_state(self) -> dict:
         return {
