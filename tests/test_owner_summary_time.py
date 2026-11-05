@@ -7,7 +7,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from memory_l1_service import L1OwnerError
-from memory_owner_summary_time import validate_time
+from memory_owner_summary_time import validate_time,source_time_evidence
 from test_owner_summary_memory import setup, run
 
 SYNTHETIC = '这是隔离验证的虚构资料，不是真实主人谈话。小禾说：以后给我推荐饮料时，别选明显苦的；我还没决定周三是否去看展。'
@@ -111,3 +111,31 @@ def test_owner_edited_unsupported_date_is_rechecked_before_commit(tmp_path,monke
             edit={'document':edited},request_id='unsupported-owner-date'))
     assert caught.value.code=='owner_summary_time_not_supported'
     assert not f.env['authority'].list_memories()
+
+
+def test_structured_time_facts_are_only_observed_original_text():
+    facts=source_time_evidence(SYNTHETIC)
+    assert facts['absolute_dates']==facts['clock_times']==facts['timezones']==[]
+    assert facts['metadata_event_time']==facts['metadata_validity_time']=={'state':'unknown'}
+    explicit=source_time_evidence('约在2026年11月4日08:30:45+08:00见，原话另提到11月5日。')
+    assert explicit['absolute_dates']==[{'year':2026,'month':11,'day':4,'precision':'day'}]
+    assert explicit['partial_calendar_dates']==[{'month':11,'day':5,'year':None}]
+    assert explicit['clock_times']==[{'hour':8,'minute':30,'second':45,'fraction':None,'precision':'second'}]
+    assert explicit['timezones']==[{'utc_offset':'+08:00'}]
+
+
+def test_worker_sends_recomputable_time_facts_without_changing_owner_prompt(tmp_path,monkeypatch):
+    f=setup(tmp_path,monkeypatch,body=SYNTHETIC)
+    marker='owner editable body unchanged'
+    f.engine._memory_l1_prompt=lambda *a,**kw:(marker,{'prompt_revision':'owner-r3'})
+    original=f.engine._daily_chat_memory_create_completion
+    async def inspect(client,**kwargs):
+        assert kwargs['messages'][0]['content']==marker
+        payload=json.loads(kwargs['messages'][1]['content'])
+        for source in payload['l1_contract']['source_texts']:
+            assert source['time_evidence']==source_time_evidence(source['text'])
+            assert 'source_recorded_at' not in source
+        assert payload['l1_contract']['semantic_contract']['source_time_evidence']['relative_expression_anchor']=='not_supplied'
+        return await original(client,**kwargs)
+    f.engine._daily_chat_memory_create_completion=inspect
+    assert run(f)['results'][0]['status']=='review'

@@ -67,6 +67,29 @@ def _check_text(text, evidence, path):
         raise L1OwnerError('owner_summary_time_not_supported',status=409,field_path=path)
 
 
+def source_time_evidence(text):
+    """Verifiable observations, with no date inferred from record metadata."""
+    values=tokens(text)
+    dates=sorted(t[1:] for t in values if t[0]=='date')
+    months=sorted(t[1:] for t in values if t[0]=='year_month' and not any(d[:2]==t[1:] for d in dates))
+    years=sorted(t[1] for t in values if t[0]=='year' and not any(d[0]==t[1] for d in dates+months))
+    partial=sorted(t[1:] for t in values if t[0]=='month_day' and not any(d[1:]==t[1:] for d in dates))
+    clocks=[t[1:] for t in values if t[0]=='clock']
+    def refines(fine,coarse):
+        return fine!=coarse and all(v is None or fine[i]==v for i,v in enumerate(coarse))
+    clocks=[clock for clock in clocks if not any(refines(fine,clock) for fine in clocks)]
+    return {'origin':'observed_original_text',
+        'absolute_dates':[{'year':y,'month':m,'day':d,'precision':'day'} for y,m,d in dates]
+            +[{'year':y,'month':m,'precision':'month'} for y,m in months]
+            +[{'year':y,'precision':'year'} for y in years],
+        'partial_calendar_dates':[{'month':m,'day':d,'year':None} for m,d in partial],
+        'clock_times':[{'hour':h,'minute':m,'second':s,'fraction':f,
+            'precision':'fraction' if f is not None else 'second' if s is not None else 'minute' if m is not None else 'hour'}
+            for h,m,s,f in sorted(clocks,key=repr)],
+        'timezones':[{'utc_offset':t[1][:3]+':'+t[1][3:]} for t in sorted(values,key=repr) if t[0]=='zone'],
+        'metadata_event_time':{'state':'unknown'}, 'metadata_validity_time':{'state':'unknown'}}
+
+
 def validate_time(document, source_texts):
     """Validate every statement against its own bindings, not the batch pool."""
     def evidence(refs):

@@ -411,6 +411,7 @@ async def prepare_owner_summary_tasks(engine, bucket_mgr, *, max_jobs=None):
                     catalog, catalog_revision = service.catalog_provider()
                     identity = source_model_identity(engine.config, selected)
                     views = semantic_sources(snapshots, bindings)
+                    from memory_owner_summary_time import source_time_evidence
                     for view, extent, source in zip(views, window['ranges'], selected):
                         # The exact L0 snapshot retains recorded_at for custody.
                         # This producer has no event-time anchor in metadata.
@@ -418,6 +419,7 @@ async def prepare_owner_summary_tasks(engine, bucket_mgr, *, max_jobs=None):
                         view.update(text=view['text'][extent['start']:extent['end']],
                             observed_range={k: extent[k] for k in ('start', 'end')}, range_coordinates='original_source_text',
                             attachment_refs=copy.deepcopy(source.get('attachment_refs', [])))
+                        view['time_evidence']=source_time_evidence(view['text'])
                     summary = claimed['envelope']['summary']
                     # The selected draft remains complete in the durable task.
                     # Each draft segment is delivered alongside a source range;
@@ -426,6 +428,12 @@ async def prepare_owner_summary_tasks(engine, bucket_mgr, *, max_jobs=None):
                         initial_chat=True, require_keywords=True, identity=identity)
                     contract['document']['required'].append('narrative')
                     contract['document']['narrative'] = contract['document']['optional'].pop('narrative')
+                    contract['source_time_evidence']={'field':'source_texts[].time_evidence',
+                        'authority':'observed_original_text_within_this_source_range',
+                        'empty_lists':'no_explicit_calendar_or_clock_evidence',
+                        'metadata_event_time':'unknown','metadata_validity_time':'unknown',
+                        'relative_expression_anchor':'not_supplied',
+                        'date_and_precision_support':'statement_own_evidence_refs_only'}
                     payload = {'input_kind': 'owner_selected_summary', 'identity': identity,
                         'owner_selected_summary': {'id': summary['id'], 'revision': summary['revision'], 'title': summary.get('title', ''),
                             'body': summary['body'][window['draft_range']['start']:window['draft_range']['end']],
