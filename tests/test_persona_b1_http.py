@@ -64,6 +64,98 @@ class HTTP(unittest.IsolatedAsyncioTestCase):
         r=await self.client.post('/internal/persona/b1/clock',json=payload,headers=headers);self.assertEqual(r.status_code,400)
         self.engine.b1_candidate=None
         r=await self.client.post('/internal/persona/b1/clock',json=payload,headers=headers);self.assertEqual(r.status_code,503)
+    def clock_receipt_fixture(self):
+        from persona_inner_state import upgrade_policy_v2
+        config=upgrade_policy_v2(layers_policy())
+        root=Path(self.tmp.name)
+        self.store=PersonaB1Store(root/'clock-v2.db',legacy_path=root/'old.db')
+        self.store.initialize('guyan',{k:.5 for k in FIELDS},NOW,config)
+        self.engine.b1_candidate=PersonaB1Adapter(self.store,'guyan',{})
+        return config['revision']
+    async def test_clock_receipt_original_identity_after_later_cursor_is_read_only(self):
+        from datetime import timedelta,timezone
+        from unittest.mock import patch
+        headers={'Authorization':'Bearer fixture-only'}
+        policy_revision=self.clock_receipt_fixture()
+        when=NOW+timedelta(hours=1)
+        payload={'scope':'guyan','occurred_at':when.isoformat(),'policy_revision':policy_revision,'growth_frames':[]}
+        applied=await self.client.post('/internal/persona/b1/clock',json=payload,headers=headers)
+        self.assertEqual(applied.status_code,200,applied.text)
+        original=applied.json()['b1_receipt']['receipt']
+        self.engine.b1_candidate.advance_clock('later',when+timedelta(minutes=1),policy_revision)
+        before=self.store.read('guyan')
+        params={'scope':'guyan','occurred_at':when.astimezone(timezone(timedelta(hours=8))).isoformat()}
+        with patch.object(self.store,'_connect',wraps=self.store._connect) as connect:
+            found=await self.client.get('/internal/persona/b1/clock/receipt',params=params,headers=headers)
+        self.assertEqual(found.status_code,200,found.text)
+        self.assertEqual(found.json(),{'status':'available','b1_receipt':{'replayed':True,'receipt':original}})
+        connect.assert_called_once_with(True)
+        self.assertEqual(self.store.read('guyan'),before)
+        self.assertNotIn('projection',found.json())
+    async def test_clock_receipt_absent_does_not_create_event_or_advance_revision(self):
+        headers={'Authorization':'Bearer fixture-only'}
+        before=self.store.read('guyan')
+        params={'scope':'guyan','occurred_at':NOW.isoformat()}
+        for _ in range(2):
+            result=await self.client.get('/internal/persona/b1/clock/receipt',params=params,headers=headers)
+            self.assertEqual(result.status_code,200,result.text)
+            self.assertEqual(result.json(),{'status':'not_found'})
+        self.assertEqual(self.store.read('guyan'),before)
+    async def test_clock_receipt_auth_and_exact_query_identity_precede_lookup(self):
+        from unittest.mock import patch
+        params={'scope':'guyan','occurred_at':NOW.isoformat()}
+        with patch.object(self.store,'receipt') as lookup:
+            for headers in ({},{'Authorization':'Bearer wrong'},{'Cookie':'ombre_session=owner-cookie'}):
+                result=await self.client.get('/internal/persona/b1/clock/receipt',params=params,headers=headers)
+                self.assertEqual(result.status_code,401)
+                self.assertEqual(result.json(),{'error':'unauthorized'})
+            for invalid in ({**params,'scope':'PRIVATE_SENTINEL'},
+                    {'scope':'guyan'}, {**params,'occurred_at':'PRIVATE_SENTINEL'},
+                    {**params,'event_id':'PRIVATE_SENTINEL'},
+                    [('scope','guyan'),('scope','guyan'),('occurred_at',NOW.isoformat())],
+                    [('scope','guyan'),('occurred_at',NOW.isoformat()),('occurred_at',NOW.isoformat())]):
+                result=await self.client.get('/internal/persona/b1/clock/receipt',params=invalid,
+                    headers={'Authorization':'Bearer fixture-only'})
+                self.assertEqual(result.status_code,400,result.text)
+                self.assertNotIn('PRIVATE_SENTINEL',result.text)
+            lookup.assert_not_called()
+        self.assertEqual(self.store.read('guyan')['revision'],0)
+    async def test_clock_receipt_missing_adapter_or_query_failure_is_not_absence(self):
+        import sqlite3
+        from unittest.mock import patch
+        params={'scope':'guyan','occurred_at':NOW.isoformat()};headers={'Authorization':'Bearer fixture-only'}
+        for failure in (sqlite3.OperationalError('PRIVATE_SENTINEL'),RuntimeError('PRIVATE_SENTINEL')):
+            with patch.object(self.store,'receipt',side_effect=failure):
+                result=await self.client.get('/internal/persona/b1/clock/receipt',params=params,headers=headers)
+            self.assertEqual(result.status_code,503)
+            self.assertEqual(result.json(),{'error':'b1_candidate_storage_unavailable'})
+            self.assertNotIn('PRIVATE_SENTINEL',result.text)
+        with patch.object(self.store,'receipt',return_value={'scope':'other','event_id':'PRIVATE_SENTINEL'}):
+            result=await self.client.get('/internal/persona/b1/clock/receipt',params=params,headers=headers)
+        self.assertEqual(result.status_code,503)
+        self.assertNotIn('PRIVATE_SENTINEL',result.text)
+        self.engine.b1_candidate=None
+        result=await self.client.get('/internal/persona/b1/clock/receipt',params=params,headers=headers)
+        self.assertEqual(result.status_code,503)
+        self.assertEqual(result.json(),{'error':'b1_candidate_not_configured'})
+        self.assertEqual(self.store.read('guyan')['revision'],0)
+    async def test_clock_absent_receipt_with_passed_cursor_cannot_reapply_original_time(self):
+        from datetime import timedelta
+        headers={'Authorization':'Bearer fixture-only'}
+        policy_revision=self.clock_receipt_fixture()
+        original_time=NOW+timedelta(minutes=1)
+        self.engine.b1_candidate.advance_clock('later',NOW+timedelta(minutes=2),policy_revision)
+        before=self.store.read('guyan')
+        params={'scope':'guyan','occurred_at':original_time.isoformat()}
+        missing=await self.client.get('/internal/persona/b1/clock/receipt',params=params,headers=headers)
+        self.assertEqual(missing.json(),{'status':'not_found'})
+        result=await self.client.post('/internal/persona/b1/clock',json={**params,
+            'policy_revision':policy_revision,'growth_frames':[]},headers=headers)
+        self.assertEqual(result.status_code,409,result.text)
+        self.assertEqual(result.json(),{'error':'b1_identity_or_revision_conflict'})
+        self.assertEqual(self.store.read('guyan'),before)
+        missing=await self.client.get('/internal/persona/b1/clock/receipt',params=params,headers=headers)
+        self.assertEqual(missing.json(),{'status':'not_found'})
     async def test_result_actual_route_auth_idempotent_no_chat_proof(self):
         result={'scope':'guyan','operation_id':'confirmed-work','status':'succeeded','proof':'her_ok','revision':1,'result_hash':'a'*64,'occurred_at':NOW.isoformat()}
         payload={'result':result,'policy_revision':layers_policy()['revision']};headers={'Authorization':'Bearer fixture-only'}

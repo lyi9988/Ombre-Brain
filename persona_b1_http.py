@@ -154,6 +154,33 @@ def register_candidate_route(mcp,engine_getter,authorized_internal,*,memory_cont
             return JSONResponse({'snapshot':value,'status':'available' if value is not None else 'no_historical_snapshot'})
         except (ValueError,TypeError,KeyError,OverflowError):return JSONResponse({'error':'invalid_b1_numeric_input'},status_code=400)
         except sqlite3.OperationalError:return JSONResponse({'error':'b1_candidate_storage_unavailable'},status_code=503)
+    @mcp.custom_route('/internal/persona/b1/clock/receipt',methods=['GET'])
+    async def clock_receipt(request):
+        if not authorized_internal(request):return JSONResponse({'error':'unauthorized'},status_code=401)
+        try:
+            adapter=getattr(engine_getter(),'b1_candidate',None)
+            if adapter is None:return JSONResponse({'error':'b1_candidate_not_configured'},status_code=503)
+            from persona_b1 import at,digest
+            query=request.query_params
+            if (len(query.multi_items())!=2 or set(query)!={'scope','occurred_at'}
+                    or query['scope']!=adapter.scope):raise ValueError('exact clock receipt identity required')
+            when=at(query['occurred_at'])
+            # advance_clock prefixes the original HTTP event identity in storage.
+            event_id='clock:http:'+digest({'namespace':'brain-b1-clock','scope':query['scope'],'at':when})
+        except (ValueError,TypeError,KeyError,OverflowError):
+            return JSONResponse({'error':'invalid_b1_clock_input'},status_code=400)
+        except Exception:
+            return JSONResponse({'error':'b1_candidate_storage_unavailable'},status_code=503)
+        try:
+            receipt=adapter.store.receipt(adapter.scope,event_id)
+            if receipt is None:return JSONResponse({'status':'not_found'})
+            if (receipt['scope']!=adapter.scope or receipt['event_id']!=event_id
+                    or receipt['occurred_at']!=when):raise ValueError('stored clock receipt identity mismatch')
+            return JSONResponse({'status':'available','b1_receipt':{'replayed':True,
+                'receipt':{key:receipt[key] for key in ('scope','event_id','source_hash','occurred_at','after_revision','status')}}})
+        except Exception:
+            # Query failures and malformed receipts never establish absence.
+            return JSONResponse({'error':'b1_candidate_storage_unavailable'},status_code=503)
     @mcp.custom_route('/internal/persona/b1/clock',methods=['POST'])
     async def clock(request):
         if not authorized_internal(request):return JSONResponse({'error':'unauthorized'},status_code=401)
