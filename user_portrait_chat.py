@@ -8,6 +8,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from datetime import date, datetime, time, timezone
+
+from utils import LOCAL_TZ
 
 
 CLAIM_KINDS = {"explicit_preference", "revisable_impression", "historical"}
@@ -15,7 +18,8 @@ SEMANTIC_METADATA = ("id", "source", "speaker", "role", "created", "active",
                      "deprecated", "type", "tags", "profile_kind", "retracted",
                      "withdrawn", "superseded_by", "corrected_by", "event_id",
                      "original_event_id", "source_event_id", "source_refs",
-                     "system", "namespace", "profile_id", "conversation_id")
+                     "system", "namespace", "profile_id", "conversation_id",
+                     "valid_from", "effective_from", "valid_until", "expires_at")
 
 
 def portrait_state_path(config: dict) -> str:
@@ -107,6 +111,25 @@ def source_is_current(bucket: dict | None) -> bool:
     if not isinstance(bucket, dict):
         return False
     meta = bucket.get("metadata") or {}
+    now = datetime.now(timezone.utc)
+    for key in ("valid_from", "effective_from", "valid_until", "expires_at"):
+        value = meta.get(key)
+        if value is None or value == "":
+            continue
+        end = key in {"valid_until", "expires_at"}
+        raw = str(value).strip()
+        try:
+            if len(raw) == 10:
+                # A dated local "valid through" includes that calendar day.
+                instant = datetime.combine(date.fromisoformat(raw), time.max if key == "valid_until" else time.min)
+            else:
+                instant = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=LOCAL_TZ)
+        if (end and now >= instant) or (not end and now < instant):
+            return False
     return not (meta.get("active") is False or meta.get("deprecated")
                 or meta.get("type") == "archived"
                 or any(meta.get(key) for key in

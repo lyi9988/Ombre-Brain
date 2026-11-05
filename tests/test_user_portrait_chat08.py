@@ -12,7 +12,7 @@ import pytest
 from memory_authority import MemoryAuthorityStore
 from portrait_engine import DailyPortraitMaintainer, PATCH_KEYS
 from user_portrait_chat import (bind_source_authority, build_user_portrait_projection,
-                                chat_evidence_ids, source_revision, portrait_state_path)
+                                chat_evidence_ids, source_is_current, source_revision, portrait_state_path)
 
 
 @pytest.fixture
@@ -77,6 +77,18 @@ def test_legacy_never_enters_chat_or_other_scopes(setup):
     state = engine.load_state()
     state["portrait"]["user"]["stable_source"] = "manual"
     assert build_user_portrait_projection(state, lambda _: None)["text"] == ""
+
+
+@pytest.mark.parametrize("key,value", [
+    ("valid_until", "2000-01-01"), ("expires_at", "2000-01-01T00:00:00Z"),
+    ("valid_from", "2099-06-01"), ("effective_from", "unresolved-date"),
+])
+def test_outside_or_unknown_source_window_stays_out_of_chat(setup, key, value):
+    engine, sources, mgr, _ = setup
+    install(engine, mgr)
+    sources["source-1"]["metadata"][key] = value
+    assert not source_is_current(sources["source-1"])
+    assert projection(engine, sources)["text"] == ""
 
 
 def test_reviewed_install_preserves_same_history_and_is_revisable(setup):
