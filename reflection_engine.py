@@ -6209,6 +6209,9 @@ class ReflectionEngine(MemoryL1Runtime):
         materials: dict,
         bucket_mgr,
         embedding_engine=None,
+        *,
+        retry_failed=False,
+        retry_timed_out=None,
     ) -> dict:
         if period != "daily":
             return {"status": "not_applicable", "reason": "period_not_daily"}
@@ -6218,6 +6221,9 @@ class ReflectionEngine(MemoryL1Runtime):
             if self.daily_chat_memory_mode == "off":
                 return {"status": "disabled", "reason": "memory_ingestion_off"}
             try:
+                if retry_failed or retry_timed_out:
+                    return await self._memory_l1_diary_task(key, bucket_mgr, retry_failed=retry_failed,
+                                                           retry_timed_out=retry_timed_out)
                 return await self._memory_l1_diary_task(key, bucket_mgr)
             except Exception as exc:
                 self.memory_authority_store.set_projection_status(memory_id="diary_task_" + key, memory_revision=0,

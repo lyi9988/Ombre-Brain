@@ -183,6 +183,85 @@ def test_timeout_marks_unknown_no_automatic_second_call(tmp_path):
     assert calls==['timeout']
 
 
+@pytest.mark.parametrize('legacy', [False, True])
+@pytest.mark.parametrize('outcome', ['rejected', 'timeout'])
+def test_retry_uses_proven_original_dispatch_and_keeps_diary_version(tmp_path, legacy, outcome):
+    import httpx
+    from openai import BadRequestError, APITimeoutError
+    e, service, _, calls = fixture(tmp_path, length=200)
+    original = e._daily_chat_memory_create_completion
+    request = httpx.Request('POST', 'https://model.invalid/v1/chat/completions')
+    async def unavailable(*args, **kwargs):
+        calls.append('original')
+        if outcome == 'timeout':
+            raise APITimeoutError(request)
+        raise BadRequestError('blocked original', response=httpx.Response(400, request=request,
+            headers={'x-trace-id':'trace-public-id'}), body={'type':'invalid_request','code':'LITELLM_ERROR'})
+    e._daily_chat_memory_create_completion = unavailable
+    first = task(e)
+    task_id, cid = first['task_id'], first['candidate_id']
+    store = DiaryProgress(service.authority)
+    old = store.get(cid)
+    if legacy:
+        # Model exactly what the previous release persisted on first dispatch.
+        value = dict(old['progress'], uncertain_window=0)
+        value.pop('last_failure')
+        with service.authority._connect() as db:
+            db.execute('UPDATE memory_diary_task_progress SET revision=1,progress_json=? WHERE task_id=?',
+                       (json.dumps(value), cid))
+        old = store.get(cid)
+    wait = task(e)
+    assert wait['reason'] == ('diary_provider_rejected' if outcome == 'rejected'
+                              else 'model_outcome_unknown_requires_retry_decision')
+    assert calls == ['original']
+    e.config['reflection']['diary_l1_read_timeout_seconds'] = 360
+    routes = []
+    async def restored(*args, **kwargs):
+        routes.append(kwargs['task_route'])
+        return await original(*args, **kwargs)
+    e._daily_chat_memory_create_completion = restored
+    def retry(expected=None):
+        return run(e._memory_l1_diary_task(DAY, None, retry_failed=True, retry_timed_out=expected))
+    if outcome == 'timeout':
+        assert retry()['reason'] == 'model_outcome_unknown_requires_retry_decision'
+        assert retry({'task_id':task_id, 'checkpoint_revision':old['revision']+1})['reason'] == 'retry_checkpoint_changed'
+        assert not routes
+        recovered = retry({'task_id':task_id, 'checkpoint_revision':old['revision']})
+        assert store.get(cid)['progress']['explicit_timeout_retries'][0]['checkpoint_revision'] == old['revision']
+    else:
+        recovered = retry()
+    assert recovered['status'] == 'pending' and recovered['candidate_id'] == cid
+    assert routes[0]['read_timeout_seconds'] == 360 and calls == ['original', 0]
+    assert task(e)['replayed'] and calls == ['original', 0]
+
+
+def test_native_sdk_wait_changes_only_diary_read_deadline(monkeypatch):
+    import httpx
+    import memory_l1_api
+    captured = {}
+    class Client:
+        base_url = 'https://example.invalid/v1'
+        def with_options(self, **kw):
+            captured.update(kw)
+            return self
+    async def create(**wire):
+        captured['wire'] = wire
+        return NS(choices=[])
+    client = Client()
+    client.chat = NS(completions=NS(create=create))
+    monkeypatch.setattr(memory_l1_api, 'prepare_request', lambda messages, *, stage: (messages, {}))
+    route = {'stage':'diary_l1', 'timeout_seconds':180, 'read_timeout_seconds':360,
+             'max_tokens':32000, 'thinking_mode':None, 'reasoning_effort':None}
+    run(memory_l1_api.create_completion(client, model='example', messages=[], route=route, temperature=0))
+    timeout = captured['timeout']
+    assert isinstance(timeout, httpx.Timeout) and timeout.read == 360
+    assert (timeout.connect, timeout.write, timeout.pool) == (180, 180, 180)
+    assert captured['max_retries'] == 0 and captured['wire']['max_tokens'] == 32000
+    run(memory_l1_api.create_completion(client, model='example', messages=[],
+        route={**route, 'stage':'auto_l1'}, temperature=0))
+    assert captured['timeout'] == 180
+
+
 def test_cancelled_run_keeps_durable_unknown_intent(tmp_path):
     e,s,state,calls=fixture(tmp_path)
     async def cancelled(*a,**kw): calls.append('cancel'); raise asyncio.CancelledError()

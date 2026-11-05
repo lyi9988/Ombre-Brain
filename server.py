@@ -12401,13 +12401,34 @@ async def api_diary_memory_retry(request):
         return JSONResponse({"error": "completed_diary_date_required"}, status_code=400)
     if not (reflection_engine.memory_authority_enabled and reflection_engine.memory_authority_store):
         return JSONResponse({"error": "formal_memory_authority_unavailable"}, status_code=409)
-    result = await reflection_engine._maybe_extract_diary_memory("daily", key, now, {}, bucket_mgr)
+    retry_timed_out = None
+    if 'retry_timed_out' in body:
+        retry_timed_out = body['retry_timed_out']
+        field_path = 'retry_timed_out'
+        if isinstance(retry_timed_out, dict) and set(retry_timed_out) == {'task_id', 'checkpoint_revision'}:
+            if not isinstance(retry_timed_out['task_id'], str) or not retry_timed_out['task_id'].strip():
+                field_path += '.task_id'
+            elif (isinstance(retry_timed_out['checkpoint_revision'], bool)
+                  or not isinstance(retry_timed_out['checkpoint_revision'], int)
+                  or retry_timed_out['checkpoint_revision'] <= 0):
+                field_path += '.checkpoint_revision'
+            else:
+                field_path = ''
+        if field_path:
+            return JSONResponse({'error': 'invalid_retry_timed_out', 'code': 'invalid_retry_timed_out',
+                                 'field_path': field_path}, status_code=400)
+    result = await reflection_engine._maybe_extract_diary_memory(
+        "daily", key, now, {}, bucket_mgr, retry_failed=True, retry_timed_out=retry_timed_out)
     # Admin operations need the outcome and durable identity, never private source text.
-    fields = ('status', 'reason', 'task_id', 'candidate_id', 'id', 'issue')
+    fields = ('status', 'reason', 'task_id', 'candidate_id', 'id', 'checkpoint_revision', 'code', 'field_path')
+    diagnostic_fields = ('window', 'reason', 'code', 'field_path', 'http_status', 'provider_param',
+                         'provider_trace_id', 'upstream_request_id', 'provider_category', 'finish_reason')
     receipt = {'date': key, **{field: result[field] for field in fields if field in result}}
+    if isinstance(result.get('issue'), dict):
+        receipt['issue'] = {name: result['issue'][name] for name in diagnostic_fields if name in result['issue']}
     if result.get('failures'):
-        receipt['failures'] = [{name: failure[name] for name in ('window', 'code', 'reason') if name in failure}
-                               for failure in result['failures']]
+        receipt['failures'] = [{name: failure[name] for name in diagnostic_fields if name in failure}
+                               for failure in result['failures'] if isinstance(failure, dict)]
     return JSONResponse(receipt)
 
 
@@ -13708,6 +13729,9 @@ async def api_config_get(request):
             ),
             **task_options(config),
             "diary_l1_source_kind": reflection_cfg.get("diary_l1_source_kind", "mcp"),
+            "diary_l1_read_timeout_seconds": reflection_cfg.get("diary_l1_read_timeout_seconds",
+                getattr(reflection_engine, "daily_chat_memory_timeout_seconds", 180.0)),
+            "diary_l1_read_timeout_inherited": "diary_l1_read_timeout_seconds" not in reflection_cfg,
             "memory_task_routes": reflection_engine.memory_task_models_public()["routes"],
             "memory_task_effective": reflection_engine.memory_task_models_public()["effective"],
             "memory_task_revision": reflection_engine.memory_task_models_public()["revision"],
@@ -13780,6 +13804,12 @@ async def api_config_update(request):
     # Validate before mutating any runtime section or persisting a partial save.
     if not isinstance(body, dict):
         return JSONResponse({"error": "invalid config object"}, status_code=400)
+    if isinstance(body.get('reflection'), dict) and 'diary_l1_read_timeout_seconds' in body['reflection']:
+        read_timeout = body['reflection']['diary_l1_read_timeout_seconds']
+        if isinstance(read_timeout, bool) or not isinstance(read_timeout, (int, float)) or not 1 <= read_timeout <= 3600:
+            return JSONResponse({'error': 'invalid_diary_l1_read_timeout_seconds',
+                                 'code': 'invalid_diary_l1_read_timeout_seconds',
+                                 'field_path': 'reflection.diary_l1_read_timeout_seconds'}, status_code=400)
     from config_activation import credential_edit_revision, is_credential_edit
     credential_edit = is_credential_edit(body)
     current_credential_revision = credential_edit_revision(config)
@@ -13831,11 +13861,13 @@ async def api_config_update(request):
             return JSONResponse({'error':exc.code, 'field_path':exc.field_path}, status_code=400)
     memory_config_base = deepcopy(config)
     memory_task_runtime_before = (reflection_engine, memory_authority_store, memory_commit_service)
-    memory_tasks_only = (set(body).issubset({"reflection", "persist", "expected_memory_task_revision", "expected_memory_l2_schema_revision"})
+    memory_tasks_only = (set(body).issubset({"reflection", "persist", "expected_memory_task_revision", "expected_memory_l2_schema_revision",
+                                          "expected_credential_revision"})
                          and isinstance(body.get("reflection"), dict)
                          and bool(body['reflection'])
                          and set(body["reflection"]).issubset({'memory_task_routes', 'memory_l2_output_schema',
-                             'memory_l2_jobs_per_run','memory_l2_concurrency','memory_l2_prepare_interval_seconds'}))
+                             'memory_l2_jobs_per_run','memory_l2_concurrency','memory_l2_prepare_interval_seconds',
+                             'diary_l1_read_timeout_seconds'}))
     memory_expected = body.get("expected_memory_revision")
     if "gateway" in body:
         if not isinstance(body["gateway"], dict):
@@ -14346,6 +14378,9 @@ async def api_config_update(request):
         if "diary_l1_source_kind" in r:
             reflection_cfg["diary_l1_source_kind"] = r["diary_l1_source_kind"]
             updated.append("reflection.diary_l1_source_kind")
+        if "diary_l1_read_timeout_seconds" in r:
+            reflection_cfg["diary_l1_read_timeout_seconds"] = r["diary_l1_read_timeout_seconds"]
+            updated.append("reflection.diary_l1_read_timeout_seconds")
         for key in GENERATION_OPTIONS:
             if key in r:
                 reflection_cfg[key] = generation_values[key]
@@ -14876,6 +14911,8 @@ async def api_config_update(request):
                         sc_reflection[key] = generation_values[key]
                 if "diary_l1_source_kind" in body["reflection"]:
                     sc_reflection["diary_l1_source_kind"] = reflection_cfg["diary_l1_source_kind"]
+                if "diary_l1_read_timeout_seconds" in body["reflection"]:
+                    sc_reflection["diary_l1_read_timeout_seconds"] = reflection_cfg["diary_l1_read_timeout_seconds"]
                 if "thinking_mode" in body["reflection"]:
                     thinking_mode = str(body["reflection"].get("thinking_mode") or "").strip().lower()
                     if thinking_mode not in {"", "enabled", "disabled"}:

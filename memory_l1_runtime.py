@@ -425,7 +425,7 @@ class MemoryL1Runtime:
                 request_id=key + ':committed', actor='commit_service', reason_codes=['MEMORY_REVISION_COMMITTED'])
         return {'id': candidate_id, 'status': 'created', 'revision': committed['revision']}
 
-    async def _memory_l1_diary_task(self, key, bucket_mgr):
+    async def _memory_l1_diary_task(self, key, bucket_mgr, *, retry_failed=False, retry_timed_out=None):
         # Suppress duplicate invocations on this engine, without holding a DB
         # transaction across model IO. Cross-process writes still use CAS.
         locks = getattr(self, '_diary_l1_task_locks', None)
@@ -435,9 +435,10 @@ class MemoryL1Runtime:
         if lock.locked():
             return {'status': 'in_progress', 'reason': 'diary_task_already_running'}
         async with lock:
-            return await self._memory_l1_diary_task_locked(key, bucket_mgr)
+            return await self._memory_l1_diary_task_locked(key, bucket_mgr, retry_failed=retry_failed,
+                                                          retry_timed_out=retry_timed_out)
 
-    async def _memory_l1_diary_task_locked(self, key, bucket_mgr):
+    async def _memory_l1_diary_task_locked(self, key, bucket_mgr, *, retry_failed=False, retry_timed_out=None):
         from memory_diary_l1 import DiaryL1Service
         options = task_options(self.config)
         prompt, prompt_context = self._memory_l1_prompt('ombre.diary_memory_prompt')
@@ -465,7 +466,7 @@ class MemoryL1Runtime:
         model_route = 'route_sha256:' + semantic_sha256({k: v for k, v in route.items() if k != 'client'})
         memory_id = 'diary_full_' + hashlib.sha256(source['source_id'].encode()).hexdigest()[:32]
         candidate_id = 'diary-l1:' + memory_id + ':' + task_id
-        from memory_diary_progress import DiaryProgress
+        from memory_diary_progress import DiaryProgress, rejected_request, window_failure
         progress_store = DiaryProgress(self.memory_authority_store)
         progress_record = progress_store.get(candidate_id)
         original_candidate = self.memory_authority_store.get_candidate(candidate_id)
@@ -483,9 +484,33 @@ class MemoryL1Runtime:
             if checkpoint.get('candidate_revision') != original_candidate['revision']:
                 return {'status': 'not_prepared', 'reason': 'candidate_changed_after_checkpoint', 'candidate_id': candidate_id}
         checkpoint = progress_record['progress'] if progress_record else None
-        if checkpoint and checkpoint.get('uncertain_window') is not None:
-            return {'status': 'not_prepared', 'reason': 'model_outcome_unknown_requires_retry_decision',
-                'candidate_id': candidate_id, 'task_id': task_id, 'window': checkpoint['uncertain_window']}
+        revision = progress_record['revision'] if progress_record else 0
+        outcome = {'status': 'not_prepared', 'candidate_id': candidate_id,
+                   'task_id': task_id, 'checkpoint_revision': revision}
+        failed = (checkpoint or {}).get('last_failure') or {}
+        previous_retries = list((checkpoint or {}).get('explicit_timeout_retries', []))
+        if retry_timed_out and retry_timed_out != {'task_id': task_id, 'checkpoint_revision': revision}:
+            return {**outcome, 'reason': 'retry_checkpoint_changed'}
+        uncertain = (checkpoint or {}).get('uncertain_window')
+        if uncertain is not None:
+            failed = failed or progress_store.original_first_failure(key, task_id, progress_record)
+            if retry_timed_out and failed.get('reason') == 'APITimeoutError' and failed.get('window') == uncertain:
+                # A previously returned local timeout has no provider result to
+                # replay. Bind a deliberate new request to that exact attempt.
+                previous_retries.append({'checkpoint_revision': revision, 'window': uncertain,
+                                         'previous_outcome': 'provider_response_unavailable'})
+            elif not (rejected_request(failed) and retry_failed):
+                reason = ('diary_provider_rejected' if rejected_request(failed)
+                          else 'model_outcome_unknown_requires_retry_decision')
+                return {**outcome, 'reason': reason, 'window': uncertain, 'issue': failed}
+        elif retry_timed_out:
+            return {**outcome, 'reason': 'timed_out_dispatch_not_found'}
+        elif rejected_request(failed) and not retry_failed:
+            return {**outcome, 'reason': 'diary_provider_rejected', 'issue': failed}
+        # A network deadline does not revise the diary or the model's output
+        # contract. Preserve the exact task identity and existing checkpoints.
+        wait = (self.config.get('reflection') or {}).get('diary_l1_read_timeout_seconds')
+        request_route = {**route, 'read_timeout_seconds': wait} if wait is not None else route
         previous_memory = self.memory_authority_store.get_memory(memory_id)
         previous_revision = previous_memory['active_revision'] if previous_memory else 0
         if checkpoint and checkpoint['previous_revision'] != previous_revision:
@@ -533,6 +558,8 @@ class MemoryL1Runtime:
             attempt_checkpoint = {'previous_revision': previous_revision, 'combined': copy.deepcopy(combined),
                 'prose': list(prose), 'scene_bodies': dict(scene_bodies),
                 'input_ranges': copy.deepcopy(input_ranges), 'confidence': list(confidence), 'uncertain_window': index}
+            if previous_retries:
+                attempt_checkpoint['explicit_timeout_retries'] = previous_retries
             try:
                 progress_record = progress_store.save(candidate_id, attempt_checkpoint,
                     expected_revision=progress_record['revision'] if progress_record else 0)
@@ -545,7 +572,7 @@ class MemoryL1Runtime:
                 response = await self._daily_chat_memory_create_completion(route['client'], model=route['model'],
                     messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}],
                     max_tokens=options['diary_l1_max_tokens'], temperature=self.temperature,
-                    use_daily_client=route['connection'] == 'daily', task_stage='diary_l1', task_route=route)
+                    use_daily_client=route['connection'] == 'daily', task_stage='diary_l1', task_route=request_route)
                 response_received = True
                 if self._completion_finish_reason(response) == 'length': raise ValueError('first_pass_output_incomplete')
                 from memory_l1_api import validate_response
@@ -598,22 +625,29 @@ class MemoryL1Runtime:
                 checkpoint = {'previous_revision': previous_revision, 'combined': copy.deepcopy(combined),
                     'prose': list(prose), 'scene_bodies': dict(scene_bodies),
                     'input_ranges': copy.deepcopy(input_ranges), 'confidence': list(confidence)}
+                if previous_retries:
+                    checkpoint['explicit_timeout_retries'] = previous_retries
                 validated_window = True
                 progress_record = progress_store.save(candidate_id, checkpoint,
                     expected_revision=progress_record['revision'] if progress_record else 0)
             except Exception as exc:
-                failures.append({'window': index, 'reason': type(exc).__name__, 'code': getattr(exc, 'code', None)})
+                failure = window_failure(exc, index)
+                if response_received:
+                    failure['finish_reason'] = self._completion_finish_reason(response)
+                failures.append(failure)
                 if validated_window:
                     # A valid result followed by a failed durable write is not
                     # an invalid model response. Keep the original intent so
                     # restart cannot automatically pay for that window again.
                     return {'status': 'not_prepared', 'reason': 'validated_checkpoint_requires_recovery',
                         'task_id': task_id, 'candidate_id': candidate_id, 'failures': failures}
-                if response_received:
-                    # A received but invalid result is known, not an unknown
-                    # provider outcome. Keep the pre-attempt successful state.
+                if response_received or rejected_request(failure) or failure['reason'] == 'APITimeoutError':
+                    # A rejection produced no completion. A read timeout closed
+                    # only the local request; preserve its uncertain dispatch.
                     known = copy.deepcopy(attempt_checkpoint)
-                    known.pop('uncertain_window', None)
+                    if response_received or rejected_request(failure):
+                        known.pop('uncertain_window', None)
+                    known['last_failure'] = failure
                     try:
                         progress_record = progress_store.save(candidate_id, known,
                             expected_revision=progress_record['revision'])
@@ -625,7 +659,9 @@ class MemoryL1Runtime:
             self.memory_authority_store.set_projection_status(memory_id='diary_task_' + key, memory_revision=0,
                 projector='memory_l1_first_pass', status='degraded', details={'state': 'failed', 'task_id': task_id,
                     'failures': failures, 'prompt_revision': prompt_context['prompt_revision']})
-            return {'status': 'failed', 'reason': 'no_complete_first_pass_window', 'failures': failures, 'task_id': task_id}
+            return {'status': 'failed', 'reason': 'no_complete_first_pass_window', 'failures': failures,
+                    'task_id': task_id, 'candidate_id': candidate_id,
+                    'checkpoint_revision': progress_record['revision'] if progress_record else 0}
         # Only the durable checkpoint is eligible for proposal construction.
         # A failed CAS never lets this invocation publish its losing draft.
         saved = progress_record['progress']
@@ -649,7 +685,8 @@ class MemoryL1Runtime:
         if row['proposal']['metadata']['diary_l1_bundle']['coverage']['state'] == 'complete':
             try:
                 progress_store.save(candidate_id,
-                    {'completed_candidate_id': candidate_id, 'candidate_revision': row['revision']},
+                    {'completed_candidate_id': candidate_id, 'candidate_revision': row['revision'],
+                     **({'explicit_timeout_retries': previous_retries} if previous_retries else {})},
                     expected_revision=progress_record['revision'])
             except Exception:
                 # The canonical candidate is already saved; compaction failure

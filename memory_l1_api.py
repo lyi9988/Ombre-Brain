@@ -215,6 +215,9 @@ async def create_completion(client, *, model, messages, route, temperature, capt
     from memory_task_routes import completion_options
     messages, schema = prepare_request(messages, stage=route['stage'])
     timeout = route.get('timeout_seconds', 180)
+    if route['stage'] == 'diary_l1' and route.get('read_timeout_seconds') is not None:
+        from httpx import Timeout
+        timeout = Timeout(timeout, read=route['read_timeout_seconds'])
     client = client.with_options(timeout=timeout, max_retries=0)
     base = urlsplit(str(client.base_url))
     if base.hostname == 'api.deepseek.com':

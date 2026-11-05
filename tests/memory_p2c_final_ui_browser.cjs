@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
-const { chromium } = require('playwright');
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE_PATH || 'playwright');
 
 const root = path.resolve(__dirname, '..');
 const asset = fs.readFileSync(path.join(root, 'dashboard_assets/chat-memory.js'), 'utf8');
@@ -119,6 +119,7 @@ function configFixture() {
   }
 
   async function test(name, run) {
+    if (process.env.CONFIG_ONLY === '1') return;
     await run();
     passed++;
     console.log('PASS', name);
@@ -183,7 +184,7 @@ function configFixture() {
       assert.match(await list.textContent(), /候选已生成/, 'late older source response cannot replace the newer receipt');
       assert.equal(await draft.inputValue(), '主人尚未保存的候选草稿');
     });
-    await panelPage.close();
+    if (panelPage) await panelPage.close();
     panelPage = null;
 
     await test('failed source retry keeps the failure receipt and re-enables the action', async () => {
@@ -202,6 +203,8 @@ function configFixture() {
 
     const api = { gets: 0, posts: [] };
     const config = configFixture();
+    config.reflection.diary_l1_read_timeout_seconds = 180;
+    config.reflection.diary_l1_read_timeout_inherited = true;
     const configPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
     const pageErrors = [];
     configPage.on('pageerror', error => pageErrors.push(error.message));
@@ -216,7 +219,15 @@ function configFixture() {
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(config) });
       }
       if (url.pathname === '/api/config' && request.method() === 'POST') {
-        api.posts.push(request.postDataJSON());
+        const body = request.postDataJSON();
+        api.posts.push(body);
+        if (Object.keys(body.reflection || {}).length === 1 && 'diary_l1_read_timeout_seconds' in body.reflection) {
+          config.reflection.diary_l1_read_timeout_seconds = body.reflection.diary_l1_read_timeout_seconds;
+          config.reflection.diary_l1_read_timeout_inherited = false;
+          return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+            ok: true, persistence: { runtime_yaml: 'saved', credentials: 'not_requested' },
+          }) });
+        }
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
           ok: false, error: 'runtime_persist_failed', persistence: { runtime_yaml: 'failed', credentials: 'not_requested' },
         }) });
@@ -240,6 +251,24 @@ function configFixture() {
       assert.equal(await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').inputValue(), '5');
       assert.equal(await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').getAttribute('min'), '1');
       assert.equal(await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').getAttribute('max'), '3600');
+      assert.equal(await configPage.locator('#cfg-reflection-diary-l1-read-timeout').inputValue(), '180');
+      assert.equal(await configPage.locator('#cfg-reflection-diary-l1-read-timeout').getAttribute('min'), '1');
+      assert.equal(await configPage.locator('#cfg-reflection-diary-l1-read-timeout').getAttribute('max'), '3600');
+      assert.match(await configPage.locator('#cfg-reflection-diary-l1-read-timeout-note').textContent(), /当前继承 L1 等待设置：180 秒/);
+      await configPage.locator('#cfg-reflection-diary-l1-read-timeout').fill('3601');
+      await configPage.locator('#cfg-reflection-diary-l1-read-timeout-save').click();
+      await configPage.waitForFunction(() => document.querySelector('#config-status')?.textContent.includes('日记 L1 读取等待（秒）须为 1–3600'));
+      assert.equal(api.posts.length, 0, 'out-of-range diary wait is rejected before the API write');
+      assert.equal(await configPage.locator('#cfg-reflection-diary-l1-read-timeout').inputValue(), '3601');
+      await configPage.locator('#cfg-reflection-diary-l1-read-timeout').fill('360');
+      await configPage.locator('#cfg-reflection-diary-l1-input-window-chars').fill('24000');
+      await configPage.locator('#cfg-reflection-diary-l1-read-timeout-save').click();
+      await configPage.waitForFunction(() => document.querySelector('#config-status')?.textContent.includes('已保存日记 L1 读取等待：360 秒，配置回读一致'));
+      assert.equal(api.posts.length, 1);
+      assert.deepEqual(api.posts[0].reflection, { diary_l1_read_timeout_seconds: 360 }, 'the wait-only edit sends no task routes or token budgets');
+      assert.deepEqual(Object.keys(api.posts[0]).sort(), ['persist', 'reflection']);
+      assert.equal(await configPage.locator('#cfg-reflection-diary-l1-input-window-chars').inputValue(), '24000', 'local save and readback preserve other drafts');
+      await configPage.locator('#cfg-reflection-diary-l1-read-timeout').fill('480');
       await configPage.locator('#cfg-reflection-diary-l1-input-window-chars').fill('24000');
       await configPage.locator('#cfg-reflection-diary-l1-source-kind').selectOption('private');
       await configPage.locator('#cfg-reflection-action-l1-jobs-per-run').fill('17');
@@ -247,7 +276,7 @@ function configFixture() {
       await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').fill('3601');
       await configPage.locator('#config-view button[onclick="saveConfig(true)"]').click();
       await configPage.waitForFunction(() => document.querySelector('#config-status')?.textContent.includes('聊天整理检查间隔须为 1–3600'));
-      assert.equal(api.posts.length, 0, 'out-of-range chat preparation interval is rejected before the API write');
+      assert.equal(api.posts.length, 1, 'out-of-range chat preparation interval is rejected before the API write');
       assert.equal(await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').inputValue(), '3601', 'invalid input remains visible for correction');
       await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').fill('3600');
       await configPage.locator('#config-view button[onclick="saveConfig(true)"]').click();
@@ -255,18 +284,20 @@ function configFixture() {
         const debug = await configPage.evaluate(() => ({ active: document.querySelector('.tab.active')?.dataset.tab, status: document.querySelector('#config-status')?.textContent, source: document.querySelector('#cfg-reflection-diary-l1-source-kind')?.value, actionJobs: document.querySelector('#cfg-reflection-action-l1-jobs-per-run')?.value }));
         throw new Error('synthetic config save did not reach the expected failure response: ' + JSON.stringify({ debug, apiPosts: api.posts, pageErrors }));
       });
-      assert.equal(api.posts.length, 1, 'save submits one synthetic API request');
-      assert.equal(api.posts[0].reflection.diary_l1_input_window_chars, 24000);
-      assert.equal(api.posts[0].reflection.diary_l1_source_kind, 'private');
-      assert.equal(api.posts[0].reflection.action_l1_jobs_per_run, 17);
-      assert.equal(api.posts[0].reflection.chat_memory_jobs_per_run, 0, 'zero explicitly pauses background chat preparation');
-      assert.equal(api.posts[0].reflection.chat_memory_prepare_interval_seconds, 3600);
+      assert.equal(api.posts.length, 2, 'the second save submits one additional synthetic API request');
+      assert.equal(api.posts[1].reflection.diary_l1_input_window_chars, 24000);
+      assert.equal(api.posts[1].reflection.diary_l1_source_kind, 'private');
+      assert.equal(api.posts[1].reflection.diary_l1_read_timeout_seconds, 480);
+      assert.equal(api.posts[1].reflection.action_l1_jobs_per_run, 17);
+      assert.equal(api.posts[1].reflection.chat_memory_jobs_per_run, 0, 'zero explicitly pauses background chat preparation');
+      assert.equal(api.posts[1].reflection.chat_memory_prepare_interval_seconds, 3600);
       assert.match(await configPage.locator('#config-status').textContent(), /输入已保留/);
 
       await configPage.locator('.tab[data-tab="model-config"]').click();
       await configPage.locator('.tab[data-tab="config"]').click();
       await configPage.waitForFunction(() => document.querySelector('#cfg-reflection-diary-l1-source-kind')?.value === 'private');
       assert.equal(await configPage.locator('#cfg-reflection-diary-l1-input-window-chars').inputValue(), '24000');
+      assert.equal(await configPage.locator('#cfg-reflection-diary-l1-read-timeout').inputValue(), '480', 'failed-save diary wait draft survives tab-triggered GET');
       assert.equal(await configPage.locator('#cfg-reflection-action-l1-jobs-per-run').inputValue(), '17');
       assert.equal(await configPage.locator('#cfg-reflection-chat-memory-jobs-per-run').inputValue(), '0');
       assert.equal(await configPage.locator('#cfg-reflection-chat-memory-prepare-interval').inputValue(), '3600');

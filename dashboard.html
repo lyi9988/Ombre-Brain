@@ -4085,6 +4085,12 @@
         </select>
       </div>
       <div class="config-row">
+        <label>日记 L1 读取等待（秒）</label>
+        <input type="number" id="cfg-reflection-diary-l1-read-timeout" min="1" max="3600" step="any" placeholder="缺省继承当前 L1 等待设置" aria-describedby="cfg-reflection-diary-l1-read-timeout-note" />
+      </div>
+      <div id="cfg-reflection-diary-l1-read-timeout-note" style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">仅影响每个日记 L1 请求的读取等待；允许 1–3600 秒。缺省继承当前 L1 等待设置，不改变 Token 预算或其他任务。</div>
+      <div style="margin-bottom:12px;"><button type="button" class="btn-secondary" id="cfg-reflection-diary-l1-read-timeout-save" onclick="saveDiaryReadTimeout()">仅保存日记等待</button></div>
+      <div class="config-row">
         <label>行动整理任务</label>
         <input type="number" id="cfg-reflection-action-l1-jobs-per-run" step="1" placeholder="从服务器配置读取" />
       </div>
@@ -4266,7 +4272,7 @@ const reflectionConfigFormIds = [
   'cfg-reflection-diary-l1-input-window-chars', 'cfg-reflection-diary-l1-max-windows',
   'cfg-reflection-diary-l1-scene-limit', 'cfg-reflection-diary-l1-max-tokens',
   'cfg-reflection-diary-l1-scene-min-value',
-  'cfg-reflection-diary-l1-source-kind', 'cfg-reflection-action-l1-jobs-per-run',
+  'cfg-reflection-diary-l1-source-kind', 'cfg-reflection-diary-l1-read-timeout', 'cfg-reflection-action-l1-jobs-per-run',
   'cfg-reflection-chat-memory-jobs-per-run', 'cfg-reflection-chat-memory-prepare-interval',
   'cfg-reflection-chat-memory-candidate-max-tokens', 'cfg-reflection-chat-memory-max-windows',
   'cfg-reflection-chat-memory-window-max-input-chars', 'cfg-reflection-chat-memory-max-per-day',
@@ -8906,6 +8912,14 @@ async function loadConfig(explicitMemoryConflictReload) {
     });
     document.getElementById('cfg-reflection-diary-l1-source-kind').value =
       (cfg.reflection && cfg.reflection.diary_l1_source_kind) || 'mcp';
+    var diaryReadTimeout = cfg.reflection && cfg.reflection.diary_l1_read_timeout_seconds;
+    document.getElementById('cfg-reflection-diary-l1-read-timeout').value =
+      diaryReadTimeout === undefined || diaryReadTimeout === null ? '' : String(diaryReadTimeout);
+    document.getElementById('cfg-reflection-diary-l1-read-timeout-note').textContent =
+      ((cfg.reflection && cfg.reflection.diary_l1_read_timeout_inherited)
+        ? '当前继承 L1 等待设置：' + diaryReadTimeout + ' 秒。'
+        : '已单独设置日记 L1 读取等待。') +
+      '仅影响每个日记 L1 请求；允许 1–3600 秒，不改变 Token 预算或其他任务。';
     reflectionConfigFormIds.forEach(function(id) {
       var el = document.getElementById(id);
       if (!el) return;
@@ -9055,6 +9069,47 @@ async function reviewCredentialConflict() {
   } catch (_) { setConfigStatus('读取最新版本失败；本页输入已保留。'); }
 }
 
+async function saveDiaryReadTimeout() {
+  var id = 'cfg-reflection-diary-l1-read-timeout';
+  var input = document.getElementById(id);
+  var button = document.getElementById(id + '-save');
+  var raw = String(input.value ?? '').trim();
+  var seconds = /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isFinite(seconds) || seconds < 1 || seconds > 3600) {
+    setConfigStatus('日记 L1 读取等待（秒）须为 1–3600 的数字；本次未提交，草稿已保留。');
+    return;
+  }
+  if (!configSnapshot) { setConfigStatus('配置尚未加载；草稿已保留。'); return; }
+  button.disabled = true;
+  try {
+    var response = await authFetch(BASE + '/api/config', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({reflection: {diary_l1_read_timeout_seconds: seconds}, persist: true}),
+    });
+    if (!response) return;
+    var result = await response.json();
+    if (!response.ok || !result.ok || !result.persistence || result.persistence.runtime_yaml !== 'saved') {
+      setConfigStatus(esc(configSavePresentation(result).text));
+      return;
+    }
+    var readback = await authFetch(BASE + '/api/config');
+    if (!readback || !readback.ok) throw new Error('readback_unconfirmed');
+    var current = (await readback.json()).reflection || {};
+    if (current.diary_l1_read_timeout_seconds !== seconds || current.diary_l1_read_timeout_inherited) {
+      setConfigStatus('已保存，但日记等待回读未匹配；当前草稿已保留，请核对后重试。');
+      return;
+    }
+    configSnapshot.reflection = configSnapshot.reflection || {};
+    configSnapshot.reflection.diary_l1_read_timeout_seconds = seconds;
+    configSnapshot.reflection.diary_l1_read_timeout_inherited = false;
+    if (reflectionConfigDraftSnapshot) reflectionConfigDraftSnapshot[id] = String(seconds);
+    document.getElementById(id + '-note').textContent = '当前已单独设置：' + seconds + ' 秒。仅影响每个日记 L1 请求；允许 1–3600 秒，不改变 Token 预算或其他任务。';
+    setConfigStatus('已保存日记 L1 读取等待：' + seconds + ' 秒，配置回读一致。');
+  } catch (_) {
+    setConfigStatus('日记等待保存或回读未确认；当前草稿已保留，请核对后重试。');
+  } finally { button.disabled = false; }
+}
+
 async function saveConfig(persist, persistEnv) {
   if (!configSnapshot) {
     setConfigStatus('<span style="color:var(--negative)">配置还没加载完成，请先刷新配置页</span>');
@@ -9182,6 +9237,8 @@ async function saveConfig(persist, persistEnv) {
       daily_chat_memory_review_max_per_day: generationIntegerValue('cfg-reflection-chat-memory-review-max-per-day', 'Daily Review 每批额度', 'daily_chat_memory_review_max_per_day'),
     };
     if (Object.keys(generationConfig).some(function(key) { return generationConfig[key] === null; })) return;
+    var diaryReadTimeout = boundedDecimalValue('cfg-reflection-diary-l1-read-timeout', '日记 L1 读取等待（秒）', 1, 3600);
+    if (diaryReadTimeout === null) return;
     candidate.dehydration = {
       model: document.getElementById('cfg-dehy-model').value,
       base_url: document.getElementById('cfg-dehy-url').value,
@@ -9235,6 +9292,7 @@ async function saveConfig(persist, persistEnv) {
       chat_memory_jobs_per_run: generationConfig.chat_memory_jobs_per_run,
       chat_memory_prepare_interval_seconds: generationConfig.chat_memory_prepare_interval_seconds,
       diary_l1_source_kind: document.getElementById('cfg-reflection-diary-l1-source-kind').value,
+      diary_l1_read_timeout_seconds: diaryReadTimeout,
       daily_chat_memory_candidate_max_tokens: generationConfig.daily_chat_memory_candidate_max_tokens,
       daily_chat_memory_max_windows_per_run: generationConfig.daily_chat_memory_max_windows_per_run,
       daily_chat_memory_window_max_input_chars: generationConfig.daily_chat_memory_window_max_input_chars,

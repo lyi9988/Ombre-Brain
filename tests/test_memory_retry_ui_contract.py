@@ -55,8 +55,8 @@ def test_diary_retry_requires_owner_and_uses_only_the_named_completed_day():
     endpoint = next(n for n in tree.body if getattr(n, 'name', '') == 'api_diary_memory_retry')
     endpoint.decorator_list = []
     calls = []
-    async def extract(period, key, now, materials, buckets):
-        calls.append((period, key))
+    async def extract(period, key, now, materials, buckets, *, retry_failed=False, retry_timed_out=None):
+        calls.append((period, key, retry_failed, retry_timed_out))
         return {'status': 'pending', 'candidate_id': 'same-diary-version', 'text': 'private text'}
     engine = SimpleNamespace(_local_now=lambda: datetime(2026,11,6,3),
                              memory_authority_enabled=True, memory_authority_store=object(),
@@ -73,4 +73,4 @@ def test_diary_retry_requires_owner_and_uses_only_the_named_completed_day():
     assert not calls
     assert json.loads(request('2026-11-02').body) == {
         'status': 'pending', 'candidate_id': 'same-diary-version', 'date': '2026-11-02'}
-    assert calls == [('daily', '2026-11-02')]
+    assert calls == [('daily', '2026-11-02', True, None)]

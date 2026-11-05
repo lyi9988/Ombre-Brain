@@ -4,7 +4,47 @@ Writes use the existing Authority database and optimistic CAS. No model calls,
 expiry-based retries, candidate transitions or new scheduling are performed.
 """
 import json
+import re
 from memory_authority import RevisionConflict
+
+
+def window_failure(exc, index):
+    """Keep provider correlation and the failing field without storing the diary or provider body."""
+    def identifier(value):
+        return value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.:\[\]-]{1,160}', value) else None
+    failure = {'window': index, 'reason': type(exc).__name__, 'code': identifier(getattr(exc, 'code', None))}
+    response = getattr(exc, 'response', None)
+    status = getattr(exc, 'status_code', None)
+    if type(status) is int:
+        failure['http_status'] = status
+    headers = getattr(response, 'headers', {})
+    body = getattr(exc, 'body', None)
+    upstream = body.get('error', body) if isinstance(body, dict) else {}
+    if isinstance(upstream, dict) and identifier(upstream.get('type')):
+        failure['provider_category'] = upstream['type']
+    # Gateways may echo source text or credentials in error.message. Retain
+    # actionable technical categories without copying that free-form message.
+    message = str(upstream.get('message') or '').lower() if isinstance(upstream, dict) else ''
+    for category, markers in (('context_length', ('context length', 'context_length_exceeded')),
+                              ('response_format', ('response_format', 'json schema', 'json_schema')),
+                              ('provider_route', ('no deployments', 'no available deployment', 'model not found')),
+                              ('rate_limit', ('rate limit', 'rate_limit')),
+                              ('content_filter', ('content policy', 'content_filter', 'content filter'))):
+        if any(marker in message for marker in markers):
+            failure['provider_category'] = category
+            break
+    for field, value in (('field_path', getattr(exc, 'field_path', None)),
+                         ('provider_param', getattr(exc, 'param', None) or
+                          (upstream.get('param') if isinstance(upstream, dict) else None)),
+                         ('provider_trace_id', headers.get('x-trace-id')),
+                         ('upstream_request_id', headers.get('x-upstream-request-id'))):
+        if identifier(value):
+            failure[field] = value
+    return failure
+
+
+def rejected_request(failure):
+    return failure.get('http_status') in (400, 401, 403, 404, 413, 422, 429) or failure.get('reason') == 'BadRequestError'
 
 
 class DiaryProgress:
@@ -25,6 +65,21 @@ class DiaryProgress:
             return {'revision': row['revision'], 'progress': json.loads(row['progress_json'])} if row else None
         finally:
             db.close()
+
+    def original_first_failure(self, day, task_id, record):
+        # Old first-dispatch checkpoints predate stored HTTP outcomes. Revision
+        # one and window zero identify that single dispatch. Never borrow an
+        # older failure for a later attempt of the same window.
+        if record['revision'] != 1 or record['progress'].get('uncertain_window') != 0:
+            return {}
+        for projection in self.authority.list_projection_status('diary_task_' + day, revision=0):
+            detail = projection['details']
+            if (projection['projector'] == 'memory_l1_first_pass' and projection['status'] == 'degraded'
+                    and detail.get('task_id') == task_id):
+                failures = [f for f in detail.get('failures', []) if f.get('window') == 0]
+                if len(failures) == 1:
+                    return failures[0]
+        return {}
 
     def save(self, task_id, progress, *, expected_revision):
         db = self.authority._connect()
