@@ -132,15 +132,34 @@ class OwnerSummarySourceReader:
             value = {'operation_id': envelope['operation_id'], 'locator': locator, 'version': source['version_id'],
                 'profile_id': source['profile_id'], 'conversation_id': source['conversation_id'], 'role': source['role']}
             with closing(self.authority._connect()) as db, db:
+                db.execute('BEGIN IMMEDIATE')
+                prior = db.execute('SELECT value FROM authority_meta WHERE key=?', (key,)).fetchone()
+                entries = json.loads(prior[0]) if prior else []
+                if isinstance(entries, dict): entries = [entries]
+                if value in entries:
+                    continue
                 db.execute('INSERT INTO authority_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-                    (key, canonical_json(value)))
+                    (key, canonical_json([value, *entries])))
 
     async def read(self, binding):
         key = SOURCE_PREFIX + semantic_sha256({k: binding[k] for k in ('source_namespace', 'source_id', 'source_revision')})
         with closing(self.authority._connect()) as db, db:
             row = db.execute('SELECT value FROM authority_meta WHERE key=?', (key,)).fetchone()
         if not row: return {'state': 'unavailable', 'reason': 'owner_summary_access_missing'}
-        access = json.loads(row['value'])
+        entries = json.loads(row['value'])
+        if isinstance(entries, dict): entries = [entries]
+        result = {'state': 'unavailable', 'reason': 'owner_summary_access_missing'}
+        for access in entries:
+            result = await self._read_access(binding, access)
+            if result.get('state') == 'available':
+                return result
+            # A later summary may have been edited independently of the
+            # original evidence. Every alternate proof rechecks current Aiz.
+            if result.get('state') not in {'changed', 'unavailable'}:
+                break
+        return result
+
+    async def _read_access(self, binding, access):
         value = await self.capture(access['operation_id'], access['locator'], access['version'])
         if value.get('state') != 'available' or value.get('eligible_source') is not True: return value
         if (value.get('source_revision') != access['version']

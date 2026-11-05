@@ -279,6 +279,18 @@ def test_same_source_coverage_links_original_memory_without_second_commit(tmp_pa
     assert result['linked_memories'][0]['memory_id'] == original
     assert result['candidate_ids'] == []
     assert len(f.env['authority'].list_memories()) == 1
+    # Changing the second draft alone cannot revoke the first owner's valid
+    # access to the same original event. Withdrawing that event affects both.
+    original_capture = OwnerSummarySourceReader.capture
+    async def changed_second(self, operation_id, locator, version):
+        if operation_id == second['operation_id']:
+            return {'state': 'changed', 'eligible_source': False}
+        return await original_capture(self, operation_id, locator, version)
+    monkeypatch.setattr(OwnerSummarySourceReader, 'capture', changed_second)
+    binding = f.env['authority'].get_candidate(original)['proposal']['metadata']['memory_l1']['evidence_bindings'][0]
+    assert asyncio.run(f.readers.locate(binding))['eligible_source']
+    f.current.valid = False
+    assert not asyncio.run(f.readers.locate(binding))['eligible_source']
 
 
 @pytest.mark.parametrize('block', ['prompt','model'])
