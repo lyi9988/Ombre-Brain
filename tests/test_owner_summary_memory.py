@@ -130,12 +130,9 @@ def test_all_sources_and_long_single_source_suffix_are_processed(tmp_path, monke
     assert row['phase'] == 'prepared', row.get('issue')
     if body: assert len(f.calls) > 1
     else: assert len(f.calls[0]['l1_contract']['source_texts']) == count
-    texts = {}
     for payload in f.calls:
         assert sum(len(s['text']) for s in payload['l1_contract']['source_texts']) <= 256
-        for source in payload['l1_contract']['source_texts']:
-            # Source group/position are retained in each original range.
-            texts.setdefault(source['source_recorded_at'], []).append(source['text'])
+        assert all('source_recorded_at' not in source for source in payload['l1_contract']['source_texts'])
     ranges = [r for w in row['windows'] for r in w['ranges']]
     for index, source in enumerate(f.envelope['context']['sources']):
         spans = [r for r in ranges if r['source_index'] == index]

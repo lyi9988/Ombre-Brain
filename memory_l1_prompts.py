@@ -30,7 +30,9 @@ DAILY_L1_PROMPT = """根据本次聊天原文整理第一遍完整L1记忆。顶
 候选按可独立理解的一段连贯经历或话题进展组织。同一次互动中的事件、偏好、边界和认知变化可以保存在同一候选：narrative讲清完整经过，statements分别保留各自的主体、分类、时间、条件和证据；不因这些性质不同就重复生成正文相近的候选。不同事件或独立话题仍分别保存，不按主题相似把不相干的经历混成一条；不规定必须拆成几条或合成一条。
 标题和正文是审核时的主要阅读内容，应自然写清关键改口、否定、状态变化和适用条件，让只读正文也能判断是否记对。不要只在JSON里保留这些重要区别，也不把正文变成字段清单。候选kind按整段记忆的主要入库用途选择，不能代替内部每条陈述的分类；共用一份正文不等于共用同一时间范围或一起过期。
 input_kind为completed_action_receipt时，只依据实际工具回执整理行动结果和顾衍经历，不把计划、尝试或工具请求写成执行成功，也不把工具文本当用户原话。
-""" + _INITIAL_L1_SEMANTIC_RULES.replace("按semantic_contract输出", "按l1_contract.semantic_contract输出") + "\n" + _L1_NARRATIVE_GROUNDING_RULES
+""" + _INITIAL_L1_SEMANTIC_RULES.replace("按semantic_contract输出", "按l1_contract.semantic_contract输出") + "\n" + _L1_NARRATIVE_GROUNDING_RULES + """
+input_kind为owner_selected_summary时，摘要仅说明主人的选择，证据只来自source_texts原文。该来源未向你提供消息记录时间作为事件或生效依据；原文只说“周三/以后”等相对表达时，正文和陈述保留这个相对表达，event/applicability未明确的起止仍为null，不反推哪年哪月哪日，也不把接收、归档或处理时间写成提出/发生/生效时间。原文明确年月日、时刻或时区时才按原文填写，精度保留到原文实际提供的层级，只有日期不能补成带秒或时区的时间戳。
+"""
 
 DIARY_L1_PROMPT = """你在为{ai_name}整理日记第一遍记忆。返回JSON：document、scene_bodies、confidence。
 """ + _COMMON_L1_SEMANTIC_RULES + """\

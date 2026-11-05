@@ -65,7 +65,7 @@ async def validate(args):
     summary['body_sha256'] = hashlib.sha256(summary['body'].encode()).hexdigest()
     event = {'event_id':'synthetic-owner-summary-event', 'version_id':'synthetic-version-1', 'role':'user',
         'text':body, 'created_at':'2026-11-01T00:00:00+00:00'}
-    envelope = {'operation_id':'synthetic.owner-summary.validation', 'summary':summary,
+    envelope = {'operation_id':getattr(args,'operation_id','synthetic.owner-summary.validation'), 'summary':summary,
         'context':{'conversation_id':'synthetic-conversation', 'branch_id':'synthetic-branch',
             'profile_id':'synthetic-profile', 'sources':[event]}}
     async def synthetic_capture(self, operation_id, locator, version):
@@ -98,7 +98,7 @@ async def validate(args):
     if args.run_real:
         result['l1_worker'] = await prepare_owner_summary_tasks(engine,buckets,max_jobs=1)
         receipt = tasks.receipt(receipt['task_id'])
-        if receipt['candidate_ids']:
+        if receipt['candidate_ids'] and not getattr(args,'l1_only',False):
             cid = receipt['candidate_ids'][0]
             candidate = authority.get_candidate(cid)
             if candidate['status'] in ('pending','accepted'):
@@ -115,4 +115,6 @@ if __name__ == '__main__':
     parser.add_argument('--config',required=True,help='Existing effective configuration; read only.')
     parser.add_argument('--output',required=True,help='New isolated directory; must not already exist.')
     parser.add_argument('--run-real',action='store_true',help='Explicitly run <= 1 auto_l1 and <= 1 presentation_l2 call.')
+    parser.add_argument('--l1-only',action='store_true',help='Leave generated drafts in original Review; do not adopt or call L2.')
+    parser.add_argument('--operation-id',default='synthetic.owner-summary.validation',help='Independent synthetic validation identity.')
     asyncio.run(validate(parser.parse_args()))

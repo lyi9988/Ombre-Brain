@@ -377,6 +377,8 @@ class MemoryL1Runtime:
             task = OwnerSummaryPreparation(self.memory_authority_store).get(task_id(operation))
             if not task:
                 raise L1OwnerError('owner_summary_operation_missing', status=409, field_path='operation_id')
+            from memory_owner_summary_time import validate_prepared
+            validate_prepared(self.memory_authority_store,proposal)
             await OwnerSummarySourceReader(self.config, self.memory_authority_store).sources(task['envelope'])
             coverage = check_summary_coverage(self.memory_authority_store, proposal)
             if coverage['status'] == 'linked':

@@ -412,6 +412,9 @@ async def prepare_owner_summary_tasks(engine, bucket_mgr, *, max_jobs=None):
                     identity = source_model_identity(engine.config, selected)
                     views = semantic_sources(snapshots, bindings)
                     for view, extent, source in zip(views, window['ranges'], selected):
+                        # The exact L0 snapshot retains recorded_at for custody.
+                        # This producer has no event-time anchor in metadata.
+                        view.pop('source_recorded_at',None)
                         view.update(text=view['text'][extent['start']:extent['end']],
                             observed_range={k: extent[k] for k in ('start', 'end')}, range_coordinates='original_source_text',
                             attachment_refs=copy.deepcopy(source.get('attachment_refs', [])))
@@ -461,6 +464,9 @@ async def prepare_owner_summary_tasks(engine, bucket_mgr, *, max_jobs=None):
                         raise L1OwnerError('first_pass_document_required', field_path='candidates')
                     cid = claimed['task_id'] + '_w' + str(index) + '_c' + str(number)
                     document = assemble_document(candidate['document'], require_keywords=True)
+                    from memory_owner_summary_time import validate_time
+                    validate_time(document,{b['binding_id']:s['text'][b['anchors'][0]['start']:b['anchors'][0]['end']]
+                        for s,b in zip(snapshots,bindings)})
                     full = prepare_model_document(service, memory_id=cid, document=document, sources=selected,
                         generation=generation, request_id=claimed['operation_id'] + ':' + str(index) + ':' + str(number),
                         catalog_context=(catalog, catalog_revision), config=engine.config, candidate_refs=candidate.get('source_refs', []))
