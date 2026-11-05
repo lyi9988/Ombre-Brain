@@ -61,6 +61,7 @@ def _usage_from_httpx_response(response: httpx.Response) -> dict | None:
     return dict(usage) if isinstance(usage, dict) else None
 
 from bucket_manager import BucketManager
+from gateway_user_portrait import GatewayUserPortrait
 from memory_system_config import (
     ConfigurationError, LIMITS as MEMORY_CONFIGURATION_LIMITS, REQUEST_CONFIGURATION,
     RequestLimit, configuration as memory_configuration, merge_config as merge_memory_config,
@@ -769,6 +770,7 @@ class GatewayService:
             self.config.get("memory_authority", {}), dict) else {}
         self.memory_authority_enabled = bool(authority_cfg.get("enabled", False))
         self.memory_authority_view = MemoryAuthorityRecallView(self.config)
+        self.user_portrait = GatewayUserPortrait(self.config, self.memory_authority_view)
         self.moment_request_rebuild_enabled = self._bool_config_value(
             authority_cfg.get("moment_request_rebuild_enabled"),
             not self.memory_authority_enabled,
@@ -925,8 +927,8 @@ class GatewayService:
             self.gateway_cfg.get("portrait_memory_enabled"),
             False,
         )
-        # Legacy raw profile_fact/anchor injection is retired. Portrait state is
-        # restored once through breath(mode="handoff") instead of every turn.
+        # Only the legacy raw profile_fact/anchor injection used this switch.
+        # The evidence-bound user section is selected in Composer.
         self.portrait_memory_enabled = False
         self.portrait_memory_budget = max(120, int(self.gateway_cfg.get("portrait_memory_budget", 360)))
         self.portrait_memory_max_sources = max(
@@ -937,11 +939,6 @@ class GatewayService:
             self.gateway_cfg.get("portrait_memory_include_anchors"),
             False,
         )
-        self._portrait_memory_cache: dict[str, Any] = {
-            "key": None,
-            "block": "",
-            "debug": self._portrait_memory_debug_base(),
-        }
         self.current_inner_state_interval_rounds = max(
             0, int(self.gateway_cfg.get("current_inner_state_interval_rounds", 0))
         )
@@ -1947,6 +1944,7 @@ class GatewayService:
             "portrait_memory_enabled": self.portrait_memory_enabled,
             "portrait_memory_configured_enabled": self.portrait_memory_configured_enabled,
             "portrait_memory_retired": True,
+            "chat_user_portrait_control": "composer:ombre.portrait_memory",
             "portrait_memory_budget": self.portrait_memory_budget,
             "portrait_memory_max_sources": self.portrait_memory_max_sources,
             "portrait_memory_include_anchors": self.portrait_memory_include_anchors,
@@ -4861,6 +4859,7 @@ class GatewayService:
                 await attach(self, payload, debug)
             return (dict(payload), None, debug) if include_debug else (dict(payload), None)
 
+        portrait_plan = prompt_plan if runtime_scope == "chat" and autonomy_context is None else None
         recall_budget_request = {}
         snapshot_meta = self._prepare_snapshot_identity(
             payload,
@@ -4876,8 +4875,9 @@ class GatewayService:
             snapshot_key = str(snapshot_meta.get("key_hash") or "")
             snapshot_entry = self._prepare_snapshot_get(snapshot_key)
             replay_started_at = time.perf_counter()
-            if snapshot_entry is not None and await memory_use.snapshot_sources_current(
-                    self, snapshot_entry, recall_budget_request):
+            if (snapshot_entry is not None
+                    and await self._portrait_snapshot_current(snapshot_entry, portrait_plan)
+                    and await memory_use.snapshot_sources_current(self, snapshot_entry, recall_budget_request)):
                 replay = self._prepare_snapshot_replay(
                     snapshot_entry,
                     snapshot_meta,
@@ -4990,8 +4990,6 @@ class GatewayService:
         persona_block = ""
         recent_material_blocks = []
         core_memory = ""
-        portrait_memory = ""
-        portrait_memory_debug: dict[str, Any] = self._portrait_memory_debug_base()
         just_now_context = ""
         just_now_context_debug: dict[str, Any] = self._just_now_context_debug_base(current_user_query)
         date_recall = ""
@@ -5173,18 +5171,6 @@ class GatewayService:
                 stage_started_at = time.perf_counter()
                 core_memory = await self._build_core_memory_block(all_buckets)
                 mark_step("core_memory", stage_started_at)
-            if needs_handoff_first or just_now_context_requested or date_recall_requested:
-                portrait_memory_debug["skip_reason"] = (
-                    "just_now_context"
-                    if just_now_context_requested and not needs_handoff_first
-                    else "date_recall"
-                    if date_recall_requested and not needs_handoff_first
-                    else handoff_skip_reason
-                )
-            else:
-                stage_started_at = time.perf_counter()
-                portrait_memory, portrait_memory_debug = self._build_portrait_memory_block(all_buckets)
-                mark_step("portrait_memory", stage_started_at)
             if self.recalled_budget > 0 or self.related_memory_budget > 0:
                 if skip_broad_dynamic_recall:
                     logger.info(
@@ -5529,6 +5515,9 @@ class GatewayService:
         memory_recall_projection['delivery_candidates'] = candidates(memory_recall_projection, records)
         recall_status = memory_recall_projection.get("recall_status", {})
         recall_status["automatic_recall_enabled"] = getattr(self, "automatic_recall_enabled", True)
+        stage_started_at = time.perf_counter()
+        portrait_memory, portrait_memory_debug, portrait_guard = await self._chat_portrait_input(portrait_plan)
+        mark_step("portrait_memory", stage_started_at)
         context_args = {
             "persona_block": persona_block,
             "core_memory": core_memory,
@@ -5712,6 +5701,13 @@ class GatewayService:
             "active_reminder_ids": active_reminder_ids,
         }
 
+        if snapshot_meta is not None:
+            memory_guard = memory_use.snapshot_guard(self, natural_input, complete=not (
+                core_memory or relationship_weather or favorite_memory or date_recall
+                or date_persona_trace or dream_context
+                or (natural_input.get("cognition_chain") or {}).get("rendered_versions")))
+            memory_guard["user_portrait"] = portrait_guard
+
         def log_prepare_timing() -> None:
             logger.info(
                 "Gateway prepare timing | session=%s model=%s stream=%s total_ms=%s "
@@ -5784,6 +5780,11 @@ class GatewayService:
             debug_payload["memory_score_evidence"] = request_score_evidence(self, natural_input)
             debug_payload["prompt_composer"] = prompt_composer_debug
             debug_payload["inner_state"] = inner_state_debug
+            portrait_delivered = any(
+                block.get("source_id") == "ombre.portrait_memory"
+                for block in composed_messages or []
+            )
+            debug_payload["portrait_memory_injected"] = portrait_delivered
             debug_payload["memory_recall_projection"] = {
                 key: value
                 for key, value in memory_recall_projection.items()
@@ -5794,7 +5795,7 @@ class GatewayService:
                 "emotion_relationship": bool(str(relationship_weather or "").strip()),
                 "memory_recall": bool(recall_status.get("injected_count")),
                 "core_memory": bool(str(core_memory or "").strip()),
-                "portrait_memory": bool(str(portrait_memory or "").strip()),
+                "portrait_memory": portrait_delivered,
                 "canonical_continuation": bool(continuation_phase),
             }
             trace_context = payload.get("_ombre_trace_context")
@@ -5824,10 +5825,7 @@ class GatewayService:
                     injected_ids=injected_ids,
                     debug_payload=debug_payload,
                     composed_messages=composed_messages,
-                    memory_guard=memory_use.snapshot_guard(self, natural_input, complete=not (
-                        core_memory or portrait_memory or relationship_weather or favorite_memory or date_recall
-                        or date_persona_trace or dream_context
-                        or (natural_input.get("cognition_chain") or {}).get("rendered_versions"))),
+                    memory_guard=memory_guard,
                 )
             log_prepare_timing()
             return forward_payload, injected_ids, debug_payload
@@ -5842,10 +5840,7 @@ class GatewayService:
                 injected_ids=injected_ids,
                 debug_payload=None,
                 composed_messages=composed_messages,
-                memory_guard=memory_use.snapshot_guard(self, natural_input, complete=not (
-                    core_memory or portrait_memory or relationship_weather or favorite_memory or date_recall
-                    or date_persona_trace or dream_context
-                    or (natural_input.get("cognition_chain") or {}).get("rendered_versions"))),
+                memory_guard=memory_guard,
             )
         return forward_payload, injected_ids
 
@@ -12289,27 +12284,42 @@ class GatewayService:
         )
         return await self._summarize_buckets(core_buckets, self.core_budget)
 
-    def _build_portrait_memory_block(self, all_buckets: list[dict]) -> tuple[str, dict[str, Any]]:
+    async def _chat_portrait_input(self, plan: dict | None):
         debug = self._portrait_memory_debug_base()
-        debug["skip_reason"] = "retired_use_breath_handoff"
-        return "", debug
+        if not plan or plan.get("fallback_legacy") or plan.get("scope") not in {"talk.initial", "talk.continuation"}:
+            return "", debug, None
+        gateway_slice = plan.get("gateway_slice") or {}
+        chain = self._prompt_scope_chain(gateway_slice, plan["scope"])
+        blocks = [b for b in gateway_slice.get("blocks") or []
+                  if isinstance(b, dict) and b.get("source_id") == "ombre.portrait_memory" and b.get("scope") in chain
+                  and b.get("enabled", True) and b.get("mode") != "off"]
+        if not blocks:
+            return "", debug, None
+        modes = [(b.get("block_id"), b.get("mode") or "live_source") for b in blocks]
+        if not any(mode in {"live_source", "frozen_snapshot"} for _, mode in modes):
+            return "", {**debug, "skip_reason": "owner_override"}, modes
+        enabled = self._bool_config_value((self.config.get("portrait") or {}).get("enabled"), True)
+        if not enabled:
+            return "", {**debug, "skip_reason": "portrait_disabled"}, modes
+        projection = await asyncio.to_thread(self.user_portrait.read)
+        text = projection["text"]
+        revision = projection["revision"]
+        status = projection["status"]
+        debug.update(enabled=True, skip_reason="" if text else status, status=status,
+                     generated_portrait_version=revision, claim_count=projection["claim_count"])
+        # A retry or a tool continuation may reuse a fully prepared request.
+        # Check this evidence again before replaying even a formerly empty block.
+        guard = (modes, revision, status, hashlib.sha256(text.encode("utf-8")).hexdigest())
+        return text, debug, guard
 
-    def _portrait_memory_debug_base(self) -> dict[str, Any]:
-        return {
-            "enabled": False,
-            "configured_enabled": bool(
-                getattr(self, "portrait_memory_configured_enabled", False)
-            ),
-            "retired": True,
-            "cache_hit": False,
-            "skip_reason": "",
-            "source_count": 0,
-            "source_ids": [],
-            "source_roles": [],
-            "source_hash": "",
-            "token_estimate": 0,
-            "generated_portrait_version": "",
-        }
+    async def _portrait_snapshot_current(self, entry: dict, plan: dict | None) -> bool:
+        _, _, current = await self._chat_portrait_input(plan)
+        return (entry.get("memory_guard") or {}).get("user_portrait") == current
+
+    @staticmethod
+    def _portrait_memory_debug_base() -> dict[str, Any]:
+        return {"enabled": False, "scope": "user", "skip_reason": "not_selected",
+                "claim_count": 0, "generated_portrait_version": None}
 
     async def _build_recent_context_block(
         self,
@@ -24898,7 +24908,7 @@ class GatewayService:
                         start, start + len(content)))
 
             add_stable_section("Core Memory", core_memory)
-            add_stable_section("Portrait Memory", portrait_memory)
+            add_stable_section("顾衍对我的了解", portrait_memory)
 
         dynamic_sections = []
         if has_dynamic_context:
@@ -25372,7 +25382,7 @@ class GatewayService:
         }
         sources = {
             "ombre.core_memory": ("Core Memory", core_memory),
-            "ombre.portrait_memory": ("Portrait Memory", portrait_memory),
+            "ombre.portrait_memory": ("顾衍对我的了解", portrait_memory),
             "ombre.just_now_context": ("Just Now Chat Context", just_now_context),
             "ombre.date_recall": ("Date Recall", date_recall),
             "ombre.context_mode": ("Context Mode", (
@@ -25465,6 +25475,8 @@ class GatewayService:
                 body = str(block.get("owner_body") or "")
             elif mode == "frozen_snapshot":
                 body = str(block.get("frozen_body") or "")
+                if source_id == "ombre.portrait_memory" and body.strip() != live_body.strip():
+                    continue  # A withdrawn or superseded automatic claim cannot be replayed.
             elif spec is not None:
                 body = str(live_body or "")
             else:
