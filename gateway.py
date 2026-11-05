@@ -28970,9 +28970,26 @@ def create_gateway_app(
     return app
 
 
+def enable_stack_diagnostics() -> bool:
+    """A local operator can capture stalled Python stacks without the HTTP loop."""
+    import faulthandler
+    import signal
+
+    signum = getattr(signal, "SIGUSR2", None)
+    if signum is None or signal.getsignal(signum) != signal.SIG_DFL:
+        return False
+    # faulthandler runs in a native signal handler. It emits file, line and
+    # function only, without request bodies, locals or environment values.
+    faulthandler.register(signum, all_threads=True, chain=False)
+    return True
+
+
 def main() -> None:
+    stack_diagnostics = enable_stack_diagnostics()
     config = load_config()
     setup_logging(config.get("log_level", "INFO"))
+    if stack_diagnostics:
+        logger.info("Gateway local stack capture ready on SIGUSR2")
     gateway_cfg = config.get("gateway", {})
     app = create_gateway_app(config=config)
     host = gateway_cfg.get("host", "0.0.0.0")
