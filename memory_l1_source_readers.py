@@ -94,6 +94,8 @@ class CanonicalMemorySourceReader:
         if not options.get('enabled') or not token or not options.get('base_url'):
             return {'state': 'unavailable', 'reason': 'canonical_source_reader_unconfigured'}
         if locator['conversation_id'] != options.get('conversation_id', 'conv-jiajia-main'):
+            if hasattr(self, 'owner_summary_reader'):
+                return await self.owner_summary_reader.read(binding)
             return {'state': 'unavailable', 'reason': 'source_outside_bound_conversation'}
         # The binding stores a digest identity. Upstream exact version is read
         # from its retained authenticated snapshot, supplied by the factory.
@@ -268,6 +270,9 @@ class AizAttachmentTextSourceReader(CanonicalMemorySourceReader):
 
     async def read(self, binding):
         from memory_attachment_source import snapshot
+        if (json.loads(binding['source_id']).get('conversation_id') != self.options.get('conversation_id', 'conv-jiajia-main')
+                and hasattr(self, 'owner_summary_reader')):
+            return await self.owner_summary_reader.read(binding)
         source = await self.capture_source(binding)
         return snapshot(source) if source.get('namespace') == 'attachment_text' else source
 
@@ -280,6 +285,9 @@ def configured_source_readers(config, authority=None):
     from memory_self_review_source import AizReviewSourceReader
     reviews = [AizReviewSourceReader(config, kind) for kind in ('daily_review', 'reply_feedback')]
     if authority:
+        from memory_owner_summary import OwnerSummarySourceReader
+        owner_summary_reader = OwnerSummarySourceReader(config, authority)
+        canonical.owner_summary_reader = owner_summary_reader
         from memory_owner_l2_source import OwnerL2EditSourceReader
         readers.append(OwnerL2EditSourceReader(authority))
         from memory_l0_sources import MemoryL0Sources
@@ -295,7 +303,10 @@ def configured_source_readers(config, authority=None):
     readers.append(canonical)
     readers.extend(browse)
     readers.extend(reviews)
-    readers.append(AizAttachmentTextSourceReader(config))
+    attachments = AizAttachmentTextSourceReader(config)
+    if authority:
+        attachments.owner_summary_reader = owner_summary_reader
+    readers.append(attachments)
     from memory_daily_attachments import AdoptedAttachmentReader
     readers.append(AdoptedAttachmentReader(config))
     readers.extend(AizDiarySourceReader(config, kind) for kind in ('private', 'digest'))

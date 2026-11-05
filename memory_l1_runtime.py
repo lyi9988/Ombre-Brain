@@ -322,6 +322,10 @@ class MemoryL1Runtime:
         service = self._memory_l1_revisions(bucket_mgr)
         candidate_id = row['candidate_id']
         if row['status'] == 'committed': return {'id': candidate_id, 'status': 'exists'}
+        if row['status'] == 'linked' and row['proposal'].get('source_type') == 'owner_summary':
+            from memory_summary_coverage import summary_link_receipt
+            return {'id': candidate_id, 'status': 'linked',
+                    'linked_memories': summary_link_receipt(self.memory_authority_store, candidate_id)}
         if edit:
             row = save_owner_candidate(self.memory_authority_store, candidate_id, edit=edit,
                 expected_revision=row['revision'], request_id=request_id + ':edit', revision_service=service)
@@ -366,10 +370,30 @@ class MemoryL1Runtime:
             # source, not all. Unused window context cannot block adoption.
             check_evidence(semantic['statements'], 'statements')
             check_evidence(semantic['attributes'], 'attributes')
+        if not prior_commit and proposal.get('source_type') == 'owner_summary':
+            from memory_owner_summary import OwnerSummaryPreparation, OwnerSummarySourceReader, task_id
+            from memory_summary_coverage import check_summary_coverage
+            operation = (proposal.get('metadata', {}).get('owner_summary') or {}).get('operation_id')
+            task = OwnerSummaryPreparation(self.memory_authority_store).get(task_id(operation))
+            if not task:
+                raise L1OwnerError('owner_summary_operation_missing', status=409, field_path='operation_id')
+            await OwnerSummarySourceReader(self.config, self.memory_authority_store).sources(task['envelope'])
+            coverage = check_summary_coverage(self.memory_authority_store, proposal)
+            if coverage['status'] == 'linked':
+                link = self.memory_authority_store.decide_candidate(
+                    candidate_id, action='link', expected_revision=row['revision'], request_id=request_id + ':link',
+                    actor='owner' if owner else 'owner_summary', reason_codes=['EXISTING_SOURCE_FACTS'])
+                return {'id': candidate_id, 'status': 'linked', 'linked_memories': link['linked_memories']}
+            if coverage['covered_statement_ids']:
+                raise L1OwnerError('summary_contains_already_adopted_statements', status=409, field_path='document.statements')
+            if coverage['status'] == 'overlap_review' and not owner:
+                raise L1OwnerError('summary_source_overlap_requires_review', status=409, field_path='document.statements')
         if wants_accept:
             row = self.memory_authority_store.decide_candidate(candidate_id, action='accept', expected_revision=row['revision'],
                 request_id=request_id + ':accept', actor='owner', reason_codes=['OWNER_ACCEPTED'])
         metadata = copy.deepcopy(proposal['metadata'])
+        if not prior_commit and proposal.get('source_type') == 'owner_summary':
+            metadata['owner_summary_coverage'] = coverage
         if source_observations is not None: metadata['source_observations_at_adoption'] = source_observations
         metadata.pop('legacy_candidate', None)
         legacy = proposal['metadata'].get('legacy_candidate') or {}

@@ -127,9 +127,10 @@ class MemoryL1SourceTasks:
             raise L1OwnerError('invalid_task_page_limit', field_path='limit')
         from memory_chat_preparation import PREFIX as CHAT_PREFIX, ChatMemoryPreparation
         from memory_browse_preparation import PREFIX as BROWSE_PREFIX, BrowseMemoryPreparation
+        from memory_owner_summary import PREFIX as SUMMARY_PREFIX, OwnerSummaryPreparation
         action_prefix = PREFIX + 'action_source_'
-        where = '((key>=? AND key<?) OR (key>=? AND key<?) OR (key>=? AND key<?))'
-        params = (action_prefix, action_prefix + '\uffff', CHAT_PREFIX, CHAT_PREFIX + '\uffff', BROWSE_PREFIX, BROWSE_PREFIX + '\uffff')
+        where = '((key>=? AND key<?) OR (key>=? AND key<?) OR (key>=? AND key<?) OR (key>=? AND key<?))'
+        params = (action_prefix, action_prefix + '\uffff', CHAT_PREFIX, CHAT_PREFIX + '\uffff', BROWSE_PREFIX, BROWSE_PREFIX + '\uffff', SUMMARY_PREFIX, SUMMARY_PREFIX + '\uffff')
         db = self.authority._connect()
         try:
             total = db.execute('SELECT count(*) FROM authority_meta WHERE ' + where, params).fetchone()[0]
@@ -138,6 +139,7 @@ class MemoryL1SourceTasks:
                 (*params, limit, offset)).fetchall()
             values = [ChatMemoryPreparation.public(json.loads(row['value'])) if row['key'].startswith(CHAT_PREFIX)
                       else BrowseMemoryPreparation.public(json.loads(row['value'])) if row['key'].startswith(BROWSE_PREFIX)
+                      else OwnerSummaryPreparation.public(json.loads(row['value'])) if row['key'].startswith(SUMMARY_PREFIX)
                       else json.loads(row['value']) for row in rows]
         finally:
             db.close()

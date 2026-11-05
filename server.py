@@ -12627,6 +12627,13 @@ async def api_chat_memory_tool(request):
         return JSONResponse({"error": "execution_outcome_unknown"}, status_code=503, headers=headers)
 
 
+@mcp.custom_route('/api/memory-authority/owner-summary', methods=['POST'])
+@mcp.custom_route('/api/memory-authority/owner-summary/{operation_id}', methods=['GET'])
+async def api_owner_summary_memory(request):
+    from memory_owner_summary import owner_summary_response
+    return await owner_summary_response(request, reflection_engine, memory_authority_store)
+
+
 async def _chat_memory_preparation_loop():
     """Consume durable submissions, including those queued before a restart."""
     from memory_browse_preparation import prepare_memory_tasks
@@ -12883,9 +12890,14 @@ async def api_memory_l1_source_tasks(request):
         from memory_browse_preparation import BrowseMemoryPreparation
         browse_tasks = BrowseMemoryPreparation(memory_authority_store)
         is_browse = bool(task_id and browse_tasks.get(str(task_id)))
+        from memory_owner_summary import OwnerSummaryPreparation
+        summary_tasks = OwnerSummaryPreparation(memory_authority_store, reflection_engine)
+        is_summary = bool(task_id and summary_tasks.get(str(task_id)))
         if is_browse:
             chat_tasks = browse_tasks
-        if task_id and (str(task_id).startswith('chat_memory_') or is_browse) and not request.url.path.endswith('/retry'):
+        elif is_summary:
+            chat_tasks = summary_tasks
+        if task_id and (str(task_id).startswith('chat_memory_') or is_browse or is_summary) and not request.url.path.endswith('/retry'):
             # Draft bodies/edit are owner-only. The writer token can submit
             # its canonical envelope, not read/edit arbitrary owner drafts.
             if not _dashboard_authenticated(request):
@@ -12919,7 +12931,7 @@ async def api_memory_l1_source_tasks(request):
             # retries the source action or changes its completion status.
             if not isinstance(payload, dict) or set(payload) != {"expected_phase"} or payload["expected_phase"] not in {"failed", "generating"}:
                 raise L1OwnerError("invalid_source_task_retry", field_path="expected_phase")
-            if str(task_id).startswith('chat_memory_') or is_browse:
+            if str(task_id).startswith('chat_memory_') or is_browse or is_summary:
                 if not _dashboard_authenticated(request):
                     return _require_dashboard_auth(request)
                 current = chat_tasks.get(str(task_id))
@@ -12927,6 +12939,10 @@ async def api_memory_l1_source_tasks(request):
                     raise L1OwnerError('task_phase_changed', status=409, field_path='expected_phase')
                 if current['phase'] == 'generating' and current.get('lease_until', 0) > __import__('time').time():
                     raise L1OwnerError('memory_preparation_in_progress', status=409, field_path='task_id')
+                if is_summary:
+                    from memory_owner_summary import OwnerSummarySourceReader
+                    await OwnerSummarySourceReader(config, memory_authority_store).sources(current['envelope'])
+                    return JSONResponse(chat_tasks.retry(current['operation_id'], current['revision']), headers=headers)
                 def retry(row):
                     row.update(phase='queued', lease_until=0, claim_token=None, issue=None)
                     return row

@@ -816,6 +816,11 @@ class ReflectionEngine(MemoryL1Runtime):
             "status": status,
             "authority_revision": int(row.get("revision") or 1),
         })
+        if proposal.get("source_type") == "owner_summary":
+            # The reviewer sees which existing revision shares its sources.
+            # Keep prior text in its own record; the candidate owns only its draft.
+            candidate["owner_summary"] = True
+            candidate["owner_summary_coverage"] = metadata.get("owner_summary_coverage") or {}
         followup = metadata.get('l3_followup')
         if isinstance(followup, dict):
             from memory_l3_followup import FollowupTasks

@@ -700,7 +700,7 @@ class MemoryAuthorityStore:
     ) -> dict[str, Any]:
         target = {
             "accept": "accepted", "reject": "rejected", "defer": "deferred", "reopen": "pending",
-            "commit": "committed", "commit_failed": "commit_failed",
+            "commit": "committed", "commit_failed": "commit_failed", "link": "linked",
         }.get(
             str(action or "").strip().lower()
         )
@@ -730,6 +730,17 @@ class MemoryAuthorityStore:
             if int(current["revision"]) != int(expected_revision):
                 raise RevisionConflict(f"expected {expected_revision}, current {current['revision']}")
             allowed = self.CANDIDATE_TRANSITIONS.get(str(current["status"]), set())
+            linked = []
+            if target == "linked" and current["status"] != "linked":
+                if (current["proposal"].get("source_type") != "owner_summary"
+                        or current["status"] not in {"pending", "deferred", "accepted", "commit_failed"}):
+                    raise InvalidTransition("link_requires_owner_summary")
+                from memory_summary_coverage import check_summary_coverage
+                coverage = check_summary_coverage(self, current["proposal"], connection=conn)
+                if coverage["status"] != "linked":
+                    raise RevisionConflict("summary_coverage_changed")
+                linked = coverage["matches"]
+                allowed = allowed | {"linked"}
             if target not in allowed:
                 if target == current["status"]:
                     conn.commit()
@@ -747,6 +758,8 @@ class MemoryAuthorityStore:
                 "revision": next_revision,
                 "updated_at": now,
             }
+            if linked:
+                result["linked_memories"] = linked
             conn.execute(
                 "INSERT INTO candidate_revisions(candidate_id,revision,status,proposal_sha256,proposal_json,"
                 "policy_json,actor,created_at) VALUES(?,?,?,?,?,?,?,?)",

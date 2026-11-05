@@ -119,9 +119,11 @@ def owner_edit_payload(row, edit, *, revision_service=None, request_id=""):
     if not isinstance(edit, dict) or not edit or set(edit) - (FIELDS | L1_FIELDS):
         raise ValueError("invalid_owner_edit")
     payload = copy.deepcopy(row["proposal"])
-    if payload.get("source_type") not in {"daily_chat", "chat_tool", "diary", "action_receipt"}:
+    if payload.get("source_type") not in {"daily_chat", "chat_tool", "diary", "action_receipt", "owner_summary"}:
         raise ValueError("unsupported_candidate_source")
     has_l1 = isinstance((payload.get("metadata") or {}).get("memory_l1"), dict)
+    if payload.get("source_type") == "owner_summary" and not has_l1:
+        raise ValueError("l1_document_required")
     if has_l1:
         if "document" not in edit:
             raise ValueError("l1_document_required")

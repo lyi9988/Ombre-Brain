@@ -2223,6 +2223,19 @@
 
   function renderDailyChatMemoryCard(item) {
     var candidate = Object.assign({}, item.candidate || {});
+    var coverage = candidate.owner_summary_coverage || {};
+    var sameSources = (coverage.matches || []).map(function(match) {
+      return String(match.memory_id) + ' · v' + String(match.revision);
+    });
+    var summaryNote = '';
+    if (candidate.owner_summary) {
+      summaryNote = '<p>主人从会话摘要提交，事实依据为选中的原消息。</p>';
+      if (sameSources.length) summaryNote += '<details><summary>来自相同来源的已有记忆</summary><p>' +
+        esc(sameSources.join('、')) + '</p><p>' +
+        (coverage.covered_statement_ids?.length
+          ? '审核时保留新增事实和条件。已采用的陈述可在 L1 编辑器中从本稿移除。'
+          : '请核对这次新增的事实或条件。') + '</p></details>';
+    }
     var id = item.id || '';
     var followup = candidate.l3_followup;
     var modelIoId = modelIoMemoryId(followup && followup.memory_id || id);
@@ -2312,7 +2325,7 @@
         '<div class="chat-memory-source-panel" hidden>' +
           '<div class="chat-memory-source-loading">读取完整原文...</div>' +
         '</div>' +
-        preparationNote + '<div class="chat-memory-semantics">' + (l1Document ? renderL1ReviewDetails(item, l1Draft ? l1Draft.document : l1Document) : renderMemorySemantics(item, draft)) + '</div>' + staleNote + blockedNote + editNote +
+        summaryNote + preparationNote + '<div class="chat-memory-semantics">' + (l1Document ? renderL1ReviewDetails(item, l1Draft ? l1Draft.document : l1Document) : renderMemorySemantics(item, draft)) + '</div>' + staleNote + blockedNote + editNote +
         (draft ? '<p class="chat-memory-edit-needed">有未保存修改' + (item.draft_orphan || revision !== item.authority_revision ? '；服务器版本或状态已变化，请核对后再操作' : '') + '。</p>' : '') +
         '<div class="chat-memory-edit-panel"' + (draft && draft.expanded ? '' : ' hidden') + '>' +
           (l1Document ? renderL1EditPanel(item, l1Document, l1Draft) :
