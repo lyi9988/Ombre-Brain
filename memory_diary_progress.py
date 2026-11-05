@@ -8,6 +8,40 @@ import re
 from memory_authority import RevisionConflict
 
 
+def _provider_issue(body):
+    """Parse common nested gateway shapes. Only fixed technical phrases leave this function."""
+    pending = [body]
+    fragments = []
+    while pending and len(fragments) < 12:
+        node = pending.pop()
+        if isinstance(node, dict):
+            pending.extend(node[key] for key in ('error', 'detail', 'message', 'code', 'type') if key in node)
+        elif isinstance(node, str):
+            value = node[:1000].strip()
+            fragments.append(value.casefold())
+            if value.startswith('{'):
+                try:
+                    pending.append(json.loads(value))
+                except ValueError:
+                    pass
+    words = ' '.join(fragments)
+    for category, markers in (
+        ('content_filter', ('content exists risk', 'content_filter', 'content filter', 'content policy',
+                            'inappropriate content', 'data_inspection_failed', 'sensitive content',
+                            '内容安全', '敏感内容', '安全策略', '风险内容', '内容审核')),
+        ('context_length', ('context length', 'context_length_exceeded', 'maximum context', '上下文长度')),
+        ('response_format', ('response_format', 'json schema', 'json_schema', '结构化输出')),
+        ('provider_route', ('no deployments', 'no available deployment', 'model not found',
+                            'no available channel', '无可用渠道', '无可用模型')),
+        ('rate_limit', ('rate limit', 'rate_limit', 'too many requests', '请求频率')),
+        ('upstream_capacity', ('overloaded', 'server busy', 'temporarily unavailable', '服务繁忙')),
+        ('invalid_parameter', ('unsupported parameter', 'invalid parameter', 'max_tokens', '参数错误'))):
+        for marker in markers:
+            if marker in words:
+                return category, marker
+    return None, None
+
+
 def window_failure(exc, index):
     """Keep provider correlation and the failing field without storing the diary or provider body."""
     def identifier(value):
@@ -22,17 +56,14 @@ def window_failure(exc, index):
     upstream = body.get('error', body) if isinstance(body, dict) else {}
     if isinstance(upstream, dict) and identifier(upstream.get('type')):
         failure['provider_category'] = upstream['type']
-    # Gateways may echo source text or credentials in error.message. Retain
-    # actionable technical categories without copying that free-form message.
-    message = str(upstream.get('message') or '').lower() if isinstance(upstream, dict) else ''
-    for category, markers in (('context_length', ('context length', 'context_length_exceeded')),
-                              ('response_format', ('response_format', 'json schema', 'json_schema')),
-                              ('provider_route', ('no deployments', 'no available deployment', 'model not found')),
-                              ('rate_limit', ('rate limit', 'rate_limit')),
-                              ('content_filter', ('content policy', 'content_filter', 'content filter'))):
-        if any(marker in message for marker in markers):
-            failure['provider_category'] = category
-            break
+    if callable(getattr(response, 'json', None)) and type(status) is int and 400 <= status <= 599:
+        try:
+            body = response.json()
+        except (ValueError, RuntimeError):
+            pass
+    category, matched = _provider_issue(body)
+    if category:
+        failure.update(provider_category=category, provider_reason_marker=matched)
     for field, value in (('field_path', getattr(exc, 'field_path', None)),
                          ('provider_param', getattr(exc, 'param', None) or
                           (upstream.get('param') if isinstance(upstream, dict) else None)),

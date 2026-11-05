@@ -262,6 +262,22 @@ def test_native_sdk_wait_changes_only_diary_read_deadline(monkeypatch):
     assert captured['timeout'] == 180
 
 
+@pytest.mark.parametrize('body,expected', [
+    ({'detail': {'error': 'provider: Content Exists Risk; confidential source excerpt'}}, 'content_filter'),
+    ({'error': {'message': '{"detail":{"message":"no available channel"}}'}}, 'provider_route'),
+    ({'message': 'confidential source excerpt'}, None),
+])
+def test_provider_issue_uses_only_recognized_error_markers(body, expected):
+    import httpx
+    from openai import BadRequestError
+    from memory_diary_progress import window_failure
+    response = httpx.Response(400, json=body, request=httpx.Request('POST', 'https://model.invalid/v1/'))
+    exc = BadRequestError('upstream', response=response, body={'code': 'LITELLM_ERROR'})
+    result = window_failure(exc, 0)
+    assert result.get('provider_category') == expected
+    assert 'confidential' not in json.dumps(result)
+
+
 def test_cancelled_run_keeps_durable_unknown_intent(tmp_path):
     e,s,state,calls=fixture(tmp_path)
     async def cancelled(*a,**kw): calls.append('cancel'); raise asyncio.CancelledError()

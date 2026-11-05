@@ -12422,7 +12422,8 @@ async def api_diary_memory_retry(request):
     # Admin operations need the outcome and durable identity, never private source text.
     fields = ('status', 'reason', 'task_id', 'candidate_id', 'id', 'checkpoint_revision', 'code', 'field_path')
     diagnostic_fields = ('window', 'reason', 'code', 'field_path', 'http_status', 'provider_param',
-                         'provider_trace_id', 'upstream_request_id', 'provider_category', 'finish_reason')
+                         'provider_trace_id', 'upstream_request_id', 'provider_category',
+                         'provider_reason_marker', 'finish_reason')
     receipt = {'date': key, **{field: result[field] for field in fields if field in result}}
     if isinstance(result.get('issue'), dict):
         receipt['issue'] = {name: result['issue'][name] for name in diagnostic_fields if name in result['issue']}
