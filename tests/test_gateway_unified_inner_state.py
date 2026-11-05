@@ -136,6 +136,8 @@ class GatewayUnifiedContextTests(unittest.IsolatedAsyncioTestCase):
             del self.service.__dict__[name]
         self.requests, self.posts = [], []
         self.response = deepcopy(FIXTURE["bridge"])
+        self.response.update(context_schema='recent-materials-v1',
+            recent_context={'source_id': 'context.recent_materials', 'blocks': []})
         self.response_status = 200
         async def transport(request):
             self.requests.append(request)
@@ -203,6 +205,8 @@ class GatewayUnifiedContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.requests[0].headers["X-Guyan-Device-ID"], "fixture-device")
         self.assertEqual(self.requests[0].headers["Authorization"], "Bearer fixture-token")
         self.assertEqual(self.requests[0].url.query, b"")
+        self.assertEqual(self.requests[0].method, 'POST')
+        self.assertTrue(json.loads(self.requests[0].content)['messages'])
         self.assertEqual(self.last_signals, inner_state_snapshots(self.response["inner_state"]))
         for prohibited in ("B1_INNER_STATE", "Current Private Affect", "PRIVATE SOURCE BODY", "private-fixture-checkpoint", '"dimensions"'):
             self.assertNotIn(prohibited, self.body(result))
@@ -210,9 +214,7 @@ class GatewayUnifiedContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(required, self.body(result))
         self.assertEqual(self.legacy_calls, [])
 
-    async def test_actual_aiz_bridge_handler_output_is_adopted_by_gateway(self):
-        from core.canonical_bridge_api import CanonicalBridgeHandlers
-        from core.conversation_store import ConversationStore
+    def actual_aiz_snapshot(self):
         from core.inner_state import DIMENSIONS, make_host_snapshot, assemble_snapshot
         original = FIXTURE['bridge']['inner_state']
         hosts = [make_host_snapshot(owner=owner, subject_id=original['subject_id'],
@@ -222,26 +224,64 @@ class GatewayUnifiedContextTests(unittest.IsolatedAsyncioTestCase):
                     for key,spec in DIMENSIONS.items() if spec.owner==owner},
             rest=original.get('rest') if owner=='aiz' else None,
             feelings=original.get('feelings',[]) if owner=='brain' else []) for owner in ('aiz','brain')]
-        full = assemble_snapshot(*hosts, subject_id=original['subject_id'])
-        reads = []
-        loop = SimpleNamespace(get_inner_state_snapshot=lambda: (reads.append('read') or full))
+        return assemble_snapshot(*hosts, subject_id=original['subject_id'])
+
+    def connect_actual_aiz_bridge(self, full, *, reference=None):
+        from core.canonical_bridge_api import CanonicalBridgeHandlers
+        from core.conversation_store import ConversationStore
+        from core.emotion_behavior import EmotionBehaviorAdapter
+        from core.prompt_composer import PromptComposerStore
+        from core.prompt_compiler import PromptCompiler
+        reference = reference or datetime.fromisoformat(full['settled_at'])
+        reads, posted, actual_body = [], [], []
+        loop = SimpleNamespace(get_inner_state_snapshot=lambda: (reads.append('read') or full),
+            now=lambda: reference, agent_cfg={'loop_interval': 300},
+            emotion_behavior=EmotionBehaviorAdapter({'mode': 'apply', 'prompt': ''}),
+            prompt_compiler=PromptCompiler(PromptComposerStore(self.root/'actual-aiz-composer.sqlite')),
+            emotion_experience_reducer=None, memory=None)
         bridge = CanonicalBridgeHandlers(store=ConversationStore(self.root/'actual-aiz-canonical.sqlite'),
             identity_id='fixture-owner', conversation_id='fixture-conversation', device_id='fixture-device', agent_loop=loop)
-        actual_body = []
         async def transport(request):
             self.assertEqual(request.url.path, '/bridge/v1/inner-state')
-            response = await bridge.inner_state(SimpleNamespace(query={}))
+            self.assertEqual(request.method, 'POST')
+            posted.append(json.loads(request.content))
+            async def payload():
+                return json.loads(request.content)
+            response = await bridge.inner_state(SimpleNamespace(method=request.method, query={}, json=payload))
             body = json.loads(response.text)
             actual_body.append(body)
             return httpx.Response(response.status, json=body)
         client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
         self.addAsyncCleanup(client.aclose)
         self.service.canonical_adapter.http_client = client
+        return reads, posted, actual_body
+
+    async def test_actual_aiz_bridge_handler_output_is_adopted_by_gateway(self):
+        full = self.actual_aiz_snapshot()
+        reads, posted, actual_body = self.connect_actual_aiz_bridge(full)
         result = await self.prepare()
         self.assertEqual(reads, ['read'])
+        self.assertTrue(posted[0]['messages'])
+        self.assertEqual(actual_body[0]['context_schema'], 'recent-materials-v1')
+        self.assertTrue(actual_body[0]['expression']['text'])
         self.assertEqual(self.body(result).count(actual_body[0]['expression']['text']), 1)
         self.assertEqual(self.last_signals, inner_state_snapshots(full))
         self.assertEqual(self.legacy_calls, [])
+
+    async def test_stale_actual_aiz_bridge_remains_empty_even_without_messages(self):
+        full = self.actual_aiz_snapshot()
+        full.update(availability='stale', reason='newer_checkpoint_pending')
+        reference = datetime.fromisoformat(full['settled_at']) + timedelta(hours=93)
+        reads, posted, actual_body = self.connect_actual_aiz_bridge(full, reference=reference)
+        for messages in (None, []):
+            result = await self.service._read_unified_inner_state_for_context(
+                self.request(), 'jiajia-main', messages=messages)
+            self.assertEqual(result['diagnostics']['state'], 'read')
+            self.assertEqual(result['text'], '')
+            self.assertEqual(result['signals'], inner_state_snapshots(full))
+        self.assertEqual(reads, ['read', 'read'])
+        self.assertEqual(posted, [{'messages': []}, {'messages': []}])
+        self.assertTrue(all(body['expression']['text'] == '' for body in actual_body))
 
     async def test_marked_request_keeps_aiz_body_and_its_affinity_without_second_read(self):
         result = await self.prepare(marked=True, upstream_state=True)
@@ -290,14 +330,17 @@ class GatewayUnifiedContextTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("OWNER RELATIONSHIP RECORD", self.body(result))
 
     async def test_mismatched_or_unavailable_api_cannot_fall_back_to_brain_only_state(self):
-        for fault in ("conversation", "expression", "partial", "generation", "http"):
+        for fault in ("conversation", "expression", "partial", "generation", "context_schema", "http"):
             with self.subTest(fault=fault):
                 self.response = deepcopy(FIXTURE["bridge"])
+                self.response.update(context_schema='recent-materials-v1',
+                    recent_context={'source_id': 'context.recent_materials', 'blocks': []})
                 self.response_status = 503 if fault == "http" else 200
                 if fault == "conversation": self.response["conversation_id"] = "different"
                 if fault == "expression": self.response["expression"]["revision"]["brain"] += 1
                 if fault == "partial": self.response["inner_state"]["dimensions"].pop("energy")
                 if fault == "generation": self.response["generation"] = True
+                if fault == "context_schema": self.response.pop('context_schema')
                 result = await self.prepare()
                 self.assertNotIn(FIXTURE["bridge"]["expression"]["text"], self.body(result))
                 self.assertEqual(result[2]["inner_state"]["state"], "unavailable")

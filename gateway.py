@@ -9131,20 +9131,17 @@ class GatewayService:
             return result
         adapter = self.canonical_adapter
         try:
-            if messages is None:
-                response = await adapter.http_client.get(
-                    adapter.base_url + "/bridge/v1/inner-state", headers=adapter._headers())
-            else:
-                # The fixed authenticated bridge owns conversation and identity.
-                # Caller metadata cannot impersonate a source or a canonical event.
-                plain = [{'role': m['role'], 'content': m['content']} for m in messages
-                         if isinstance(m, dict) and m.get('role') in {'system', 'user', 'assistant', 'tool'}
-                         and isinstance(m.get('content'), str)]
-                response = await adapter.http_client.post(
-                    adapter.base_url + "/bridge/v1/inner-state", headers=adapter._headers(), json={'messages': plain})
+            # Chat always uses the Aiz adapter/Composer path, including an empty
+            # window. GET is the full display projection, not model context.
+            # Caller metadata cannot impersonate a canonical event or source.
+            plain = [{'role': m['role'], 'content': m['content']} for m in (messages or [])
+                     if isinstance(m, dict) and m.get('role') in {'system', 'user', 'assistant', 'tool'}
+                     and isinstance(m.get('content'), str)]
+            response = await adapter.http_client.post(
+                adapter.base_url + "/bridge/v1/inner-state", headers=adapter._headers(), json={'messages': plain})
             response.raise_for_status()
             body = response.json()
-            if messages is not None and body.get('context_schema') != 'recent-materials-v1':
+            if body.get('context_schema') != 'recent-materials-v1':
                 raise ValueError('recent_context_bridge_contract_mismatch')
             if (not isinstance(body, dict) or body.get("conversation_id") != adapter.conversation_id
                     or body.get("generation") is not False):
