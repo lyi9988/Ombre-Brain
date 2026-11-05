@@ -21,7 +21,7 @@ from test_memory_authority_r1 import reflection_config
 from test_memory_diary_l1_p2b import setup_diary
 
 
-def setup(tmp_path, monkeypatch, *, mode='review', count=1, body=None, draft=None, during=None):
+def setup(tmp_path, monkeypatch, *, mode='review', count=1, body=None, draft=None, during=None, image_only=False):
     env = setup_diary(tmp_path / 'memory', 'unrelated diary')
     config = reflection_config(tmp_path / 'engine', mode=mode)
     config['gateway'] = {'canonical_continuation': {'enabled':True, 'base_url':'http://aiz.test', 'conversation_id':'other-fixed-conversation'}}
@@ -37,6 +37,8 @@ def setup(tmp_path, monkeypatch, *, mode='review', count=1, body=None, draft=Non
         'body_sha256':hashlib.sha256(summary_body.encode()).hexdigest()}
     sources = [{'event_id':'event-' + str(i), 'version_id':'v-' + str(i), 'role':'user' if i % 2 == 0 else 'assistant',
         'text':body or '计划仍要等预约确认。' + str(i), 'created_at':'2026-11-01T00:00:00+00:00', 'seq':i} for i in range(count)]
+    if image_only:
+        sources[0].update(text='', attachment_refs=[{'resource_id':'fixture-image','mime':'image/png','text_status':'not_applicable'}])
     envelope = {'operation_id':'owner-summary.fixture', 'summary':summary,
         'context':{'conversation_id':'real-app-conversation', 'branch_id':'real-branch', 'profile_id':'real-profile', 'sources':sources}}
     current = NS(valid=True)
@@ -75,6 +77,13 @@ def setup(tmp_path, monkeypatch, *, mode='review', count=1, body=None, draft=Non
 
 def run(f):
     return asyncio.run(prepare_owner_summary_tasks(f.engine, f.env['buckets']))
+
+
+def test_image_only_without_text_is_a_real_reference_but_no_invented_long_term_memory(tmp_path, monkeypatch):
+    f = setup(tmp_path, monkeypatch, image_only=True)
+    receipt = run(f)['results'][0]
+    assert receipt['status'] == 'no_new_memory'
+    assert receipt['candidate_ids'] == [] and not f.calls
 
 
 def test_owner_selection_queues_then_original_review_and_commit_l2(tmp_path, monkeypatch):

@@ -51,7 +51,9 @@ def validate(envelope):
     seen = set()
     for source in context['sources']:
         if (not isinstance(source, dict) or set(source) - {'event_id', 'version_id', 'role', 'text', 'created_at', 'seq', 'text_sha256', 'attachment_refs'}
-                or any(not isinstance(source.get(k), str) or not source[k] for k in ('event_id', 'version_id', 'role', 'text', 'created_at'))
+                or any(not isinstance(source.get(k), str) or not source[k] for k in ('event_id', 'version_id', 'role', 'created_at'))
+                or not isinstance(source.get('text'), str)
+                or (not source['text'].strip() and not source.get('attachment_refs'))
                 or source['role'] not in ('user', 'assistant', 'tool') or source['event_id'] in seen
                 or source.get('text_sha256', hashlib.sha256(source['text'].encode()).hexdigest()) != hashlib.sha256(source['text'].encode()).hexdigest()):
             raise L1OwnerError('invalid_owner_summary_source', field_path='context.sources')
@@ -99,6 +101,10 @@ class OwnerSummarySourceReader:
                     or any((value.get('summary') or {}).get(k) != summary[k] for k in ('id', 'revision', 'body_sha256'))):
                 raise L1OwnerError('owner_summary_source_changed', status=409, field_path='sources')
             actual = {**expected, 'created_at': value.get('recorded_at') or expected['created_at']}
+            if not actual['text'].strip():
+                # Still checked its actual event/version above. Its readable
+                # attachment, if any, is supplied by the genuine reader below.
+                continue
             source = canonical_source(actual, conversation_id=context['conversation_id'], profile_id=context['profile_id'])
             source['attachment_refs'] = copy.deepcopy(expected.get('attachment_refs', []))
             sources.append(source)
@@ -352,6 +358,10 @@ async def prepare_owner_summary_tasks(engine, bucket_mgr, *, max_jobs=None):
                         and not any(w.get('output') for w in pending.get('windows') or [] if w['state'] != 'prepared')):
                     raise L1OwnerError('execution_outcome_unknown', field_path='generation')
                 sources = await reader.sources(claimed['envelope'])
+                if not sources:
+                    tasks.finish(claimed, phase='prepared', issue=None)
+                    results.append(tasks.receipt(claimed['task_id']))
+                    continue
                 reader.register(claimed['envelope'], sources)
                 for cid in claimed['candidate_ids']:
                     existing = engine.memory_authority_store.get_candidate(cid)
