@@ -448,7 +448,11 @@ class MemoryL1Runtime:
         sources = self._memory_l1_sources()
         captured = await sources.capture_diary(key, binding_id='diary-source')
         source, binding = captured['source'], captured['binding']
-        if binding is None: return {'status': 'not_prepared', 'reason': 'source_unavailable'}
+        if binding is None:
+            if (source.get('state') == 'not_found' and source.get('reason') == 'source_not_found'
+                    and source.get('http_status') == 404):
+                return {'status': 'skipped', 'reason': 'no_diary'}
+            return {'status': 'not_prepared', 'reason': 'source_unavailable'}
         service = self._memory_l1_revisions(bucket_mgr)
         catalog, catalog_revision = service.catalog_provider()
         # Freeze the vocabulary actually shown to this job; an owner hot edit

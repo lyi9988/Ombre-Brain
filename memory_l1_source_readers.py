@@ -170,6 +170,18 @@ class AizDiarySourceReader(CanonicalMemorySourceReader):
                 params={'kind': 'diary_' + self.kind, 'source_id': source_id, 'version': version},
                 headers={'Authorization': 'Bearer ' + token,
                          'X-Guyan-Device-ID': str(options.get('device_id') or 'ombre-gateway-operit')})
+            # Only this authenticated authority's explicit current-day absence
+            # is an empty diary. Missing routes, auth/service failures and a
+            # disappeared pinned revision remain read failures.
+            if response.status_code == 404 and version == 'current' and self.kind in {'private', 'digest'}:
+                try:
+                    envelope = response.json()
+                except ValueError:
+                    envelope = None
+                error = envelope.get('error') if isinstance(envelope, dict) else None
+                if isinstance(error, dict) and error.get('code') == 'source_not_found':
+                    return {'state': 'not_found', 'reason': 'source_not_found', 'http_status': 404,
+                            'source_namespace': self.namespace, 'source_id': source_id}
             response.raise_for_status()
             result = response.json().get('source', {})
         if result.get('source_namespace') != self.namespace or result.get('source_id') != source_id:
