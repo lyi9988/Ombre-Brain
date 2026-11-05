@@ -3369,6 +3369,13 @@ class GatewayService:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
             return auth_result
+        if self._runtime_scope_for_request(request) == "internal:autonomy_chain":
+            trace_id = str(request.headers.get("X-Guyan-Trace-Id") or "")
+            if re.fullmatch(r"trace-autonomy-[0-9a-f]{32}", trace_id):
+                # Ordinary provider tracing starts after prepare_payload.
+                # Keep the original planning request locatable even before that point.
+                request.scope["guyan_autonomy_ingress_trace"] = trace_id
+                logger.info("Autonomy model request | trace=%s phase=received", trace_id)
         try:
             self._maybe_reload_runtime_overlay()
             snapshot = self._memory_configuration_snapshot(apply=True)
@@ -3401,6 +3408,10 @@ class GatewayService:
         boundaries = {"received_at_unix_ms": boundary_clock["received_at_unix_ms"]}
         def mark_boundary(name):
             boundaries[name] = round((time.perf_counter() - boundary_clock["start"]) * 1000, 3)
+            trace_id = request.scope.get("guyan_autonomy_ingress_trace")
+            if trace_id and name in ("canonical_enter_ms", "prepare_enter_ms", "prepare_exit_ms"):
+                logger.info("Autonomy model request | trace=%s phase=%s elapsed_ms=%s",
+                            trace_id, name, boundaries[name])
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
             return auth_result

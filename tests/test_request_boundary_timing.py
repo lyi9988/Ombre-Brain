@@ -12,7 +12,7 @@ from gateway import GatewayService
 from model_request_trace import ModelRequestTraceStore
 
 
-def test_handler_offsets_and_retry_preparations_use_only_their_own_request(tmp_path, monkeypatch):
+def test_handler_offsets_and_retry_preparations_use_only_their_own_request(tmp_path, monkeypatch, caplog):
     class Clock:
         now = 10.0
         def perf_counter(self):
@@ -70,6 +70,18 @@ def test_handler_offsets_and_retry_preparations_use_only_their_own_request(tmp_p
                              "messages": [{"role": "user", "content": "PRIVATE_BODY_DO_NOT_OBSERVE"}]}
             response = await service.handle_chat(request)
             assert json.loads(response.body) == {"ok": True}
+        trace_id = "trace-autonomy-" + "a" * 32
+        planner = Request({"type": "http", "method": "POST", "path": "/v1/chat/completions",
+                           "headers": [(b"x-guyan-runtime-scope", b"internal:autonomy_chain"),
+                                       (b"x-guyan-trace-id", trace_id.encode())]})
+        planner._json = {"model": "fixture", "stream": True,
+                         "messages": [{"role": "user", "content": "PRIVATE_PLANNING_BODY"}]}
+        with caplog.at_level("INFO", logger=gateway.logger.name):
+            await service.handle_chat(planner)
+        phases = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Autonomy model request |")]
+        assert [line.split("phase=")[1].split()[0] for line in phases] == [
+            "received", "canonical_enter_ms", "prepare_enter_ms", "prepare_exit_ms"]
+        assert all(trace_id in line and "PRIVATE_PLANNING_BODY" not in line for line in phases)
     asyncio.run(run())
     trace = service.model_request_trace.get("same-trace", view="metadata")
     assert len(trace["preparations"]) == 2
