@@ -855,11 +855,13 @@ class ReflectionEngine(MemoryL1Runtime):
             if receipt:
                 preparation = {'preparation_key': receipt['key'],
                     'preparation_status': ('stale_source' if receipt.get('stale') else
+                        'candidate_kind_retry_ready' if receipt.get('kind_retry_ready') else
                         'requires_manual_retry' if receipt.get('issue') else
                         'waiting_budget' if candidate_id not in receipt['processed_ids'] and authority_status not in
                             ('rejected', 'deferred', 'committed') else 'processed'),
                     'preparation_counts': queue.counts(receipt),
-                    'preparation_issue': receipt.get('issue'), 'requires_manual_retry': bool(receipt.get('issue'))}
+                    'preparation_issue': receipt.get('issue'),
+                    'requires_manual_retry': receipt.get('requires_manual_retry', bool(receipt.get('issue')))}
                 candidate.update(preparation)
         return {
             "id": candidate_id,
@@ -1189,7 +1191,8 @@ class ReflectionEngine(MemoryL1Runtime):
                         and row.get("profile_id", profile_id) == profile_id):
                     latest_by_date.setdefault(date_key, row)
             automatic_reasons = {"window_budget_exhausted", "candidate_budget_exhausted", "source_batch_exhausted",
-                                 "candidate_budget_exhausted_prepared", "retained_candidates_need_processing"}
+                                 "candidate_budget_exhausted_prepared", "retained_candidates_need_processing",
+                                 "candidate_kind_retry_ready"}
             outstanding, unresolved = [], {}
             resume_problem = None
             for date_key, prior in sorted(latest_by_date.items()):
@@ -3977,7 +3980,7 @@ class ReflectionEngine(MemoryL1Runtime):
                     segmented, segment_meta = await extract_segments(self, key, window,
                         mode=mode, min_confidence=min_confidence, candidate_budget=remaining,
                         call_budget=self.daily_chat_memory_max_windows_per_run-window_budget_used,
-                        self_context=self_context, audit=audit)
+                        self_context=self_context, audit=audit, force=force)
                 except Exception as exc:
                     meta.update(partial=True, reason=getattr(exc, 'code', type(exc).__name__),
                                 failed_window_index=index+1)
@@ -4012,6 +4015,7 @@ class ReflectionEngine(MemoryL1Runtime):
                 preparation_key = None
                 receipt = None
                 replace_failure = False
+                retry_receipt = None
                 if preparation_queue:
                     source_fingerprint = hashlib.sha256(json.dumps(
                         {'date': key, 'profile': self.memory_semantic_profile_id, 'window': window},
@@ -4022,9 +4026,17 @@ class ReflectionEngine(MemoryL1Runtime):
                     preparation_queue.invalidate_scope(scope, preparation_key)
                     receipt = preparation_queue.get(preparation_key)
                     generation_fingerprint = self._daily_chat_memory_window_budget_key(key, window, 1)
-                    if receipt and receipt.get('issue') and (force or receipt.get('generation_fingerprint') != generation_fingerprint):
-                        replace_failure = True
-                        receipt = None
+                    category_retry = preparation_queue.claim_kind_retry(receipt) if client else False
+                    if client and receipt and receipt.get('kind_retry_ready') and not category_retry:
+                        meta.update(partial=True, reason='candidate_repair_already_dispatched', failed_window_index=index+1)
+                        break
+                    if receipt and receipt.get('issue') and (category_retry or force or receipt.get('generation_fingerprint') != generation_fingerprint):
+                        if not receipt.get('stale'):
+                            replace_failure = True
+                            retry_receipt, receipt = receipt, None
+                if retry_receipt and not client:
+                    meta.update(partial=True, reason='memory_model_unconfigured', failed_window_index=index+1)
+                    break
                 if receipt:
                     if receipt.get('stale'):
                         meta.update(partial=True, reason='source_preparation_stale', failed_window_index=index + 1)
@@ -4043,6 +4055,7 @@ class ReflectionEngine(MemoryL1Runtime):
                         max_candidates=remaining,
                         window_index=index + 1,
                         window_total=len(windows),
+                        **self._daily_l1_repair_args(preparation_queue, retry_receipt),
                     )
                 else:
                     # The legacy fallback shares the same full-window budget
@@ -4067,12 +4080,15 @@ class ReflectionEngine(MemoryL1Runtime):
                 if not receipt:
                     meta["model_candidate_count"] += len(window_candidates)
                 window_generated_count = len(window_candidates)
+                if retry_receipt and window_stats.get('prompt_disabled'):
+                    meta.update(partial=True, reason='prompt_disabled', failed_window_index=index+1)
+                    break
                 if window_stats.get("empty_output") or window_stats.get("parse_failure"):
                     # A provider failure is not an intentional empty candidate
                     # list. Retain this window's sources for recovery.
                     meta.update(partial=True, reason="empty_model_outputs" if window_stats.get("empty_output")
                                 else "window_parse_failure", failed_window_index=index + 1)
-                    if preparation_queue:
+                    if preparation_queue and not replace_failure:
                         preparation_queue.prepare(preparation_key, [], self.memory_ingestion_policy,
                             scope=scope, source_fingerprint=source_fingerprint, generated_count=window_generated_count,
                             generation_fingerprint=generation_fingerprint, replace_failure=replace_failure,
@@ -4116,6 +4132,7 @@ class ReflectionEngine(MemoryL1Runtime):
                                     'schema_error': window_stats.get('schema_error')} if invalid_count else
                                    {'code': 'first_pass_document_required', 'pending_count': incomplete_count}
                                    if incomplete_count else None),
+                            rejected_drafts=window_stats.get('rejected_drafts'),
                             replace_failure=replace_failure)
                         window_candidates = [self._authority_candidate_legacy_item(row)['candidate']
                             for row in preparation_queue.remaining(receipt)]
@@ -4140,8 +4157,9 @@ class ReflectionEngine(MemoryL1Runtime):
                     break
                 if receipt and receipt.get('issue'):
                     raw_candidates.extend(window_candidates)
-                    meta.update(partial=True, reason=receipt['issue']['code'], failed_window_index=index + 1,
-                        requires_manual_retry=True)
+                    meta.update(partial=True, reason=('candidate_kind_retry_ready' if receipt.get('kind_retry_ready')
+                        else receipt['issue']['code']), failed_window_index=index + 1,
+                        requires_manual_retry=receipt.get('requires_manual_retry', True))
                     if audit is not None: audit['preparation_issue'] = receipt['issue']
                     break
             except Exception as exc:
@@ -4150,7 +4168,9 @@ class ReflectionEngine(MemoryL1Runtime):
                 meta["window_failures"] = 1
                 meta["failed_window_index"] = index + 1
                 meta['reason'] = getattr(exc, 'code', 'window_extraction_failed')
-                if preparation_queue and preparation_key:
+                if replace_failure:
+                    meta['requires_manual_retry'] = True
+                if preparation_queue and preparation_key and not replace_failure:
                     try:
                         preparation_queue.prepare(preparation_key, [], self.memory_ingestion_policy,
                             scope=scope, source_fingerprint=source_fingerprint, generated_count=0,
@@ -4213,6 +4233,21 @@ class ReflectionEngine(MemoryL1Runtime):
                 return False
         return not has_user_statement
 
+    @staticmethod
+    def _daily_l1_repair_args(queue, receipt):
+        if not receipt or receipt['issue'].get('code') != 'invalid_l1_document':
+            return {}
+        count = receipt['issue'].get('rejected_count', 0)
+        drafts = queue.rejected_drafts(receipt)
+        if drafts and len(drafts) == count:
+            return {'candidate_repairs': drafts}
+        if count:
+            # Pre-upgrade receipts only know the count and validated siblings.
+            # Reconsult the same source revision and explicitly exclude those siblings.
+            return {'missing_candidates': {'missing_count': count,
+                    'already_retained_ids': receipt['candidate_ids']}}
+        return {}
+
     async def _extract_window_candidates(
         self,
         key: str,
@@ -4226,6 +4261,8 @@ class ReflectionEngine(MemoryL1Runtime):
         segment_context=None,
         saved_response=None,
         response_checkpoint=None,
+        candidate_repairs=None,
+        missing_candidates=None,
     ) -> tuple[list[dict], dict]:
         route = self._memory_task_route("auto_l1")
         client, model, use_daily_client = route["client"], route["model"], route["connection"] == "daily"
@@ -4255,12 +4292,14 @@ class ReflectionEngine(MemoryL1Runtime):
             prompt = self._daily_chat_memory_prompt(max_candidates=max_candidates)
         if not prompt.strip():
             return [], {"empty_output": False, "parse_failure": False, "prompt_disabled": True, "finish_reason": "disabled"}
-        if self.memory_authority_store:
+        if self.memory_authority_store and not candidate_repairs:
             sources = daily_sources(window, profile_id=self.memory_semantic_profile_id)
             related = self.memory_authority_store.find_candidates_by_sources([s["source_key"] for s in sources])
             remaining = 3000
             comparisons = []
             for row in related:
+                if row['status'] in ('rejected', 'deferred'):
+                    continue
                 body = str(row["proposal"].get("proposed_body") or "")
                 excerpt = body[:min(600, remaining)]
                 if not excerpt:
@@ -4271,6 +4310,12 @@ class ReflectionEngine(MemoryL1Runtime):
                 remaining -= len(excerpt)
             if comparisons:
                 payload["existing_source_memories"] = comparisons
+        if candidate_repairs:
+            payload['candidate_repairs'] = candidate_repairs
+        elif missing_candidates:
+            payload['recover_missing'] = {**missing_candidates,
+                'instruction': '仅从本窗口原消息找尚未保留且有据的回忆；勿重写已保留回忆。'
+                               '最多返回 missing_count 条；确实没有额外内容可返回空列表。'}
         if "l1_contract" in payload:
             # Keep sources in the middle and the output contract last, including
             # when comparison-only records have been added above.
@@ -4298,6 +4343,9 @@ class ReflectionEngine(MemoryL1Runtime):
             )
             if response_checkpoint is not None:
                 response_checkpoint(response)
+        if candidate_repairs:
+            from memory_l1_api import repaired_candidate_response
+            response = repaired_candidate_response(response, candidate_repairs)
         raw = self._completion_content(response)
         stats: dict = {
             "empty_output": not str(raw or "").strip(),
@@ -4309,7 +4357,14 @@ class ReflectionEngine(MemoryL1Runtime):
             raise L1OwnerError('first_pass_output_incomplete', field_path='generation')
         if l1_sources is not None:
             from memory_l1_api import validate_candidate_items
-            candidates, stats['schema_error'] = validate_candidate_items(response)
+            rejected = {}
+            candidates, stats['schema_error'] = validate_candidate_items(response, rejected_drafts=rejected,
+                    repair_slots=list(candidate_repairs or ()))
+            if rejected:
+                stats['rejected_drafts'] = rejected
+            if missing_candidates and len(candidates) > missing_candidates['missing_count']:
+                from memory_l1_service import L1OwnerError
+                raise L1OwnerError('candidate_repair_exceeds_missing_count', field_path='candidates')
         else:
             from memory_l1_api import validate_response
             validate_response(response)
@@ -4358,7 +4413,8 @@ class ReflectionEngine(MemoryL1Runtime):
                         item['source_event_ids'] = [str(event['id']) for turn in selected_turns
                             for event in turn.get('_semantic_sources', []) if str(event.get('id', '')).isdigit()
                             and raw_event_source(event, profile_id=self.memory_semantic_profile_id)['source_key'] in selected_keys]
-                    task_seed = {"date": key, "window": window_index, "candidate": index,
+                    original_index = int(list(candidate_repairs)[index][5:]) if candidate_repairs else index
+                    task_seed = {"date": key, "window": window_index, "candidate": original_index,
                         "prompt": prompt_context["prompt_revision"], "sources": [s["source_key"] for s in l1_sources]}
                     if segment_context is not None:
                         task_seed['segment'] = segment_context
@@ -5087,7 +5143,7 @@ class ReflectionEngine(MemoryL1Runtime):
                 content=content,
                 tags=candidate_tags,
             )
-            if not kind or kind == "love_letter":
+            if not kind:
                 record_hard("invalid_candidate_type")
                 continue
             title = str(candidate.get("title") or "").strip()
@@ -5616,7 +5672,7 @@ class ReflectionEngine(MemoryL1Runtime):
                 content=str(updated.get("content") or ""),
                 tags=tags,
             )
-            if kind and kind != "love_letter":
+            if kind:
                 updated["kind"] = kind
         if "domain" in edit:
             domain = self._daily_chat_memory_edit_string_list(edit.get("domain"), limit=4)

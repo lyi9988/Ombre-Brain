@@ -12383,6 +12383,34 @@ async def api_reflection_run(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@mcp.custom_route("/api/diary-memory/retry", methods=["POST"])
+async def api_diary_memory_retry(request):
+    """Retry one finished date through the same formal task and source as the scheduler."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+        key = body['date']
+        day = datetime.strptime(key, '%Y-%m-%d').date()
+    except (TypeError, ValueError, KeyError):
+        return JSONResponse({"error": "invalid_diary_date"}, status_code=400)
+    now = reflection_engine._local_now()
+    if key != day.isoformat() or day >= now.date():
+        return JSONResponse({"error": "completed_diary_date_required"}, status_code=400)
+    if not (reflection_engine.memory_authority_enabled and reflection_engine.memory_authority_store):
+        return JSONResponse({"error": "formal_memory_authority_unavailable"}, status_code=409)
+    result = await reflection_engine._maybe_extract_diary_memory("daily", key, now, {}, bucket_mgr)
+    # Admin operations need the outcome and durable identity, never private source text.
+    fields = ('status', 'reason', 'task_id', 'candidate_id', 'id', 'issue')
+    receipt = {'date': key, **{field: result[field] for field in fields if field in result}}
+    if result.get('failures'):
+        receipt['failures'] = [{name: failure[name] for name in ('window', 'code', 'reason') if name in failure}
+                               for failure in result['failures']]
+    return JSONResponse(receipt)
+
+
 @mcp.custom_route("/api/daily-chat-memory/run", methods=["POST"])
 async def api_daily_chat_memory_run(request):
     """Run daily Gateway chat memory extraction; review mode writes pending candidates only."""
@@ -12397,6 +12425,8 @@ async def api_daily_chat_memory_run(request):
     if not isinstance(body, dict):
         body = {}
     try:
+        retry_only = _bool_value(body.get("retry_failed_windows"), False)
+        force = _bool_value(body.get("force"), False)
         result = await reflection_engine.run_daily_chat_memory(
             bucket_mgr,
             conversation_turn_store=gateway_state_store,
@@ -12405,10 +12435,12 @@ async def api_daily_chat_memory_run(request):
             embedding_engine=embedding_engine,
             key=str(body.get("date") or ""),
             mode=str(body.get("mode") or ""),
-            force=_bool_value(body.get("force"), False) or _bool_value(body.get("retry_failed_windows"), False),
+            force=force or retry_only,
         )
+        if retry_only and not force:
+            result["daily_activity_summary"] = {"status": "skipped", "reason": "only_failed_memory_windows_requested"}
+            return JSONResponse(result)
         try:
-            activity_date = str(body.get("date") or result.get("date") or "")
             activity_result = await reflection_engine.run_daily_activity_summary(
                 conversation_turn_store=gateway_state_store,
                 raw_event_store=raw_event_store,

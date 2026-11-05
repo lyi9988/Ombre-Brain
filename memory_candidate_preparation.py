@@ -1,10 +1,11 @@
 """Durable preparation receipts referencing the existing Authority candidates.
 
-Only identifiers and counters live in authority_meta. All generated text,
-semantic documents, revisions and owner decisions stay in candidates.
+Public receipts hold identifiers, counts and safe diagnostics. Failed model
+drafts are isolated from candidates and recall until their full L1 validates.
 """
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
@@ -13,12 +14,29 @@ import uuid
 from memory_authority import CandidateNotFound, IdempotencyConflict
 
 PREFIX = 'memory_candidate_preparation:'
+RETRY_PREFIX = 'memory_l1_rejected_drafts:'
 
 
 class MemoryCandidatePreparation:
     def __init__(self, authority): self.authority = authority
 
     def get(self, key): return self.authority.get_meta(PREFIX + key)
+
+    def rejected_drafts(self, receipt):
+        if not receipt or receipt.get('stale') or not receipt.get('issue'):
+            return {}
+        return self.authority.get_meta(RETRY_PREFIX + receipt['key'], {}) or {}
+
+    def claim_kind_retry(self, receipt):
+        """An exact-source, category-only request may run once without an operator."""
+        if not receipt or not receipt.get('kind_retry_ready') or receipt.get('stale'):
+            return False
+        with closing(self.authority._connect()) as db, db:
+            claimed = db.execute("UPDATE authority_meta SET value=json_set(value, '$.kind_retry_ready', json('false'), "
+                "'$.kind_retry_attempted', json('true'), '$.requires_manual_retry', json('true')) WHERE key=? "
+                "AND json_extract(value,'$.kind_retry_ready')=1 AND json_extract(value,'$.stale')=0",
+                (PREFIX + receipt['key'],)).rowcount
+            return claimed == 1
 
     def _complete_unedited_l1_draft(self, db, row, proposal, policy):
         """A corrected first pass can complete its untouched preparation draft.
@@ -66,7 +84,7 @@ class MemoryCandidatePreparation:
         return True
 
     def prepare(self, key, proposals, policy, *, scope, source_fingerprint, generated_count=None,
-                issue=None, generation_fingerprint=None, replace_failure=False):
+                issue=None, generation_fingerprint=None, replace_failure=False, rejected_drafts=None):
         """Save every validated draft and its ID receipt in one transaction."""
         db = self.authority._connect()
         try:
@@ -107,15 +125,25 @@ class MemoryCandidatePreparation:
                     incomplete.append(cid)
             if incomplete and issue is None:
                 issue = {'code': 'first_pass_document_required', 'pending_candidate_ids': incomplete}
+            kind_retry_attempted = bool(receipt and receipt.get('kind_retry_attempted'))
+            kind_retry_ready = (bool(rejected_drafts) and bool(issue)
+                and len(rejected_drafts) == issue.get('rejected_count') and not kind_retry_attempted
+                and all(draft['kind_only'] for draft in rejected_drafts.values()))
             receipt = {'key': key, 'scope': scope, 'source_fingerprint': source_fingerprint,
                 'candidate_ids': unique_ids, 'processed_ids': [cid for cid in receipt['processed_ids']
                     if cid not in completed_drafts] if receipt else [], 'stale': False,
                 'generated_count': (receipt['generated_count'] if receipt else 0) + (len(proposals) if generated_count is None else generated_count),
                 'validated_count': len(unique_ids), 'issue': issue, 'generation_fingerprint': generation_fingerprint,
-                'requires_manual_retry': bool(issue),
+                'kind_retry_ready': kind_retry_ready, 'kind_retry_attempted': kind_retry_attempted,
+                'requires_manual_retry': bool(issue) and not kind_retry_ready,
                 'created_at': receipt['created_at'] if receipt else datetime.now(timezone.utc).isoformat(timespec='seconds')}
             db.execute('INSERT INTO authority_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                 (PREFIX + key, json.dumps(receipt, ensure_ascii=False, sort_keys=True)))
+            if not issue:
+                db.execute('DELETE FROM authority_meta WHERE key=?', (RETRY_PREFIX + key,))
+            elif rejected_drafts:
+                db.execute('INSERT INTO authority_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                    (RETRY_PREFIX + key, json.dumps(rejected_drafts, ensure_ascii=False, sort_keys=True)))
             db.commit()
             return receipt
         except Exception:
@@ -167,6 +195,7 @@ class MemoryCandidatePreparation:
                 receipt = json.loads(row['value'])
                 if receipt['key'] != current_key and not receipt.get('stale'):
                     receipt['stale'] = True
+                    db.execute('DELETE FROM authority_meta WHERE key=?', (RETRY_PREFIX + receipt['key'],))
                     db.execute('UPDATE authority_meta SET value=? WHERE key=?',
                         (json.dumps(receipt, ensure_ascii=False, sort_keys=True), row['key']))
             db.commit()

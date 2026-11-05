@@ -71,7 +71,7 @@ class ChatSegmentProgress:
 
 
 async def extract_segments(engine, day, window, *, mode, min_confidence,
-                           candidate_budget, call_budget, self_context, audit):
+                           candidate_budget, call_budget, self_context, audit, force=False):
     """Prepare once, then drain through the unchanged daily Authority writer."""
     from memory_candidate_preparation import MemoryCandidatePreparation
     from memory_source_provenance import daily_sources
@@ -115,16 +115,51 @@ async def extract_segments(engine, day, window, *, mode, min_confidence,
         output.extend(engine._authority_candidate_legacy_item(row)['candidate'] for row in rows[:remaining])
         return len(rows) > remaining
 
+    def prepare_candidates(candidates, stats, key, *, replace_failure=False):
+        local_audit = {}
+        normalized = engine._normalize_daily_chat_memory_candidates(day, candidates, window,
+            max_candidates=max(1, len(candidates)+1), min_confidence=min_confidence,
+            mode=mode, audit=local_audit)
+        invalid = local_audit.get('hard_rejects', {}).get('invalid_l1_document', 0)
+        issue = ({'code': 'invalid_l1_document', 'rejected_count': invalid,
+                  'schema_error': stats.get('schema_error')} if invalid else None)
+        return queue.prepare(key, [engine._daily_chat_memory_proposal(item, mode=mode) for item in normalized],
+            engine.memory_ingestion_policy, scope=scope, source_fingerprint=key,
+            generated_count=len(candidates), issue=issue, rejected_drafts=stats.get('rejected_drafts'),
+            replace_failure=replace_failure)
+
     # Old prepared proposals remain canonical, including owner revisions.
-    for key in state['receipts']:
+    for index, key in enumerate(state['receipts']):
         receipt = queue.get(key)
         if receipt is None:
             raise L1OwnerError('segment_receipt_missing', status=409)
+        if (force or receipt.get('kind_retry_ready')) and (receipt.get('issue') or {}).get('code') == 'invalid_l1_document':
+            if calls >= call_budget:
+                meta.update(reason='window_budget_exhausted', model_call_count=calls)
+                return output, meta
+            if receipt.get('kind_retry_ready') and not queue.claim_kind_retry(receipt):
+                meta.update(reason='candidate_repair_already_dispatched', requires_manual_retry=True,
+                            model_call_count=calls)
+                return output, meta
+            calls += 1
+            try:
+                candidates, stats = await engine._extract_window_candidates(day, window,
+                    self_context=self_context, max_candidates=prompt_limit, window_index=index+1,
+                    window_total=len(plan), segment_context={**plan[index], 'task_id': task_id},
+                    **engine._daily_l1_repair_args(queue, receipt))
+                if stats.get('empty_output') or stats.get('parse_failure') or stats.get('prompt_disabled'):
+                    raise L1OwnerError('segment_invalid_response', field_path='generation')
+                receipt = prepare_candidates(candidates, stats, key, replace_failure=True)
+            except Exception as exc:
+                meta.update(reason=getattr(exc, 'code', type(exc).__name__), requires_manual_retry=True,
+                            model_call_count=calls)
+                return output, meta
         if collect(receipt):
             meta['reason'] = 'candidate_budget_exhausted_prepared'
             return output, meta
         if receipt.get('issue'):
-            meta.update(reason=receipt['issue']['code'], requires_manual_retry=True)
+            meta.update(reason=('candidate_kind_retry_ready' if receipt.get('kind_retry_ready') else receipt['issue']['code']),
+                        requires_manual_retry=receipt.get('requires_manual_retry', True))
             return output, meta
     while state['cursor'] < len(plan):
         if state['phase'] == 'dispatched':
@@ -162,16 +197,7 @@ async def extract_segments(engine, day, window, *, mode, min_confidence,
                     raise L1OwnerError('prompt_disabled', field_path='generation')
                 if stats.get('empty_output') or stats.get('parse_failure'):
                     raise L1OwnerError('segment_invalid_response', field_path='generation')
-                local_audit = {}
-                normalized = engine._normalize_daily_chat_memory_candidates(day, candidates, window,
-                    max_candidates=max(1, len(candidates)+1), min_confidence=min_confidence,
-                    mode=mode, audit=local_audit)
-                invalid = local_audit.get('hard_rejects', {}).get('invalid_l1_document', 0)
-                issue = {'code': 'invalid_l1_document', 'rejected_count': invalid} if invalid else None
-                receipt = queue.prepare(preparation_key,
-                    [engine._daily_chat_memory_proposal(item, mode=mode) for item in normalized],
-                    engine.memory_ingestion_policy, scope=scope, source_fingerprint=preparation_key,
-                    generated_count=len(candidates), issue=issue)
+                receipt = prepare_candidates(candidates, stats, preparation_key)
             except Exception as exc:
                 meta.update(reason=('model_outcome_unknown_requires_retry_decision'
                     if state['phase'] == 'dispatched' else getattr(exc, 'code', type(exc).__name__)),
@@ -184,7 +210,8 @@ async def extract_segments(engine, day, window, *, mode, min_confidence,
             meta['reason'] = 'candidate_budget_exhausted_prepared'
             break
         if receipt.get('issue'):
-            meta.update(reason=receipt['issue']['code'], requires_manual_retry=True)
+            meta.update(reason=('candidate_kind_retry_ready' if receipt.get('kind_retry_ready') else receipt['issue']['code']),
+                        requires_manual_retry=receipt.get('requires_manual_retry', True))
             break
     else:
         if state['phase'] != 'complete':

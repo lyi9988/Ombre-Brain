@@ -16,6 +16,23 @@ from memory_l1_contract import canonical_json, semantic_sha256
 from memory_l1_service import L1OwnerError
 
 
+def _same_l2_dependencies(saved, current, *, owner_prose=False):
+    """Pre-relation L2s can match only the verified, unchanged initial relation state."""
+    if not isinstance(saved, dict) or not isinstance(current, dict):
+        return False
+    if owner_prose:
+        # A writing prompt/model change does not invalidate the owner's wording.
+        writing = {'prompt_revision', 'model_route_revision'}
+        saved = {key: value for key, value in saved.items() if key not in writing}
+        current = {key: value for key, value in current.items() if key not in writing}
+    if 'relation_dependencies' not in saved and 'relation_dependencies' in current:
+        empty = {'generation': 0, 'relations': [], 'guards': [],
+                 'l1_sync_required': False, 'sync_scope': None}
+        if current['relation_dependencies'] == {**empty, 'token': semantic_sha256(empty)}:
+            current = {key: value for key, value in current.items() if key != 'relation_dependencies'}
+    return saved == current
+
+
 def initialize(conn):
     for sql in (
         """CREATE TABLE IF NOT EXISTS memory_l2_heads (
@@ -281,14 +298,8 @@ class MemoryL2Store:
 
     @staticmethod
     def dependencies_match(product, dependency):
-        saved = product['dependency_versions']
-        if product['actor'] == 'owner' and product['publication'] == 'active':
-            # A writing prompt/model change does not invalidate owner prose.
-            # All fact, source-scope, catalog and schema dependencies still apply.
-            writing = {'prompt_revision', 'model_route_revision'}
-            return ({k:v for k,v in saved.items() if k not in writing}
-                    == {k:v for k,v in dependency.items() if k not in writing})
-        return saved == dependency
+        return _same_l2_dependencies(product['dependency_versions'], dependency,
+                owner_prose=product['actor'] == 'owner' and product['publication'] == 'active')
 
     def enqueue(self, memory_id, dependency, request_id):
         conn = self.authority._connect()
@@ -345,12 +356,15 @@ class MemoryL2Store:
                             (job['memory_id'], time.time())).fetchone(): return None
             head = conn.execute('SELECT * FROM memory_l2_heads WHERE memory_id=?', (job['memory_id'],)).fetchone()
             completed = conn.execute('SELECT dependency_json,created_at FROM memory_l2_revisions WHERE memory_id=? ORDER BY presentation_revision DESC LIMIT 1', (job['memory_id'],)).fetchone()
-            if completed and json.loads(completed['dependency_json']) == dependency and completed['created_at'] >= job['created_at']:
+            if (completed and completed['created_at'] >= job['created_at']
+                    and _same_l2_dependencies(json.loads(completed['dependency_json']), dependency)):
                 conn.execute("UPDATE memory_l2_jobs SET state='ready',reason='already_current',updated_at=? WHERE task_id=?", (time.time(), task_id))
                 conn.commit(); return None
             ready = conn.execute('SELECT dependency_json,sync_state FROM memory_l2_revisions WHERE memory_id=? AND presentation_revision=?',
                                  (job['memory_id'], head['presentation_revision'])).fetchone()
-            if ready and json.loads(ready['dependency_json']) == dependency and ready['sync_state'] != 'pending_l1' and (job['reason'] != 'owner_requested' or head['presentation_revision'] != job['base_presentation_revision']):
+            if (ready and ready['sync_state'] != 'pending_l1'
+                    and (job['reason'] != 'owner_requested' or head['presentation_revision'] != job['base_presentation_revision'])
+                    and _same_l2_dependencies(json.loads(ready['dependency_json']), dependency)):
                 conn.execute("UPDATE memory_l2_jobs SET state='ready',reason='already_current',updated_at=? WHERE task_id=?", (time.time(), task_id))
                 conn.commit(); return None
             if (job['first_pass_revision'] != dependency['first_pass_revision'] or not dependency.get('l1_content_sha256')

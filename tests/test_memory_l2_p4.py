@@ -96,6 +96,45 @@ def test_owner_edit_is_versioned_idempotent_and_never_overwritten(tmp_path):
         run(service.save('m1', {**payload, 'request_id':'stale-other'}))
 
 
+@pytest.mark.parametrize('owner_edited', [False, True])
+def test_l2_from_before_relation_tracking_reuses_the_saved_head(tmp_path, owner_edited):
+    from contextlib import closing
+    from memory_l2_store import enqueue_in_transaction
+
+    service, authority, calls = setup(tmp_path)
+    run(service.run_once(1))
+    if owner_edited:
+        edit = owner_payload(service)
+        edit['document']['full_injection_text'] = '那一次的经过，我希望这样记下来。'
+        run(service.save('m1', edit))
+    head = service.detail('m1')['l2']['presentation']
+    expected_text = head['document']['full_injection_text']
+    with closing(authority._connect()) as db, db:
+        # This fixture was seeded with today's writer. A real pre-tracking
+        # memory has neither its relation-generation row nor the L2 field.
+        db.execute("DELETE FROM memory_relation_generations WHERE memory_id='m1'")
+        db.execute("UPDATE memory_l2_revisions SET dependency_json=json_remove(dependency_json,"
+                   "'$.relation_dependencies') WHERE memory_id=? AND presentation_revision=?",
+                   ('m1', head['presentation_revision']))
+        enqueue_in_transaction(db, 'm1', head['first_pass_revision'], request_id='automatic-resume')
+    sid = run(service.revisions.detail('m1'))['l1']['document']['statements'][0]['statement_id']
+    item = {'memory_id': 'm1', 'revision': head['first_pass_revision'], 'statement_ids': [sid],
+            'allowed_uses': ['historical_evidence'], 'statement_uses': {sid: 'historical_evidence'},
+            'narrative_allowed': True}
+    assert run(service.resolve({'items': [item]}))['items'][0]['text'] == expected_text
+    run(service.run_once(1))
+    assert len(calls) == 1
+    current = service.detail('m1')['l2']
+    assert current['state'] == 'ready'
+    assert current['current_presentation_revision'] == head['presentation_revision']
+    assert 'relation_dependencies' not in current['presentation']['dependency_versions']
+    # Even a relationship that was later withdrawn leaves a nonzero generation.
+    with closing(authority._connect()) as db, db:
+        db.execute("INSERT INTO memory_relation_generations VALUES('m1',1,'fixture-relation-change')")
+    stale = run(service.resolve({'items': [item]}))['items'][0]
+    assert stale['state'] == 'stale' and not stale['text']
+
+
 def test_fact_edit_saved_as_l3_pending_sync_then_confirmed_after_l1_revision(tmp_path):
     service, _, _ = setup(tmp_path)
     run(service.run_once(1))

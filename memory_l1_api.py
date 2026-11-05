@@ -1,11 +1,21 @@
 """Native API output contracts derived from the complete, editable L1 schema."""
 from copy import deepcopy
+import re
 
 from memory_l1_catalog_schema import model_document_schema
 
 
 AUTO_KINDS = ('key_event', 'stable_preference', 'boundary', 'signal',
               'commitment', 'project_state', 'relationship_anchor', 'self_insight', 'love_letter')
+
+POLICY_KIND_GUIDE = (
+    '整份回忆的 kind 回答“为什么留下它”。key_event=具体经历，stable_preference=持续偏好，'
+    'boundary=边界，signal=约定信号，commitment=承诺，project_state=事项进展，'
+    'relationship_anchor=关系中的重要经历，self_insight=对自己的理解，love_letter=有原文依据的情书锚点。'
+    '每条 statement.classification.kind 描述那一句的性质。'
+    '例如“以后都喜欢这个装订方式”可用 stable_preference，里面的陈述可用 preference；'
+    '一次出游可用 key_event，里面可有 experience 或 fact。亲密表达照实保留，写过、收到或送达分别以来源为准。'
+)
 
 
 def ref(name):
@@ -117,7 +127,7 @@ def build_schema(source_ids, catalog, *, stage="auto_l1", narrative_from_draft=F
     defs['Document'] = document
     defs['Candidate'] = obj({
         'kind': {'type': 'string', 'enum': list(AUTO_KINDS),
-                 'description': 'Automatic ingestion policy only, separate from statement classification.'},
+                 'description': POLICY_KIND_GUIDE},
         'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
         'source_refs': ref('EvidenceRefs'), 'reason': {'type': 'string'},
         'document': ref('Document'),
@@ -173,6 +183,19 @@ def prepare_request(messages, *, stage):
         '没有可靠精确范围时省略source_ranges，保留有据的source_refs；不得猜测范围。'
         'conditions.state=known仅表示条件内容明确，不表示已满足。联合条件挂在它约束的计划或承诺上，'
         '不可拆成已经成立的事实；结合原文前后段的未知、否定和更正，逐条核对statements，不只核对正文。')
+    if stage == 'auto_l1':
+        envelope['semantic_contract']['output_rules'] += POLICY_KIND_GUIDE
+        if 'candidate_repairs' in payload:
+            # Each key belongs to one rejected item, including when two items
+            # use the same original message. No slot exists for a valid sibling.
+            repairs = payload['candidate_repairs']
+            slots = {key: ({'type': 'string', 'enum': list(AUTO_KINDS)}
+                           if item['kind_only'] else ref('Candidate')) for key, item in repairs.items()}
+            schema = {'$schema': schema['$schema'], '$defs': schema['$defs'], **obj(slots, slots)}
+            envelope['semantic_contract']['response_format'] = {
+                'root': {key: '入库类别字符串' if item['kind_only'] else '一份修正后的完整Candidate'
+                         for key, item in repairs.items()},
+                'rules': '这是对上次失败草稿的定点修正。按上面每个键各返回一个值；参照原消息，不新增回忆。'}
     result[-1]['content'] = json.dumps(payload, ensure_ascii=False)
     return result, schema
 
@@ -257,7 +280,7 @@ def validate_response(response):
                            field_path='.'.join(map(str, error.absolute_path)) or 'document')
 
 
-def validate_candidate_items(response):
+def validate_candidate_items(response, *, rejected_drafts=None, repair_slots=()):
     """Retain individually valid drafts without claiming the batch was valid.
 
     The root and every retained Candidate use the unchanged native schema.
@@ -285,8 +308,64 @@ def validate_candidate_items(response):
         raise L1OwnerError('native_l1_schema_mismatch', field_path='.'.join(map(str, error.absolute_path)))
     validator = Draft202012Validator({'$defs': schema['$defs'], '$ref': '#/$defs/Candidate'})
     result = []
-    for item in candidates:
+    for index, item in enumerate(candidates):
         error = next(validator.iter_errors(item), None)
-        result.append(item if error is None else {'_candidate_validation_issue': {
-            'code': 'native_l1_schema_mismatch', 'field_path': '.'.join(map(str, error.absolute_path))}})
+        if error is None:
+            result.append(item)
+            continue
+        field = '.'.join(map(str, error.absolute_path))
+        slot = repair_slots[index] if repair_slots else f'item_{index}'
+        source_index = int(slot.removeprefix('item_'))
+        issue = {'code': 'native_l1_schema_mismatch', 'field_path': field}
+        if field == 'kind':
+            value = error.instance
+            diagnostic = {'candidate_index': source_index, 'validator': error.validator,
+                          'actual_type': type(value).__name__}
+            kind_schema = schema['$defs']['Candidate'].get('properties', {}).get('kind')
+            if isinstance(kind_schema, dict) and isinstance(kind_schema.get('enum'), list):
+                diagnostic['allowed_kinds'] = list(kind_schema['enum'])
+            # Record only vocabulary-shaped identifiers, never source prose or a raw response.
+            if isinstance(value, str) and re.fullmatch(r'[a-z][a-z_]{0,39}', value):
+                diagnostic['actual_kind'] = value
+            elif isinstance(value, str):
+                diagnostic['actual_length'] = len(value)
+            issue.update(diagnostic)
+            if schema_issue['field_path'] == f'candidates.{index}.kind':
+                schema_issue.update(diagnostic)
+        result.append({'_candidate_validation_issue': issue})
+        if rejected_drafts is not None:
+            # A category-only retry must not regenerate or rewrite an otherwise
+            # valid document. Other errors need the full item validated again.
+            kind_only = False
+            if isinstance(item, dict) and ('kind' not in item or field == 'kind'):
+                kind_only = validator.is_valid({**item, 'kind': AUTO_KINDS[0]})
+            rejected_drafts[slot] = {'draft': item, 'issue': issue, 'kind_only': kind_only}
     return result, schema_issue
+
+
+def repaired_candidate_response(response, repairs):
+    """Project a validated per-item correction back through the full original validator."""
+    import json
+    from types import SimpleNamespace
+    from jsonschema import Draft202012Validator
+    from memory_l1_service import L1OwnerError
+    schema = response.native_schema
+    try:
+        validate_response(response)
+    except L1OwnerError as exc:
+        if exc.code != 'native_l1_schema_mismatch':
+            raise
+    values = json.loads(response.choices[0].message.content)
+    if not isinstance(values, dict) or values.keys() != repairs.keys():
+        raise L1OwnerError('candidate_repair_slots_mismatch', field_path='candidate_repairs')
+    items = []
+    for key, row in repairs.items():
+        result = row['draft']
+        validator = Draft202012Validator({'$defs': schema['$defs'], **schema['properties'][key]})
+        if validator.is_valid(values[key]):
+            result = {**result, 'kind': values[key]} if row['kind_only'] else values[key]
+        items.append(result)
+    candidate_schema = {'$defs': schema['$defs'], **obj({'candidates': array(ref('Candidate'))}, ('candidates',))}
+    message = SimpleNamespace(content=json.dumps({'candidates': items}, ensure_ascii=False))
+    return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason='stop')],
+                           native_schema=candidate_schema)

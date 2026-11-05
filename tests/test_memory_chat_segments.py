@@ -34,8 +34,12 @@ def fixture(tmp_path, *, calls_per_run=1, mode='review'):
         assert kwargs['response_format']['type'] == 'json_schema'
         assert kwargs['max_tokens'] == 32000  # Existing route budget is intact.
         control['system_message'] = kwargs['messages'][0]['content']
-        payload = json.loads(kwargs['messages'][-1]['content'])['l1_contract']
+        request = json.loads(kwargs['messages'][-1]['content'])
+        payload = request['l1_contract']
         calls.append(payload)
+        if request.get('candidate_repairs'):
+            correction = {slot: 'stable_preference' for slot in request['candidate_repairs']}
+            return NS(choices=[NS(message=NS(content=json.dumps(correction)), finish_reason='stop')])
         if control['fail']: raise TimeoutError('synthetic unknown outcome')
         if control['cancel']: raise asyncio.CancelledError()
         segment = payload['segment']
@@ -53,7 +57,7 @@ def fixture(tmp_path, *, calls_per_run=1, mode='review'):
                 'retrieval': {'keywords': ['偏好', str(core['start'])]}}
             if control['bad']:
                 doc['scenes'][0]['source_ranges'][0]['end'] = 999999
-            candidates.append({'kind': 'stable_preference', 'confidence': 0.99,
+            candidates.append({'kind': control.get('kind', 'stable_preference'), 'confidence': 0.99,
                 'reason': '来源明确说明偏好', 'source_refs': [ref], 'document': doc})
         return NS(choices=[NS(message=NS(content=json.dumps({'candidates': candidates}, ensure_ascii=False)),
                               finish_reason='stop')])
@@ -207,6 +211,21 @@ def test_invalid_range_is_not_consumed_or_resent(tmp_path):
     assert meta['last_processed_event_id'] == 0
     extract(e, window)
     assert len(calls) == 1
+
+
+def test_category_in_a_long_window_retries_only_the_original_segment(tmp_path):
+    e, _, window, calls, state = fixture(tmp_path)
+    state['kind'] = 'fact'
+    rows, meta = extract(e, window)
+    assert not rows and meta['reason'] == 'candidate_kind_retry_ready'
+    state.pop('kind')
+    repaired, recovered = extract(e, window)
+    assert len(repaired) == 1 and len(calls) == 2
+    assert recovered['segment_progress']['cursor'] == 1
+    assert calls[0]['segment'] == calls[1]['segment']
+    acknowledge(e, repaired)
+    extract(e, window)
+    assert calls[-1]['segment']['core_range'] != calls[0]['segment']['core_range']
 
 
 def test_sparse_source_labels_and_original_coordinates(tmp_path):

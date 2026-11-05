@@ -215,6 +215,30 @@ def test_stale_receipt_never_resumes_or_adopts_even_if_its_old_source_reappears(
     assert reverted['cursor_updated'] is False and len(client.calls) == 2
 
 
+@pytest.mark.parametrize('invalid_kind', ['fact', '这段私人原文不属于分类标识。'])
+def test_outer_kind_failure_keeps_the_original_candidate_position_and_safe_value(tmp_path, invalid_kind):
+    from memory_l1_api import AUTO_KINDS
+
+    engine, client, buckets = daily(tmp_path)
+    good, bad = generated(1), generated(2)
+    bad['kind'] = invalid_kind
+    client.content = json.dumps({'candidates': [good, bad]}, ensure_ascii=False)
+    result = run_day(engine, raw_day(2), buckets=buckets)
+    assert result['status'] == 'partial' and len(result['candidates']) == 1
+    queue = MemoryCandidatePreparation(engine.memory_authority_store)
+    receipt = queue.get(result['candidates'][0]['preparation_key'])
+    diagnostic = receipt['issue']['schema_error']
+    assert diagnostic['field_path'] == 'candidates.1.kind'
+    assert diagnostic['candidate_index'] == 1 and diagnostic['validator'] == 'enum'
+    assert diagnostic['allowed_kinds'] == list(AUTO_KINDS)
+    if invalid_kind == 'fact':
+        assert diagnostic['actual_kind'] == invalid_kind
+    else:
+        assert diagnostic['actual_length'] == len(invalid_kind)
+        assert invalid_kind not in json.dumps(diagnostic, ensure_ascii=False)
+    assert good['document']['narrative']['body'] not in json.dumps(diagnostic, ensure_ascii=False)
+
+
 def test_mixed_invalid_response_keeps_valid_l1_blocks_retry_and_force_can_correct(tmp_path):
     engine, client, buckets = daily(tmp_path)
     good, bad = generated(1), generated(2)
@@ -232,12 +256,84 @@ def test_mixed_invalid_response_keeps_valid_l1_blocks_retry_and_force_can_correc
     assert receipt['requires_manual_retry'] is True and receipt['validated_count'] == 1
     blocked = run_day(engine, raw_day(2), buckets=buckets)
     assert blocked['reason'] == 'invalid_l1_document' and len(client.calls) == 1
-    client.content = json.dumps({'candidates': [good, generated(2)]}, ensure_ascii=False)
+    client.content = json.dumps({'item_1': generated(2)}, ensure_ascii=False)
     corrected = run_day(engine, raw_day(2), buckets=buckets, force=True)
     assert corrected['status'] == 'pending' and corrected['last_raw_event_id'] == 2
     assert len(client.calls) == 2 and engine.memory_authority_store.count_candidates(status='all') == 2
     assert engine.memory_authority_store.get_candidate(rows[0]['candidate_id']) == rows[0]
     assert queue.get(key)['issue'] is None
+    assert queue.rejected_drafts(queue.get(key)) == {}
+    repair_input = json.loads(client.calls[-1]['messages'][-1]['content'])
+    assert list(repair_input['candidate_repairs']) == ['item_1']
+
+
+def test_category_retry_only_accepts_the_slot_and_keeps_the_entire_draft(tmp_path):
+    engine, client, buckets = daily(tmp_path)
+    good, original = generated(1), generated(2)
+    original['kind'] = 'experience'
+    client.content = json.dumps({'candidates': [good, original]}, ensure_ascii=False)
+    first = run_day(engine, raw_day(2), buckets=buckets)
+    queue = MemoryCandidatePreparation(engine.memory_authority_store)
+    key = first['candidates'][0]['preparation_key']
+    retained = engine.memory_authority_store.list_candidates(status='all')[0]
+    assert queue.rejected_drafts(queue.get(key))['item_1']['kind_only']
+    assert 'draft' not in queue.get(key)['issue']
+    client.content = json.dumps({'item_1': 'fact'})
+    assert first['reason'] == 'candidate_kind_retry_ready'
+    failed = run_day(engine, raw_day(2), buckets=buckets)
+    assert failed['status'] == 'partial' and not failed['cursor_updated']
+    assert engine.daily_chat_memory_run_cursor()['last_raw_event_id'] == 0
+    assert queue.rejected_drafts(queue.get(key))['item_1']['draft'] == original
+    run_day(engine, raw_day(2), buckets=buckets)
+    assert len(client.calls) == 2
+    client.content = json.dumps({'item_1': 'commitment'})
+    recovered = run_day(engine, raw_day(2), buckets=buckets, force=True)
+    assert recovered['last_raw_event_id'] == 2 and recovered['status'] == 'pending'
+    assert engine.memory_authority_store.get_candidate(retained['candidate_id']) == retained
+    recovered_row = next(row for row in queue.rows(queue.get(key)) if row['candidate_id'] != retained['candidate_id'])
+    assert recovered_row['proposal']['proposed_body'] == original['document']['narrative']['body']
+    assert recovered_row['proposal']['metadata']['memory_l1']['statements']
+    assert not engine.memory_authority_store.list_memories()
+
+
+def test_pre_upgrade_receipt_recovers_only_missing_item_from_original_window(tmp_path):
+    from memory_candidate_preparation import RETRY_PREFIX
+    engine, client, buckets = daily(tmp_path)
+    good, missing = generated(1), generated(2)
+    client.content = json.dumps({'candidates': [good, {**missing, 'kind': 'fact'}]}, ensure_ascii=False)
+    first = run_day(engine, raw_day(2), buckets=buckets)
+    key = first['candidates'][0]['preparation_key']
+    queue = MemoryCandidatePreparation(engine.memory_authority_store)
+    receipt = queue.get(key)
+    receipt.pop('kind_retry_ready')
+    receipt.pop('kind_retry_attempted')
+    engine.memory_authority_store.set_meta(PREFIX + key, receipt)
+    engine.memory_authority_store.set_meta(RETRY_PREFIX + key, {})
+    sibling = queue.rows(receipt)[0]
+    client.content = json.dumps({'candidates': [missing]}, ensure_ascii=False)
+    result = run_day(engine, raw_day(2), buckets=buckets, force=True)
+    assert result['status'] == 'pending' and len(result['candidates']) == 1
+    request = json.loads(client.calls[-1]['messages'][-1]['content'])
+    assert request['recover_missing']['missing_count'] == 1
+    assert request['recover_missing']['already_retained_ids'] == [sibling['candidate_id']]
+    assert len(request['l1_contract']['source_texts']) == 2
+    assert engine.memory_authority_store.get_candidate(sibling['candidate_id']) == sibling
+
+
+def test_chat_letter_from_actual_sources_stays_in_review(tmp_path):
+    engine, client, buckets = daily(tmp_path)
+    events = raw_day(1)
+    events[0]['text'] = '这是我写给顾衍的情书：一直喜欢你，想让你知道。'
+    letter = generated(1, long=False)
+    letter.update(kind='love_letter', reason='主人在当前消息写的情书。')
+    letter['document']['narrative'] = {'title': '她写给我的信', 'body': '她写下一封信，告诉我她一直喜欢我。'}
+    letter['document']['statements'][0]['content'] = '她在这条消息里写了一封情书。'
+    client.content = json.dumps({'candidates': [letter]}, ensure_ascii=False)
+    result = run_day(engine, events, buckets=buckets)
+    assert result['status'] == 'pending'
+    row = engine.memory_authority_store.list_candidates(status='all')[0]
+    assert row['proposal']['memory_type'] == 'love_letter' and row['status'] == 'pending'
+    assert row['proposal']['source_refs']
 
 
 def test_action_mixed_invalid_response_retains_valid_draft_and_original_retry_can_correct(tmp_path, monkeypatch):
