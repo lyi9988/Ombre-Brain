@@ -54,11 +54,44 @@ class BucketActivationLedger:
                 (activation_id, bucket_id, activated_at))
 
     def effective(self, bucket_id, metadata):
-        result = base_metadata(metadata)
         with self._connect() as db:
             row = db.execute('SELECT COUNT(*) AS count,MAX(activated_at) AS latest '
                 'FROM bucket_activation_receipts WHERE bucket_id=?', (bucket_id,)).fetchone()
-        count, latest = row['count'], row['latest']
+        return self._effective_metadata(metadata, row['count'], row['latest'])
+
+    def effective_many(self, items):
+        """Project one live receipt snapshot over all requested base metadata.
+
+        Only the reads are shared. Nothing survives this call, so another
+        process's activation is observed by the next list or single read.
+        """
+        items = list(items)
+        if not items:
+            return []
+        def key(bucket_id):
+            # A YAML ID can be numeric. Match SQLite's TEXT affinity, as the
+            # existing single-bucket query does, without changing the ID.
+            if isinstance(bucket_id, bool):
+                return str(int(bucket_id))
+            return str(bucket_id) if isinstance(bucket_id, (int, float)) else bucket_id
+        ids = list(dict.fromkeys(key(bucket_id) for bucket_id, _metadata in items))
+        receipts = {}
+        with self._connect() as db:
+            db.execute('BEGIN')
+            # Keep each IN clause under SQLite's older parameter limit while
+            # retaining every bucket and using the same read transaction.
+            for offset in range(0, len(ids), 400):
+                batch = ids[offset:offset + 400]
+                rows = db.execute('SELECT bucket_id,COUNT(*) AS count,MAX(activated_at) AS latest '
+                    'FROM bucket_activation_receipts WHERE bucket_id IN ('
+                    + ','.join('?' for _ in batch) + ') GROUP BY bucket_id', batch)
+                receipts.update({row['bucket_id']: (row['count'], row['latest']) for row in rows})
+        return [self._effective_metadata(metadata, *receipts.get(key(bucket_id), (0, None)))
+                for bucket_id, metadata in items]
+
+    @staticmethod
+    def _effective_metadata(metadata, count, latest):
+        result = base_metadata(metadata)
         base_count, base_active = result.get('activation_count', 0), result.get('last_active')
         if not count:
             return result

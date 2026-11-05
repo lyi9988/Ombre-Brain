@@ -1254,6 +1254,7 @@ class BucketManager:
         递归遍历目录（含域子目录），列出所有记忆桶。
         """
         buckets = []
+        batch = []
 
         dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir]
         if include_archive:
@@ -1267,10 +1268,24 @@ class BucketManager:
                     if not filename.endswith(".md"):
                         continue
                     file_path = os.path.join(root, filename)
-                    bucket = self._load_bucket(file_path)
-                    if bucket:
-                        buckets.append(bucket)
+                    bucket = self._load_bucket(file_path, apply_activation=False)
+                    if not bucket:
+                        continue
+                    identifier = bucket['id']
+                    if isinstance(identifier, str) or (isinstance(identifier, int) and -(1 << 63) <= identifier < (1 << 63)):
+                        batch.append(bucket)
+                    else:
+                        # Preserve SQLite's native conversion for unusual legacy
+                        # types, and isolate an invalid file just as a single read does.
+                        bucket = self._load_bucket(file_path)
+                        if not bucket:
+                            continue
+                    buckets.append(bucket)
 
+        metadata = self.activation_ledger.effective_many(
+            (bucket['id'], bucket['metadata']) for bucket in batch)
+        for bucket, effective in zip(batch, metadata):
+            bucket['metadata'] = effective
         return buckets
 
     # ---------------------------------------------------------
@@ -1426,18 +1441,19 @@ class BucketManager:
     # Internal: load bucket data from .md file
     # 内部：从 .md 文件加载桶数据
     # ---------------------------------------------------------
-    def _load_bucket(self, file_path: str) -> Optional[dict]:
+    def _load_bucket(self, file_path: str, *, apply_activation: bool = True) -> Optional[dict]:
         """
         Parse a Markdown file and return structured bucket data.
         解析 Markdown 文件，返回桶的结构化数据。
         """
         try:
             raw = Path(file_path).read_text(encoding="utf-8")
-            post = frontmatter.load(file_path)
+            post = frontmatter.loads(raw)
             bucket_id = post.get("id", Path(file_path).stem)
             return {
                 "id": bucket_id,
-                "metadata": self.activation_ledger.effective(bucket_id, post.metadata),
+                "metadata": (self.activation_ledger.effective(bucket_id, post.metadata)
+                             if apply_activation else post.metadata),
                 "content": post.content,
                 "path": file_path,
                 "content_start_line": _markdown_body_start_line(raw),
