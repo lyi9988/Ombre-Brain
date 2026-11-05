@@ -12436,6 +12436,7 @@ async def api_daily_chat_memory_run(request):
             key=str(body.get("date") or ""),
             mode=str(body.get("mode") or ""),
             force=force or retry_only,
+            chat_windows_only=retry_only and not force,
         )
         if retry_only and not force:
             result["daily_activity_summary"] = {"status": "skipped", "reason": "only_failed_memory_windows_requested"}

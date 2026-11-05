@@ -2580,6 +2580,7 @@ class ReflectionEngine(MemoryL1Runtime):
         key: str = "",
         mode: str = "",
         force: bool = False,
+        chat_windows_only: bool = False,
         now: datetime | None = None,
     ) -> dict:
         """Run daily chat memory with a per-process concurrency lock.
@@ -2665,7 +2666,7 @@ class ReflectionEngine(MemoryL1Runtime):
                 result["candidates"] = list(all_candidates.values())
                 if result.get("status") == "zero_candidates":
                     result["status"] = "pending" if effective_mode == "review" else "created"
-            if self.memory_authority_enabled and self.memory_authority_store:
+            if not chat_windows_only and self.memory_authority_enabled and self.memory_authority_store:
                 result['action_memory_preparation'] = await self._memory_l1_action_tasks(bucket_mgr, mode=effective_mode)
                 if not getattr(self, '_daily_chat_memory_cancel_requested', False):
                     try:

@@ -39,6 +39,7 @@ def test_failed_window_retry_targets_memory_without_forcing_summary(payload, mem
     assert response.status_code == 200
     assert calls['memory']['key'] == '2026-10-17'
     assert calls['memory']['force'] is memory_force
+    assert calls['memory']['chat_windows_only'] is (summary_force is None)
     if summary_force is None:
         assert 'summary' not in calls
     else:

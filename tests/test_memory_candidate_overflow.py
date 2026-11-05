@@ -320,6 +320,18 @@ def test_pre_upgrade_receipt_recovers_only_missing_item_from_original_window(tmp
     assert engine.memory_authority_store.get_candidate(sibling['candidate_id']) == sibling
 
 
+def test_explicit_failed_window_retry_does_not_start_unrelated_preparation(tmp_path):
+    engine, client, buckets = daily(tmp_path)
+    client.content = json.dumps({'candidates': [generated(1)]}, ensure_ascii=False)
+    async def unexpected(*args, **kwargs):
+        pytest.fail('chat window retry started a different source task')
+    engine._memory_l1_action_tasks = engine._memory_l1_attachment_tasks = unexpected
+    result = asyncio.run(engine.run_daily_chat_memory(buckets, raw_event_store=FakeRawEvents(raw_day(1)),
+        conversation_turn_store=FakeTurns([]), key='2026-08-18', mode='review', force=True,
+        chat_windows_only=True))
+    assert result['status'] == 'pending' and len(client.calls) == 1
+
+
 def test_chat_letter_from_actual_sources_stays_in_review(tmp_path):
     engine, client, buckets = daily(tmp_path)
     events = raw_day(1)
