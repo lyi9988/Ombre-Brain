@@ -314,18 +314,26 @@ class LegacyMemoryBackfill:
         if row.get('policy', {}).get('requires_owner_confirmation') is not True:
             raise L1OwnerError('backfill_candidate_not_model_only', status=409)
 
-    @staticmethod
-    def _check_revision_scope(previous, document):
+    def _check_revision_scope(self, previous, document):
         old = previous['proposal']['metadata']['memory_l1']['evidence_bindings']
+        transitions = []
         for binding in document['evidence_bindings']:
             supports = [item for item in old if all(item[key] == binding[key]
                 for key in ('source_namespace', 'source_id', 'source_revision', 'author_ref', 'speaker_ref'))]
+            if not supports:
+                from memory_legacy_participants import participant_only_rebinding, compatible_scope
+                for item in old:
+                    proof = participant_only_rebinding(item, binding, readers=self.source_reader_factory(), config=self.config)
+                    if proof:
+                        supports.append(compatible_scope(item, binding))
+                        transitions.append({**proof, 'previous_candidate_revision': previous['revision']})
             for anchor in binding['anchors']:
                 if not any(all(prior[key] == anchor[key] for key in
                     ('target_namespace', 'target_id', 'target_revision', 'text_view_id', 'coordinate_unit'))
                     and prior['start'] <= anchor['start'] < anchor['end'] <= prior['end']
                     for item in supports for prior in item['anchors']):
                     raise L1OwnerError('backfill_revision_source_scope_changed', status=409, field_path='sources')
+        return transitions
 
     @staticmethod
     def _revision_result(row, memory_id, base_revision, *, replayed):
@@ -389,7 +397,9 @@ class LegacyMemoryBackfill:
             candidate_refs=payload.get('source_refs', []))
         body, semantic = split_document(document)
         if revising:
-            self._check_revision_scope(existing, document)
+            transitions = self._check_revision_scope(existing, document)
+            if transitions:
+                base['source_participant_rebindings'] = [*base.get('source_participant_rebindings', []), *transitions]
         base['source_witnesses'] = self._witnesses(memory_id, base, semantic, sources=sources)
         if revising:
             base['model_revision_request'] = {'request_id': payload['request_id'], 'request_sha256': fingerprint,

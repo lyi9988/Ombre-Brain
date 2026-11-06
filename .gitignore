@@ -25,6 +25,7 @@ tests/*
 !tests/test_memory_legacy_projection.py
 !tests/test_memory_legacy_model_revision.py
 !tests/test_memory_legacy_kind.py
+!tests/test_memory_legacy_participants.py
 !tests/memory_l3_followup_review_browser.cjs
 .pytest-tmp/
 *.pyc
