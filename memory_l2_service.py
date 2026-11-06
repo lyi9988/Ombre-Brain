@@ -219,8 +219,21 @@ class MemoryL2Service:
         result = self.store.enqueue(memory_id, dependency, payload['request_id'])
         return {'status': 'ok', 'memory_id': memory_id, **result}
 
+    async def prepare_followup(self, memory_id, payload):
+        self.request(payload, {'expected_l1_revision','request_id','followup_task_id'})
+        from memory_l3_followup import MemoryFollowups
+        from memory_followup_l2 import review_context
+        context = await review_context(MemoryFollowups(self.engine, None), payload['followup_task_id'], memory_id=memory_id)
+        if context['identity']['l1_revision'] != payload['expected_l1_revision']:
+            raise RevisionConflict('L1 changed')
+        _prompt, _route, generation = self.generation_context()
+        dependency = self.store.current_dependency(memory_id, generation)
+        result = self.store.enqueue(memory_id, dependency, payload['request_id'], followup=context['identity'])
+        return {'status':'ok', 'memory_id':memory_id, **result, 'followup_task_id':payload['followup_task_id'],
+            'review_required':True, 'current_presentation_preserved':True}
+
     async def save(self, memory_id, payload):
-        self.request(payload, {'expected_l1_revision', 'expected_presentation_revision', 'request_id', 'document', 'change_kind'}, {'edit_note','confirm_sync_proposals'})
+        self.request(payload, {'expected_l1_revision', 'expected_presentation_revision', 'request_id', 'document', 'change_kind'}, {'edit_note','confirm_sync_proposals','followup_task_id'})
         if payload['change_kind'] not in ('wording', 'facts'): raise L1OwnerError('invalid_l2_change_kind')
         if 'edit_note' in payload and not isinstance(payload['edit_note'], str): raise L1OwnerError('string_required', field_path='edit_note')
         confirmations = payload.get('confirm_sync_proposals', [])
@@ -229,8 +242,20 @@ class MemoryL2Service:
         fingerprint = semantic_sha256(payload)
         prior = self.store.request_receipt(memory_id, payload['request_id'], fingerprint)
         if prior:
+            if payload.get('followup_task_id'):
+                from memory_l3_followup import MemoryFollowups
+                from memory_followup_l2 import acknowledge_save
+                acknowledge_save(MemoryFollowups(self.engine, None), payload['followup_task_id'])
             return {'status':'ok', 'memory_id':memory_id, **prior,
                     'l2':self.detail(memory_id, prior['presentation_revision'])['l2']}
+        followup = None
+        if 'followup_task_id' in payload:
+            from memory_l3_followup import MemoryFollowups
+            from memory_followup_l2 import review_context
+            if payload['change_kind'] != 'wording':
+                raise L1OwnerError('l2_followup_must_preserve_l1', status=409)
+            followup = (await review_context(MemoryFollowups(self.engine, None),
+                payload['followup_task_id'], memory_id=memory_id))['identity']
         base = await self.revisions.detail(memory_id)
         if base['l1']['state'] != 'current': raise L1OwnerError('l1_required', status=409)
         if base['current_revision'] != payload['expected_l1_revision']: raise RevisionConflict('L1 changed')
@@ -243,7 +268,11 @@ class MemoryL2Service:
         if dependency['first_pass_revision'] != payload['expected_l1_revision']: raise RevisionConflict('L1 changed')
         receipt = self.store.save(memory_id, payload['document'], dependency, request_id=payload['request_id'],
             expected_revision=payload['expected_presentation_revision'], actor='owner', change_kind=payload['change_kind'],
-            request_fingerprint=fingerprint, edit_note=payload.get('edit_note',''), confirm_sync_proposals=confirmations)
+            request_fingerprint=fingerprint, edit_note=payload.get('edit_note',''), confirm_sync_proposals=confirmations,
+            followup=followup)
+        if followup:
+            from memory_followup_l2 import acknowledge_save
+            acknowledge_save(MemoryFollowups(self.engine, None), followup['task_id'])
         return {'status': 'ok', 'memory_id': memory_id, **receipt,
                 'l2': self.detail(memory_id, receipt['presentation_revision'])['l2']}
 
@@ -508,6 +537,16 @@ class MemoryL2Service:
                 if not route['configured']: raise L1OwnerError('l2_model_unconfigured')
                 full_material = await self._material(job['memory_id'], dep['first_pass_revision'])
                 material = semantic_input_projection(full_material)
+                followup = self.store.followup_for_job(job['task_id'])
+                followup_service = None
+                if followup:
+                    from memory_l3_followup import MemoryFollowups
+                    from memory_followup_l2 import review_context
+                    followup_service = MemoryFollowups(self.engine, None)
+                    checked = await review_context(followup_service, followup['task_id'], memory_id=job['memory_id'])
+                    if checked['identity'] != followup:
+                        raise RevisionConflict('L2 followup source or draft changed')
+                    material['owner_feedback_correction'] = checked['material']
                 from memory_l2_schema import output_schema, validate_output
                 schema = output_schema(getattr(self.engine, 'config', {}))
                 material['output_schema'] = schema
@@ -540,8 +579,13 @@ class MemoryL2Service:
                 if rechecked['related_memory_updates']['token'] != full_material['related_memory_updates']['token']:
                     raise L1OwnerError('l2_relation_source_dependency_changed', status=409)
                 if self.generation_context()[2] != generation: raise L1OwnerError('l2_generation_configuration_changed')
+                if followup:
+                    checked = await review_context(followup_service, followup['task_id'], memory_id=job['memory_id'])
+                    if checked['identity'] != followup:
+                        raise RevisionConflict('L2 followup source or draft changed during generation')
                 result = self.store.save(job['memory_id'], document, dep, request_id=job['task_id'],
-                    expected_revision=job['base_presentation_revision'], actor='model', job=job)
+                    expected_revision=job['base_presentation_revision'], actor='model', job=job,
+                    force_candidate=bool(followup))
                 model_io.finish(io_id)
                 results.append({'task_id': job['task_id'], 'state': 'ready', **result})
             except asyncio.CancelledError:

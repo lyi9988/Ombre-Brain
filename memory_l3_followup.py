@@ -114,6 +114,81 @@ class FollowupTasks(ChatMemoryPreparation):
         return {k: deepcopy(row.get(k)) for k in ('task_id', 'memory_id', 'phase', 'revision', 'created_at',
             'updated_at', 'candidate_ids', 'issue', 'attempts', 'receipt', 'generation', 'related_candidates')}
 
+    def current_receipt(self, task_id):
+        """Read one original task and its actual adoption, without queue work."""
+        if not isinstance(task_id, str) or not task_id.startswith('followup_') or len(task_id) > 200:
+            raise L1OwnerError('invalid_followup_task_id')
+        with closing(self.authority._connect()) as db:
+            db.execute('PRAGMA query_only=ON')
+            db.execute('BEGIN')
+            found = db.execute('SELECT value FROM authority_meta WHERE key=?', (self.prefix + task_id,)).fetchone()
+            if found is None:
+                raise L1OwnerError('followup_not_found', status=404)
+            task = json.loads(found[0])
+            mid, phase = task['memory_id'], task['phase']
+            if phase == 'adopted':
+                phase = 'awaiting_receipt'  # A task label alone is never adoption.
+            ref = task['envelope']['updates'][0]['memory_ref']
+            l1, l2 = None, None
+            if ref.get('l1_revision') is not None and db.execute(
+                    'SELECT 1 FROM memory_revisions WHERE memory_id=? AND revision=?',
+                    (mid, ref['l1_revision'])).fetchone():
+                l1 = ref['l1_revision']
+            if ref.get('l2_revision') is not None and db.execute(
+                    'SELECT 1 FROM memory_l2_revisions WHERE memory_id=? AND presentation_revision=?',
+                    (mid, ref['l2_revision'])).fetchone():
+                l2 = ref['l2_revision']
+            committed = db.execute('SELECT operation_id,status,result_json FROM commit_log WHERE idempotency_key=?',
+                ('program-l1:followup:' + mid + ':' + task_id,)).fetchone()
+            adopted = db.execute('SELECT revision FROM memory_revisions WHERE memory_id=? AND revision=? AND operation_id=?',
+                (mid, json.loads(committed['result_json']).get('revision'), committed['operation_id'])).fetchone(
+                ) if committed and committed['status'] == 'committed' else None
+            presentation_adoption = db.execute('SELECT value FROM authority_meta WHERE key=?',
+                ('memory_l2_followup_adoption:' + task_id,)).fetchone()
+            actual_presentation = None
+            if presentation_adoption:
+                proof = json.loads(presentation_adoption[0])
+                saved = db.execute('SELECT * FROM memory_l2_revisions WHERE memory_id=? AND presentation_revision=?',
+                    (mid, proof['l2_revision'])).fetchone()
+                if (proof.get('task_id') == task_id and proof.get('memory_id') == mid and saved
+                        and saved['actor'] == 'owner' and saved['publication'] == 'active'
+                        and saved['request_id'] == proof['request_id']
+                        and saved['first_pass_revision'] == proof['l1_revision']
+                        and semantic_sha256(json.loads(saved['document_json'])) == proof['document_sha256']):
+                    actual_presentation = proof
+            if actual_presentation:
+                phase, l1, l2 = 'adopted', actual_presentation['l1_revision'], actual_presentation['l2_revision']
+            elif adopted:
+                phase, l1, l2 = 'adopted', adopted['revision'], None
+                presentation = db.execute('''SELECT r.* FROM memory_l2_heads h JOIN memory_l2_revisions r
+                    ON r.memory_id=h.memory_id AND r.presentation_revision=h.presentation_revision
+                    WHERE h.memory_id=? AND r.first_pass_revision=? AND r.publication='active'
+                    AND r.sync_state='not_required' ''', (mid, l1)).fetchone()
+                if presentation and (presentation['actor'] == 'owner'
+                        or json.loads(presentation['document_json']).get('review', {}).get('required') is False):
+                    l2 = presentation['presentation_revision']
+            elif task.get('candidate_ids'):
+                candidates = [db.execute('SELECT status FROM candidates WHERE candidate_id=?', (cid,)).fetchone()
+                              for cid in task['candidate_ids']]
+                statuses = {row['status'] for row in candidates if row}
+                if statuses & {'pending', 'deferred'} and phase not in {'failed','source_changed','disabled','queued','generating'}:
+                    phase = 'waiting_review'
+                elif 'rejected' in statuses:
+                    phase = 'rejected'
+                elif 'commit_failed' in statuses:
+                    phase = 'failed'
+                elif 'committed' in statuses:
+                    phase = 'awaiting_receipt'
+            if not (actual_presentation or adopted) and task.get('l2_job_id'):
+                job = db.execute('SELECT state FROM memory_l2_jobs WHERE task_id=? AND memory_id=?',
+                    (task['l2_job_id'], mid)).fetchone()
+                if job and job['state'] in {'failed','stale'}:
+                    phase = 'failed' if job['state'] == 'failed' else 'source_changed'
+                elif job and job['state'] in {'pending','running'}:
+                    phase = 'queued' if job['state'] == 'pending' else 'generating'
+            return {'task_id': task_id, 'memory_id': mid, 'phase': phase,
+                    'l1_revision': l1, 'l2_revision': l2}
+
     def enqueue_update(self, payload, update):
         task_id = 'followup_' + update['update_id'].split(':', 1)[1]
         # Different unrelated updates in a replayed batch do not change this task.
@@ -269,6 +344,15 @@ class MemoryFollowups:
         for binding in detail['l1']['document']['evidence_bindings']:
             if not (await reader.locate(binding)).get('eligible_source'):
                 raise L1OwnerError('followup_original_source_unavailable', status=409)
+        if claimed['envelope'].get('schema') == 'self-review-followup-v1':
+            from memory_self_review_source import check_native_sources, native_feedback_layer
+            _, actual = await check_native_sources(claimed['envelope'], self.engine.config,
+                self.review_source_reader, with_sources=True)
+            if (update['kind'] == 'correction' or update['long_term_value'] == 'explicit_owner_correction') and native_feedback_layer(
+                    actual['self_review'], update, actual) == 'l2':
+                from memory_followup_l2 import review_context, prepare_candidate
+                await review_context(self, claimed['task_id'])
+                return prepare_candidate(self, claimed, sources)
         related = self.authority.find_candidates_by_sources([s['source_key'] for s in sources]
             + binding_source_keys([row['binding'] for row in evidence]))
         # Exact content + exact source set is reusable; merely sharing a turn
@@ -354,6 +438,16 @@ class MemoryFollowups:
         if not meta:
             raise L1OwnerError('not_followup_candidate')
         cid = row['candidate_id']
+        if meta.get('layer') == 'l2':
+            from memory_followup_l2 import actions
+            status = self.tasks.current_receipt(meta['task_id'])
+            if status['phase'] == 'adopted':
+                return {'id': cid, 'status': 'exists', **status}
+            if edit:
+                return self.edit_draft(row, edit, request_id=request_id)
+            await self._check_native_delivery(self.tasks.get(meta['task_id']))
+            return {'id': cid, 'status': 'waiting_review', 'memory_id': meta['memory_id'],
+                    'task_id': meta['task_id'], 'review_actions': actions(self.tasks.get(meta['task_id']))}
         if row['status'] == 'committed':
             return {'id': cid, 'status': 'exists', 'memory_id': meta['memory_id']}
         if edit:

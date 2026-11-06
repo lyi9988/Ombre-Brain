@@ -173,7 +173,7 @@ async def check_native_sources(payload, config, reader=None, *, with_sources=Fal
     if review.get('review') != payload['review']:
         raise L1OwnerError('native_review_output_identity_mismatch')
     originals = review.get('memory_updates') or []
-    catalogue = {row['target_key'] for row in review.get('memory_targets') or []}
+    catalogue = {row['target_key']: row for row in review.get('memory_targets') or []}
     accepted = set()
     def matches_original(row, update, semantic):
         if (not isinstance(row, dict) or row.get('memory_fragment_ref', row.get('target_key')) != update['target_key']
@@ -188,8 +188,62 @@ async def check_native_sources(payload, config, reader=None, *, with_sources=Fal
         if not matches or update['target_key'] not in catalogue:
             raise L1OwnerError('followup_not_in_original_review')
         if all(key in actual for key in update['evidence_refs']):
+            if 'feedback_origins' in review and any(
+                    actual[key].get('kind') == 'reply_feedback' and any(
+                        isinstance(diagnosis, dict) and diagnosis.get('feedback_id') == actual[key].get('feedback_id')
+                        for diagnosis in review.get('feedback_diagnoses') or [])
+                    for key in update['evidence_refs']) and not (
+                    update['kind'] == 'correction' or update['long_term_value'] == 'explicit_owner_correction'):
+                raise L1OwnerError('followup_diagnosed_feedback_requires_correction', status=409)
+            if 'feedback_origins' in review and (update['kind'] == 'correction'
+                    or update['long_term_value'] == 'explicit_owner_correction'):
+                fragment = next(row for row in payload['context']['fragments']
+                                if row['fragment_id'] == update['memory_ref']['fragment_id'])
+                original = catalogue[update['target_key']].get('fragment')
+                if not isinstance(original, dict) or any(original.get(key) != fragment.get(key) for key in TARGET_FIELDS):
+                    raise L1OwnerError('followup_original_delivery_target_mismatch', status=409)
+                native_feedback_layer(review, update, actual)
             accepted.add(update['update_id'])
     return (accepted, actual) if with_sources else accepted
+
+
+def native_feedback_layer(review, update, sources):
+    """Qualify exact, selected owner annotations against their original targets.
+
+    Old completed reviews retain their original contract. New corrections may
+    use only the target sent for each cited annotation, never a fresh search hit.
+    """
+    if 'feedback_origins' not in review:
+        return None
+    feedback = [sources[key] for key in update['evidence_refs']
+                if key in sources and sources[key].get('kind') == 'reply_feedback']
+    if not feedback:
+        raise L1OwnerError('followup_original_feedback_required', status=409)
+    origins = review['feedback_origins']
+    chosen = review.get('feedback_ids') or []
+    layers = set()
+    for source in feedback:
+        fid, revision = source.get('feedback_id'), source.get('feedback_revision')
+        key = f'reply-feedback:{fid}:r{revision}'
+        diagnoses = [row for row in review.get('feedback_diagnoses') or []
+                     if isinstance(row, dict) and row.get('feedback_id') == fid]
+        origin = origins.get(key) if isinstance(origins, dict) else None
+        diagnosis = diagnoses[0] if len(diagnoses) == 1 else {}
+        ref = update['memory_ref']
+        if (not isinstance(fid, str) or type(revision) is not int or revision < 1
+                or source.get('source_key') != key or fid not in chosen
+                or source.get('eligible_source') is not True
+                or not isinstance(origin, dict) or origin.get('status') != 'available'
+                or diagnosis.get('layer') not in {'l1','l2'}
+                or not isinstance(diagnosis.get('reason'), str) or not diagnosis['reason'].strip()
+                or diagnosis.get('memory_fragment_ref') != update['target_key']
+                or not any(isinstance(target, dict) and target.get('target_key') == update['target_key']
+                    and target.get('source_state') == 'available'
+                    and all(target.get(field) == ref[field] for field in ('memory_id','l1_revision','l2_revision'))
+                    for target in origin.get('targets') or [])):
+            raise L1OwnerError('followup_feedback_origin_mismatch', status=409)
+        layers.add(diagnosis['layer'])
+    return 'l2' if layers == {'l2'} else 'l1'
 
 
 async def native_sources(service, task):

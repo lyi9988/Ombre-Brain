@@ -301,7 +301,7 @@ class MemoryL2Store:
         return _same_l2_dependencies(product['dependency_versions'], dependency,
                 owner_prose=product['actor'] == 'owner' and product['publication'] == 'active')
 
-    def enqueue(self, memory_id, dependency, request_id):
+    def enqueue(self, memory_id, dependency, request_id, *, followup=None):
         conn = self.authority._connect()
         try:
             conn.execute('BEGIN IMMEDIATE')
@@ -318,10 +318,44 @@ class MemoryL2Store:
             if not request_id.startswith('dependency:'):
                 head = conn.execute('SELECT presentation_revision FROM memory_l2_heads WHERE memory_id=?', (memory_id,)).fetchone()
                 conn.execute("UPDATE memory_l2_jobs SET reason='owner_requested',base_presentation_revision=? WHERE task_id=? AND state='pending' AND reason!='owner_requested'", (head['presentation_revision'], ident))
+            if followup:
+                self._check_followup(conn, memory_id, followup)
+                key = 'memory_l2_followup_job:' + ident
+                prior = conn.execute('SELECT value FROM authority_meta WHERE key=?', (key,)).fetchone()
+                if prior and json.loads(prior[0]) != followup:
+                    raise IdempotencyConflict('L2 followup request changed')
+                conn.execute('INSERT OR IGNORE INTO authority_meta VALUES(?,?)', (key, canonical_json(followup)))
+                task_key = 'memory_l3_followup:' + followup['task_id']
+                task = json.loads(conn.execute('SELECT value FROM authority_meta WHERE key=?', (task_key,)).fetchone()[0])
+                if task.get('l2_job_id') != ident:
+                    task.update(l2_job_id=ident, revision=task['revision'] + 1)
+                    conn.execute('UPDATE authority_meta SET value=? WHERE key=?', (canonical_json(task), task_key))
             conn.commit()
             return {'task_id': ident, 'state': 'pending'}
         except Exception:
             conn.rollback(); raise
+        finally: conn.close()
+
+    @staticmethod
+    def _check_followup(conn, memory_id, identity):
+        task = conn.execute('SELECT value FROM authority_meta WHERE key=?',
+            ('memory_l3_followup:' + identity['task_id'],)).fetchone()
+        candidate = conn.execute('SELECT revision,status FROM candidates WHERE candidate_id=?',
+            (identity['task_id'],)).fetchone()
+        head = conn.execute('SELECT presentation_revision FROM memory_l2_heads WHERE memory_id=?', (memory_id,)).fetchone()
+        if (not task or json.loads(task[0]).get('memory_id') != memory_id or not candidate
+                or candidate['status'] not in {'pending','deferred'}
+                or candidate['revision'] != identity['candidate_revision']
+                or not head or head['presentation_revision'] != identity['l2_revision']):
+            raise RevisionConflict('L2 followup target or draft changed')
+        return json.loads(task[0])
+
+    def followup_for_job(self, task_id):
+        conn = self.authority._connect()
+        try:
+            row = conn.execute('SELECT value FROM authority_meta WHERE key=?',
+                ('memory_l2_followup_job:' + task_id,)).fetchone()
+            return json.loads(row[0]) if row else None
         finally: conn.close()
 
     def pending(self, limit):
@@ -390,7 +424,7 @@ class MemoryL2Store:
         finally: conn.close()
 
     def save(self, memory_id, document, dependency, *, request_id, expected_revision, actor, change_kind='wording', job=None,
-             request_fingerprint=None, edit_note='', confirm_sync_proposals=()):
+             request_fingerprint=None, edit_note='', confirm_sync_proposals=(), force_candidate=False, followup=None):
         fingerprint = request_fingerprint or semantic_sha256({'document':document, 'dependency':dependency, 'expected_revision':expected_revision,
                                        'actor':actor, 'change_kind':change_kind})
         conn = self.authority._connect()
@@ -410,7 +444,18 @@ class MemoryL2Store:
                 lease = conn.execute('SELECT state,lease_token FROM memory_l2_jobs WHERE task_id=?', (job['task_id'],)).fetchone()
                 if not lease or lease['state'] != 'running' or lease['lease_token'] != job['lease_token']:
                     raise RevisionConflict('L2 job lease changed')
-            candidate = bool(job and head and head['owner_protected'])
+                if force_candidate:
+                    bound = conn.execute('SELECT value FROM authority_meta WHERE key=?',
+                        ('memory_l2_followup_job:' + job['task_id'],)).fetchone()
+                    if not bound:
+                        raise L1OwnerError('l2_followup_job_binding_required', status=409)
+                    self._check_followup(conn, memory_id, json.loads(bound[0]))
+            followup_task = None
+            if followup:
+                if actor != 'owner' or change_kind != 'wording' or job:
+                    raise L1OwnerError('owner_l2_followup_save_required', status=409)
+                followup_task = self._check_followup(conn, memory_id, followup)
+            candidate = force_candidate or bool(job and head and head['owner_protected'])
             revision = conn.execute('SELECT COALESCE(MAX(presentation_revision),0)+1 FROM memory_l2_revisions WHERE memory_id=?', (memory_id,)).fetchone()[0]
             from memory_l3_sync import CLOSED, CONTRACT, initial_processing
             all_proposals = conn.execute('SELECT presentation_revision,state,proposal_json FROM memory_l2_sync_proposals WHERE memory_id=?', (memory_id,)).fetchall()
@@ -424,6 +469,13 @@ class MemoryL2Store:
                 raise L1OwnerError('l3_sync_action_required', status=409, field_path='confirm_sync_proposals')
             sync = 'pending_l1' if actor == 'owner' and (change_kind == 'facts' or pending) else 'not_required'
             before = conn.execute('SELECT document_json,units_state FROM memory_l2_revisions WHERE memory_id=? AND presentation_revision=?', (memory_id, current_revision)).fetchone()
+            if followup_task and followup_task.get('l2_job_id'):
+                # The editor starts from the pending full draft, not the old
+                # active head. Compare against that exact draft so a text-only
+                # owner edit cannot retain the draft's now-outdated units.
+                draft = conn.execute("SELECT document_json,units_state FROM memory_l2_revisions WHERE memory_id=? AND request_id=? AND publication='candidate'",
+                    (memory_id, followup_task['l2_job_id'])).fetchone()
+                before = draft or before
             units_state = 'current'
             if actor == 'owner':
                 previous = json.loads(before['document_json']) if before else None
@@ -458,6 +510,16 @@ class MemoryL2Store:
                 state = 'pending_review' if candidate or document.get('review', {}).get('required', True) else 'ready'
                 reason = 'owner_l2_preserved' if candidate else 'l2_semantic_review_required' if state == 'pending_review' else ''
                 conn.execute("UPDATE memory_l2_jobs SET state=?,reason=?,updated_at=? WHERE task_id=?", (state, reason, time.time(), job['task_id']))
+            if followup:
+                adoption = {'task_id': followup['task_id'], 'memory_id': memory_id,
+                    'l1_revision': dependency['first_pass_revision'], 'before_l2_revision': current_revision,
+                    'l2_revision': revision, 'request_id': request_id, 'document_sha256': semantic_sha256(document)}
+                conn.execute('INSERT INTO authority_meta(key,value) VALUES(?,?)',
+                    ('memory_l2_followup_adoption:' + followup['task_id'], canonical_json(adoption)))
+                task_key = 'memory_l3_followup:' + followup['task_id']
+                task = json.loads(conn.execute('SELECT value FROM authority_meta WHERE key=?', (task_key,)).fetchone()[0])
+                task.update(phase='adopted', receipt={'layer':'l2', **adoption}, revision=task['revision'] + 1)
+                conn.execute('UPDATE authority_meta SET value=? WHERE key=?', (canonical_json(task), task_key))
             conn.commit()
             return {'presentation_revision': revision, 'sync_state': sync, 'replayed': False,
                     'state': 'pending_sync' if sync == 'pending_l1' else

@@ -211,8 +211,12 @@ class MemoryL3Records:
                 adopted = self.authority.get_commit_by_idempotency('program-l1:followup:' + memory_id + ':' + row['task_id'])
                 if adopted and adopted['status'] == 'committed':
                     receipt = {'operation_id': adopted['operation_id'], 'result': adopted['result']}
-            source_refs = ['canonical_event:' + s['event_id'] + '@' + s['version_id']
-                for s in row['envelope']['sources'] if s['role'] in {span['role'] for span in update['evidence_spans']}]
+            if row['envelope'].get('schema') == 'self-review-followup-v1':
+                source_refs = [s['source_namespace'] + ':' + s['source_id'] + '@' + s['source_revision']
+                    for s in row['envelope']['sources'] if s['source_key'] in update['evidence_refs']]
+            else:
+                source_refs = ['canonical_event:' + s['event_id'] + '@' + s['version_id']
+                    for s in row['envelope']['sources'] if s['role'] in {span['role'] for span in update['evidence_spans']}]
             items.append({'event_id': row['task_id'], 'kind': 'followup_proposal',
                 'state': (candidates[0]['status'] if candidates and candidates[0] else row['phase']),
                 'revision': row['revision'], 'created_at': row['created_at'], 'author': 'memory_followup',

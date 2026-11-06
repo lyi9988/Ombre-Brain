@@ -1143,6 +1143,22 @@ async def api_memory_followup_submission(request):
         return JSONResponse({'error': {'code': 'invalid_followup_submission'}}, status_code=400)
 
 
+@mcp.custom_route('/internal/memory-followups/{task_id}', methods=['GET'])
+async def api_memory_followup_receipt(request):
+    from starlette.responses import JSONResponse
+    from memory_l3_followup import FollowupTasks
+    from memory_l1_service import L1OwnerError
+    if not _authorized_memory_write(request):
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+    if reflection_engine is None or memory_authority_store is None or not getattr(reflection_engine, 'memory_authority_enabled', False):
+        return JSONResponse({'error': 'memory_authority_unavailable'}, status_code=503)
+    try:
+        task = FollowupTasks(memory_authority_store).current_receipt(request.path_params.get('task_id'))
+        return JSONResponse({'task': task}, headers={'Cache-Control': 'no-store'})
+    except L1OwnerError as exc:
+        return JSONResponse({'error': {'code': exc.code}}, status_code=exc.status)
+
+
 @mcp.custom_route('/api/memory-authority/memories/{memory_id}/evolution/followups/{task_id}/retry', methods=['POST'])
 async def api_memory_followup_retry(request):
     from starlette.responses import JSONResponse
@@ -12819,7 +12835,9 @@ async def api_memory_l2(request):
             try: payload = json.loads(raw)
             except (ValueError, UnicodeError): raise L1OwnerError('invalid_json') from None
             if resolving: result = await service.resolve(payload)
-            elif request.url.path.endswith('/prepare'): result = service.prepare(memory_id, payload)
+            elif request.url.path.endswith('/prepare'):
+                result = (await service.prepare_followup(memory_id, payload)
+                    if isinstance(payload, dict) and 'followup_task_id' in payload else service.prepare(memory_id, payload))
             else: result = await service.save(memory_id, payload)
         return JSONResponse(result, headers=headers)
     except (RevisionConflict, IdempotencyConflict) as exc:
