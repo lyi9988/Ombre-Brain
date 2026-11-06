@@ -173,13 +173,19 @@ async def attach(service, payload, debug):
     trace = service._trace_from_payload(payload)
     recall_id = trace.get('autonomy_memory_recall_id')
     if not recall_id: return
-    if trace.get('runtime_scope') != 'internal:autonomy_chain':
+    purpose = trace.get('runtime_scope')
+    if purpose not in {'internal:autonomy_chain', 'internal:self_adjustment'}:
         raise ValueError('autonomy_memory_consumer_scope_mismatch')
     prepared = service.memory_delivery.autonomy_preparation(recall_id)
     if prepared is None: raise ValueError('autonomy_memory_preparation_not_found')
     current = await read_context(service, prepared['scope'])
     if current.get('status') != 'prepared':
         raise ValueError('autonomy_memory_preparation_no_longer_current')
+    if current.get('model_runtime_scope', 'internal:autonomy_chain') != purpose:
+        raise ValueError('autonomy_memory_consumer_scope_mismatch')
+    if purpose == 'internal:self_adjustment' and (trace.get('request_id') != prepared['scope']['cycle_id']
+            or current.get('request_id') != prepared['scope']['cycle_id']):
+        raise ValueError('daily_review_memory_cycle_mismatch')
     ref = {'scope': prepared['scope'], 'trace_id': trace.get('trace_id', '')}
     trace['memory_delivery_manifest'] = {'scope': prepared['scope'],
         'fragments': prepared['fragments'], 'request': ref}

@@ -37,6 +37,32 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def test_review_memory_requires_its_exact_real_daily_cycle_and_successful_wire(tmp_path, monkeypatch):
+    store = MemoryDeliveryStore(tmp_path / 'review.sqlite')
+    async def source(_service, scope):
+        return {'state':'available', 'scope':scope, 'status':'prepared', 'request_id':scope['cycle_id'],
+                'model_runtime_scope':'internal:self_adjustment', 'query':'daily context'}
+    async def prepare_payload(payload, _conversation, **kwargs):
+        return payload, None, {'memory_recall_projection': projection()}
+    monkeypatch.setattr(autonomy_memory, 'read_context', source)
+    service = SimpleNamespace(prepare_payload=prepare_payload, memory_delivery=store,
+                              _trace_from_payload=lambda p: p['_ombre_trace_context'])
+    prepared = run(autonomy_memory.prepare(service, SCOPE, model='owner-model'))
+    trace = {'runtime_scope':'internal:self_adjustment', 'request_id':SCOPE['cycle_id'],
+             'trace_id':'review-test', 'autonomy_memory_recall_id':prepared['recall_id']}
+    def payload(values):
+        return {'messages': prepared['memory_messages'], '_ombre_trace_context': values}
+    for wrong in ({'runtime_scope':'chat'}, {'runtime_scope':'internal:autonomy_chain'}, {'request_id':'other'}):
+        with pytest.raises(ValueError, match='mismatch'):
+            run(autonomy_memory.attach(service, payload({**trace, **wrong}), {}))
+    valid = payload(trace)
+    run(autonomy_memory.attach(service, valid, {}))
+    GatewayService._begin_memory_delivery(service, valid, {'messages':prepared['memory_messages']})
+    assert store.lookup(SCOPE)['state'] == 'unavailable'
+    GatewayService._succeed_memory_delivery(service, valid)
+    assert [f['text'] for f in store.lookup(SCOPE)['context']['fragments']] == [TEXT]
+
+
 def test_native_recall_preparation_is_not_delivery_and_successful_wire_is(tmp_path, monkeypatch):
     store = MemoryDeliveryStore(tmp_path / 'gateway.sqlite')
     async def source(_service, scope):
