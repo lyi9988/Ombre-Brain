@@ -56,6 +56,9 @@ def participant_only_rebinding(old, new, *, readers, config):
         before, after = readers.copy(old), readers.copy(new)
         if not isinstance(before, dict) or not isinstance(after, dict):
             return None
+        if any(before.get(key) != after.get(key)
+               for key in (before.keys() | after.keys()) - {'participant', 'source_revision'}):
+            return None
         unknown = before.get('participant') or {}
         if (unknown.get('resolution') != 'unbound_source' or unknown.get('subject_id') is not None
                 or unknown.get('kind') != 'unknown' or after.get('participant') != configured

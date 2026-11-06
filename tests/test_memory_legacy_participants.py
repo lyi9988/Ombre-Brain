@@ -82,7 +82,7 @@ def test_exact_config_rebinds_only_actor_digest_and_keeps_old_candidate_and_memo
         assert db.execute('SELECT count(*) FROM memory_l2_jobs').fetchone()[0] == 0
 
 
-@pytest.mark.parametrize('change', ['outside', 'expand', 'known_actor_changed', 'old_copy_missing', 'source_text_changed'])
+@pytest.mark.parametrize('change', ['outside', 'expand', 'known_actor_changed', 'old_copy_missing', 'source_text_changed', 'source_time_changed'])
 def test_participant_rebinding_does_not_relax_source_or_actor_scope(tmp_path, change):
     service, payload, _, first = initial(tmp_path, main=change != 'outside')
     if change == 'outside':
@@ -114,6 +114,9 @@ def test_participant_rebinding_does_not_relax_source_or_actor_scope(tmp_path, ch
     elif change == 'source_text_changed':
         with sqlite3.connect(tmp_path / 'buckets/gateway_state.db') as db:
             db.execute("UPDATE conversation_turns SET user_text='来源正文变了'")
+    elif change == 'source_time_changed':
+        with sqlite3.connect(tmp_path / 'buckets/gateway_state.db') as db:
+            db.execute("UPDATE conversation_turns SET created_at='2026-09-02T00:00:00Z'")
     with pytest.raises(L1OwnerError, match='backfill_revision_source_scope_changed|backfill_source_not_currently_readable'):
         run(service.stage('old-memory', request))
     assert service.authority.get_candidate(first['candidate_id']) == first
