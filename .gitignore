@@ -1,5 +1,6 @@
 __pycache__/
 tests/*
+!tests/test_memory_chat_event_prompt_sources.py
 !tests/test_stage03_memory_delivery.py
 !tests/test_stage03_recall_composer_delivery.py
 !tests/test_stage03_relation_wire.py

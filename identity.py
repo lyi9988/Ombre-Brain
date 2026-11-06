@@ -24,17 +24,17 @@ def _clean_list(value, default: list[str]) -> list[str]:
     return [item for item in items if item] or list(default)
 
 
-def identity_names(config: dict | None = None) -> dict:
+def identity_names(config: dict | None = None, *, memory_defaults: bool = False) -> dict:
     cfg = {}
     if isinstance(config, dict) and isinstance(config.get("identity"), dict):
         cfg = config["identity"]
 
     aliases = _clean_list(cfg.get("user_aliases"), DEFAULT_USER_ALIASES)
-    ai_name = _clean_string(cfg.get("ai_name"), DEFAULT_AI_NAME)
+    ai_name = _clean_string(cfg.get("ai_name"), "顾衍" if memory_defaults else DEFAULT_AI_NAME)
     user_name = _clean_string(cfg.get("user_name"), DEFAULT_USER_NAME)
     user_display_name = _clean_string(
         cfg.get("user_display_name") or cfg.get("human_name"),
-        DEFAULT_USER_DISPLAY_NAME,
+        "润润" if memory_defaults else DEFAULT_USER_DISPLAY_NAME,
     )
     relationship_terms = list(dict.fromkeys([ai_name, user_name, user_display_name, *aliases]))
     return {
