@@ -160,6 +160,8 @@ class GatewayStateStore:
         )
         self._migrate_conversation_turns_canonical_key(conn)
         self._migrate_canonical_turn_claims(conn)
+        from autonomy_plan_result import initialize as initialize_planning_results
+        initialize_planning_results(conn)
         conn.commit()
         conn.close()
 

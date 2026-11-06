@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import json
+import sqlite3
 import codecs
 import time
 import asyncio
@@ -3376,6 +3377,16 @@ class GatewayService:
                 # Keep the original planning request locatable even before that point.
                 request.scope["guyan_autonomy_ingress_trace"] = trace_id
                 logger.info("Autonomy model request | trace=%s phase=received", trace_id)
+        from autonomy_plan_result import HEADER, identity, reserve, record
+        planning_receipt = None
+        if HEADER in request.headers:
+            try:
+                planning_receipt = identity(request, await request.json())
+                existing = reserve(self.state_store, planning_receipt)
+                if existing is not None:
+                    return existing
+            except (ValueError, TypeError) as exc:
+                return JSONResponse({'error': {'code': str(exc)}}, status_code=400)
         try:
             self._maybe_reload_runtime_overlay()
             snapshot = self._memory_configuration_snapshot(apply=True)
@@ -3388,6 +3399,12 @@ class GatewayService:
         token = REQUEST_CONFIGURATION.set(frozen)
         try:
             response = await self._handle_chat_unfrozen(request)
+            if planning_receipt is not None:
+                # Complete the private handoff even if the originating HTTP client timed out.
+                try:
+                    record(self.state_store, planning_receipt, response)
+                except (ValueError, TypeError, AttributeError, sqlite3.Error) as exc:
+                    logger.warning('Planning result handoff unavailable | type=%s', type(exc).__name__)
             if isinstance(response, StreamingResponse):
                 iterator = response.body_iterator
                 async def frozen_stream():
@@ -4818,15 +4835,34 @@ class GatewayService:
         # Reset in finally even on timeout; concurrent turns cannot share clocks.
         scope = (payload.get("_ombre_trace_context") or {}).get("runtime_scope", "chat")
         from memory_delivery import capture_carriers
-        with use_clock(request, enabled=scope == "chat") as clock, capture_carriers():
-            result = await self._prepare_payload_with_clock(
-                payload, session_id, include_favorite_memory=include_favorite_memory,
-                include_debug=include_debug, debug_detail=debug_detail,
-                continuation_phase=continuation_phase, prompt_plan=prompt_plan,
-                request=request, snapshot_identity=snapshot_identity, autonomy_context=autonomy_context)
-            if include_debug and len(result) == 3:
-                result[2]["time_context"] = clock_metadata(result[0].get("messages") or [])
-            return result
+        frozen = REQUEST_CONFIGURATION.get()
+        configuration_token = None
+        if autonomy_context is not None and (not frozen or frozen.get("service") != id(self)):
+            # Autonomous Recall enters here without handle_chat's request
+            # snapshot. Use the same immutable owner settings and one effective
+            # policy instance so its query caches survive the whole preparation.
+            try:
+                self._maybe_reload_runtime_overlay()
+                snapshot = self._memory_configuration_snapshot(apply=True)
+            except (ConfigurationError, OSError, ValueError):
+                snapshot = memory_configuration(self.config)
+            configuration_token = REQUEST_CONFIGURATION.set({
+                "service": id(self), "revision": snapshot["revision"], "values": snapshot["values"],
+                "base_recall_policy": self.recall_policy,
+            })
+        try:
+            with use_clock(request, enabled=scope == "chat") as clock, capture_carriers():
+                result = await self._prepare_payload_with_clock(
+                    payload, session_id, include_favorite_memory=include_favorite_memory,
+                    include_debug=include_debug, debug_detail=debug_detail,
+                    continuation_phase=continuation_phase, prompt_plan=prompt_plan,
+                    request=request, snapshot_identity=snapshot_identity, autonomy_context=autonomy_context)
+                if include_debug and len(result) == 3:
+                    result[2]["time_context"] = clock_metadata(result[0].get("messages") or [])
+                return result
+        finally:
+            if configuration_token is not None:
+                REQUEST_CONFIGURATION.reset(configuration_token)
 
     async def _prepare_payload_with_clock(
         self,
@@ -7167,17 +7203,37 @@ class GatewayService:
     async def handle_autonomy_memory_recall(self, request: Request) -> JSONResponse:
         auth = self._authorize(request.headers.get('Authorization', ''))
         if auth is not None: return auth
+        diagnostics = {}
         try:
-            from autonomy_memory import scope_from, prepare
+            from autonomy_memory import scope_from, prepare, preparation_contract
+            contract = preparation_contract(self)
+            if request.method == 'GET':
+                return JSONResponse(contract, headers={'Cache-Control': 'no-store'})
             query = await request.json()
             if not isinstance(query, dict) or set(query) != {'scope', 'model'}:
                 raise ValueError('autonomy_scope_and_model_required')
-            result = await prepare(self, scope_from(query['scope']), model=query['model'])
+            result = await asyncio.wait_for(prepare(self, scope_from(query['scope']),
+                model=query['model'], diagnostics=diagnostics), timeout=contract['total_seconds'])
             return JSONResponse(result, headers={'Cache-Control': 'no-store'})
         except (ValueError, TypeError, KeyError) as exc:
             return JSONResponse({'state': 'unavailable', 'reason': str(exc)}, status_code=400)
-        except (httpx.HTTPError, asyncio.TimeoutError):
-            return JSONResponse({'state': 'unavailable', 'reason': 'autonomy_source_read_failed'}, status_code=503)
+        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+            return JSONResponse({'state': 'unavailable',
+                'reason': 'autonomy_recall_prepare_deadline' if isinstance(exc, asyncio.TimeoutError)
+                          else 'autonomy_source_read_failed',
+                'failure_stage': diagnostics.get('failure_stage', 'source_context'),
+                'error_type': type(exc).__name__}, status_code=503)
+
+    async def handle_autonomy_plan_result(self, request: Request) -> JSONResponse:
+        auth = self._authorize(request.headers.get('Authorization', ''))
+        if auth is not None:
+            return auth
+        from autonomy_plan_result import lookup
+        try:
+            result = lookup(self.state_store, await request.json())
+        except (TypeError, ValueError) as exc:
+            return JSONResponse({'error': {'code': str(exc)}}, status_code=400)
+        return JSONResponse(result, headers={'Cache-Control': 'no-store'})
 
     async def handle_model_request_trace_clear(self, request: Request) -> JSONResponse:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
@@ -28842,6 +28898,9 @@ def create_gateway_app(
     async def memory_delivery_route(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_memory_delivery(request)
 
+    async def autonomy_plan_result_route(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_autonomy_plan_result(request)
+
     async def autonomy_memory_recall_route(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_autonomy_memory_recall(request)
 
@@ -28911,7 +28970,8 @@ def create_gateway_app(
             Route("/api/debug/upstream-usage", upstream_usage_debug, methods=["GET"]),
             Route("/internal/attachment-adoption/lookup", attachment_adoption_lookup, methods=["POST"]),
             Route("/internal/memory-delivery/lookup", memory_delivery_route, methods=["POST"]),
-            Route("/internal/autonomy/memory-recall", autonomy_memory_recall_route, methods=["POST"]),
+            Route("/internal/autonomy/memory-recall", autonomy_memory_recall_route, methods=["GET", "POST"]),
+            Route("/internal/autonomy/planning-result", autonomy_plan_result_route, methods=["POST"]),
             Route("/internal/memory-delivery/activate", memory_delivery_route, methods=["POST"]),
             Route("/api/debug/model-requests", model_request_trace_list, methods=["GET"]),
             Route("/api/debug/model-requests/events", model_request_trace_events, methods=["GET"]),

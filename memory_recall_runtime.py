@@ -574,7 +574,11 @@ async def verify_sources(service, request, query, items, *, refresh=False):
             continue
         check = checked.get(cache_keys.get((record["memory_id"], record["revision"])))
         if bindings_by_bucket.get(bid) and (not check or check.get("state") != "ok"):
-            item["admission_reason"] = "l0_source_not_current_or_eligible"
+            # A deadline/transport failure is an unknown qualification, not
+            # evidence that this same source was actually withdrawn. Both
+            # remain excluded; only a real negative response names ineligibility.
+            item["admission_reason"] = ("l0_source_verification_unavailable" if not check
+                                        else "l0_source_not_current_or_eligible")
             request.setdefault("incomplete_reasons", []).append(item["admission_reason"])
             continue
         statuses = (check or {}).get("sources") or {}

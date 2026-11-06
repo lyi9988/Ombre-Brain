@@ -1973,8 +1973,6 @@ class RecallPolicy:
         )
         if not any(marker in text for marker in probe_markers):
             return False
-        if any(re.search(r"[\u4e00-\u9fff]", term) for term in self.extract_entity_keywords(text)):
-            return False
         recall_intent_markers = (
             "记得",
             "记忆",
@@ -1993,7 +1991,11 @@ class RecallPolicy:
             "look up",
             "why",
         )
-        return not any(marker in text for marker in recall_intent_markers)
+        # Either kind of evidence rejects the probe-only classification. Check
+        # the literal markers before extracting entities from a complete record.
+        if any(marker in text for marker in recall_intent_markers):
+            return False
+        return not any(re.search(r"[\u4e00-\u9fff]", term) for term in self.extract_entity_keywords(text))
 
     def _is_affect_only_query(self, query: str) -> bool:
         compact = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(query or "").lower())
@@ -2144,11 +2146,15 @@ class RecallPolicy:
             value = mixed if stripped == self._compact_entity_keyword(mixed) else stripped
             add(value, strong=True)
 
+        expanded_entities: set[str] = set()
         for word, flag in self._posseg_words(raw):
             if (
                 flag in ENTITY_KEYWORD_POS_TAGS
                 or any(str(flag or "").startswith(prefix) for prefix in ENTITY_KEYWORD_POS_PREFIXES)
             ):
+                if word in expanded_entities:
+                    continue
+                expanded_entities.add(word)
                 add(word, strong=True)
                 for expanded in self._expand_entity_title_suffixes(raw, word):
                     add(expanded, strong=True)
@@ -2261,16 +2267,19 @@ class RecallPolicy:
         compact_entity = self._compact_entity_keyword(entity)
         if not compact_raw or not compact_entity:
             return []
+        suffixes = tuple(
+            (suffix, self._compact_entity_keyword(suffix))
+            for suffix in sorted(ENTITY_KEYWORD_TITLE_SUFFIXES, key=len, reverse=True)
+        )
         output: list[str] = []
         start = 0
         while True:
             index = compact_raw.find(compact_entity, start)
             if index < 0:
                 break
-            tail = compact_raw[index + len(compact_entity):]
-            for suffix in sorted(ENTITY_KEYWORD_TITLE_SUFFIXES, key=len, reverse=True):
-                compact_suffix = self._compact_entity_keyword(suffix)
-                if compact_suffix and tail.startswith(compact_suffix):
+            tail_start = index + len(compact_entity)
+            for suffix, compact_suffix in suffixes:
+                if compact_suffix and compact_raw.startswith(compact_suffix, tail_start):
                     output.append(entity + suffix)
                     break
             start = index + max(1, len(compact_entity))
@@ -2286,71 +2295,88 @@ class RecallPolicy:
     def _locatable_query_terms_cached(self, raw: str) -> tuple[str, ...]:
         output: list[str] = []
         seen: set[str] = set()
+        strip_fragments = self._locatable_query_strip_fragments()
+        normalized_terms: dict[str, str] = {}
+        def add(value: object, *, force: bool = False) -> bool:
+            raw_term = str(value or "")
+            if raw_term not in normalized_terms:
+                normalized_terms[raw_term] = self._normalize_locatable_query_term(
+                    raw_term, strip_fragments=strip_fragments,
+                )
+            cleaned = normalized_terms[raw_term]
+            if not cleaned:
+                return False
+            key = self._compact_entity_keyword(cleaned)
+            if not key or key in seen:
+                return False
+            if not force and not self._locatable_query_term_allowed(cleaned):
+                return False
+            seen.add(key)
+            output.append(cleaned)
+            return len(output) >= 8
+
+        for phrase in extract_protected_phrases(raw):
+            if add(phrase):
+                return tuple(output)
+        for match in ENTITY_QUOTED_RE.finditer(raw):
+            if add(match.group(1)):
+                return tuple(output)
+        for match in ENTITY_VERSION_RE.finditer(raw):
+            if add(match.group(0)):
+                return tuple(output)
+        for match in ENTITY_ENGLISH_RE.finditer(raw):
+            if add(match.group(0)):
+                return tuple(output)
+        for match in ENTITY_NUMBER_RE.finditer(raw):
+            if add(match.group(0)):
+                return tuple(output)
+        for match in re.finditer(
+            r"[A-Za-z0-9_.:-]*[\u4e00-\u9fff]+[A-Za-z0-9_.:-]+|[A-Za-z0-9_.:-]+[\u4e00-\u9fff]+[A-Za-z0-9_.:-]*",
+            raw,
+        ):
+            if add(match.group(0)):
+                return tuple(output)
+
         content_term_keys = {
             self._compact_entity_keyword(term)
             for term in content_terms_for_query(raw, self.options)
             if self._compact_entity_keyword(term)
         }
-
-        def add(value: object, *, force: bool = False) -> None:
-            cleaned = self._normalize_locatable_query_term(value)
-            if not cleaned:
-                return
-            if not force and not self._locatable_query_term_allowed(cleaned):
-                return
-            key = self._compact_entity_keyword(cleaned)
-            if not key or key in seen:
-                return
-            seen.add(key)
-            output.append(cleaned)
-
-        for phrase in extract_protected_phrases(raw):
-            add(phrase)
-        for match in ENTITY_QUOTED_RE.finditer(raw):
-            add(match.group(1))
-        for match in ENTITY_VERSION_RE.finditer(raw):
-            add(match.group(0))
-        for match in ENTITY_ENGLISH_RE.finditer(raw):
-            add(match.group(0))
-        for match in ENTITY_NUMBER_RE.finditer(raw):
-            add(match.group(0))
-        for match in re.finditer(
-            r"[A-Za-z0-9_.:-]*[\u4e00-\u9fff]+[A-Za-z0-9_.:-]+|[A-Za-z0-9_.:-]+[\u4e00-\u9fff]+[A-Za-z0-9_.:-]*",
-            raw,
-        ):
-            add(match.group(0))
-
         for term in self._pos_structural_locatable_terms(raw, content_term_keys=content_term_keys):
-            add(term)
+            if add(term):
+                return tuple(output)
 
         specific_terms = self.specific_query_terms(raw)
+        specific_pairs = [(term, self._compact_entity_keyword(term)) for term in specific_terms]
         compact_raw = self._compact_entity_keyword(raw)
         structural_terms = list(output)
         for structural_term in structural_terms:
             structural_key = self._compact_entity_keyword(structural_term)
-            for term in specific_terms:
-                term_key = self._compact_entity_keyword(term)
+            for term, term_key in specific_pairs:
                 if not term_key or term_key == structural_key or term_key not in structural_key:
                     continue
                 if self._contained_structural_subterm_allowed(term):
-                    add(term)
-        for left, right in product(structural_terms, specific_terms):
+                    if add(term):
+                        return tuple(output)
+        suffix_terms = [term for term in specific_terms if str(term or "").strip() in LOCATABLE_COMPOUND_SUFFIX_TERMS]
+        for left, right in product(structural_terms, suffix_terms):
             left_text = str(left or "").strip()
             right_text = str(right or "").strip()
             if not left_text or not right_text or left_text == right_text:
                 continue
-            if right_text not in LOCATABLE_COMPOUND_SUFFIX_TERMS:
-                continue
             combined = f"{left_text}{right_text}"
             if self._compact_entity_keyword(combined) in compact_raw:
-                add(combined)
+                if add(combined):
+                    return tuple(output)
         if query_has_facet(raw, "embodiment", self.options):
-            add("身体")
-            add("具身")
+            if add("身体") or add("具身"):
+                return tuple(output)
         for term in self._relation_axis_locatable_terms(raw, specific_terms):
-            add(term)
+            if add(term):
+                return tuple(output)
         for term in self._event_place_locatable_terms(raw, specific_terms):
-            add(term, force=True)
+            if add(term, force=True):
+                return tuple(output)
 
         return tuple(output[:8])
 
@@ -2366,6 +2392,7 @@ class RecallPolicy:
             if self._normalize_entity_keyword(word)
         ]
         output: list[str] = []
+        expanded_entities: set[str] = set()
 
         def add(value: object) -> None:
             cleaned = self._normalize_entity_keyword(value)
@@ -2375,6 +2402,11 @@ class RecallPolicy:
         for word, flag in tokens:
             if flag in ENTITY_KEYWORD_POS_TAGS or any(flag.startswith(prefix) for prefix in ENTITY_KEYWORD_POS_PREFIXES):
                 word = self._strip_leading_axis_conjunction(word, content_term_keys=content_term_keys)
+                # Expansion already searches the complete query, including all
+                # suffix occurrences. Repeated POS tokens add no new candidates.
+                if word in expanded_entities:
+                    continue
+                expanded_entities.add(word)
                 add(word)
                 for expanded in self._expand_entity_title_suffixes(raw, word):
                     add(expanded)
@@ -2500,28 +2532,37 @@ class RecallPolicy:
             return True
         return bool(re.fullmatch(r"[\u4e00-\u9fff]{2,8}", key))
 
-    def _normalize_locatable_query_term(self, value: object) -> str:
+    def _locatable_query_strip_fragments(self) -> tuple[str, ...]:
+        strip_terms = set(LOCATABLE_STRIP_TERMS)
+        strip_terms.update(str(term or "") for term in self.options.context_terms)
+        strip_terms.update(str(term or "") for term in self.ai_reaction_names)
+        names = identity_names()
+        strip_terms.update(
+            str(term or "")
+            for term in (
+                names.get("ai_name"),
+                names.get("user_name"),
+                names.get("user_display_name"),
+                *(names.get("user_aliases") or []),
+            )
+        )
+        return tuple(sorted(
+            (self._compact_entity_keyword(term) for term in strip_terms),
+            key=len, reverse=True,
+        ))
+
+    def _normalize_locatable_query_term(
+        self, value: object, *, strip_fragments: tuple[str, ...] | None = None,
+    ) -> str:
         cleaned = self._normalize_entity_keyword(value)
         if not cleaned:
             return ""
         compact = self._compact_entity_keyword(cleaned)
         if not compact:
             return ""
-
-        strip_terms = set(LOCATABLE_STRIP_TERMS)
-        strip_terms.update(str(term or "") for term in self.options.context_terms)
-        strip_terms.update(str(term or "") for term in self.ai_reaction_names)
-        strip_terms.update(
-            str(term or "")
-            for term in (
-                identity_names().get("ai_name"),
-                identity_names().get("user_name"),
-                identity_names().get("user_display_name"),
-                *(identity_names().get("user_aliases") or []),
-            )
-        )
-        for term in sorted(strip_terms, key=lambda item: len(self._compact_entity_keyword(item)), reverse=True):
-            fragment = self._compact_entity_keyword(term)
+        if strip_fragments is None:
+            strip_fragments = self._locatable_query_strip_fragments()
+        for fragment in strip_fragments:
             if fragment:
                 compact = compact.replace(fragment, "")
 

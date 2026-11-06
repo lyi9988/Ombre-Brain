@@ -1,5 +1,6 @@
 """Native planning recall requires a successful provider wire and an exact source."""
 import asyncio
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +44,7 @@ def test_native_recall_preparation_is_not_delivery_and_successful_wire_is(tmp_pa
             'query': 'Continue the sample-size analysis', 'request_id': 'cycle-1'}
     async def prepare_payload(payload, _conversation, **kwargs):
         assert kwargs['autonomy_context']['scope']['conversation_id'] == SCOPE['conversation_id']
+        assert kwargs['include_debug'] is True and kwargs['debug_detail'] == 'compact'
         return payload, None, {'memory_recall_projection': projection()}
     monkeypatch.setattr(autonomy_memory, 'read_context', source)
     service = SimpleNamespace(prepare_payload=prepare_payload, memory_delivery=store,
@@ -103,12 +105,49 @@ def test_internal_http_recall_route_requires_auth_and_server_prepared_scope(tmp_
                 base_url='http://local.test') as client:
             route = '/internal/autonomy/memory-recall'
             request = {'scope': SCOPE, 'model': 'owner-model'}
+            assert (await client.get(route)).status_code == 401
+            contract = await client.get(route, headers={'Authorization': 'Bearer gateway-test-token'})
+            assert contract.status_code == 200
+            assert contract.json()['schema'] == 'autonomy-recall-contract-v1'
+            assert contract.json()['total_seconds'] >= contract.json()['selection_limit_seconds'] >= 30
             assert (await client.post(route, json=request)).status_code == 401
             response = await client.post(route, json=request,
                 headers={'Authorization': 'Bearer gateway-test-token'})
             assert response.status_code == 200
             assert response.json()['memory_messages']
             assert service.memory_delivery.lookup(SCOPE)['state'] == 'unavailable'
+        await service.http_client.aclose()
+    run(scenario())
+
+
+@pytest.mark.parametrize('failure', ['source_timeout', 'prepare_timeout', 'total_deadline'])
+def test_recall_http_failures_expose_stage_without_source_text(tmp_path, monkeypatch, failure):
+    service, _ = gateway_service(lambda _: httpx.Response(200, json={}))
+    async def source(_service, scope):
+        if failure == 'source_timeout':
+            raise httpx.ReadTimeout('PRIVATE_SOURCE_TEXT')
+        return {'state': 'available', 'scope': scope, 'status': 'prepared',
+            'query': 'Continue actual source', 'request_id': scope['cycle_id']}
+    async def prepare_payload(*args, **kwargs):
+        if failure == 'prepare_timeout':
+            raise httpx.ReadTimeout('PRIVATE_SOURCE_TEXT')
+        await asyncio.sleep(.03)
+    monkeypatch.setattr(autonomy_memory, 'read_context', source)
+    monkeypatch.setattr(service, 'prepare_payload', prepare_payload)
+    if failure == 'total_deadline':
+        monkeypatch.setattr(autonomy_memory, 'preparation_contract', lambda _: {'total_seconds': .001})
+    from gateway import create_gateway_app
+    app = create_gateway_app(config={'gateway': {}}, service=service)
+    app.state.gateway_service = service
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://local.test') as client:
+            response = await client.post('/internal/autonomy/memory-recall', json={'scope': SCOPE, 'model': 'owner-model'},
+                headers={'Authorization': 'Bearer gateway-test-token'})
+            assert response.status_code == 503
+            result = response.json()
+            assert result['failure_stage'] == ('source_context' if failure == 'source_timeout' else 'recall_prepare')
+            assert result['error_type'] == ('TimeoutError' if failure == 'total_deadline' else 'ReadTimeout')
+            assert 'PRIVATE_SOURCE_TEXT' not in response.text
         await service.http_client.aclose()
     run(scenario())
 
@@ -129,6 +168,18 @@ def test_real_prepare_native_query_alias_smoke(tmp_path, monkeypatch):
     service.memory_detail_recall_budget = 4000
     service.recent_budget = 0
     service.retrieval_mode = 'bucket'
+    # This older half-constructed fixture must expose the same effective
+    # configuration contract as a real service to the native request snapshot.
+    from memory_system_config import LIMITS
+    service.gateway_cfg = service.config.setdefault('gateway', {})
+    for _name, (section, key, _minimum, _maximum, default, _label) in LIMITS.items():
+        if section == 'gateway':
+            attribute = 'recalled_budget' if key == 'recalled_memory_budget' else key
+            service.gateway_cfg[key] = service.__dict__.get(attribute, default)
+        else:
+            service.config.setdefault(section, {})[key] = default
+    from reranker_engine import RerankerEngine
+    service.reranker_engine = RerankerEngine(service.config)
     async def listed(**kwargs): return buckets
     service._list_gateway_buckets = listed
     from gateway import memory_use
@@ -158,6 +209,23 @@ def test_real_prepare_native_query_alias_smoke(tmp_path, monkeypatch):
     assert resolved == ['synthetic-alias']
     assert result['memory_messages'], __import__('json').dumps(captured['memory_recall_projection'], ensure_ascii=False, default=str)
     assert service.memory_delivery.lookup(SCOPE)['state'] == 'unavailable'
+
+    # Full UI diagnostics and the background compact view must expose exactly
+    # the same source-bound L2/projection and audit stages to this consumer.
+    native = run(autonomy_memory.read_context(service, SCOPE))
+    full_payload = {'model': 'synthetic-alias', 'messages': [{'role': 'system', 'content': native['query']}],
+        '_ombre_trace_context': {'runtime_scope': 'internal:autonomy_chain',
+            'conversation_id': SCOPE['conversation_id'], 'request_id': native['request_id'], 'recall_signals': {}}}
+    _, _, full = run(original_prepare(full_payload, SCOPE['conversation_id'], include_debug=True,
+        debug_detail='full', autonomy_context=native))
+    for key in ('compiled_memory_blocks', 'delivery_candidates', 'rendered_memory_spans', 'presentation_trace', 'recall_status'):
+        assert full['memory_recall_projection'].get(key) == captured['memory_recall_projection'].get(key)
+    assert set(full['prepare_timing_debug']['steps_ms']) == set(captured['prepare_timing_debug']['steps_ms'])
+    for key in ('sources', 'l2_resolve', 'final_source_recheck'):
+        compact_io = captured['prepare_timing_debug']['recall_io'].get(key) or {}
+        full_io = full['prepare_timing_debug']['recall_io'].get(key) or {}
+        for count in ('calls', 'passes', 'timeouts'):
+            assert full_io.get(count) == compact_io.get(count)
 
 
     assert captured['prepare_timing_debug']['recall_input']['staged_user_event_ids'] == []
@@ -192,3 +260,41 @@ def test_native_recall_input_never_constructs_a_user_message():
     assert value['q_current'] == context['query']
     with pytest.raises(ValueError):
         autonomy_memory.recall_input({**context, 'status': 'completed'})
+
+
+@pytest.mark.parametrize('final_state,expected', [
+    ('deadline', 'l0_source_verification_unavailable'),
+    ('transport', 'l0_source_verification_unavailable'),
+    ('memory_not_current_or_eligible', 'l0_source_not_current_or_eligible'),
+    ('withdrawn', 'l0_source_not_eligible'),
+])
+def test_final_source_refresh_cannot_reuse_an_old_positive_check(tmp_path, monkeypatch, final_state, expected):
+    import memory_recall_runtime as memory_use
+    from test_memory_recall_projection_r2 import _fixture, _request
+    _, service, view, buckets, _ = _fixture(tmp_path, monkeypatch)
+    request = _request(view, ['bucket-l1'])
+    memory_use.prepare(service, request, request['q_current'], buckets)
+    calls = []
+    async def read_batch(_service, _request, stage, path, payload):
+        calls.append(deepcopy(payload))
+        if len(calls) == 2 and final_state == 'deadline':
+            raise asyncio.TimeoutError
+        if len(calls) == 2 and final_state == 'transport':
+            raise httpx.ReadError('PRIVATE_SOURCE_TEXT')
+        return {'items': [{**{k: item[k] for k in ('memory_id', 'revision')},
+            'state': 'memory_not_current_or_eligible' if len(calls) == 2 and final_state == 'memory_not_current_or_eligible' else 'ok',
+            'sources': {binding: {'state': 'withdrawn' if len(calls) == 2 and final_state == 'withdrawn' else 'available',
+                'eligible_source': not (len(calls) == 2 and final_state == 'withdrawn')}
+                for binding in item['binding_ids']}}
+            for item in payload['items']]}
+    monkeypatch.setattr(memory_use, 'read_batch', read_batch)
+    initial = [{'bucket': buckets[0], 'score': .9}]
+    assert len(asyncio.run(memory_use.verify_sources(service, request, request['q_current'], initial))) == 1
+    final = [{'bucket': buckets[0], 'score': .9}]
+    assert asyncio.run(memory_use.verify_sources(service, request, request['q_current'], final, refresh=True)) == []
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert final[0]['admission_reason'] == expected
+    assert request['usage_by_bucket']['bucket-l1']['state'] == 'excluded'
+    if final_state == 'deadline':
+        assert 'final_source_deadline' in request['incomplete_reasons']
+        assert 'l0_source_not_current_or_eligible' not in request['incomplete_reasons']

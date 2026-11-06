@@ -803,7 +803,7 @@ def recall_topic_query(
         return ""
     focus = recall_focus_query(text, options)
     focus_topic = _strip_query_water_terms(focus, options)
-    raw_topic = _strip_query_water_terms(text, options)
+    raw_topic = focus_topic if focus == text else _strip_query_water_terms(text, options)
     if focus != text and focus_topic and raw_topic and len(raw_topic) < len(focus_topic):
         return raw_topic
     return focus_topic or raw_topic
@@ -1550,6 +1550,7 @@ def _strip_query_water_terms(
     stop_terms.difference_update(protected_cjk_stop_terms)
     fragment_stop_terms = set(QUERY_EXTRA_STOPWORDS)
     fragment_stop_terms.difference_update(protected_cjk_stop_terms)
+    ordered_fragment_stop_terms = _ordered_cjk_water_terms(fragment_stop_terms)
     tokens: list[str] = []
     removed_water = False
     scan_text = text
@@ -1576,7 +1577,9 @@ def _strip_query_water_terms(
                 removed_water = True
                 continue
             if re.fullmatch(r"[\u4e00-\u9fff]+", compact_key):
-                stripped = _strip_cjk_water_fragments(compact_key, fragment_stop_terms)
+                stripped = _strip_cjk_water_fragments(
+                    compact_key, fragment_stop_terms, ordered_terms=ordered_fragment_stop_terms,
+                )
                 if stripped != compact_key:
                     removed_water = True
                 compact_key = stripped
@@ -1596,16 +1599,24 @@ def _strip_query_water_terms(
     return " ".join(tokens)
 
 
-def _strip_cjk_water_fragments(text: str, stop_terms: set[str]) -> str:
-    cleaned = str(text or "")
-    if not cleaned:
-        return ""
+def _ordered_cjk_water_terms(stop_terms: set[str]) -> tuple[str, ...]:
     cjk_stop_terms = [
         term
         for term in stop_terms
         if term and re.fullmatch(r"[\u4e00-\u9fff]+", term)
     ]
-    for term in sorted(cjk_stop_terms, key=len, reverse=True):
+    return tuple(sorted(cjk_stop_terms, key=len, reverse=True))
+
+
+def _strip_cjk_water_fragments(
+    text: str, stop_terms: set[str], *, ordered_terms: tuple[str, ...] | None = None,
+) -> str:
+    cleaned = str(text or "")
+    if not cleaned:
+        return ""
+    if ordered_terms is None:
+        ordered_terms = _ordered_cjk_water_terms(stop_terms)
+    for term in ordered_terms:
         if term and term != cleaned:
             cleaned = cleaned.replace(term, "")
             if not cleaned:

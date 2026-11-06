@@ -1,11 +1,33 @@
 """Native activity recall consumer; uses the original Recall and delivery store."""
 from copy import deepcopy
+import math
+import time
 
 from memory_delivery import digest, compiled_candidates
 
 FIELDS = {'consumer_kind', 'conversation_id', 'identity_id', 'activity_id',
           'activity_revision', 'source_scope', 'cycle_id', 'operation_id'}
 HEADER = 'X-Guyan-Autonomy-Memory-Recall'
+
+
+def preparation_contract(service):
+    """Bound the whole operation without shortening its existing selection IO.
+
+    Source read and the surrounding preparation use the existing Gateway read
+    allowance. Reserve the existing selectable maximum (30s), so a cached
+    contract also covers an owner changing Recall from 15s to 30s at runtime.
+    This is an operation/transport deadline, not a new retrieval quality budget.
+    """
+    from gateway import DEFAULT_GATEWAY_UPSTREAM_READ_TIMEOUT_SECONDS
+    read = getattr(getattr(getattr(service, 'http_client', None), 'timeout', None), 'read', None)
+    if isinstance(read, bool) or not isinstance(read, (int, float)) or not math.isfinite(read) or read <= 0:
+        read = DEFAULT_GATEWAY_UPSTREAM_READ_TIMEOUT_SECONDS
+    selection = getattr(service, 'recall_timeout_seconds', 15.0)
+    selection_limit = max(30.0, selection)
+    return {'schema': 'autonomy-recall-contract-v1', 'state': 'available',
+        'source_read_seconds': read, 'preparation_seconds': read,
+        'selection_seconds': selection, 'selection_limit_seconds': selection_limit,
+        'total_seconds': read * 2 + selection_limit}
 
 
 def recall_input(context):
@@ -107,8 +129,12 @@ async def historical_input_states(service, context):
     return list(states.values())
 
 
-async def prepare(service, scope, *, model):
+async def prepare(service, scope, *, model, diagnostics=None):
+    diagnostics = diagnostics if diagnostics is not None else {}
+    started = time.perf_counter()
+    diagnostics['failure_stage'] = 'source_context'
     context = await read_context(service, scope)
+    diagnostics['source_context_ms'] = round((time.perf_counter() - started) * 1000)
     if context.get('status') != 'prepared' or not isinstance(context.get('query'), str) or not context['query'].strip():
         raise ValueError('autonomy_prepared_source_required')
     # This is a real activity search cue, never a fabricated user/chat event.
@@ -116,8 +142,13 @@ async def prepare(service, scope, *, model):
         '_ombre_trace_context': {'runtime_scope': 'internal:autonomy_chain',
             'conversation_id': scope['conversation_id'], 'request_id': context.get('request_id'),
             'recall_signals': context.get('recall_signals') or {}}}
+    diagnostics['failure_stage'] = 'recall_prepare'
+    prepare_started = time.perf_counter()
+    # This consumer needs the exact compiled projection, not UI-only full
+    # candidate prose/re-scoring. Compact keeps projection/timings intact.
     _, _, debug = await service.prepare_payload(payload, scope['conversation_id'],
-        include_debug=True, debug_detail='full', autonomy_context=context)
+        include_debug=True, debug_detail='compact', autonomy_context=context)
+    diagnostics['recall_prepare_ms'] = round((time.perf_counter() - prepare_started) * 1000)
     projection = debug.get('memory_recall_projection') or {}
     frozen = compiled_candidates(projection, projection.get('delivery_candidates') or [])
     messages = []
@@ -131,8 +162,10 @@ async def prepare(service, scope, *, model):
             'source_refs': {'scope': deepcopy(scope), 'fragments': [
                 {k: deepcopy(v) for k, v in f.items() if not k.startswith('_')} for f in refs]}}})
     recall_id = service.memory_delivery.prepare_autonomy(scope, frozen, messages)
+    diagnostics.update(failure_stage='completed', duration_ms=round((time.perf_counter() - started) * 1000))
     return {'state': 'available', 'scope': scope, 'recall_id': recall_id,
         'memory_messages': messages, 'recall_status': projection.get('recall_status'),
+        'preparation': deepcopy(diagnostics),
         'assessment': {'uses': 'not_assessed', 'reactions': 'not_assessed'}}
 
 
