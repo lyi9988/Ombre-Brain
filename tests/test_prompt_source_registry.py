@@ -70,7 +70,8 @@ def test_l2_generation_prompt_is_registered_and_has_gateway_fallback_factory():
     body = factory_body(source_id)
 
     assert spec.scope == "memory.reflection"
-    assert spec.source_revision == "factory-memory-l2-generation-v5-scoped-readable-writing"
+    assert "自然第一人称" in spec.factory_body() and "证据片段里没有回应" in spec.factory_body()
+    assert spec.source_revision == "factory-memory-l2-generation-v6-personal-voice"
     assert spec.factory_body() == body
     assert "review" in body and "required" in body and "reasons" in body
     assert "仅放审阅元数据" in body
