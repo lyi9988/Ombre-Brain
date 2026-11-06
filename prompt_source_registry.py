@@ -61,7 +61,7 @@ _MEMORY_L2_GENERATION_PROMPT = """把这条 L1 已经收录的内容写成供聊
 
 事实依据是 sources 中的真实原文；L1 帮助组织完整经历、主体、时间、条件、认知变化和未解决问题。不要把 L1 的归档评语或写作痕迹当成发生过的事；L1 与原文有分歧时不补故事，有实质冲突就在 review 中说明。rings 若含后续更正或反馈，照实保留变化及其先后，不冒充当初原话。
 
-正文采用记忆中助手的自然第一人称；用户和第三方的经历保留实际人名与归属，不能把别人的症状、想法或行为写成“我”的。保留原文明确的否定、条件、例外、计划未定和认知变化；历史状态仍属于那次经历，单次请求不改成长期偏好。来源消息的时间可说明何时说过这件事；另有明确事件时间时按事件时间表达，不把说话时间当成计划开始或事情完成的时间。没有必要就不加日期，未知也不用写成技术说明。
+记忆中属于自己亲历的事，正文用自然第一人称回想。已确认是两个人的直接聊天，用“你”或当时自然的称呼写一起经历这件事的人。同一句话里要让人看得清谁问、谁答、谁在形容谁。我说过的观察就写我当时怎么说；只有对方自己说过或明确认同的内容才归为对方的看法或偏好。证据片段里没有回应，不必在回忆末尾汇报缺了什么。若约定是否达成就是记忆要点，则自然写清当时谈到了哪一步。引用或转述第三人时保留实际人名与归属。保留原文明确的否定、条件、例外、计划未定和认知变化；历史状态仍属于那次经历，单次请求不改成长期偏好。来源消息的时间可说明何时说过这件事；另有明确事件时间时按事件时间表达，不把说话时间当成计划开始或事情完成的时间。没有必要就不加日期，未知也不用写成技术说明。
 
 写出完整的重要经历与理解，保留有意义的细节、动机和因果；不强制压缩成摘要，不为凑长度重复表达。动机、心理活动及“我意识到”等理解必须有原文依据。“我记得／我记住了”的叙事视角不证明当时作过回应；原文未提供助手回应时，不补“我答应了、我先收下、我未追问”等动作。正文不写提取、分类、归档、核验、采用、审核结果，也不附机器标签、ID、检索词或给聊天模型的操作指令。必要的时间、条件与不确定性自然写进经历。
 
@@ -100,10 +100,10 @@ FIXED_PROMPT_SOURCES = {
               revision="factory-chat-event-selection-v2"),
         _spec("ombre.daily_chat_event_assembly_prompt", "memory.daily_chat_event_assembly",
               "memory_chat_event_prompts:EVENT_ASSEMBLY_PROMPT", render="identity",
-              revision="factory-chat-event-assembly-v4"),
+              revision="factory-chat-event-assembly-v5"),
         _spec("ombre.memory_l2_generation_prompt", "memory.reflection",
               "prompt_source_registry:_MEMORY_L2_GENERATION_PROMPT",
-              revision="factory-memory-l2-generation-v5-scoped-readable-writing"),
+              revision="factory-memory-l2-generation-v6-personal-voice"),
         _spec("ombre.memory_l3_sync_prompt", "memory.reflection",
               "prompt_source_registry:_MEMORY_L3_SYNC_PROMPT", revision="factory-memory-l3-scoped-sync-v1"),
         _spec("ombre.daily_chat_summary_prompt", "memory.daily_chat_review",

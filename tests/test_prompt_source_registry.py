@@ -73,7 +73,8 @@ def test_l2_generation_prompt_is_composer_editable_and_keeps_its_contract(tmp_pa
     prompt = detail["factory_body"]
 
     assert spec.scope == "memory.reflection"
-    assert detail["source_revision"] == "factory-memory-l2-generation-v5-scoped-readable-writing"
+    assert "自然第一人称" in spec.factory_body() and "证据片段里没有回应" in spec.factory_body()
+    assert detail["source_revision"] == "factory-memory-l2-generation-v6-personal-voice"
     for requirement in (
         "full_injection_text", "coherent_sections", "optional_use_variants",
         "review", "required", "reasons", "statement_refs", "intended_use",

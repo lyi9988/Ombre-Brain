@@ -37,6 +37,8 @@ def test_event_factories_are_independently_scoped_and_use_configured_identity(tm
     resolved, metadata = resolve_fixed_prompt(store, source_id, config={'identity': {'ai_name': '配置助手'}})
     assert '配置助手' in resolved and '{ai_name}' not in resolved
     assert metadata['status'] == 'legacy_default'
+    if source_id == 'ombre.daily_chat_event_assembly_prompt':
+        assert "用“我”回想" in resolved and "{user_display_name}" not in resolved
     assert FIXED_PROMPT_SOURCES['ombre.daily_chat_memory_prompt'].factory_body() == DAILY_L1_PROMPT
 
 
