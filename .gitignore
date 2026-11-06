@@ -23,6 +23,7 @@ tests/*
 !tests/test_memory_legacy_backfill.py
 !tests/test_memory_legacy_backfill_api.py
 !tests/test_memory_legacy_projection.py
+!tests/test_memory_legacy_model_revision.py
 !tests/memory_l3_followup_review_browser.cjs
 .pytest-tmp/
 *.pyc

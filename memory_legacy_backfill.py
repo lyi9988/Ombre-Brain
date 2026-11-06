@@ -199,7 +199,8 @@ class LegacyMemoryBackfill:
         required = {'expected_revision', 'request_id', 'original_body_sha256',
                     'document', 'sources', 'generation', 'confidence'}
         if (not isinstance(payload, dict) or not required <= set(payload)
-                or set(payload) - required - {'sensitive', 'reason', 'source_refs'}
+                or set(payload) - required - {'sensitive', 'reason', 'source_refs',
+                    'expected_candidate_revision', 'expected_proposal_sha256'}
                 or type(payload['expected_revision']) is not int or payload['expected_revision'] < 1
                 or not isinstance(payload['request_id'], str) or not 1 <= len(payload['request_id'].strip()) <= 128
                 or not isinstance(payload['original_body_sha256'], str)
@@ -217,6 +218,14 @@ class LegacyMemoryBackfill:
         generation = payload['generation']
         if not isinstance(generation, dict) or generation.get('actor') != 'legacy_backfill':
             raise L1OwnerError('backfill_model_generation_required', field_path='generation')
+        revision_fields = {'expected_candidate_revision', 'expected_proposal_sha256'}
+        if revision_fields.intersection(payload):
+            if (not revision_fields <= set(payload) or type(payload['expected_candidate_revision']) is not int
+                    or payload['expected_candidate_revision'] < 1
+                    or not isinstance(payload['expected_proposal_sha256'], str)
+                    or len(payload['expected_proposal_sha256']) != 64
+                    or any(c not in '0123456789abcdef' for c in payload['expected_proposal_sha256'])):
+                raise L1OwnerError('backfill_model_revision_preconditions_required')
 
     async def _sources(self, sources):
         snapshots, bindings = bind_sources(sources, config=self.config)
@@ -251,12 +260,93 @@ class LegacyMemoryBackfill:
         return {'status': 'ok', 'memory_id': memory_id, 'current_revision': memory['active_revision'],
                 'candidate': self.authority.get_candidate(cid), 'adoption_is_separate': True}
 
+    @staticmethod
+    def _revision_prior(db, key, fingerprint):
+        prior = db.execute('SELECT result_json FROM candidate_decisions WHERE request_id=?', (key,)).fetchone()
+        if not prior:
+            return None
+        row = json.loads(prior['result_json'])
+        request = row['proposal']['metadata']['legacy_backfill'].get('model_revision_request') or {}
+        if request.get('request_sha256') != fingerprint:
+            raise IdempotencyConflict('model revision request id content changed')
+        return row
+
+    def _check_model_revision(self, db, row, payload):
+        if row is None:
+            raise L1OwnerError('backfill_candidate_not_found', status=404)
+        cid, proposal = row['candidate_id'], row['proposal']
+        if row['status'] != 'pending':
+            code = ('backfill_candidate_adoption_started' if row['status'] in {'accepted', 'committed', 'commit_failed'}
+                    else 'backfill_candidate_review_decided')
+            raise L1OwnerError(code, status=409)
+        if db.execute('SELECT 1 FROM candidate_decisions WHERE candidate_id=? AND from_status!=to_status '
+                      "AND actor!='policy' LIMIT 1", (cid,)).fetchone():
+            raise L1OwnerError('backfill_candidate_review_decided', status=409)
+        if db.execute("SELECT 1 FROM candidate_revisions WHERE candidate_id=? AND actor='owner' LIMIT 1", (cid,)).fetchone():
+            raise L1OwnerError('backfill_candidate_owner_modified', status=409)
+        history = db.execute('SELECT actor,status,proposal_json FROM candidate_revisions WHERE candidate_id=?', (cid,)).fetchall()
+        for version in history:
+            if version['status'] != 'pending':
+                raise L1OwnerError('backfill_candidate_review_decided', status=409)
+            saved = json.loads(version['proposal_json'])
+            metadata = saved.get('metadata') or {}
+            generation = (metadata.get('memory_l1') or {}).get('generation') or {}
+            if (version['actor'] not in {'policy', 'legacy_backfill_revision'}
+                    or saved.get('source_type') != 'legacy_backfill' or saved.get('requested_mode') != 'review'
+                    or saved.get('owner_explicit') is not False or metadata.get('owner_edit_request_hash')
+                    or generation.get('origin') != 'first_pass_model' or generation.get('actor') != 'legacy_backfill'):
+                raise L1OwnerError('backfill_candidate_not_model_only', status=409)
+        base = proposal.get('metadata', {}).get('legacy_backfill') or {}
+        if (not isinstance(base.get('memory_id'), str)
+                or _candidate_id(base['memory_id'], payload['expected_revision']) != cid
+                or base.get('expected_revision') != payload['expected_revision']
+                or base.get('original_body_sha256') != payload['original_body_sha256']):
+            raise L1OwnerError('backfill_revision_base_changed', status=409)
+        if row['revision'] != payload['expected_candidate_revision']:
+            raise L1OwnerError('backfill_candidate_revision_conflict', status=409, field_path='expected_candidate_revision')
+        if row['proposal_sha256'] != payload['expected_proposal_sha256']:
+            raise L1OwnerError('backfill_candidate_proposal_conflict', status=409, field_path='expected_proposal_sha256')
+        if payload['request_id'] == base.get('request_id'):
+            raise IdempotencyConflict('model revision must not reuse the original stage request id')
+        if db.execute("SELECT 1 FROM commit_log WHERE aggregate_id=? AND operation_kind='memory_revision' "
+                      "AND status IN ('prepared','body_written') LIMIT 1", (base['memory_id'],)).fetchone():
+            raise L1OwnerError('backfill_target_commit_in_progress', status=409)
+        if row.get('policy', {}).get('requires_owner_confirmation') is not True:
+            raise L1OwnerError('backfill_candidate_not_model_only', status=409)
+
+    @staticmethod
+    def _check_revision_scope(previous, document):
+        old = previous['proposal']['metadata']['memory_l1']['evidence_bindings']
+        for binding in document['evidence_bindings']:
+            supports = [item for item in old if all(item[key] == binding[key]
+                for key in ('source_namespace', 'source_id', 'source_revision', 'author_ref', 'speaker_ref'))]
+            for anchor in binding['anchors']:
+                if not any(all(prior[key] == anchor[key] for key in
+                    ('target_namespace', 'target_id', 'target_revision', 'text_view_id', 'coordinate_unit'))
+                    and prior['start'] <= anchor['start'] < anchor['end'] <= prior['end']
+                    for item in supports for prior in item['anchors']):
+                    raise L1OwnerError('backfill_revision_source_scope_changed', status=409, field_path='sources')
+
+    @staticmethod
+    def _revision_result(row, memory_id, base_revision, *, replayed):
+        return {'status': 'revised', 'candidate': row, 'candidate_id': row['candidate_id'],
+                'memory_id': memory_id, 'base_revision': base_revision, 'replayed': replayed,
+                'adopted': False, 'adoption_is_separate': True}
+
     async def stage(self, memory_id, payload):
         self._validate(payload)
         cid = _candidate_id(memory_id, payload['expected_revision'])
         fingerprint = semantic_sha256(payload)
         existing = self.authority.get_candidate(cid)
-        if existing:
+        revising = 'expected_candidate_revision' in payload
+        revision_key = 'legacy-backfill-model-revision:' + cid + ':' + payload['request_id']
+        if revising:
+            with closing(self.authority._connect()) as db:
+                prior = self._revision_prior(db, revision_key, fingerprint)
+                if prior:
+                    return self._revision_result(prior, memory_id, payload['expected_revision'], replayed=True)
+                self._check_model_revision(db, existing, payload)
+        elif existing:
             if existing['proposal']['metadata']['legacy_backfill']['request_sha256'] != fingerprint:
                 raise L1OwnerError('backfill_draft_already_exists', status=409, field_path='request_id')
             return {'status': 'exists', 'candidate': existing, 'replayed': True,
@@ -265,7 +355,8 @@ class LegacyMemoryBackfill:
         memory, generation = self.authority.get_memory_state_snapshot(memory_id)
         if not memory:
             raise MemoryNotFound(memory_id)
-        base = {'memory_id': memory_id, 'expected_revision': payload['expected_revision'],
+        base = deepcopy(existing['proposal']['metadata']['legacy_backfill']) if revising else {
+                'memory_id': memory_id, 'expected_revision': payload['expected_revision'],
                 'original_body_sha256': payload['original_body_sha256'], 'state_generation': generation,
                 'request_id': payload['request_id'], 'request_sha256': fingerprint,
                 'reason': payload.get('reason', '为同一条历史记忆补齐有来源的第一遍语义结构。')}
@@ -273,6 +364,8 @@ class LegacyMemoryBackfill:
             _check_base(self.authority, db, memory_id, base)
         original = await self.revisions.detail(memory_id, payload['expected_revision'])
         projected, legacy_proof = await self._projection_base(memory_id, memory, base)
+        if revising and legacy_proof != base.get('legacy_projection'):
+            raise RevisionConflict('legacy projection base changed after preparation')
         if legacy_proof:
             base['legacy_projection'] = legacy_proof
         # A migrated legacy record can still lack its immutable file. Retain
@@ -293,11 +386,18 @@ class LegacyMemoryBackfill:
             previous=original['l1']['document'], config=self.config,
             candidate_refs=payload.get('source_refs', []))
         body, semantic = split_document(document)
+        if revising:
+            self._check_revision_scope(existing, document)
         base['source_witnesses'] = self._witnesses(memory_id, base, semantic, sources=sources)
+        if revising:
+            base['model_revision_request'] = {'request_id': payload['request_id'], 'request_sha256': fingerprint,
+                'expected_candidate_revision': payload['expected_candidate_revision'],
+                'expected_proposal_sha256': payload['expected_proposal_sha256'], 'reason': payload.get('reason', '')}
         proposal = MemoryProposal.from_mapping({'proposal_id': cid, 'source_type': 'legacy_backfill',
             'proposed_body': body, 'source_refs': original['revisions'][0]['source_refs'],
             'source_status': 'verified', 'memory_type': 'memory', 'confidence': payload['confidence'],
-            'requested_mode': 'review', 'owner_explicit': False, 'sensitive': payload.get('sensitive', False),
+            'requested_mode': 'review', 'owner_explicit': False,
+            'sensitive': payload.get('sensitive', False) or (existing['proposal'].get('sensitive', False) if revising else False),
             'metadata': {'memory_l1': semantic, 'legacy_backfill': base,
                          'legacy_candidate': {'title': document['narrative']['title'], 'kind': 'memory',
                              'mode': 'review', 'source_verification': 'verified'}}})
@@ -305,9 +405,18 @@ class LegacyMemoryBackfill:
                                 requires_owner_confirmation=True)
         with closing(self.authority._connect()) as db, db:
             db.execute('BEGIN IMMEDIATE')
+            if revising:
+                prior = self._revision_prior(db, revision_key, fingerprint)
+                if prior:
+                    return self._revision_result(prior, memory_id, payload['expected_revision'], replayed=True)
             _check_base(self.authority, db, memory_id, base)
             current = self.authority._candidate_row(db.execute('SELECT * FROM candidates WHERE candidate_id=?', (cid,)).fetchone())
-            if current:
+            if revising:
+                self._check_model_revision(db, current, payload)
+                revised = self.authority._revise_candidate(db, cid, expected_revision=current['revision'],
+                    proposal=proposal, request_id=revision_key, actor='legacy_backfill_revision')
+                return self._revision_result(revised, memory_id, payload['expected_revision'], replayed=False)
+            elif current:
                 if current['proposal']['metadata']['legacy_backfill']['request_sha256'] != fingerprint:
                     raise IdempotencyConflict('another backfill draft was saved')
                 row, replayed = current, True
