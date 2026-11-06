@@ -821,6 +821,8 @@ class ReflectionEngine(MemoryL1Runtime):
             # Keep prior text in its own record; the candidate owns only its draft.
             candidate["owner_summary"] = True
             candidate["owner_summary_coverage"] = metadata.get("owner_summary_coverage") or {}
+        if isinstance(metadata.get('legacy_backfill'), dict):
+            candidate['legacy_backfill'] = dict(metadata['legacy_backfill'])
         followup = metadata.get('l3_followup')
         if isinstance(followup, dict):
             from memory_l3_followup import FollowupTasks
@@ -3687,6 +3689,19 @@ class ReflectionEngine(MemoryL1Runtime):
                     results.append({"id": candidate_id, "status": decided.get("status")})
                     continue
 
+                if row.get('proposal', {}).get('metadata', {}).get('legacy_backfill'):
+                    from memory_legacy_backfill import LegacyMemoryBackfill
+                    from memory_l1_service import L1OwnerError
+                    try:
+                        candidate_result = await LegacyMemoryBackfill(self._memory_l1_revisions(bucket_mgr),
+                            self._memory_l1_sources, config=self.config).adopt(row,
+                                edit=safe_edits.get(candidate_id), request_id=f"{rid}:{candidate_id}")
+                    except L1OwnerError as exc:
+                        candidate_result = {'id': candidate_id, 'status': 'invalid_source' if 'source' in exc.code else 'revision_conflict',
+                                            'reason': exc.code}
+                    created += int(candidate_result.get('status') == 'created')
+                    results.append(candidate_result)
+                    continue
                 if row.get('proposal', {}).get('metadata', {}).get('l3_followup'):
                     from memory_l3_followup import MemoryFollowups
                     candidate_result = await MemoryFollowups(self, bucket_mgr).adopt(row, owner=True,

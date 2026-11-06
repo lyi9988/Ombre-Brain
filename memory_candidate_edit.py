@@ -47,6 +47,9 @@ def _owner_l1_edit_payload(row, edit, *, revision_service, request_id):
         base_revision = bundle.get("expected_revision")
         if not memory_id or type(base_revision) is not int or base_revision < 0:
             raise ValueError("diary_l1_root_revision_invalid")
+    elif isinstance(metadata.get('legacy_backfill'), dict):
+        memory_id = metadata['legacy_backfill']['memory_id']
+        base_revision = metadata['legacy_backfill']['expected_revision']
     else:
         memory_id = str(row.get("candidate_id") or payload.get("proposal_id") or "").strip()
         base_revision = 0
@@ -119,7 +122,7 @@ def owner_edit_payload(row, edit, *, revision_service=None, request_id=""):
     if not isinstance(edit, dict) or not edit or set(edit) - (FIELDS | L1_FIELDS):
         raise ValueError("invalid_owner_edit")
     payload = copy.deepcopy(row["proposal"])
-    if payload.get("source_type") not in {"daily_chat", "chat_tool", "diary", "action_receipt", "owner_summary"}:
+    if payload.get("source_type") not in {"daily_chat", "chat_tool", "diary", "action_receipt", "owner_summary", "legacy_backfill"}:
         raise ValueError("unsupported_candidate_source")
     has_l1 = isinstance((payload.get("metadata") or {}).get("memory_l1"), dict)
     if payload.get("source_type") == "owner_summary" and not has_l1:

@@ -13044,6 +13044,42 @@ async def api_memory_l1_source_tasks(request):
         return JSONResponse({"error": "invalid_source_task_request"}, status_code=400, headers=headers)
 
 
+@mcp.custom_route('/api/memory-authority/memories/{memory_id}/legacy-backfill', methods=['GET', 'POST'])
+async def api_memory_legacy_backfill(request):
+    """Persist a targeted Review draft; no model call or adopted memory write."""
+    import json
+    from starlette.responses import JSONResponse
+    from memory_authority import IdempotencyConflict, MemoryNotFound, RevisionConflict
+    from memory_l1_contract import L1ContractError
+    from memory_l1_service import L1OwnerError
+    from memory_legacy_backfill import LegacyMemoryBackfill
+    err = _require_owner_or_internal_index_maintenance(request)
+    if err: return err
+    headers = {'Cache-Control': 'no-store'}
+    if memory_authority_store is None or memory_commit_service is None:
+        return JSONResponse({'error': {'code': 'memory_authority_unavailable'}}, status_code=503, headers=headers)
+    memory_id = str(request.path_params.get('memory_id') or '')
+    try:
+        service = LegacyMemoryBackfill(_memory_l1_revision_service(), reflection_engine._memory_l1_sources, config=config)
+        if request.method == 'GET':
+            result = service.detail(memory_id)
+        else:
+            raw = await request.body()
+            if len(raw) > 524288:
+                return JSONResponse({'error': {'code': 'request_too_large'}}, status_code=413, headers=headers)
+            result = await service.stage(memory_id, json.loads(raw))
+        return JSONResponse(result, headers=headers)
+    except (RevisionConflict, IdempotencyConflict) as exc:
+        return JSONResponse({'error': {'code': 'revision_conflict' if isinstance(exc, RevisionConflict) else 'idempotency_conflict'}}, status_code=409, headers=headers)
+    except MemoryNotFound:
+        return JSONResponse({'error': {'code': 'memory_not_found'}}, status_code=404, headers=headers)
+    except (L1OwnerError, L1ContractError) as exc:
+        return JSONResponse({'error': {'code': exc.code, 'field_path': getattr(exc, 'field_path', getattr(exc, 'path', ''))}},
+            status_code=getattr(exc, 'status', 400), headers=headers)
+    except (ValueError, TypeError, UnicodeError):
+        return JSONResponse({'error': {'code': 'invalid_legacy_backfill_request'}}, status_code=400, headers=headers)
+
+
 @mcp.custom_route("/api/memory-authority/schema", methods=["GET"])
 @mcp.custom_route("/api/memory-authority/memories/{memory_id}/revisions", methods=["POST"])
 @mcp.custom_route("/api/memory-authority/memories/{memory_id}/revisions/{revision}", methods=["GET"])

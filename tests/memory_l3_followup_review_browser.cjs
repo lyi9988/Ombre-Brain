@@ -33,7 +33,9 @@ const styles = (dashboard.match(/<style[^>]*>[\s\S]*?<\/style>/g) || []).join('\
       preparing.candidate.l3_followup = { memory_id: 'target-memory-8', target_title: '另一段原记忆', expected_revision: 2,
         kind: 'correction', preparation_state: 'queued', changes: [], reason: '' };
       const ordinary = base('ordinary'); ordinary.candidate.content = '普通候选原正文';
-      window.items = [prepared, preparing, ordinary];
+      const backfill = base('backfill-candidate');
+      backfill.candidate.legacy_backfill = { memory_id: 'target-legacy-memory', expected_revision: 3 };
+      window.items = [prepared, preparing, ordinary, backfill];
       window.authFetch = async (url, options) => {
         calls.push({ url: String(url), method: options?.method || 'GET' });
         if (options?.method && options.method !== 'GET') throw Error('unexpected write');
@@ -61,12 +63,16 @@ const styles = (dashboard.match(/<style[^>]*>[\s\S]*?<\/style>/g) || []).join('\
     assert.equal(await ordinary.locator('[data-field="content"]').inputValue(), '普通候选仍然可编辑');
     assert.equal(await card.locator('[data-model-io-toggle]').getAttribute('data-model-io-id'), 'target-memory-7');
     assert.equal(await ordinary.locator('[data-model-io-toggle]').getAttribute('data-model-io-id'), 'ordinary');
+    const backfill = page.locator('[data-candidate-id="backfill-candidate"]');
+    assert.match(await backfill.locator('.chat-memory-backfill-review').textContent(), /补齐原记忆：target-legacy-memory · 原版本 3/);
+    assert.match(await backfill.locator('.chat-memory-backfill-review').textContent(), /同一条记忆的新版本/);
+    assert.equal(await backfill.locator('[data-model-io-toggle]').getAttribute('data-model-io-id'), 'target-legacy-memory');
     await card.locator('[data-model-io-toggle]').click();
     const calls = await page.evaluate(() => window.calls);
     assert.ok(calls.some(call => call.url.includes('target-memory-7') && call.url.includes('model-io')));
     assert.ok(calls.every(call => call.method === 'GET'));
     assert.deepEqual(errors, []);
-    assert.match(dashboard, /chat-memory\.js\?v=20261026-l3-followup-review-r1/);
+    assert.match(dashboard, /chat-memory\.js\?v=20261106-legacy-backfill-r1/);
     console.log(JSON.stringify({ passed: 1, browser: 'Edge', followupTargetAndRevision: true, localBeforeAfterReadOnly: true,
       objectValuesEscaped: true, preparingPlanNotAdopted: true, ordinaryEditingPreserved: true,
       modelIoUsesTargetMemory: true, actualWrites: 0, realModelCalls: 0 }));

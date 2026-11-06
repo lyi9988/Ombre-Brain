@@ -2238,9 +2238,15 @@
           ? '审核时保留新增事实和条件。已采用的陈述可在 L1 编辑器中从本稿移除。'
           : '请核对这次新增的事实或条件。') + '</p></details>';
     }
+    var backfill = candidate.legacy_backfill;
+    if (backfill) {
+      summaryNote += '<p class="chat-memory-backfill-review">补齐原记忆：' + esc(String(backfill.memory_id || '')) +
+        ' · 原版本 ' + esc(String(backfill.expected_revision || '')) +
+        '。确认后保存为同一条记忆的新版本；原稿、历史版本和主人手编的第二遍稿保留。</p>';
+    }
     var id = item.id || '';
     var followup = candidate.l3_followup;
-    var modelIoId = modelIoMemoryId(followup && followup.memory_id || id);
+    var modelIoId = modelIoMemoryId(followup && followup.memory_id || backfill && backfill.memory_id || id);
     var draft = memoryDrafts.get(id);
     var revision = draft ? draft.revision : Number(item.authority_revision || candidate.authority_revision || 0);
     var l1Document = itemL1Document(item);

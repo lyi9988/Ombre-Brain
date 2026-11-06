@@ -113,6 +113,13 @@ class CanonicalMemorySourceReader:
             return {'state': result.get('state', 'unavailable'), 'reason': result.get('reason', 'source_not_effective')}
         if result.get('source_id') != locator['event_id'] or result.get('source_revision') != version:
             return {'state': 'unavailable', 'reason': 'source_identity_mismatch'}
+        roles = [value.get('role') for value in (result.get('author_ref'), result.get('author'))
+                 if isinstance(value, dict) and value.get('role') is not None]
+        if result.get('role') is not None:
+            roles.append(result['role'])
+        if (any(role != locator['role'] for role in roles)
+                or (getattr(self, 'require_author_identity', False) and not roles)):
+            return {'state': 'unavailable', 'reason': 'source_identity_mismatch'}
         actual = {**locator, 'namespace': 'canonical_event', 'text': result['text'], 'version_id': version,
                   'recorded_at': canonical_recorded_at(result)}
         return attributed_snapshot(actual, binding, self.config)

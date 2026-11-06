@@ -194,7 +194,9 @@ class MemoryL3Records:
                 'revision': row['revision'], 'state': 'current' if row['revision'] == memory['active_revision'] else 'history',
                 'created_at': row['created_at'], 'author': row['created_by'], 'source_refs': json.loads(row['source_refs_json']),
                 'details': {'decision_source': row['decision_source'], 'operation_id': row['operation_id'],
-                    'edit_note': (meta.get('memory_l1_owner_request') or {}).get('edit_note', '')}})
+                    'edit_note': ((meta.get('memory_l1_legacy_backfill') or {}).get('reason', '')
+                        if row['decision_source'] == 'owner_backfill_review'
+                        else (meta.get('memory_l1_owner_request') or {}).get('edit_note', ''))}})
         for row in presentations:
             items.append({'event_id': 'l2:' + str(row['presentation_revision']), 'kind': 'l2_revision',
                 'presentation_revision': row['presentation_revision'], 'revision': row['first_pass_revision'],

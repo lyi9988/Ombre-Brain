@@ -780,9 +780,13 @@ class MemoryAuthorityStore:
         finally:
             conn.close()
 
-    @staticmethod
-    def _validate_program_commit_context(conn, payload):
+    def _validate_program_commit_context(self, conn, payload):
         context = (payload.get('metadata') or {}).get('memory_l1_program_context') or {}
+        if context.get('origin') == 'legacy_backfill':
+            if payload.get('actor') == 'legacy_backfill' and payload.get('decision_source') == 'owner_backfill_review':
+                from memory_legacy_backfill import validate_commit_context
+                validate_commit_context(self, conn, payload)
+            return
         if context.get('origin') != 'owner_l2':
             return
         row = conn.execute('SELECT h.presentation_revision,r.document_json FROM memory_l2_heads h '
