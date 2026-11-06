@@ -17,14 +17,15 @@ from memory_l1_service import L1OwnerError
 from memory_l3_followup import FollowupTasks, run_followup_tasks
 from memory_authority import MemoryAuthorityStore, RevisionConflict
 from memory_l3_records import MemoryL3Records
-from memory_self_review_source import check_native_sources, snapshot, target_key, TARGET_FIELDS
+from memory_self_review_source import check_native_sources, matches_l2_diagnosis_draft, snapshot, target_key, TARGET_FIELDS
 from persona_memory_reaction_context import memory_ref
 from test_memory_l2_p4 import run, owner_payload
 from test_stage03_l3_followup import fixture
 
 
 def native_fixture(tmp_path, *, layer='l1', mode='auto', owner_l2=False,
-                   kind='correction', value='explicit_owner_correction'):
+                   kind='correction', value='explicit_owner_correction',
+                   diagnosis_only=False, diagnosis_contract='l2-owner-feedback-v1'):
     service, l2, calls, _ = fixture(tmp_path, mode=mode)
     engine = service.engine
     engine.config = {'persona': {'profile_id':'test-profile'},
@@ -63,7 +64,12 @@ def native_fixture(tmp_path, *, layer='l1', mode='auto', owner_l2=False,
         'content':'只更正原材料中这一个具体差异。','evidence_refs':[feedback_key]}
     original = {'memory_fragment_ref':key, **semantic}
     diagnosis = {'feedback_id':'fb-1','layer':layer,'reason':'原文与使用文字在这里不一致。','memory_fragment_ref':key}
-    text = canonical_json({'feedback_ids':['fb-1'],'feedback_diagnoses':[diagnosis],'memory_updates':[original]})
+    parsed = {'feedback_ids':['fb-1'],'feedback_diagnoses':[diagnosis]}
+    if diagnosis_only:
+        semantic['content'] = diagnosis['reason']
+    else:
+        parsed['memory_updates'] = [original]
+    text = canonical_json(parsed)
     review = {'identity_id':'owner','conversation_id':'c1','run_id':'run-1','cycle_id':'cycle-1',
         'operation_id':'operation-1','output_sha256':sha256(text.encode()).hexdigest()}
     def source(kind, key, text, locator, revision):
@@ -73,11 +79,13 @@ def native_fixture(tmp_path, *, layer='l1', mode='auto', owner_l2=False,
             'text':text,'text_view_id':'native.exact-v1','content_sha256':sha256(text.encode()).hexdigest(),
             'recorded_at':'2026-11-06T02:00:00+00:00'}
     daily = source('daily_review','self_review',text, {'identity_id':'owner','conversation_id':'c1','run_id':'run-1'},review['output_sha256'])
-    daily.update(review=review, memory_updates=[original],
+    daily.update(review=review, memory_updates=parsed.get('memory_updates') or [],
         memory_targets=[{'target_key':key,'fragment':{field:fragment.get(field) for field in TARGET_FIELDS}}],
         feedback_origins={feedback_key:{'status':'available','targets':[{'target_key':key,'source_state':'available',
             'memory_id':'m1','l1_revision':2,'l2_revision':fragment['l2_revision']}]}},
         feedback_ids=['fb-1'],feedback_diagnoses=[diagnosis])
+    if diagnosis_only and diagnosis_contract is not None:
+        daily['diagnosis_draft_contract'] = diagnosis_contract
     feedback = source('reply_feedback',feedback_key,'主人具体指出原L2中的这一处差异。',
         {'identity_id':'owner','conversation_id':'c1','feedback_id':'fb-1'}, 'feedback:1:receipt')
     feedback.update(feedback_id='fb-1',feedback_revision=1)
@@ -333,3 +341,84 @@ def test_owner_changed_followup_draft_invalidates_queued_l2_generation(tmp_path)
     assert changed['proposal']['proposed_body']=='主人补充的具体呈现修订意见。'
     assert changed['proposal']['metadata']['legacy_candidate']['title']=='保留这个标题'
     assert service.authority.get_memory('m1')['active_revision']==2
+
+
+def resign_native_update(payload):
+    update=payload['updates'][0]
+    semantic={key:update[key] for key in ('target_key','kind','long_term_value','content','evidence_refs')}
+    update['update_id']='ml3:'+digest({'review':payload['review'],**semantic})
+
+
+def test_exact_l2_diagnosis_without_raw_update_enters_original_waiting_review_task(tmp_path):
+    service,l2,calls,payload,actual=native_fixture(tmp_path,layer='l2',diagnosis_only=True,owner_l2=True)
+    raw=deepcopy(actual['self_review']['text'])
+    assert 'memory_updates' not in json.loads(raw)
+    assert actual['self_review']['memory_updates']==[]
+    recorded=run(service.submit(payload))
+    task_id=recorded['tasks'][0]['task_id']
+    prepared=run(run_followup_tasks(service.engine,None,max_jobs=1))['results'][0]
+    assert prepared['task_id']==task_id and prepared['phase']=='waiting_review',prepared
+    assert calls==[] and service.authority.get_memory('m1')['active_revision']==2
+    candidate=service.authority.get_candidate(task_id)
+    assert candidate['status']=='pending' and candidate['proposal']['metadata']['l3_followup']['layer']=='l2'
+    assert candidate['proposal']['proposed_body']==actual['self_review']['feedback_diagnoses'][0]['reason']
+    assert actual['self_review']['text']==raw and actual['self_review']['memory_updates']==[]
+    assert run(service.submit(payload))['tasks'][0]['task_id']==task_id
+    handoff=run(service.adopt(candidate,owner=True,request_id='open-original-l2-review'))
+    assert handoff['status']=='waiting_review' and handoff['review_actions']['save_parameters']['followup_task_id']==task_id
+    assert service.tasks.current_receipt(task_id)['phase']=='waiting_review'
+
+
+@pytest.mark.parametrize('bad',['no_contract','wrong_contract','no_origins','l1','reply','unclear','not_chosen',
+    'wrong_feedback','wrong_target','not_delivered','changed_origin','changed_reason','extra_evidence',
+    'understanding_label','explicit_same_feedback','explicit_same_target'])
+def test_diagnosis_draft_cannot_expand_original_owner_l2_authority(tmp_path,bad):
+    service,_,calls,payload,actual=native_fixture(tmp_path,layer='l2',diagnosis_only=True)
+    review=actual['self_review'];update=payload['updates'][0]
+    if bad=='no_contract':review.pop('diagnosis_draft_contract')
+    elif bad=='wrong_contract':review['diagnosis_draft_contract']='unknown-v1'
+    elif bad=='no_origins':review.pop('feedback_origins')
+    elif bad in {'l1','reply','unclear'}:review['feedback_diagnoses'][0]['layer']=bad
+    elif bad=='not_chosen':review['feedback_ids']=[]
+    elif bad=='wrong_feedback':review['feedback_diagnoses'][0]['feedback_id']='other-feedback'
+    elif bad=='wrong_target':review['feedback_diagnoses'][0]['memory_fragment_ref']='memory-target:other'
+    elif bad=='not_delivered':review['memory_targets']=[]
+    elif bad=='changed_origin':review['feedback_origins']['reply-feedback:fb-1:r1']['targets'][0]['source_state']='changed'
+    elif bad=='changed_reason':update['content']+='添加的推断。';resign_native_update(payload)
+    elif bad=='extra_evidence':update['evidence_refs'].append('self_review');resign_native_update(payload)
+    elif bad=='understanding_label':
+        update.update(kind='understanding',long_term_value='specific_future_use');resign_native_update(payload)
+    elif bad=='explicit_same_feedback':
+        review['memory_updates']=[{'memory_fragment_ref':'different-target','kind':'understanding',
+            'long_term_value':'none','content':'明确选择不产生另一项长期更正。','evidence_refs':['reply-feedback:fb-1:r1']}]
+    elif bad=='explicit_same_target':
+        review['memory_updates']=[{'memory_fragment_ref':update['target_key'],'kind':'question',
+            'long_term_value':'none','content':'该目标已被显式处理。','evidence_refs':['self_review']}]
+    with pytest.raises(L1OwnerError):run(service.submit(payload))
+    assert service.tasks.list()==[] and calls==[]
+    assert service.authority.get_memory('m1')['active_revision']==2
+
+
+@pytest.mark.parametrize('revision',[None,0,-1,True])
+def test_diagnosis_draft_requires_an_original_positive_l2_revision(tmp_path,revision):
+    _,_,_,payload,actual=native_fixture(tmp_path,layer='l2',diagnosis_only=True)
+    update=deepcopy(payload['updates'][0]);update['memory_ref']['l2_revision']=revision
+    assert not matches_l2_diagnosis_draft(actual['self_review'],update,actual)
+
+
+def test_diagnosis_draft_loses_source_after_read_without_adopting_or_calling_model(tmp_path):
+    service,_,calls,payload,actual=native_fixture(tmp_path,layer='l2',diagnosis_only=True)
+    recorded=run(service.submit(payload));task_id=recorded['tasks'][0]['task_id']
+    actual['reply-feedback:fb-1:r1']['eligible_source']=False
+    failed=run(run_followup_tasks(service.engine,None,max_jobs=1))['results'][0]
+    assert failed['task_id']==task_id and failed['phase']=='failed'
+    assert calls==[] and service.authority.get_candidate(task_id) is None
+    assert service.authority.get_memory('m1')['active_revision']==2
+
+
+def test_unrelated_malformed_raw_evidence_does_not_block_a_legitimate_diagnosis_draft(tmp_path):
+    service,_,calls,payload,actual=native_fixture(tmp_path,layer='l2',diagnosis_only=True)
+    actual['self_review']['memory_updates']=[{'memory_fragment_ref':'unrelated-target','evidence_refs':123}]
+    assert matches_l2_diagnosis_draft(actual['self_review'],payload['updates'][0],actual)
+    recorded=run(service.submit(payload))
+    assert recorded['tasks'][0]['phase']=='queued' and calls==[]

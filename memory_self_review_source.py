@@ -16,6 +16,7 @@ from memory_l1_service import L1OwnerError
 from persona_memory_reaction_context import validate_context, memory_ref
 
 SCHEMA = 'self-review-followup-v1'
+L2_DIAGNOSIS_DRAFT_CONTRACT = 'l2-owner-feedback-v1'
 NAMESPACES = {'daily_review': 'snapshot.aiz.self_review', 'reply_feedback': 'snapshot.aiz.reply_feedback'}
 TARGET_FIELDS = ('memory_id', 'bucket_id', 'l1_revision', 'l2_revision', 'source_group_id',
                  'text_sha256', 'source_refs', 'coverage', 'legacy_body_sha256')
@@ -185,7 +186,9 @@ async def check_native_sources(payload, config, reader=None, *, with_sources=Fal
     for update in payload['updates']:
         semantic = {key: update[key] for key in ('kind', 'long_term_value', 'content', 'evidence_refs')}
         matches = any(matches_original(row, update, semantic) for row in originals)
-        if not matches or update['target_key'] not in catalogue:
+        diagnosis_draft = (not matches and matches_l2_diagnosis_draft(
+            review, update, {source['source_key']: source for source in payload['sources']}))
+        if not (matches or diagnosis_draft) or update['target_key'] not in catalogue:
             raise L1OwnerError('followup_not_in_original_review')
         if all(key in actual for key in update['evidence_refs']):
             if 'feedback_origins' in review and any(
@@ -202,9 +205,48 @@ async def check_native_sources(payload, config, reader=None, *, with_sources=Fal
                 original = catalogue[update['target_key']].get('fragment')
                 if not isinstance(original, dict) or any(original.get(key) != fragment.get(key) for key in TARGET_FIELDS):
                     raise L1OwnerError('followup_original_delivery_target_mismatch', status=409)
-                native_feedback_layer(review, update, actual)
+                layer = native_feedback_layer(review, update, actual)
+                if diagnosis_draft and layer != 'l2':
+                    raise L1OwnerError('qualified_l2_followup_required', status=409)
             accepted.add(update['update_id'])
     return (accepted, actual) if with_sources else accepted
+
+
+def matches_l2_diagnosis_draft(review, update, sources):
+    """Recognize only the exact owner-review draft declared by the source.
+
+    This does not append to raw memory_updates or authorize adoption. The
+    original delivery catalogue and live annotations are checked by the caller.
+    """
+    if (review.get('diagnosis_draft_contract') != L2_DIAGNOSIS_DRAFT_CONTRACT
+            or not isinstance(review.get('feedback_origins'), dict)
+            or update['kind'] != 'correction' or update['long_term_value'] != 'explicit_owner_correction'
+            or len(update['evidence_refs']) != 1
+            or type(update['memory_ref'].get('l2_revision')) is not int
+            or update['memory_ref']['l2_revision'] < 1):
+        return False
+    key = update['evidence_refs'][0]
+    source = sources.get(key) or {}
+    if source.get('kind') != 'reply_feedback':
+        return False
+    locator = json.loads(source['source_id'])
+    fid = locator.get('feedback_id')
+    diagnoses = [row for row in review.get('feedback_diagnoses') or []
+                 if isinstance(row, dict) and row.get('feedback_id') == fid]
+    if len(diagnoses) != 1 or fid not in (review.get('feedback_ids') or []):
+        return False
+    diagnosis = diagnoses[0]
+    if (diagnosis.get('layer') != 'l2' or diagnosis.get('memory_fragment_ref') != update['target_key']
+            or not isinstance(diagnosis.get('reason'), str) or not diagnosis['reason'].strip()
+            or update['content'] != diagnosis['reason']):
+        return False
+    # An explicit decision about either the annotation or this target wins,
+    # including value=none and ordinary-understanding labels.
+    for row in review.get('memory_updates') or []:
+        if isinstance(row, dict) and (row.get('memory_fragment_ref', row.get('target_key')) == update['target_key']
+                or isinstance(row.get('evidence_refs'), list) and key in row['evidence_refs']):
+            return False
+    return True
 
 
 def native_feedback_layer(review, update, sources):
