@@ -200,7 +200,7 @@ class LegacyMemoryBackfill:
                     'document', 'sources', 'generation', 'confidence'}
         if (not isinstance(payload, dict) or not required <= set(payload)
                 or set(payload) - required - {'sensitive', 'reason', 'source_refs',
-                    'expected_candidate_revision', 'expected_proposal_sha256'}
+                    'expected_candidate_revision', 'expected_proposal_sha256', 'kind', 'kind_generation'}
                 or type(payload['expected_revision']) is not int or payload['expected_revision'] < 1
                 or not isinstance(payload['request_id'], str) or not 1 <= len(payload['request_id'].strip()) <= 128
                 or not isinstance(payload['original_body_sha256'], str)
@@ -362,6 +362,8 @@ class LegacyMemoryBackfill:
                 'reason': payload.get('reason', '为同一条历史记忆补齐有来源的第一遍语义结构。')}
         with closing(self.authority._connect()) as db:
             _check_base(self.authority, db, memory_id, base)
+        from memory_legacy_classification import candidate_kind
+        base['candidate_kind'] = candidate_kind(payload, existing['proposal'] if revising else None)
         original = await self.revisions.detail(memory_id, payload['expected_revision'])
         projected, legacy_proof = await self._projection_base(memory_id, memory, base)
         if revising and legacy_proof != base.get('legacy_projection'):
@@ -395,11 +397,11 @@ class LegacyMemoryBackfill:
                 'expected_proposal_sha256': payload['expected_proposal_sha256'], 'reason': payload.get('reason', '')}
         proposal = MemoryProposal.from_mapping({'proposal_id': cid, 'source_type': 'legacy_backfill',
             'proposed_body': body, 'source_refs': original['revisions'][0]['source_refs'],
-            'source_status': 'verified', 'memory_type': 'memory', 'confidence': payload['confidence'],
+            'source_status': 'verified', 'memory_type': base['candidate_kind']['value'] or 'memory', 'confidence': payload['confidence'],
             'requested_mode': 'review', 'owner_explicit': False,
             'sensitive': payload.get('sensitive', False) or (existing['proposal'].get('sensitive', False) if revising else False),
             'metadata': {'memory_l1': semantic, 'legacy_backfill': base,
-                         'legacy_candidate': {'title': document['narrative']['title'], 'kind': 'memory',
+                         'legacy_candidate': {'title': document['narrative']['title'], 'kind': base['candidate_kind']['value'] or 'memory',
                              'mode': 'review', 'source_verification': 'verified'}}})
         policy = PolicyDecision('queue_review', ('REVIEW_LEGACY_SAME_ID_BACKFILL',), 'review',
                                 requires_owner_confirmation=True)
@@ -463,10 +465,12 @@ class LegacyMemoryBackfill:
                 metadata, source_refs = prior['payload']['metadata'], prior['payload']['source_refs']
             else:
                 old = self.authority.get_memory_revision(memory_id, base['expected_revision'])
-                metadata = deepcopy(old['metadata'])
+                from memory_legacy_classification import active_metadata
+                metadata, classification_projection = active_metadata(self.authority, old, proposal)
                 metadata.update(memory_l1=proposal['metadata']['memory_l1'],
                     name=proposal['metadata']['memory_l1']['narrative']['title'],
-                    memory_l1_legacy_backfill={**base, 'candidate_id': cid},
+                    memory_l1_legacy_backfill={**base, 'candidate_id': cid,
+                        'classification_projection': classification_projection},
                     memory_l1_program_context={'origin': 'legacy_backfill', 'proposal_id': cid,
                         'candidate_revision': row['revision'], 'proposal_sha256': row['proposal_sha256']})
                 source_refs = old['source_refs']
