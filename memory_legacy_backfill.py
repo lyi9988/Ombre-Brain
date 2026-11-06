@@ -17,7 +17,7 @@ import frontmatter
 
 from memory_authority import (IdempotencyConflict, MemoryNotFound, MemoryProposal,
                               PolicyDecision, RevisionConflict)
-from memory_commit_service import body_sha256
+from memory_commit_service import ProjectionNotApplied, body_sha256
 from memory_l1_contract import canonical_json, semantic_sha256
 from memory_l1_ingestion import bind_sources, prepare_model_document
 from memory_l1_schema import split_document
@@ -72,6 +72,23 @@ class LegacyMemoryBackfill:
         self.revisions, self.authority = revisions, revisions.authority
         self.source_reader_factory = source_reader_factory
         self.config = config
+
+    async def _projection_base(self, memory_id, memory, base):
+        projected = await self.revisions.buckets.get(memory['bucket_id'])
+        if not projected or body_sha256(projected.get('content') or '') != base['original_body_sha256']:
+            raise L1OwnerError('backfill_projection_changed', status=409)
+        markers = projected.get('metadata', {})
+        if type(markers.get('memory_revision')) is int and markers['memory_revision'] == base['expected_revision']:
+            return projected, None
+        if 'memory_revision' not in markers:
+            from memory_legacy_projection import verify_unversioned_legacy
+            try:
+                proof, _ = verify_unversioned_legacy(self.authority, self.revisions.commit.projection, projected,
+                    memory_id=memory_id, bucket_id=memory['bucket_id'], expected_revision=base['expected_revision'])
+                return projected, proof
+            except ProjectionNotApplied:
+                pass
+        raise L1OwnerError('backfill_projection_changed', status=409)
 
     def _readers(self):
         readers = self.source_reader_factory()
@@ -255,10 +272,9 @@ class LegacyMemoryBackfill:
         with closing(self.authority._connect()) as db:
             _check_base(self.authority, db, memory_id, base)
         original = await self.revisions.detail(memory_id, payload['expected_revision'])
-        projected = await self.revisions.buckets.get(memory['bucket_id'])
-        if (not projected or body_sha256(projected.get('content') or '') != payload['original_body_sha256']
-                or projected.get('metadata', {}).get('memory_revision') != payload['expected_revision']):
-            raise L1OwnerError('backfill_projection_changed', status=409)
+        projected, legacy_proof = await self._projection_base(memory_id, memory, base)
+        if legacy_proof:
+            base['legacy_projection'] = legacy_proof
         # A migrated legacy record can still lack its immutable file. Retain
         # its verified original before a later Review can replace the bucket.
         snapshot = self.revisions.commit.projection.snapshot_path(memory_id, payload['expected_revision'])
@@ -321,10 +337,9 @@ class LegacyMemoryBackfill:
             with closing(self.authority._connect()) as db:
                 memory = _check_base(self.authority, db, memory_id, base)
             if not prior:
-                projected = await self.revisions.buckets.get(memory['bucket_id'])
-                if (not projected or body_sha256(projected.get('content') or '') != base['original_body_sha256']
-                        or projected.get('metadata', {}).get('memory_revision') != base['expected_revision']):
-                    raise L1OwnerError('backfill_projection_changed', status=409)
+                _, legacy_proof = await self._projection_base(memory_id, memory, base)
+                if legacy_proof != base.get('legacy_projection'):
+                    raise RevisionConflict('legacy projection base changed after preparation')
             readers = self._readers()
             for binding in proposal['metadata']['memory_l1']['evidence_bindings']:
                 if not (await readers.locate(binding)).get('eligible_source'):

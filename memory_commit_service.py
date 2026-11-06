@@ -122,6 +122,7 @@ class BucketMemoryProjection:
         metadata: Mapping[str, Any],
         operation_id: str,
         snapshot_path: str,
+        legacy_base: dict | None = None,
     ) -> BucketProjectionResult:
         canonical_body = canonical_memory_body(body)
         expected_hash = body_sha256(canonical_body)
@@ -134,10 +135,16 @@ class BucketMemoryProjection:
                 if body_sha256(existing.get("content") or "") != expected_hash:
                     raise BodyHashMismatch("idempotent Bucket projection body changed")
             else:
-                if current_revision != int(expected_revision):
+                if current_revision != int(expected_revision) and legacy_base is None:
                     raise ProjectionNotApplied(
                         f"Bucket revision mismatch: expected {expected_revision}, current {current_revision}"
                     )
+                if legacy_base is not None:
+                    from memory_legacy_projection import ACTIVITY_FIELDS, verify_legacy_files
+                    activity = verify_legacy_files(self, legacy_base, existing, memory_id=memory_id,
+                        bucket_id=bucket_id, expected_revision=expected_revision)
+                    metadata = {k: v for k, v in metadata.items() if k not in ACTIVITY_FIELDS}
+                    metadata.update(activity)
                 known, extra = self._metadata_fields(metadata)
                 extra.update({
                     "memory_id": memory_id,
@@ -302,6 +309,17 @@ class MemoryCommitService:
         from memory_semantics import guard_metadata
         metadata = guard_metadata(dict(metadata or {}), canonical_body)
         previous = self.authority.get_memory_revision(memory_id, int(expected_revision)) if expected_revision else None
+        legacy_base = None
+        if (previous and expected_revision == 1 and previous.get('decision_source') == 'migration'
+                and isinstance(self.projection, BucketMemoryProjection)):
+            existing = await self.projection.bucket_manager.get(bucket_id)
+            if existing and 'memory_revision' not in (existing.get('metadata') or {}):
+                from memory_legacy_projection import ACTIVITY_FIELDS, verify_unversioned_legacy
+                legacy_base, activity = verify_unversioned_legacy(self.authority, self.projection, existing,
+                    memory_id=memory_id, bucket_id=bucket_id, expected_revision=expected_revision)
+                if self.authority.get_commit_by_idempotency(idempotency_key) is None:
+                    metadata = {k: v for k, v in metadata.items() if k not in ACTIVITY_FIELDS}
+                    metadata.update(activity)
         if previous and "memory_l1" in previous.get("metadata", {}) and not l1_write_intent:
             if (previous["body_sha256"] != body_sha256(canonical_body)
                     or metadata.get("memory_l1") != previous["metadata"]["memory_l1"]):
@@ -337,7 +355,7 @@ class MemoryCommitService:
         if commit.get("status") != "prepared":
             raise CommitStateError(f"cannot project commit from {commit.get('status')}")
         try:
-            projected = await self.projection.write_revision(
+            projection_args = dict(
                 memory_id=memory_id,
                 bucket_id=bucket_id,
                 revision=next_revision,
@@ -347,6 +365,9 @@ class MemoryCommitService:
                 operation_id=operation_id,
                 snapshot_path=snapshot_path,
             )
+            if legacy_base is not None:
+                projection_args['legacy_base'] = legacy_base
+            projected = await self.projection.write_revision(**projection_args)
         except ProjectionNotApplied:
             self.authority.abort_memory_commit(operation_id, error_code="projection_not_applied")
             raise
