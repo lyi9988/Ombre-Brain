@@ -22,7 +22,7 @@ def _revisions(snapshot, participant):
         for value in versions}
 
 
-def participant_only_rebinding(old, new, *, readers, config):
+def participant_only_rebinding(old, new, *, readers, config, snapshots=None):
     """Unknown -> exact configured canonical pair, same raw source and text.
 
     A project may retain several old client conversation coordinates. Each
@@ -53,7 +53,7 @@ def participant_only_rebinding(old, new, *, readers, config):
                 or any(configured.get(key) != canonical.get(key) for key in ('subject_id', 'kind'))
                 or new.get('author_ref') != configured['subject_id'] or new.get('speaker_ref') != configured['subject_id']):
             return None
-        before, after = readers.copy(old), readers.copy(new)
+        before, after = snapshots if snapshots is not None else (readers.copy(old), readers.copy(new))
         if not isinstance(before, dict) or not isinstance(after, dict):
             return None
         if any(before.get(key) != after.get(key)
@@ -94,3 +94,19 @@ def compatible_scope(old, new):
     for anchor in result['anchors']:
         anchor['target_revision'] = new['source_revision']
     return result
+
+
+def historical_unknown_snapshot(binding, current, previous, *, config):
+    """Read an unchanged historical unknown version without promoting its actor.
+
+    `current` must come from the actual configured reader. A retained copy
+    alone cannot qualify; the same strict participant-only proof is required.
+    """
+    actor = current.get('participant') or {}
+    new = deepcopy(binding)
+    new.update(source_revision=current.get('source_revision'),
+        author_ref=actor.get('subject_id'), speaker_ref=actor.get('subject_id'))
+    for anchor in new.get('anchors', []):
+        anchor['target_revision'] = current.get('source_revision')
+    proof = participant_only_rebinding(binding, new, readers=None, config=config, snapshots=(previous, current))
+    return deepcopy(previous) if proof else None

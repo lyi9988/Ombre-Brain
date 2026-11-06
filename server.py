@@ -13327,6 +13327,7 @@ async def api_daily_chat_memory_runs(request):
 async def api_daily_chat_memory_confirm(request):
     """Confirm or reject pending daily chat memory candidates."""
     from starlette.responses import JSONResponse
+    from memory_l1_service import L1OwnerError
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -13356,17 +13357,20 @@ async def api_daily_chat_memory_confirm(request):
     if revisions is not None and (not isinstance(revisions, dict) or any(
             type(revisions.get(str(item))) is not int or revisions[str(item)] < 1 for item in ids)):
         return JSONResponse({"error": "invalid_expected_revisions"}, status_code=400)
-    result = await reflection_engine.confirm_daily_chat_memory(
-        [str(item or "") for item in ids],
-        bucket_mgr,
-        embedding_engine=embedding_engine,
-        action=action,
-        edits=body.get("edits") if isinstance(body.get("edits"), dict) else None,
-        request_id=str(body.get("request_id") or "").strip() or None,
-        reject_reason=reason or None,
-        reject_note=str(body.get("reason_note") or "").strip() or None,
-        expected_revisions=revisions,
-    )
+    try:
+        result = await reflection_engine.confirm_daily_chat_memory(
+            [str(item or "") for item in ids],
+            bucket_mgr,
+            embedding_engine=embedding_engine,
+            action=action,
+            edits=body.get("edits") if isinstance(body.get("edits"), dict) else None,
+            request_id=str(body.get("request_id") or "").strip() or None,
+            reject_reason=reason or None,
+            reject_note=str(body.get("reason_note") or "").strip() or None,
+            expected_revisions=revisions,
+        )
+    except L1OwnerError as exc:
+        return JSONResponse({"error": {"code": exc.code, "field_path": exc.field_path}}, status_code=exc.status)
     if result.get("status") == "rate_limited":
         return JSONResponse(result, status_code=429)
     invalid_sources = [

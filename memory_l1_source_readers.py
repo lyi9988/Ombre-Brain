@@ -40,8 +40,9 @@ def canonical_recorded_at(source):
 
 
 class LocalMemorySourceReader:
-    def __init__(self, config, kind):
+    def __init__(self, config, kind, authority=None):
         self.config, self.kind = config, kind
+        self.authority = authority
         self.namespace = 'snapshot.ombre.' + kind
 
     async def read(self, binding):
@@ -77,6 +78,13 @@ class LocalMemorySourceReader:
         snapshot = attributed_snapshot(actual, binding, self.config)
         if snapshot['source_id'] != binding['source_id']:
             return {'state': 'unavailable', 'reason': 'source_identity_mismatch'}
+        if snapshot['source_revision'] != binding['source_revision'] and self.authority is not None:
+            from memory_l0_sources import MemoryL0Sources
+            from memory_legacy_participants import historical_unknown_snapshot
+            previous = MemoryL0Sources(self.authority).copy(binding)
+            historical = historical_unknown_snapshot(binding, snapshot, previous, config=self.config)
+            if historical is not None:
+                snapshot = historical
         return snapshot
 
 
@@ -297,7 +305,7 @@ class AizAttachmentTextSourceReader(CanonicalMemorySourceReader):
 
 
 def configured_source_readers(config, authority=None):
-    readers = [LocalMemorySourceReader(config, 'raw_event'), LocalMemorySourceReader(config, 'conversation_turn')]
+    readers = [LocalMemorySourceReader(config, 'raw_event', authority), LocalMemorySourceReader(config, 'conversation_turn', authority)]
     canonical = CanonicalMemorySourceReader(config)
     action = AizActionSourceReader(config)
     browse = [AizBrowseSourceReader(config, view) for view in ('article', 'reading')]
