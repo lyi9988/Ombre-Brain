@@ -102,7 +102,7 @@ FIXED_PROMPT_SOURCES = {
               revision="factory-chat-event-selection-v2"),
         _spec("ombre.daily_chat_event_assembly_prompt", "memory.daily_chat_event_assembly",
               "memory_chat_event_prompts:EVENT_ASSEMBLY_PROMPT", render="identity",
-              revision="factory-chat-event-assembly-v3"),
+              revision="factory-chat-event-assembly-v4"),
         _spec("ombre.memory_l2_generation_prompt", "memory.reflection",
               "prompt_source_registry:_MEMORY_L2_GENERATION_PROMPT",
               revision="factory-memory-l2-generation-v5-scoped-readable-writing"),
