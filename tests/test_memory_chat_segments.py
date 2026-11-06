@@ -151,6 +151,26 @@ def test_cancel_keeps_unknown_intent(tmp_path):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize('finish,content', [('stop', ''), ('length', '{"candidates":')])
+def test_known_bad_segment_retries_only_on_explicit_request(tmp_path, finish, content):
+    engine, _, window, _, _ = fixture(tmp_path)
+    real_create = engine.client.chat.completions.create
+    dispatched = []
+
+    async def once_bad(**kwargs):
+        dispatched.append(True)
+        if len(dispatched) == 1:
+            return NS(choices=[NS(message=NS(content=content), finish_reason=finish)])
+        return await real_create(**kwargs)
+
+    engine.client.chat.completions.create = once_bad
+    assert extract(engine, window)[1]['requires_manual_retry']
+    assert extract(engine, window)[1]['requires_manual_retry'] and len(dispatched) == 1
+    candidates, progress = asyncio.run(engine._extract_daily_chat_memory_candidates(
+        DAY, window, mode='review', max_candidates=10, audit={}, force=True))
+    assert len(dispatched) == 2 and candidates and progress['segment_progress']['cursor'] == 1
+
+
 def test_response_saved_before_prepare_crash_reused(tmp_path, monkeypatch):
     e, s, window, calls, _ = fixture(tmp_path)
     original = MemoryCandidatePreparation.prepare

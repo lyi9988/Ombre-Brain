@@ -4063,6 +4063,14 @@
         <input type="number" id="cfg-reflection-chat-memory-turns" min="0" max="10000" />
       </div>
       <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">默认 0；0 表示按日期读取当天全部原文，只影响自动记忆候选</div>
+      <div class="config-row">
+        <label>后台处理方式</label>
+        <select id="cfg-reflection-chat-memory-extraction-mode">
+          <option value="single_pass">一次生成完整记忆</option>
+          <option value="event_first">先选经历，再整理记忆</option>
+        </select>
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">默认一次生成；先选经历会先挑选值得保留的经历，再逐份整理，可能增加模型调用。保存后新的后台批次使用；已经开始处理的窗口按原方式续做。</div>
       <div style="margin:14px 0 8px;padding:10px 12px;background:var(--surface);border-radius:8px;font-size:12px;color:var(--text-dim);line-height:1.7;">
         <strong>后台 L1 候选生成预算</strong><br />以下值控制输入窗口、单次模型输出与内部批次节奏；同一任务按窗口连续处理该日期来源，单批候选额度不是全天总上限。它们不控制最终记忆召回或 Prompt 注入条数，后者在“记忆浮现”页单独配置。保存值以服务器配置回读为准。
       </div>
@@ -4268,6 +4276,7 @@ let memoryConfigConflict = false;
 const reflectionConfigFormIds = [
   'cfg-reflection-enabled', 'cfg-reflection-auto',
   'cfg-reflection-chat-memory-mode', 'cfg-reflection-chat-memory-turns',
+  'cfg-reflection-chat-memory-extraction-mode',
   'cfg-reflection-memory-anchor',
   'cfg-reflection-diary-l1-input-window-chars', 'cfg-reflection-diary-l1-max-windows',
   'cfg-reflection-diary-l1-scene-limit', 'cfg-reflection-diary-l1-max-tokens',
@@ -8878,6 +8887,8 @@ async function loadConfig(explicitMemoryConflictReload) {
       (cfg.reflection && cfg.reflection.auto_enabled) === false ? 'false' : 'true';
     document.getElementById('cfg-reflection-chat-memory-mode').value =
       (cfg.reflection && cfg.reflection.daily_chat_memory_mode) || 'review';
+    document.getElementById('cfg-reflection-chat-memory-extraction-mode').value =
+      (cfg.reflection && cfg.reflection.daily_chat_memory_extraction_mode) || 'single_pass';
     document.getElementById('cfg-reflection-chat-memory-turns').value =
       (cfg.reflection && cfg.reflection.daily_chat_memory_turn_limit) ?? 0;
     document.getElementById('cfg-reflection-memory-anchor').value =
@@ -9282,6 +9293,7 @@ async function saveConfig(persist, persistEnv) {
       enabled: document.getElementById('cfg-reflection-enabled').value === 'true',
       auto_enabled: document.getElementById('cfg-reflection-auto').value === 'true',
       daily_chat_memory_mode: document.getElementById('cfg-reflection-chat-memory-mode').value || 'review',
+      daily_chat_memory_extraction_mode: document.getElementById('cfg-reflection-chat-memory-extraction-mode').value || 'single_pass',
       daily_chat_memory_turn_limit: numberValue('cfg-reflection-chat-memory-turns', 0),
       diary_l1_input_window_chars: generationConfig.diary_l1_input_window_chars,
       diary_l1_max_windows: generationConfig.diary_l1_max_windows,

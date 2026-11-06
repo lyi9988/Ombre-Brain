@@ -56,6 +56,20 @@ class Tests(unittest.TestCase):
         config['identity']['source_participants'][0]['participant']['display_name']='新名字'
         after=bind_sources([source],config=config)
         self.assertEqual(before[1],after[1]);self.assertEqual(before[0][0]['source_revision'],after[0][0]['source_revision'])
+
+    def test_renaming_the_owner_conversation_assistant_keeps_the_historical_binding(self):
+        original_text = '我以前叫 Claude。'
+        source = canonical(role='assistant', text=original_text)
+        config = {**CONFIG, 'identity': {'ai_name': 'Claude'}}
+        old, old_bindings = bind_sources([source], config=config)
+        config['identity']['ai_name'] = '顾衍'
+        new, new_bindings = bind_sources([source], config=config)
+        self.assertEqual(old[0]['participant']['display_name'], 'Claude')
+        self.assertEqual(new[0]['participant']['display_name'], '顾衍')
+        self.assertEqual(new[0]['text'], original_text)
+        self.assertEqual(new[0]['source_revision'], old[0]['source_revision'])
+        self.assertEqual(new_bindings, old_bindings)
+
     def test_conflicting_mapping_is_unknown(self):
         source=canonical(conversation='peer-room');config=mapped_config(source)
         bad=copy.deepcopy(config['identity']['source_participants'][0]);bad['participant']['subject_id']='peer:other'

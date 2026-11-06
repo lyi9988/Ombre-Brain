@@ -13728,6 +13728,8 @@ async def api_config_get(request):
                 )
                 or "review"
             ),
+            "daily_chat_memory_extraction_mode": reflection_cfg.get(
+                "daily_chat_memory_extraction_mode", "single_pass"),
             "daily_chat_memory_hour": int(
                 reflection_cfg.get(
                     "daily_chat_memory_hour",
@@ -13823,6 +13825,11 @@ async def api_config_update(request):
     # Validate before mutating any runtime section or persisting a partial save.
     if not isinstance(body, dict):
         return JSONResponse({"error": "invalid config object"}, status_code=400)
+    if (isinstance(body.get('reflection'), dict)
+            and 'daily_chat_memory_extraction_mode' in body['reflection']
+            and body['reflection']['daily_chat_memory_extraction_mode'] not in ('single_pass', 'event_first')):
+        return JSONResponse({'error': 'invalid_daily_chat_memory_extraction_mode',
+                             'field_path': 'reflection.daily_chat_memory_extraction_mode'}, status_code=400)
     if isinstance(body.get('reflection'), dict) and 'diary_l1_read_timeout_seconds' in body['reflection']:
         read_timeout = body['reflection']['diary_l1_read_timeout_seconds']
         if isinstance(read_timeout, bool) or not isinstance(read_timeout, (int, float)) or not 1 <= read_timeout <= 3600:
@@ -13886,7 +13893,7 @@ async def api_config_update(request):
                          and bool(body['reflection'])
                          and set(body["reflection"]).issubset({'memory_task_routes', 'memory_l2_output_schema',
                              'memory_l2_jobs_per_run','memory_l2_concurrency','memory_l2_prepare_interval_seconds',
-                             'diary_l1_read_timeout_seconds'}))
+                             'diary_l1_read_timeout_seconds', 'daily_chat_memory_extraction_mode'}))
     memory_expected = body.get("expected_memory_revision")
     if "gateway" in body:
         if not isinstance(body["gateway"], dict):
@@ -14460,6 +14467,9 @@ async def api_config_update(request):
                 mode = "review"
             reflection_cfg["daily_chat_memory_mode"] = mode
             updated.append("reflection.daily_chat_memory_mode")
+        if "daily_chat_memory_extraction_mode" in r:
+            reflection_cfg["daily_chat_memory_extraction_mode"] = r["daily_chat_memory_extraction_mode"]
+            updated.append("reflection.daily_chat_memory_extraction_mode")
         if "daily_chat_memory_hour" in r:
             reflection_cfg["daily_chat_memory_hour"] = _int_between(
                 r.get("daily_chat_memory_hour"),
@@ -14909,6 +14919,8 @@ async def api_config_update(request):
                 if "daily_chat_memory_mode" in body["reflection"]:
                     mode = str(body["reflection"].get("daily_chat_memory_mode") or "review").strip().lower()
                     sc_reflection["daily_chat_memory_mode"] = mode if mode in {"auto", "review", "off"} else "review"
+                if "daily_chat_memory_extraction_mode" in body["reflection"]:
+                    sc_reflection["daily_chat_memory_extraction_mode"] = reflection_cfg["daily_chat_memory_extraction_mode"]
                 if "daily_chat_memory_hour" in body["reflection"]:
                     sc_reflection["daily_chat_memory_hour"] = _int_between(
                         body["reflection"].get("daily_chat_memory_hour"),

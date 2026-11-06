@@ -2631,7 +2631,10 @@ class ReflectionEngine(MemoryL1Runtime):
                 audit = audits[-1] if audits and audits[-1].get("run_id") == result.get("run_id") else {}
                 next_cursor = {"raw": int(audit.get("processed_until_seq", 0)),
                                "turn": int(audit.get("processed_until_turn_id", 0))}
-                marker = (next_cursor["raw"], next_cursor["turn"], receipt_progress)
+                event_progress = audit.get('event_progress') or {}
+                event_cursor = ((event_progress['task_id'], event_progress['revision'])
+                                if event_progress.get('task_id') and event_progress.get('revision') else None)
+                marker = (next_cursor["raw"], next_cursor["turn"], receipt_progress, event_cursor)
                 result["progress"] = {"batches_completed": batch_count,
                     "current_batch_completed_windows": audit.get("processed_window_count", 0),
                     "current_batch_total_windows": audit.get("window_count", 0),
@@ -2655,7 +2658,7 @@ class ReflectionEngine(MemoryL1Runtime):
                     result["progress"]["state"] = "stopped"
                     break
                 progress_keys[marker] = True
-                if (not receipt_progress and next_cursor["raw"] <= int(result.get("source_start_seq") or 0)
+                if (not receipt_progress and not event_cursor and next_cursor["raw"] <= int(result.get("source_start_seq") or 0)
                         and next_cursor["turn"] <= int(audit.get("source_start_turn_id") or 0)):
                     result.update(reason="continuation_requires_progress")
                     result["progress"]["state"] = "stopped"
@@ -3026,16 +3029,20 @@ class ReflectionEngine(MemoryL1Runtime):
             for result in (write_result.get("results") or [])
             if isinstance(result, dict)
         }
+        def handled_status(candidate):
+            delivery = result_by_id.get(str(candidate.get("id") or ""), {})
+            if delivery.get("status") in {"created", "exists"}:
+                return "applied"
+            if delivery.get("status") == "pending" and delivery.get("preparation_status") != "required":
+                # The original ingestion policy durably queued this candidate for its owner.
+                return "pending"
+            return "apply_failed"
+
         candidates = [
             {
                 **candidate,
                 "mode": "auto",
-                "status": (
-                    "applied"
-                    if result_by_id.get(str(candidate.get("id") or ""), {}).get("status")
-                    in {"created", "exists"}
-                    else "apply_failed"
-                ),
+                "status": handled_status(candidate),
             }
             for candidate in candidates
         ]
@@ -3049,13 +3056,17 @@ class ReflectionEngine(MemoryL1Runtime):
             audit["processed_until_turn_id"] = turn_cursor_target
         cursor_updated = advance_source_cursor()
         applied_count = sum(1 for candidate in candidates if candidate.get("status") == "applied")
-        audit["status"] = "partial" if partial else ("success" if write_result.get("created") else "exists")
+        pending_count = sum(1 for candidate in candidates if candidate.get("status") == "pending")
+        finished_status = "created" if write_result.get("created") else ("exists" if applied_count else "pending")
+        audit["pending_count"] = pending_count
+        audit["status"] = "partial" if partial else ("success" if finished_status == "created" else finished_status)
         audit["error_category"] = partial_reason if partial else ""
         audit["auto_applied_count"] = applied_count
         audit["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self._store_daily_chat_memory_run_audit(audit)
         return {
-            "status": "partial" if partial else ("created" if write_result.get("created") else "exists"),
+            "status": "partial" if partial else finished_status,
+            "pending_count": pending_count,
             "reason": partial_reason if partial else "",
             "date": key,
             "mode": effective_mode,
@@ -3975,6 +3986,41 @@ class ReflectionEngine(MemoryL1Runtime):
                 meta.update(partial=True, reason=("window_budget_exhausted"
                     if window_budget_used >= self.daily_chat_memory_max_windows_per_run else "candidate_budget_exhausted"))
                 break
+            if preparation_queue:
+                from memory_chat_event_flow import window_method, extract_event_window
+                method, fingerprint = window_method(self, key, window, plans[index].exceeds_char_target)
+                if method == 'event_first':
+                    if self._daily_chat_memory_window_is_noise(window):
+                        processed_stop = plans[index].next_start
+                        meta["skipped_noise_window_count"] += 1
+                        if audit is not None:
+                            audit.update(skipped_noise_window_count=meta["skipped_noise_window_count"],
+                                         processed_window_count=index+1)
+                        continue
+                    try:
+                        rows, progress = await extract_event_window(self, key, window, fingerprint=fingerprint,
+                            oversized=plans[index].exceeds_char_target, mode=mode, min_confidence=min_confidence,
+                            candidate_budget=remaining, call_budget=self.daily_chat_memory_max_windows_per_run-window_budget_used,
+                            window_index=index+1, window_total=len(windows), audit=audit, force=force)
+                    except Exception as exc:
+                        meta.update(partial=True, reason=getattr(exc, 'code', None) or type(exc).__name__,
+                                    failed_window_index=index+1)
+                        break
+                    raw_candidates.extend(rows)
+                    window_budget_used += progress['model_call_count']
+                    meta['model_call_count'] += progress['model_call_count']
+                    meta['model_candidate_count'] += progress['model_candidate_count']
+                    meta['event_progress'] = progress
+                    if audit is not None:
+                        audit.update(model_call_count=meta['model_call_count'], event_progress=progress)
+                    if progress['partial']:
+                        meta.update(partial=True, reason=progress['reason'], failed_window_index=index+1,
+                                    requires_manual_retry=progress['requires_manual_retry'])
+                        break
+                    processed_stop = plans[index].next_start
+                    if audit is not None:
+                        audit['processed_window_count'] = index + 1
+                    continue
             if plans[index].exceeds_char_target and preparation_queue:
                 from memory_chat_segments import extract_segments
                 try:
@@ -4056,6 +4102,7 @@ class ReflectionEngine(MemoryL1Runtime):
                         max_candidates=remaining,
                         window_index=index + 1,
                         window_total=len(windows),
+                        mode=mode,
                         **self._daily_l1_repair_args(preparation_queue, retry_receipt),
                     )
                 else:
@@ -4258,12 +4305,15 @@ class ReflectionEngine(MemoryL1Runtime):
         max_candidates: int | None = None,
         window_index: int = 1,
         window_total: int = 1,
+        mode: str | None = None,
         attachment_sources=(),
         segment_context=None,
         saved_response=None,
         response_checkpoint=None,
         candidate_repairs=None,
         missing_candidates=None,
+        selected_event=None,
+        before_model_call=None,
     ) -> tuple[list[dict], dict]:
         route = self._memory_task_route("auto_l1")
         client, model, use_daily_client = route["client"], route["model"], route["connection"] == "daily"
@@ -4281,19 +4331,37 @@ class ReflectionEngine(MemoryL1Runtime):
         }
         l1_sources = None
         prompt_context = None
+        support_segment = segment_context
         if self.memory_authority_enabled and self.memory_authority_store:
-            l1_payload, l1_sources, l1_catalog_context = self._memory_l1_daily_context(window,
-                attachment_sources=attachment_sources, segment_context=segment_context)
+            if selected_event is None:
+                l1_payload, l1_sources, l1_catalog_context = self._memory_l1_daily_context(window,
+                    attachment_sources=attachment_sources, segment_context=segment_context)
+                prompt, prompt_context = self._memory_l1_prompt("ombre.daily_chat_memory_prompt",
+                    runtime_values={"max_candidates": max(1, int(max_candidates or self.daily_chat_memory_max_per_day or 1))})
+            else:
+                from memory_chat_event_spans import event_source_views, event_envelope
+                originals = daily_sources(window, profile_id=self.memory_semantic_profile_id)
+                views, fragments = event_source_views(selected_event, originals)
+                core = ({k: segment_context[k] for k in ('core_source', 'core_range')} if segment_context else {})
+                l1_payload, l1_sources, l1_catalog_context = event_envelope(self, views, fragments, **core)
+                support_segment = l1_payload.get('segment') if core else None
+                if not core:
+                    l1_payload.pop('segment', None)
+                payload.pop('self_anchor_entry', None)
+                # The selection has already grouped the passages. Its model-written
+                # summary can contain an interpretation which none of the quotes supports.
+                payload.update(input_kind='daily_chat_event_assembly', selection_focus={
+                    'source_refs':[row['binding_id'] for row in l1_payload['source_texts']],
+                    'evidence':False})
+                prompt, prompt_context = self._memory_l1_prompt("ombre.daily_chat_event_assembly_prompt")
             payload['identity'] = l1_payload['identity']
             payload.pop('conversation_turns', None)
             payload["l1_contract"] = l1_payload
-            prompt, prompt_context = self._memory_l1_prompt("ombre.daily_chat_memory_prompt",
-                runtime_values={"max_candidates": max(1, int(max_candidates or self.daily_chat_memory_max_per_day or 1))})
         else:
             prompt = self._daily_chat_memory_prompt(max_candidates=max_candidates)
         if not prompt.strip():
             return [], {"empty_output": False, "parse_failure": False, "prompt_disabled": True, "finish_reason": "disabled"}
-        if self.memory_authority_store and not candidate_repairs:
+        if self.memory_authority_store and not candidate_repairs and selected_event is None:
             sources = daily_sources(window, profile_id=self.memory_semantic_profile_id)
             related = self.memory_authority_store.find_candidates_by_sources([s["source_key"] for s in sources])
             remaining = 3000
@@ -4329,6 +4397,8 @@ class ReflectionEngine(MemoryL1Runtime):
                 native_schema=saved_response.get('native_schema'),
                 native_status=saved_response.get('native_status', 'completed'))
         else:
+            if before_model_call is not None:
+                before_model_call(prompt_context, route)
             response = await self._daily_chat_memory_create_completion(
                 client,
                 model=model,
@@ -4359,8 +4429,17 @@ class ReflectionEngine(MemoryL1Runtime):
         if l1_sources is not None:
             from memory_l1_api import validate_candidate_items
             rejected = {}
+            # Unknown callers and non-chat sources retain strict behavior. Use
+            # the actual run mode, never the config's default normalization.
+            layout_repairs = {} if mode == 'review' and window and not attachment_sources else None
             candidates, stats['schema_error'] = validate_candidate_items(response, rejected_drafts=rejected,
-                    repair_slots=list(candidate_repairs or ()))
+                    repair_slots=list(candidate_repairs or ()), review_layout_repairs=layout_repairs)
+            if layout_repairs:
+                stats['review_layout_repairs'] = layout_repairs
+                for index, item in enumerate(candidates):
+                    slot = list(candidate_repairs)[index] if candidate_repairs else f'item_{index}'
+                    if slot in layout_repairs:
+                        item['_review_layout_repair'] = copy.deepcopy(layout_repairs[slot])
             if rejected:
                 stats['rejected_drafts'] = rejected
             if missing_candidates and len(candidates) > missing_candidates['missing_count']:
@@ -4375,6 +4454,10 @@ class ReflectionEngine(MemoryL1Runtime):
                 stats["parse_failure"] = bool(str(raw or "").strip())
                 return [], stats
         result = [item for item in candidates if isinstance(item, dict)]
+        if selected_event is not None and len(result) != 1:
+            from memory_l1_service import L1OwnerError
+            raise L1OwnerError('event_assembly_empty' if not result else 'event_assembly_multiple_candidates',
+                               field_path='candidates')
         if l1_sources is not None:
             for index, item in enumerate(result):
                 if item.get('_candidate_validation_issue'): continue
@@ -4394,10 +4477,10 @@ class ReflectionEngine(MemoryL1Runtime):
                     # to archive/event/turn identities used by the existing policy.
                     from memory_l1_ingestion import candidate_source_refs
                     refs = candidate_source_refs(draft, item.get('source_refs', []), len(l1_sources))
-                    if segment_context is not None:
+                    if support_segment is not None:
                         from memory_l1_service import L1OwnerError
-                        core_ref = segment_context['core_source']
-                        core = segment_context['core_range']
+                        core_ref = support_segment['core_source']
+                        core = support_segment['core_range']
                         if core_ref not in refs:
                             raise L1OwnerError('candidate_outside_segment_core', field_path='candidate.source_refs')
                         core_ranges = [r for scene in draft.get('scenes', []) for r in scene.get('source_ranges', [])
@@ -4415,16 +4498,26 @@ class ReflectionEngine(MemoryL1Runtime):
                             for event in turn.get('_semantic_sources', []) if str(event.get('id', '')).isdigit()
                             and raw_event_source(event, profile_id=self.memory_semantic_profile_id)['source_key'] in selected_keys]
                     original_index = int(list(candidate_repairs)[index][5:]) if candidate_repairs else index
+                    from memory_l1_contract import semantic_sha256
+                    provenance = {'prompt_revision': prompt_context['prompt_revision'],
+                        'model_route_revision': 'route_sha256:' + semantic_sha256({k:v for k,v in route.items() if k != 'client'})}
+                    if selected_event is not None and saved_response and saved_response.get('generation_context'):
+                        provenance.update(saved_response['generation_context'])
                     task_seed = {"date": key, "window": window_index, "candidate": original_index,
-                        "prompt": prompt_context["prompt_revision"], "sources": [s["source_key"] for s in l1_sources]}
+                        "prompt": provenance["prompt_revision"], "sources": [s["source_key"] for s in l1_sources]}
                     if segment_context is not None:
                         task_seed['segment'] = segment_context
-                    from memory_l1_contract import semantic_sha256
+                    if selected_event is not None:
+                        task_seed['event_anchors'] = selected_event['anchors']
+                        # Custody keeps the complete L0. Only these passages are evidence for this memory.
+                        item['_event_passages'] = [
+                            {source['role'] + '_text': source['text'][source['_model_range']['start']:source['_model_range']['end']]}
+                            for ref, source in available.items() if ref in refs]
                     item["_l1_sources"] = l1_sources
                     item["_l1_catalog_context"] = l1_catalog_context
-                    item["_l1_generation"] = {"prompt_revision": prompt_context["prompt_revision"],
-                        "model_route_revision": "route_sha256:" + semantic_sha256({k: v for k, v in route.items() if k != "client"}),
-                        "task_id": "daily-task-" + semantic_sha256(task_seed)[:40], "actor": "daily_chat_first_pass"}
+                    item["_l1_generation"] = {**provenance,
+                        "task_id": "daily-task-" + semantic_sha256(task_seed)[:40],
+                        "actor": "daily_chat_event_assembly" if selected_event is not None else "daily_chat_first_pass"}
                 except Exception as exc:
                     from memory_chat_preparation import issue
                     result[index] = {'_candidate_validation_issue': issue(exc)}
@@ -5198,12 +5291,18 @@ class ReflectionEngine(MemoryL1Runtime):
             if not clean_turns:
                 record_hard("no_clean_source")
                 continue
-            original_excerpt = self._daily_chat_memory_excerpt_for_turns(candidate, clean_turns)
+            policy_turns = clean_turns
+            if (self.memory_authority_enabled and isinstance(model_doc, dict) and candidate.get('_l1_sources')
+                    and (candidate.get('_l1_generation') or {}).get('actor') == 'daily_chat_event_assembly'):
+                policy_turns = candidate['_event_passages']
+                original_excerpt = '\n'.join(text for passage in policy_turns for text in passage.values())
+            else:
+                original_excerpt = self._daily_chat_memory_excerpt_for_turns(candidate, clean_turns)
             if not original_excerpt:
                 record_hard("no_clean_source_sentence")
                 continue
             generation_source = str(candidate.get("generation_source") or "model").strip().lower() or "model"
-            if not self._daily_chat_memory_source_supports_kind(kind, clean_turns):
+            if not self._daily_chat_memory_source_supports_kind(kind, policy_turns):
                 # candidate_type must be supported by the source; ordinary comfort
                 # replies must not become boundary/key_event/stable_preference.
                 record_hard("candidate_type_not_supported_by_source")
@@ -5211,6 +5310,8 @@ class ReflectionEngine(MemoryL1Runtime):
             source_hash = self._daily_chat_memory_source_hash_for_turns(clean_turns)
             # ---- V4 soft flags: Review keeps these visible for the owner ----
             soft_flags: list[str] = []
+            if effective_mode == 'review' and candidate.get('_review_layout_repair'):
+                soft_flags.append('retrieval_relocated_from_narrative')
             if generation_source == "model" and self._daily_chat_memory_proposed_echoes_excerpt(
                 content,
                 original_excerpt,
@@ -5218,7 +5319,7 @@ class ReflectionEngine(MemoryL1Runtime):
                 # Wholesale copy: keep in Review as needs-editing, never approve
                 # until the owner rewrites the proposed memory.
                 soft_flags += ["excerpt_overlap", "needs_owner_edit"]
-            if self._daily_chat_memory_source_is_weak(kind, clean_turns):
+            if self._daily_chat_memory_source_is_weak(kind, policy_turns):
                 soft_flags.append("weak_source_support")
             if self._daily_chat_memory_low_value_social_noise(content, kind):
                 soft_flags.append("possibly_transient")
@@ -5307,6 +5408,8 @@ class ReflectionEngine(MemoryL1Runtime):
                 "source_event_ids": source_event_ids[:160],
                 "reason": str(candidate.get("reason") or "").strip()[:160],
             })
+            if effective_mode == 'review' and candidate.get('_review_layout_repair'):
+                item['review_layout_repair'] = copy.deepcopy(candidate['_review_layout_repair'])
             if isinstance(model_doc, dict):
                 try:
                     from memory_l1_schema import split_document

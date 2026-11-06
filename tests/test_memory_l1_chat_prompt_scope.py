@@ -11,6 +11,9 @@ from memory_l1_schema import catalog_with_defaults
 from memory_l1_semantic_wire import assemble_document, semantic_contract, semantic_sources
 from memory_l1_service import L1OwnerError
 from memory_chat_preparation import ChatMemoryPreparation, prepare_chat_tasks
+from chat_memory_tool import chat_evidence_sources
+from memory_source_identity import source_model_identity
+from memory_source_provenance import daily_sources
 from test_chat_memory_preparation import setup as setup_chat
 from identity import identity_names, model_identity
 
@@ -173,11 +176,12 @@ def test_chat_preparation_sends_scoped_contract_and_minute_timezone_source_view(
     assert result["results"][0]["memory_status"] == "pending"
     assert len(calls) == 1
     model_input = calls[0]
-    assert model_input["identity"] == expected_identity
+    assert model_input["identity"] == source_model_identity(engine.config, chat_evidence_sources(
+        envelope["context"], profile_id=engine.memory_semantic_profile_id))
     semantic = model_input["semantic_contract"]
     for axis in ("subjects", "entity_types"):
-        assert semantic["catalog"][axis]["user"] == "润润"
-        assert semantic["catalog"][axis]["assistant"] == "顾衍"
+        assert semantic["catalog"][axis]["user"] == expected_identity["user"]["name"]
+        assert semantic["catalog"][axis]["assistant"] == expected_identity["assistant"]["name"]
     assert semantic["catalog"]["kinds"] == {
         "experience": "经历", "state": "状态", "fact": "事实", "preference": "偏好",
         "boundary": "边界", "intention": "意向", "interpretation": "解释", "procedure": "做法",
@@ -198,8 +202,8 @@ def test_auto_l1_sends_each_source_once_and_keeps_legacy_window_input(tmp_path, 
     env, engine, _, calls = setup_chat(tmp_path)
     expected_identity = set_test_identity(engine)
     assert expected_identity == {
-        "user": {"name": "润润", "aliases": ["小润", "配置昵称"]},
-        "assistant": {"name": "顾衍", "aliases": []},
+        "user": {"name": "配置里的显示名", "aliases": ["小润", "配置昵称"]},
+        "assistant": {"name": "配置里的助手名", "aliases": []},
     }
     monkeypatch.setattr(
         engine.memory_authority_store,
@@ -220,7 +224,8 @@ def test_auto_l1_sends_each_source_once_and_keeps_legacy_window_input(tmp_path, 
         "ombre.daily_chat_memory_prompt",
         runtime_values={"max_candidates": 1},
     )
-    assert "本次对话角色：user=润润，assistant=顾衍。" in system_prompt
+    assert "主人是配置里的显示名，助手是配置里的助手名" in system_prompt
+    assert "小润、配置昵称" in system_prompt
     engine._memory_l1_prompt = lambda source_id, runtime_values=None: (system_prompt, prompt_context)
 
     user_text = "润润说：周末改到周日，票还没买。"
@@ -261,20 +266,22 @@ def test_auto_l1_sends_each_source_once_and_keeps_legacy_window_input(tmp_path, 
     assert len(calls) == 1 and len(candidates) == 1
     model_input = calls[0]
     assert "conversation_turns" not in model_input
-    assert model_input["identity"] == expected_identity
+    assert model_input["identity"] == source_model_identity(
+        engine.config, daily_sources(window, profile_id=engine.memory_semantic_profile_id))
     assert system_prompts[0] == system_prompt
     assert list(model_input)[-1] == "l1_contract"
     assert model_input["existing_source_memories"][0]["candidate_id"] == "comparison-only-existing"
     l1_contract = model_input["l1_contract"]
-    assert list(l1_contract) == ["source_texts", "catalog_revision", "semantic_contract"]
+    assert list(l1_contract) == ["identity", "source_texts", "catalog_revision", "semantic_contract"]
+    assert l1_contract["identity"] == model_input["identity"]
     contract = l1_contract["semantic_contract"]
     assert list(contract)[-1] == "response_format"
     assert "narrative" in contract["document"]["required"]
     assert "narrative" not in contract["document"]["optional"]
     assert "retrieval" in contract["document"]["required"]
     assert contract["document"]["retrieval"]["keywords"] == "non-empty string[];由模型根据材料提供"
-    assert contract["catalog"]["subjects"]["user"] == "润润"
-    assert contract["catalog"]["subjects"]["assistant"] == "顾衍"
+    assert contract["catalog"]["subjects"]["user"] == expected_identity["user"]["name"]
+    assert contract["catalog"]["subjects"]["assistant"] == expected_identity["assistant"]["name"]
     response_format = contract["response_format"]
     assert response_format["root"] == {"candidates": "Candidate[]"}
     assert response_format["Candidate"] == {

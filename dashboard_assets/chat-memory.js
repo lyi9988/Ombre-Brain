@@ -1099,6 +1099,7 @@
     weak_source_support: '来源支持较弱',
     previously_rejected_similar: '曾拒绝过相似内容',
     needs_owner_edit: '需要先编辑再写入',
+    retrieval_relocated_from_narrative: '原关键词移到正确位置',
   };
 
   var SOFT_FLAG_HINTS = {
@@ -1110,6 +1111,7 @@
     weak_source_support: '来源支撑较弱（例如只有助手单方表述），主人判断。',
     previously_rejected_similar: '之前拒绝过类似候选，但这次来源/内容不同，可重新考虑。',
     needs_owner_edit: '建议记忆基本是原文照抄，编辑成可读记忆后才能写入。',
+    retrieval_relocated_from_narrative: '仅把模型原有的关键词对象移到正确位置，正文、来源和语义未改写；仍由主人审阅。',
   };
 
   function legacyNoOriginal(item) {

@@ -6,6 +6,12 @@ tests/*
 !tests/test_browse_memory_preparation.py
 !tests/test_stage03_memory_reactions.py
 !tests/test_stage03_daily_complete_l1.py
+!tests/test_memory_l1_review_layout.py
+!tests/test_memory_chat_event_flow.py
+!tests/test_memory_chat_event_prompt_sources.py
+!tests/test_memory_chat_event_spans.py
+!tests/test_memory_chat_extraction_mode_config.py
+!tests/test_memory_l2_event_span_projection.py
 !tests/test_stage03_chat_diary_contract.py
 !tests/test_memory_l3_sync.py
 !tests/test_stage03_inner_affinity_config.py

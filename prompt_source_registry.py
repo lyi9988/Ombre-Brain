@@ -91,10 +91,16 @@ FIXED_PROMPT_SOURCES = {
         _spec("ombre.diary_memory_prompt", "memory.reflection",
               "memory_l1_prompts:DIARY_L1_PROMPT", render="domain_identity", revision="factory-diary-semantic-v6-native-l1"),
         _spec("ombre.chat_memory_prepare_prompt", "memory.chat_prepare",
-              "memory_l1_prompts:CHAT_PREPARATION_PROMPT", render="domain_identity", revision="factory-chat-semantic-v10-native-l1"),
+              "memory_l1_prompts:CHAT_PREPARATION_PROMPT", render="domain_identity", revision="factory-chat-semantic-v11-configured-names"),
         _spec("ombre.daily_chat_memory_prompt", "memory.daily_chat_review",
               "memory_l1_prompts:DAILY_L1_PROMPT",
-              render="domain_identity", required=("{max_candidates}",), revision="factory-memory-semantic-v13-owner-summary-source-time"),
+              render="domain_identity", required=("{max_candidates}",), revision="factory-memory-semantic-v16-valued-kinds"),
+        _spec("ombre.daily_chat_event_selection_prompt", "memory.daily_chat_event_selection",
+              "memory_chat_event_prompts:EVENT_SELECTION_PROMPT", render="identity",
+              revision="factory-chat-event-selection-v2"),
+        _spec("ombre.daily_chat_event_assembly_prompt", "memory.daily_chat_event_assembly",
+              "memory_chat_event_prompts:EVENT_ASSEMBLY_PROMPT", render="identity",
+              revision="factory-chat-event-assembly-v3"),
         _spec("ombre.memory_l2_generation_prompt", "memory.reflection",
               "prompt_source_registry:_MEMORY_L2_GENERATION_PROMPT",
               revision="factory-memory-l2-generation-v5-scoped-readable-writing"),
@@ -238,9 +244,11 @@ def prompt_source_kind(source_id: str) -> str:
     return "unknown"
 
 
-def _identity_values(config: dict | None) -> dict[str, str]:
+def _identity_values(config: dict | None, source_id: str) -> dict:
     from identity import identity_names
-    return identity_names(config or {})
+    return identity_names(config, memory_defaults=source_id in (
+        "ombre.daily_chat_memory_prompt", "ombre.chat_memory_prepare_prompt",
+        "ombre.daily_chat_event_selection_prompt", "ombre.daily_chat_event_assembly_prompt"))
 
 
 def render_factory_body(spec: FixedPromptSource, body: str,
@@ -257,7 +265,7 @@ def render_factory_body(spec: FixedPromptSource, body: str,
         rendered = rendered.replace("{domain_options_text}", domain_prompt_options_text())
     if spec.render_mode in {"identity", "domain_identity", "identity_format"}:
         from identity import render_identity_template
-        rendered = render_identity_template(rendered, _identity_values(config))
+        rendered = render_identity_template(rendered, _identity_values(config, spec.source_id))
     return rendered
 
 

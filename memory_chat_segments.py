@@ -145,7 +145,7 @@ async def extract_segments(engine, day, window, *, mode, min_confidence,
             try:
                 candidates, stats = await engine._extract_window_candidates(day, window,
                     self_context=self_context, max_candidates=prompt_limit, window_index=index+1,
-                    window_total=len(plan), segment_context={**plan[index], 'task_id': task_id},
+                    window_total=len(plan), mode=mode, segment_context={**plan[index], 'task_id': task_id},
                     **engine._daily_l1_repair_args(queue, receipt))
                 if stats.get('empty_output') or stats.get('parse_failure') or stats.get('prompt_disabled'):
                     raise L1OwnerError('segment_invalid_response', field_path='generation')
@@ -165,6 +165,9 @@ async def extract_segments(engine, day, window, *, mode, min_confidence,
         if state['phase'] == 'dispatched':
             meta.update(reason='model_outcome_unknown_requires_retry_decision', requires_manual_retry=True)
             break
+        if state['phase'] == 'invalid_response' and not force:
+            meta.update(reason=state['error'], requires_manual_retry=True)
+            break
         if len(output) >= candidate_budget:
             meta['reason'] = 'candidate_budget_exhausted'
             break
@@ -176,7 +179,9 @@ async def extract_segments(engine, day, window, *, mode, min_confidence,
             if state['phase'] != 'received' and calls >= call_budget:
                 break
             if state['phase'] != 'received':
-                save({**state, 'phase': 'dispatched'}, dispatch=True)
+                # A deliberate retry of a known bad response gets a fresh result. A
+                # received result interrupted only by local storage is replayed below.
+                save({**state, 'phase': 'dispatched', 'response': None}, dispatch=True)
                 calls += 1
             # Persist the provider result BEFORE parsing. Reuse on restart, even
             # if normalization or candidate storage crashed after receipt.
@@ -189,7 +194,7 @@ async def extract_segments(engine, day, window, *, mode, min_confidence,
             try:
                 candidates, stats = await engine._extract_window_candidates(day, window,
                     self_context=self_context, max_candidates=prompt_limit,
-                    window_index=index+1, window_total=len(plan),
+                    window_index=index+1, window_total=len(plan), mode=mode,
                     segment_context={**segment, 'task_id': task_id},
                     saved_response=state.get('response'), response_checkpoint=received)
                 meta['model_candidate_count'] += len(candidates)
@@ -199,6 +204,11 @@ async def extract_segments(engine, day, window, *, mode, min_confidence,
                     raise L1OwnerError('segment_invalid_response', field_path='generation')
                 receipt = prepare_candidates(candidates, stats, preparation_key)
             except Exception as exc:
+                if (state['phase'] == 'received' and isinstance(exc, L1OwnerError)
+                        and exc.code in {'native_l1_invalid_json', 'native_l1_schema_mismatch',
+                                         'first_pass_output_incomplete', 'first_pass_candidates_required',
+                                         'segment_invalid_response'}):
+                    save({**state, 'phase':'invalid_response', 'error':exc.code})
                 meta.update(reason=('model_outcome_unknown_requires_retry_decision'
                     if state['phase'] == 'dispatched' else getattr(exc, 'code', type(exc).__name__)),
                     requires_manual_retry=True, model_call_count=calls)

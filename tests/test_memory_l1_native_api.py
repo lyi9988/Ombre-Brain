@@ -151,6 +151,60 @@ def test_reference_guidance_uses_original_contract_without_adding_source_text():
     assert schema["$defs"]["SceneSourceRef"]["enum"] == SOURCE_IDS
 
 
+@pytest.mark.parametrize('event_first', [False, True])
+def test_chat_candidates_accept_only_an_exact_optional_schema_declaration(event_first):
+    request = messages(nested=True)
+    payload = json.loads(request[-1]["content"])
+    payload.update(window={"index": 1, "total": 1})
+    if event_first:
+        payload["input_kind"] = "daily_chat_event_assembly"
+    request[-1]["content"] = json.dumps(payload)
+    _, schema = prepare_request(request, stage="auto_l1")
+    validate = Draft202012Validator(schema).is_valid
+    value = wrapped("auto_l1")
+    assert validate(value) and validate({**value, "$schema": "https://json-schema.org/draft/2020-12/schema"})
+    assert not validate({**value, "$schema": "https://fixture.invalid/other"})
+    assert not validate({**value, "schema_check": True})
+    assert validate({**value, "candidates": value["candidates"] * 2}) == (not event_first)
+
+
+@pytest.mark.parametrize("source_kind", [None, "owner_selected_summary", "completed_action_receipt"])
+def test_auto_l1_kind_guidance_agrees_across_wire_fields_and_respects_source(source_kind):
+    request = messages(nested=True)
+    payload = json.loads(request[-1]["content"])
+    payload["window"] = {"index": 1, "total": 1}
+    if source_kind:
+        payload["input_kind"] = source_kind
+    request[-1]["content"] = json.dumps(payload, ensure_ascii=False)
+    prepared, schema = prepare_request(request, stage="auto_l1")
+    kind = schema["$defs"]["Candidate"]["properties"]["kind"]
+    rules = json.loads(prepared[-1]["content"])["l1_contract"]["semantic_contract"]["output_rules"]
+    assert kind["description"] in rules
+    assert {"self_insight", "love_letter"} <= set(kind["enum"])
+    assert ("持续项目" in kind["description"]) == (source_kind is None)
+    assert ("project_state=事项进展" in kind["description"]) == (source_kind is not None)
+
+
+def test_cognition_repair_uses_the_configured_roles_for_the_rejected_item_only():
+    request = messages(nested=True)
+    payload = json.loads(request[-1]["content"])
+    payload["window"] = {"index": 1, "total": 1}
+    payload["candidate_repairs"] = {"item_1": {"kind_only": False, "issue": {"field_path": "document.statements.0.cognition"}}}
+    payload["l1_contract"]["semantic_contract"]["catalog"]["cognition_roles"]["owner_view"] = "自定义看法"
+    request[-1]["content"] = json.dumps(payload, ensure_ascii=False)
+    prepared, repair_schema = prepare_request(request, stage="auto_l1")
+    rules = json.loads(prepared[-1]["content"])["l1_contract"]["semantic_contract"]["response_format"]["rules"]
+    assert "owner_view" in rules and "supported" in rules
+    assert repair_schema["required"] == ["item_1"]
+    candidate = wrapped("auto_l1")["candidates"][0]
+    cognition = candidate["document"]["statements"][0]["cognition"]
+    cognition["role"] = "owner_view"
+    validator = Draft202012Validator(repair_schema)
+    assert validator.is_valid({"item_1": candidate})
+    cognition["role"] = "interpretation"  # Valid statement kind, not a configured cognition role.
+    assert not validator.is_valid({"item_1": candidate})
+
+
 class FakeClient:
     def __init__(self, raw='{"candidates": []}', *, base_url="https://api.deepseek.com/v1/", error=None):
         self.base_url = base_url

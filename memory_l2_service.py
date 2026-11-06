@@ -53,8 +53,8 @@ def semantic_input_projection(material):
     def omit(value, fields):
         return {key: copy.deepcopy(item) for key, item in value.items() if key not in fields}
     def anchors(values):
-        return [omit(anchor, {'target_id', 'target_namespace', 'target_revision',
-                              'text_view_id', 'text_sha256', 'quote_sha256'})
+        # Custody anchors contribute coordinates, never raw-text sidecars.
+        return [{key: copy.deepcopy(anchor[key]) for key in ('start', 'end', 'coordinate_unit') if key in anchor}
                 for anchor in values]
     def member(value, revision_field):
         result = omit(value, {'generation', revision_field})
@@ -92,7 +92,7 @@ def semantic_input_projection(material):
     def relevant(binding_id):
         return not referenced_sources or binding_id in referenced_sources
     # Source identity, revision and hashes are program custody. Evidence refs
-    # retain the exact binding_id and offsets; full source prose stays below.
+    # retain the exact binding_id and offsets; observed source prose stays below.
     doc['evidence_bindings'] = [{key: (anchors(binding[key]) if key == 'anchors' else copy.deepcopy(binding[key])) for key in
         ('binding_id', 'author_ref', 'speaker_ref', 'anchors') if key in binding}
         for binding in material['l1_document'].get('evidence_bindings', [])
@@ -105,20 +105,38 @@ def semantic_input_projection(material):
             **{key: copy.deepcopy(source.get(key)) for key in
                ('text', 'title', 'author', 'speaker')},
             'source_recorded_at': source.get('recorded_at')}
-        if source['binding'].get('source_namespace') == 'snapshot.aiz.browse.article':
+        namespace = source['binding'].get('source_namespace')
+        chat_source = namespace in {'snapshot.aiz.canonical_event', 'snapshot.ombre.raw_event',
+                                    'snapshot.ombre.conversation_turn'}
+        if namespace == 'snapshot.aiz.browse.article' or chat_source:
             # L0 retains the full acquired page, but only actually read ranges
-            # qualify as this reading's evidence. Keep gaps/absolute offsets in
-            # the model view rather than quietly exposing the unread article.
-            text = projected.pop('text')
+            # or selected chat spans qualify as evidence. Preserve disjoint
+            # ranges and absolute codepoint positions without filling gaps.
+            text = projected['text']
             ranges = []
-            for anchor in sorted(source['binding']['anchors'], key=lambda a: (a['start'], a['end'])):
+            observed = source['binding'].get('anchors', [])
+            if not isinstance(observed, list) or not isinstance(text, str):
+                raise L1OwnerError('l2_source_range_invalid', field_path='sources.anchors')
+            for anchor in observed:
+                if (not isinstance(anchor, dict) or type(anchor.get('start')) is not int
+                        or type(anchor.get('end')) is not int
+                        or not 0 <= anchor['start'] < anchor['end'] <= len(text)
+                        or anchor.get('coordinate_unit') not in (None, 'unicode_codepoint')):
+                    raise L1OwnerError('l2_source_range_invalid', field_path='sources.anchors')
+            for anchor in sorted(observed, key=lambda a: (a['start'], a['end'])):
                 if ranges and anchor['start'] <= ranges[-1][1]:
                     ranges[-1][1] = max(ranges[-1][1], anchor['end'])
                 else:
                     ranges.append([anchor['start'], anchor['end']])
-            projected.update(read_ranges=[{'start': left, 'end': right, 'text': text[left:right]}
-                for left, right in ranges], source_length=len(text),
-                coordinate_unit='unicode_codepoint_absolute_half_open')
+            partial_chat = chat_source and ranges and ranges != [[0, len(text)]]
+            if namespace == 'snapshot.aiz.browse.article' or partial_chat:
+                projected.pop('text')
+                if partial_chat:
+                    # A chat snapshot title may summarize/copy the full message.
+                    projected.pop('title', None)
+                projected.update(read_ranges=[{'start': left, 'end': right, 'text': text[left:right]}
+                    for left, right in ranges], source_length=len(text),
+                    coordinate_unit='unicode_codepoint_absolute_half_open')
         # Current-source qualification is completed by _material, not by the
         # model. Keep substantive source limitations without repeating the
         # snapshot reader's technical disclaimer as if it were an experience.

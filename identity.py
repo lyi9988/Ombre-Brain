@@ -24,17 +24,17 @@ def _clean_list(value, default: list[str]) -> list[str]:
     return [item for item in items if item] or list(default)
 
 
-def identity_names(config: dict | None = None) -> dict:
+def identity_names(config: dict | None = None, *, memory_defaults: bool = False) -> dict:
     cfg = {}
     if isinstance(config, dict) and isinstance(config.get("identity"), dict):
         cfg = config["identity"]
 
     aliases = _clean_list(cfg.get("user_aliases"), DEFAULT_USER_ALIASES)
-    ai_name = _clean_string(cfg.get("ai_name"), DEFAULT_AI_NAME)
+    ai_name = _clean_string(cfg.get("ai_name"), "顾衍" if memory_defaults else DEFAULT_AI_NAME)
     user_name = _clean_string(cfg.get("user_name"), DEFAULT_USER_NAME)
     user_display_name = _clean_string(
         cfg.get("user_display_name") or cfg.get("human_name"),
-        DEFAULT_USER_DISPLAY_NAME,
+        "润润" if memory_defaults else DEFAULT_USER_DISPLAY_NAME,
     )
     relationship_terms = list(dict.fromkeys([ai_name, user_name, user_display_name, *aliases]))
     return {
@@ -61,11 +61,11 @@ def generic_identity_names() -> dict:
 
 
 def model_identity(config: dict | None = None) -> dict:
-    """Owner-approved L1 role names; retain aliases from existing settings."""
-    names = identity_names(config)
+    """Use the same display names for L1 material and its prompt placeholders."""
+    names = identity_names(config, memory_defaults=True)
     return {
-        "user": {"name": "润润", "aliases": names["user_aliases"]},
-        "assistant": {"name": "顾衍", "aliases": []},
+        "user": {"name": names["user_display_name"], "aliases": names["user_aliases"]},
+        "assistant": {"name": names["ai_name"], "aliases": []},
     }
 
 

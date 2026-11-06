@@ -683,6 +683,7 @@ reflection:
   daily_min_memory_items: 5        # ordinary memory/update items required before daily impression writes
   daily_conversation_turn_limit: 12 # small short-term turn window for daily impression material
   daily_chat_memory_mode: review   # review = pending candidates; auto = write selected Gateway chat memories; off = disabled
+  daily_chat_memory_extraction_mode: single_pass  # event_first selects experiences before preparing each L1; opt-in because it can add model calls
   daily_chat_memory_hour: 0        # organize the previous day's Gateway chats after local midnight
   daily_chat_memory_turn_limit: 0  # 0 = use all raw_events for that date; >0 caps restored turns
   daily_chat_memory_max_per_day: 10 # compatibility name: internal candidate batch size; the same job continues until the date is complete
