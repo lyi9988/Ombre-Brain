@@ -1,13 +1,152 @@
 """Native activity recall consumer; uses the original Recall and delivery store."""
 from copy import deepcopy
 import math
+import os
+import sqlite3
 import time
+from urllib.parse import quote
+
+import httpx
 
 from memory_delivery import digest, compiled_candidates
 
 FIELDS = {'consumer_kind', 'conversation_id', 'identity_id', 'activity_id',
           'activity_revision', 'source_scope', 'cycle_id', 'operation_id'}
 HEADER = 'X-Guyan-Autonomy-Memory-Recall'
+
+
+async def feedback_evidence(service, context):
+    """Resolve annotated replies from the authenticated daily planning record."""
+    from memory_delivery import scope_from as delivery_scope
+    origins, fragments = {}, {}
+    if context.get('model_runtime_scope') != 'internal:self_adjustment':
+        return origins, []
+    for key, original in (context.get('feedback_turns') or {}).items():
+        origin = origins[key] = {'status': 'unavailable', 'targets': []}
+        if not isinstance(original, dict) or original.get('consumer_kind'):
+            continue
+        try:
+            scope = delivery_scope(original)
+            result = service.memory_delivery.lookup(scope)
+        except (sqlite3.Error, ValueError, KeyError, TypeError):
+            continue
+        if result.get('state') != 'available':
+            continue
+        receipt = result['context']
+        if (receipt.get('scope') != scope or not receipt.get('delivery_receipt_id')
+                or receipt.get('delivery_sha256') != digest({k: receipt[k] for k in ('schema', 'scope', 'fragments')})):
+            continue
+        rows = receipt['fragments']
+        origin.update(status='available' if rows else 'empty', fragment_count=len(rows),
+                      receipt_id=receipt['delivery_receipt_id'],
+                      requests=[{k: req[k] for k in ('trace_id', 'logical_request_id', 'request_id', 'request_ordinal',
+                          'fragment_ids', 'configuration_revision', 'prompt_preset_revision', 'provider_payload_sha256')
+                          if k in req} for req in result.get('requests', [])])
+        for row in rows:
+            fragment_id = row['fragment_id']
+            origin['targets'].append({'fragment_id': fragment_id, 'target_key': 'memory-target:' + digest({
+                k: row.get(k) for k in ('memory_id','bucket_id','l1_revision','l2_revision','source_group_id',
+                                        'text_sha256','source_refs','coverage','legacy_body_sha256')}),
+                'memory_id': row['memory_id'],
+                'l1_revision': row.get('l1_revision'), 'l2_revision': row.get('l2_revision')})
+            fragments[fragment_id] = row
+    if not fragments:
+        return origins, []
+    formal = [f for f in fragments.values() if type(f.get('l1_revision')) is int and f['l1_revision'] > 0]
+    try:
+        states = {r['fragment_id']: r['state'] for r in
+                  await service._validate_memory_delivery({'fragments': formal})} if formal else {}
+    except (httpx.HTTPError, sqlite3.Error, ValueError, TypeError, KeyError, TimeoutError):
+        states = {}  # Original delivery survives; present eligibility remains unknown.
+    for origin in origins.values():
+        for target in origin['targets']:
+            target['source_state'] = states.get(target['fragment_id'], 'unavailable')
+    return origins, [row for row in formal if states.get(row['fragment_id']) == 'available'
+                     and not row['coverage'].get('wire_partial')]
+
+
+async def source_excerpt(service, fragment, binding, token_budget):
+    """Read just the bound L0 range. A historical fallback is not evidence."""
+    from memory_delivery import sha
+    anchor = next((a for a in binding.get('anchors', []) if isinstance(a, dict)
+                   and type(a.get('start')) is int and type(a.get('end')) is int
+                   and 0 < a['end'] - a['start'] <= 4 * token_budget), None)
+    client = getattr(service, 'http_client', None)
+    if not anchor or client is None:
+        return None
+    base = os.environ.get('OMBRE_MEMORY_INDEX_ADMIN_URL', 'http://ombre-brain:8000').rstrip('/')
+    token = os.environ.get('OMBRE_MEMORY_WRITE_TOKEN') or getattr(service, 'gateway_token', '')
+    url = base + '/api/memory-authority/memories/' + quote(fragment['memory_id'], safe='') + '/sources/' + quote(binding['binding_id'], safe='')
+    try:
+        response = await client.get(url, headers={'Authorization': 'Bearer ' + token},
+            params={'revision': fragment['l1_revision'], 'start': anchor['start'], 'end': anchor['end']})
+        response.raise_for_status()
+        source = response.json()['source']
+        if not isinstance(source, dict):
+            return None
+        text = source.get('text')
+        if (source.get('eligible_source') is True and source.get('binding') == binding
+                and isinstance(text, str) and sha(text) == anchor.get('quote_sha256')):
+            return text
+    except (httpx.HTTPError, ValueError, TypeError, KeyError):
+        pass
+    return None
+
+
+async def add_feedback_evidence(service, original, sections, normal_spans):
+    """Use the original Recall carriers and their whole-section budgets."""
+    from utils import count_tokens_approx
+    view = getattr(service, 'memory_authority_view', None)
+    reader = getattr(view, 'memory_l1_recall_map', None)
+    records = reader([f['bucket_id'] for f in original]) if callable(reader) and original else {}
+    selected, excerpts = [], {}
+    for kind, (normal, limit) in list(sections.items()):
+        parts = []
+        for f in original:
+            if f['coverage'].get('section') != kind:
+                continue
+            text = f['text']
+            record = records.get(f['bucket_id']) or {}
+            statements = (record.get('document') or {}).get('statements') or []
+            ids = set(f['coverage'].get('statement_ids') or [])
+            facts = [s for s in statements if s.get('statement_id') in ids and isinstance(s.get('content'), str)]
+            label = '被批注的原回复当时收到的记忆片段：\n'
+            excerpt = label + text
+            if count_tokens_approx('\n\n'.join([*parts, excerpt])) > limit:
+                continue
+            if facts and record.get('revision') == f['l1_revision']:
+                compared = excerpt + '\n同版 L1 对应陈述：\n' + '\n'.join(s['content'] for s in facts)
+                if count_tokens_approx('\n\n'.join([*parts, compared])) <= limit:
+                    excerpt = compared
+                    binding_ids = {bid for s in facts for bid in s.get('evidence_refs') or []}
+                    refs = {r['binding_id'] for r in f.get('source_refs', [])}
+                    for binding in (record['document'].get('evidence_bindings') or []):
+                        if binding.get('binding_id') not in binding_ids & refs:
+                            continue
+                        key = (f['memory_id'], f['l1_revision'], binding['binding_id'])
+                        if key not in excerpts:
+                            excerpts[key] = await source_excerpt(service, f, binding, limit)
+                        text_view = excerpts[key]
+                        if text_view:
+                            compared = excerpt + '\n原始记录中的对应文字：\n' + text_view
+                            if count_tokens_approx('\n\n'.join([*parts, compared])) <= limit:
+                                excerpt = compared
+            parts.append(excerpt)
+            # final_fragments creates its own content identity. Copy only the
+            # original semantic candidate, never re-hash an existing id into it.
+            selected.append({k: deepcopy(v) for k,v in f.items() if k != 'fragment_id'})
+        if parts:
+            if normal and count_tokens_approx('\n\n'.join([*parts, normal])) <= limit:
+                if not any(normal in part for part in parts):
+                    parts.append(normal)
+            else:
+                for span in normal_spans:
+                    text = span.get('text')
+                    if (span.get('section') == kind and text and not any(text in part for part in parts)
+                            and count_tokens_approx('\n\n'.join([*parts, text])) <= limit):
+                        parts.append(text)
+            sections[kind] = ('\n\n'.join(parts), limit)
+    return selected
 
 
 def preparation_contract(service):
@@ -137,6 +276,9 @@ async def prepare(service, scope, *, model, diagnostics=None):
     diagnostics['source_context_ms'] = round((time.perf_counter() - started) * 1000)
     if context.get('status') != 'prepared' or not isinstance(context.get('query'), str) or not context['query'].strip():
         raise ValueError('autonomy_prepared_source_required')
+    origins, original_fragments = await feedback_evidence(service, context)
+    if original_fragments:
+        context = {**context, '_feedback_evidence': original_fragments}
     # This is a real activity search cue, never a fabricated user/chat event.
     payload = {'model': model, 'messages': [{'role': 'system', 'content': context['query']}],
         '_ombre_trace_context': {'runtime_scope': 'internal:autonomy_chain',
@@ -164,7 +306,7 @@ async def prepare(service, scope, *, model, diagnostics=None):
     recall_id = service.memory_delivery.prepare_autonomy(scope, frozen, messages)
     diagnostics.update(failure_stage='completed', duration_ms=round((time.perf_counter() - started) * 1000))
     return {'state': 'available', 'scope': scope, 'recall_id': recall_id,
-        'memory_messages': messages, 'recall_status': projection.get('recall_status'),
+        'memory_messages': messages, 'recall_status': projection.get('recall_status'), 'feedback_origins': origins,
         'preparation': deepcopy(diagnostics),
         'assessment': {'uses': 'not_assessed', 'reactions': 'not_assessed'}}
 

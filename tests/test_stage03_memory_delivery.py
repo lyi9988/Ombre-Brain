@@ -45,6 +45,38 @@ def completed(store, scope=SCOPE, *, bid='bucket-1', legacy=False):
     return store.complete(scope)
 
 
+def test_daily_review_rereads_annotated_reply_even_when_day_recall_selects_another_memory(tmp_path):
+    from autonomy_memory import feedback_evidence, add_feedback_evidence
+    store = MemoryDeliveryStore(tmp_path / 'delivery.sqlite')
+    old = completed(store)['fragments'][0]
+    empty_scope = {**SCOPE, 'assistant_source_event_id':'other-version'}
+    empty_attempt = store.begin(empty_scope, 'another-model-invocation', [])
+    store.succeed(empty_attempt)
+    store.complete(empty_scope)
+    current = ['available']
+    async def validate(context):
+        return [{'fragment_id': row['fragment_id'], 'state': current[0]} for row in context['fragments']]
+    service = SimpleNamespace(memory_delivery=store, _validate_memory_delivery=validate)
+    context = {'model_runtime_scope': 'internal:self_adjustment', 'feedback_turns': {
+        'correct-reply': SCOPE, 'empty-reply': empty_scope, 'no-receipt': None}}
+    origins, fragments = run(feedback_evidence(service, context))
+    assert [origins[k]['status'] for k in context['feedback_turns']] == ['available','empty','unavailable']
+    assert origins['correct-reply']['requests'][0]['trace_id'] == 'trace-1'
+    assert [f['fragment_id'] for f in fragments] == [old['fragment_id']]
+    sections = {'direct': ('An unrelated memory from tonight.', 500)}
+    pinned = run(add_feedback_evidence(service, fragments, sections, []))
+    projection = {'compiled_memory_blocks':[{'source_id':'ombre.memory_recall','content':sections['direct'][0]}]}
+    frozen = compiled_candidates(projection, pinned)
+    final = final_fragments(frozen, {'messages':[{'role':'system','content':sections['direct'][0]}]})
+    assert final == [old] and 'unrelated memory' in sections['direct'][0]
+    assert final_fragments(frozen, {'messages':[{'role':'user','content':'memory block disabled'}]}) == []
+    assert not run(add_feedback_evidence(service, fragments, {'direct': ('owner selection', 0)}, []))
+    current[0] = 'withdrawn'
+    seen, fragments = run(feedback_evidence(service, context))
+    assert not fragments and seen['correct-reply']['targets'][0]['source_state'] == 'withdrawn'
+    assert run(feedback_evidence(service, {**context,'model_runtime_scope':'internal:autonomy_chain'})) == ({}, [])
+
+
 def use_query(context, *, use_id='use-1', status='new_use', episode=None, fresh=False):
     evidence = {'event_id': 'assistant-event', 'start': 0, 'end': 5, 'text_sha256': sha('proof')}
     use = {'use_id': use_id, 'fragment_ref': context['fragments'][0]['fragment_id'],
@@ -56,6 +88,43 @@ def use_query(context, *, use_id='use-1', status='new_use', episode=None, fresh=
     return {**context['scope'], 'delivery_receipt_id': context['delivery_receipt_id'],
         'delivery_sha256': context['delivery_sha256'], 'user_event_id': 'user-event',
         'assistant_event_id': 'assistant-event', 'uses': [use]}
+
+
+def test_original_receipt_enters_daily_http_recall_through_its_normal_composer(tmp_path, monkeypatch):
+    from test_memory_local_first_settings import _base_config
+    config = _base_config(tmp_path)
+    config['gateway'].update(upstream_base_url='https://provider.fixture/v1', upstream_default_model='public-model')
+    monkeypatch.setenv('OMBRE_GATEWAY_TOKEN', 'gateway-test')
+    monkeypatch.setenv('OMBRE_GATEWAY_UPSTREAM_API_KEY', 'fake-provider')
+    async def scenario():
+        service = GatewayService(config)
+        service.gateway_token = 'gateway-test'
+        original = completed(service.memory_delivery)
+        async def qualify(context):
+            return [{'fragment_id': f['fragment_id'], 'state': 'available'} for f in context['fragments']]
+        monkeypatch.setattr(service, '_validate_memory_delivery', qualify)
+        scope = {'consumer_kind':'autonomy', 'conversation_id':SCOPE['conversation_id'], 'identity_id':'owner',
+            'activity_id':None, 'activity_revision':None, 'source_scope':'day', 'cycle_id':'day-1', 'operation_id':'op-1'}
+        def daily(request):
+            assert request.url.path == '/bridge/v1/autonomy-memory-context'
+            return httpx.Response(200, json={'state':'available','status':'prepared','scope':scope,
+                'request_id':'day-1','query':'Compare the unrelated M42 observation.',
+                'recall_signals':{'state':'available','snapshots':[]}, 'model_runtime_scope':'internal:self_adjustment',
+                'feedback_turns':{'reply-feedback:a:r1':SCOPE}})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(daily)) as bridge:
+            service.canonical_adapter = SimpleNamespace(enabled=True, conversation_id=SCOPE['conversation_id'],
+                base_url='https://aiz.fixture',token='bridge-test',device_id='fixture',http_client=bridge)
+            app = create_gateway_app(config=config, service=service)
+            app.state.gateway_service = service
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://gateway.fixture') as client:
+                response = await client.post('/internal/autonomy/memory-recall', json={'scope':scope,'model':'public-model'},
+                    headers={'Authorization':'Bearer gateway-test'})
+                assert response.status_code == 200
+                result = response.json()
+                assert result['feedback_origins']['reply-feedback:a:r1']['receipt_id'] == original['delivery_receipt_id']
+                assert original['fragments'][0]['text'] in '\n'.join(m['content'] for m in result['memory_messages'])
+        await service.http_client.aclose()
+    run(scenario())
 
 
 class Buckets:

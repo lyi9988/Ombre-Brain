@@ -5536,6 +5536,17 @@ class GatewayService:
                         stage["timing_key"] = "projection_recovery." + stage["timing_key"]
                     query_planner_debug.setdefault("candidate_stages", []).append(stage)
                 query_planner_debug["final_bucket_ids"] = list(natural_input.get("selected_buckets") or [])
+        original_candidates = []
+        if (autonomy_context and autonomy_context.get('_feedback_evidence')
+                and getattr(self, 'automatic_recall_enabled', True) and natural_input.get('composer_recall_enabled')):
+            from autonomy_memory import add_feedback_evidence
+            sections = {'direct': (recalled_memory, self.recalled_budget),
+                'targeted': (targeted_memory_detail, self.memory_detail_recall_budget),
+                'diffused': (related_memory, self.related_memory_budget), 'recent': (recent_context, self.recent_budget)}
+            original_candidates = await add_feedback_evidence(self, autonomy_context['_feedback_evidence'], sections,
+                natural_input.get('rendered_memory_spans') or [])
+            recalled_memory, targeted_memory_detail, related_memory, recent_context = (
+                sections[name][0] for name in ('direct', 'targeted', 'diffused', 'recent'))
         memory_recall_projection = self._build_memory_recall_projection(
             recalled_memory=recalled_memory,
             targeted_memory_detail=targeted_memory_detail,
@@ -5559,7 +5570,20 @@ class GatewayService:
             bucket = bucket_by_id.get(span['bucket_id'])
             if bucket:
                 span['legacy_body_sha256'] = sha(str(bucket.get('content') or ''))
-        memory_recall_projection['delivery_candidates'] = candidates(memory_recall_projection, records)
+        memory_recall_projection['delivery_candidates'] = original_candidates + candidates(memory_recall_projection, records)
+        if original_candidates:
+            # Preserve the semantic identity from the original receipt.
+            # These spans are for the existing post-Composer measurement only.
+            spans = list(memory_recall_projection.get('rendered_memory_spans') or [])
+            for candidate in original_candidates:
+                span = {'section': candidate['coverage']['section'], 'bucket_id': candidate['bucket_id'],
+                        'text': candidate['text']}
+                if span not in spans:
+                    spans.append(span)
+                for field, key in (('selected_bucket_ids', 'bucket_id'), ('selected_memory_ids', 'memory_id')):
+                    if candidate[key] not in memory_recall_projection[field]:
+                        memory_recall_projection[field].append(candidate[key])
+            memory_recall_projection['rendered_memory_spans'] = spans
         recall_status = memory_recall_projection.get("recall_status", {})
         recall_status["automatic_recall_enabled"] = getattr(self, "automatic_recall_enabled", True)
         stage_started_at = time.perf_counter()
@@ -7044,7 +7068,9 @@ class GatewayService:
             return
         projection = debug.get('memory_recall_projection') or {}
         frozen = compiled_candidates(projection, projection.get('delivery_candidates') or [])
-        ref = {'scope': scope, 'trace_id': trace.get('trace_id', '')}
+        ref = {'scope': scope, 'trace_id': trace.get('trace_id', ''),
+               'configuration_revision': projection.get('configuration_revision'),
+               'prompt_preset_revision': (debug.get('prompt_composer') or {}).get('preset_revision')}
         trace['memory_delivery_manifest'] = {'scope': scope, 'fragments': frozen, 'request': ref}
         payload['_ombre_trace_context'] = trace
         debug['_memory_delivery_request'] = ref
@@ -7059,7 +7085,9 @@ class GatewayService:
         attempt = store.begin(manifest['scope'], trace.get('trace_id', ''),
             final_fragments(manifest['fragments'], provider_payload), request={
                 'logical_request_id': trace.get('logical_request_id'), 'request_id': trace.get('request_id'),
-                'request_ordinal': trace.get('request_ordinal'), 'provider_payload_sha256': digest(provider_payload)})
+                'request_ordinal': trace.get('request_ordinal'), 'provider_payload_sha256': digest(provider_payload),
+                'configuration_revision': manifest['request'].get('configuration_revision'),
+                'prompt_preset_revision': manifest['request'].get('prompt_preset_revision')})
         manifest['request']['attempt_id'] = attempt
 
     def _succeed_memory_delivery(self, payload):
