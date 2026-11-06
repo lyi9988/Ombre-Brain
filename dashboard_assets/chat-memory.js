@@ -1215,6 +1215,44 @@
       return '<li><details><summary>' + esc(key) + '</summary><pre>' +
         esc(typeof generation[key] === 'object' ? JSON.stringify(generation[key], null, 2) : displayValue(generation[key])) + '</pre></details></li>';
     }).join('');
+    var candidateKindLabels = {
+      key_event: '关键经历', stable_preference: '稳定偏好', boundary: '边界', signal: '约定信号',
+      commitment: '承诺或约定', project_state: '项目进展', relationship_anchor: '关系锚点',
+      self_insight: '自我认识', love_letter: '情书锚点', durable_fact: '持续事实', preference: '偏好',
+      relationship_event: '关系经历', shared_experience: '共同经历', daily_impression: '每日印象',
+      reflection: '反思', diary_memory: '日记记忆', import_memory: '导入记忆', memory: '记忆',
+      identity: '身份', alias: '别名'
+    };
+    var hasCandidateKind = Object.prototype.hasOwnProperty.call(candidate, 'kind');
+    var candidateKind = candidate.kind;
+    var candidateKindId = typeof candidateKind === 'string' ? candidateKind.trim() : displayValue(candidateKind);
+    var candidateKindText = !hasCandidateKind ? '旧候选未提供 candidate.kind'
+      : candidateKind == null || candidateKindId === '' ? 'candidate.kind 字段已提供但为空'
+        : (Object.prototype.hasOwnProperty.call(candidateKindLabels, candidateKindId)
+          ? candidateKindLabels[candidateKindId] + '（' + candidateKindId + '）'
+          : '未配置可读名称（' + candidateKindId + '）');
+    var retrieval = document.retrieval && typeof document.retrieval === 'object' && !Array.isArray(document.retrieval)
+      ? document.retrieval : null;
+    function retrievalListText(field) {
+      if (!retrieval) return '旧稿未提供 retrieval 对象';
+      if (!Object.prototype.hasOwnProperty.call(retrieval, field)) return '旧稿未提供此字段';
+      if (!Array.isArray(retrieval[field])) return '字段格式不是数组：' + displayValue(retrieval[field]);
+      if (!retrieval[field].length) return '明确为空（0 项）';
+      return retrieval[field].map(displayValue).join('、');
+    }
+    var hasDomain = Object.prototype.hasOwnProperty.call(candidate, 'domain');
+    var domainText = !hasDomain ? ''
+      : Array.isArray(candidate.domain) && !candidate.domain.length ? '明确为空（0 项）'
+        : Array.isArray(candidate.domain) ? candidate.domain.map(displayValue).join('、')
+        : candidate.domain == null || candidate.domain === '' ? '字段已提供但为空'
+          : displayValue(candidate.domain);
+    var intakeOverview = '<section data-l1-intake-overview>' +
+      '<strong>整份稿的入库类别与召回字段</strong>' +
+      '<p><strong>入库类别 candidate.kind：</strong>' + esc(candidateKindText) + '</p>' +
+      (hasDomain ? '<p><strong>领域 candidate.domain：</strong>' + esc(domainText) + '</p>' : '') +
+      '<p><strong>召回关键词 document.retrieval.keywords：</strong>' + esc(retrievalListText('keywords')) + '</p>' +
+      '<p><strong>标签 document.retrieval.tags：</strong>' + esc(retrievalListText('tags')) + '</p>' +
+      '</section>';
     var kindLabels = { experience: '经历', state: '状态', fact: '事实', preference: '偏好', boundary: '边界',
       intention: '意向', interpretation: '理解', procedure: '做法' };
     var definitions = (generation.catalog_snapshot || {}).definitions || [];
@@ -1262,6 +1300,7 @@
     return '<details class="chat-memory-excerpt-details chat-memory-l1-details" data-l1-statements>' +
       '<summary>结构化记忆 · ' + statements.length + ' 条陈述 · ' + (document.scenes || []).length + ' 个场景</summary>' +
       '<p>这里记录各条陈述的性质；来源核对通过不等于这些结论已被主人确认。</p>' +
+      intakeOverview +
       (statementRows ? '<ol>' + statementRows + '</ol>' : '<p>没有提取到独立陈述。</p>') + '</details>' +
       '<details class="chat-memory-excerpt-details chat-memory-l1-details" data-l1-sources>' +
       '<summary>来源定位 · ' + bindings.length + ' 项材料 · ' + usedBindings.length + ' 项被陈述引用</summary>' +
