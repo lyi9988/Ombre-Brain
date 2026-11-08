@@ -12,15 +12,14 @@ from memory_authority import IdempotencyConflict
 from memory_l1_contract import canonical_json, semantic_sha256
 from memory_l1_service import L1OwnerError
 from memory_l1_wire_schema import chat_submission_parameters
-from memory_model_io import MemoryModelIO, completion_parameters
+from memory_model_io import MemoryModelIO, completion_parameters, model_error_details
 
 PREFIX = 'memory_l1_chat_task:'
 
 
 def issue(exc):
-    """Only program-defined codes/paths, never exception messages with values."""
-    return {'code': getattr(exc, 'code', type(exc).__name__),
-            'field_path': getattr(exc, 'field_path', getattr(exc, 'path', ''))}
+    details = model_error_details(exc)
+    return {'code': details['code'], 'field_path': details['field_path']}
 
 
 def validate_submission(envelope):
@@ -410,12 +409,12 @@ async def prepare_chat_tasks(engine, bucket_mgr, *, max_jobs=None):
                 model_io.finish(io_id)
                 results.append(tasks.receipt(memory_id))
             except Exception as exc:
-                if io_id: model_io.finish(io_id, error=exc)
+                failure = model_io.finish(io_id, error=exc) if io_id else issue(exc)
                 try:
-                    tasks.finish(claimed, phase='failed', issue=issue(exc), **completion_meta)
+                    tasks.finish(claimed, phase='failed', issue=failure, **completion_meta)
                 except L1OwnerError:
                     pass  # A newer owner draft owns its own queued task.
-                results.append({'task_id': claimed['task_id'], 'status': 'failed', 'issue': issue(exc)})
+                results.append({'task_id': claimed['task_id'], 'status': 'failed', 'issue': failure})
         return {'status': 'completed', 'results': results}
     finally:
         engine._chat_preparation_running = False

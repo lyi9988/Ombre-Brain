@@ -9,6 +9,7 @@ import copy
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 import uuid
 
 from memory_l1_contract import canonical_json
@@ -33,6 +34,27 @@ def completion_parameters(route, temperature):
 
 def _field(obj, name):
     return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
+def model_error_details(error):
+    """Keep structured diagnostics without copying exception text or provider payloads."""
+    error_type = type(error).__name__
+    code = getattr(error, 'code', None)
+    if type(code) is not int and (type(code) is not str or not re.fullmatch(r'[A-Za-z0-9_]{1,160}', code)):
+        code = error_type
+    path = getattr(error, 'field_path', None) or getattr(error, 'path', None)
+    schema_path = r'[A-Za-z_]\w*(?:\.\w+|\[[0-9]+\])*'
+    patch_pointer = r'(?:/(?:[-\w.:]|~[01])+)+'
+    if type(path) is not str or len(path) > 160 or not re.fullmatch(
+            schema_path + '|' + patch_pointer, path, flags=re.ASCII):
+        path = ''
+    details = {'code': code, 'error_type': error_type, 'field_path': path}
+    status = getattr(error, 'status_code', None)
+    if status is None:
+        status = getattr(getattr(error, 'response', None), 'status_code', None)
+    if type(status) is int and 100 <= status <= 599:
+        details['http_status'] = status
+    return details
 
 
 def response_usage(response):
@@ -129,18 +151,18 @@ class MemoryModelIO:
             transport={'timeout_seconds': timeout_seconds, 'max_retries': 0})
 
     def finish(self, io_id, *, error=None):
-        changes = {'status': 'failed' if error else 'succeeded',
-                   'validation': {'status': 'failed' if error else 'passed'}}
-        if error:
-            # Program-defined type/code/path; provider exception text may contain secrets.
-            safe = {'code': getattr(error, 'code', type(error).__name__),
-                    'field_path': getattr(error, 'field_path', getattr(error, 'path', ''))}
-            changes.update(error=safe, validation={'status': 'failed', 'issue': safe})
-        # Do not clear visible output or response accounting on either outcome.
         row = self.authority.get_meta(io_id)
+        failure = None
+        changes = {'status': 'succeeded', 'validation': {'status': 'passed'}}
+        if error is not None:
+            failure = model_error_details(error)
+            failure['failure_phase'] = 'response_processing' if row['status'] == 'validating' else 'request'
+            changes.update(status='failed', error=failure, validation={'status': 'failed', 'issue': failure})
+        # Do not clear visible output or response accounting on either outcome.
         if not row.get('ended_at'):
             changes['ended_at'] = _stamp()
         self._update(io_id, **changes)
+        return failure
 
     def list(self, memory_id, limit=20, offset=0):
         if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0:

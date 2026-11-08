@@ -10,6 +10,8 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from memory_authority import MemoryAuthorityStore
+from memory_l1_contract import L1ContractError
+from memory_l1_service import L1OwnerError
 from memory_model_io import MemoryModelIO
 
 
@@ -39,10 +41,16 @@ def test_owner_route_full_call_pending_memory_and_other_tokens_denied(tmp_path):
     authority = MemoryAuthorityStore({'state_dir': str(tmp_path)})
     recorder = MemoryModelIO(authority)
     text = 'Complete visible content. ' * 2000
-    recorder.start('pending-task', stage='chat_l1', task_id='pending-task', attempt=1,
-                   messages=[{'role': 'user', 'content': text}], parameters={'model': 'test-model'})
-    recorder.start('other-memory', stage='chat_l1', task_id='other-memory', attempt=1,
-                   messages=[{'role': 'user', 'content': 'other private body'}], parameters={'model': 'test-model'})
+    io_id = recorder.start('pending-task', stage='chat_l1', task_id='pending-task', attempt=1,
+                          messages=[{'role': 'user', 'content': text}], parameters={'model': 'test-model'})
+    recorder.returned(io_id, response={}, raw_output='{}', finish_reason='stop')
+    recorder.finish(io_id, error=L1ContractError('nonempty_string_required', 'document.statements[0].content'))
+    other_id = recorder.start('other-memory', stage='memory_l3_sync', task_id='other-memory', attempt=1,
+                              messages=[{'role': 'user', 'content': 'other private body'}],
+                              parameters={'model': 'test-model'})
+    recorder.returned(other_id, response={}, raw_output='{}', finish_reason='stop')
+    pointer = '/statements/st-test/content'
+    recorder.finish(other_id, error=L1OwnerError('l3_patch_member_not_found', field_path=pointer))
     app = app_for(authority)
     url = '/api/memory-authority/memories/pending-task/model-io'
     for token in ('', 'writer', 'internal-read'):
@@ -51,8 +59,16 @@ def test_owner_route_full_call_pending_memory_and_other_tokens_denied(tmp_path):
     assert result.status_code == 200
     assert result.headers['cache-control'] == 'no-store'
     assert len(result.json()['items']) == 1
-    assert result.json()['items'][0]['messages'][0]['content'] == text
+    record = result.json()['items'][0]
+    assert record['messages'][0]['content'] == text
+    assert record['stage'] == 'chat_l1' and record['status'] == 'failed'
+    assert record['error'] == record['validation']['issue'] == {
+        'code': 'nonempty_string_required', 'error_type': 'L1ContractError',
+        'field_path': 'document.statements[0].content', 'failure_phase': 'response_processing',
+    }
     assert 'other private body' not in result.text
+    other = get(app, '/api/memory-authority/memories/other-memory/model-io').json()['items'][0]
+    assert other['error']['field_path'] == pointer
 
 
 def test_model_io_route_empty_legacy_and_pagination_validation(tmp_path):

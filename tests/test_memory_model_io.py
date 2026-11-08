@@ -3,7 +3,9 @@ import copy
 import json
 from types import SimpleNamespace as NS
 
+import httpx
 import pytest
+from openai import AuthenticationError, BadRequestError
 
 from memory_authority import MemoryAuthorityStore
 from memory_chat_preparation import ChatMemoryPreparation, prepare_chat_tasks
@@ -46,17 +48,41 @@ def test_actual_chat_wire_visible_output_and_accounting_survive_validation(tmp_p
     assert tasks.detail(key)['preparation_output']['text'] == captured['raw']
 
 
-def test_provider_failure_preserves_actual_input_without_exception_secret(tmp_path):
+@pytest.mark.parametrize(('error_type', 'status', 'provider_code', 'code'), [
+    (BadRequestError, 400, None, 'BadRequestError'),
+    (AuthenticationError, 401, 'invalid_api_key', 'invalid_api_key'),
+    (RuntimeError, None, 'LITELLM_ERROR', 'LITELLM_ERROR'),
+])
+def test_provider_failure_preserves_actual_input_without_exception_secret(tmp_path, error_type, status,
+                                                                          provider_code, code):
     env, engine, envelope, _ = setup(tmp_path)
-    key = ChatMemoryPreparation(env['authority']).enqueue(envelope)['task_id']
+    tasks = ChatMemoryPreparation(env['authority'])
+    key = tasks.enqueue(envelope)['task_id']
+    secret = 'secret-provider-credential'
+    request = httpx.Request('POST', 'https://example.test/?token=' + secret,
+                            headers={'Authorization': 'Bearer ' + secret})
     async def fail(*args, **kwargs):
-        raise RuntimeError('secret-provider-credential')
+        if status is None:
+            error = error_type(secret)
+            error.code = provider_code
+        else:
+            body = {'code': provider_code, 'message': secret}
+            response = httpx.Response(status, request=request, json=body, headers={'X-Debug': secret})
+            error = error_type(secret, response=response, body=body)
+        error.path = str(request.url)
+        raise error
     engine._daily_chat_memory_create_completion = fail
-    asyncio.run(prepare_chat_tasks(engine, env['buckets']))
+    result = asyncio.run(prepare_chat_tasks(engine, env['buckets']))
     record = MemoryModelIO(env['authority']).list(key)['items'][0]
+    expected = {'code': code, 'error_type': error_type.__name__, 'field_path': '', 'failure_phase': 'request'}
+    if status is not None:
+        expected['http_status'] = status
+    receipt = tasks.receipt(key)
     assert record['status'] == 'failed' and record['raw_output'] is None
+    assert record['error'] == record['validation']['issue'] == expected
+    assert receipt['issue'] == result['results'][0]['issue'] == expected
     assert json.loads(record['messages'][1]['content'])['draft'] == envelope['arguments']
-    assert 'secret-provider-credential' not in json.dumps(record)
+    assert secret not in json.dumps([record, receipt, result])
 
 
 @pytest.mark.parametrize('finish', ['stop', 'length'])
