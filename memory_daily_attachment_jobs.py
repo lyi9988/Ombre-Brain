@@ -15,8 +15,14 @@ async def run_attachment_jobs(engine, bucket_mgr, *, day, mode, options):
     from memory_candidate_preparation import MemoryCandidatePreparation
     from memory_authority import MemoryProposal
     from memory_l1_api import AUTO_KINDS
+    from memory_l1_v2_generation import enabled
     if mode == 'off' or engine._daily_chat_memory_candidate_limit(mode) <= 0:
         return {'status': 'disabled', 'results': []}
+    if enabled(engine.config):
+        # A model-input adoption receipt identifies material that was read, not
+        # a separate research activity or an explicit request to remember it.
+        # Those qualified sources enter through chat_l1 or action_l1 instead.
+        return {'status': 'not_applicable', 'reason': 'attachments_follow_qualified_memory_intent', 'results': []}
     sources,issues=await collect_daily_attachments(day,timezone=str(engine.tz),config=engine.config,
         profile_id=engine.memory_semantic_profile_id)
     queue=MemoryCandidatePreparation(engine.memory_authority_store)

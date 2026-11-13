@@ -325,6 +325,11 @@ class MemoryCommitService:
                     or metadata.get("memory_l1") != previous["metadata"]["memory_l1"]):
                 raise CommitStateError("structured L1 requires a coordinated body and semantic revision")
         from memory_l1_schema import bind_l1_metadata
+        from memory_l1_v2 import is_v2, validate_adoptable_kind
+        semantic = metadata.get('memory_l1')
+        if is_v2(semantic) and not self.authority.get_commit_by_idempotency(idempotency_key):
+            if not previous or semantic != previous['metadata'].get('memory_l1') or previous['body_sha256'] != body_sha256(canonical_body):
+                validate_adoptable_kind(semantic.get('kind'))
         metadata = bind_l1_metadata(canonical_body, metadata)
         expected_hash = body_sha256(canonical_body)
         next_revision = int(expected_revision) + 1

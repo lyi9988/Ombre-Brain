@@ -34,3 +34,6 @@ python-multipart>=0.0.9
 
 # 向量相似度计算 (导入模式/聚类)
 numpy>=1.24.0
+
+# L1 v2 request budgeting using the same estimate as the whole-window trial.
+tiktoken>=0.11.0,<1.0.0

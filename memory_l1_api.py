@@ -269,7 +269,8 @@ def _field(value, name, default=None):
     return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
 
 
-async def create_completion(client, *, model, messages, route, temperature, capture=None):
+async def create_completion(client, *, model, messages, route, temperature, capture=None,
+                            response_format=None, validation_schema=None):
     """Native Responses for DeepSeek; standard Chat JSON Schema elsewhere.
 
     No protocol fallback, semantic repair, or implicit retry is performed.
@@ -278,7 +279,11 @@ async def create_completion(client, *, model, messages, route, temperature, capt
     from types import SimpleNamespace as NS
     from urllib.parse import urlsplit
     from memory_task_routes import completion_options
-    messages, schema = prepare_request(messages, stage=route['stage'])
+    if response_format is None:
+        messages, schema = prepare_request(messages, stage=route['stage'])
+        response_format = {'type': 'json_schema', 'json_schema': {'name': 'memory_l1', 'schema': schema}}
+    else:
+        schema = validation_schema if validation_schema is not None else response_format['json_schema']['schema']
     timeout = route.get('timeout_seconds', 180)
     if route['stage'] == 'diary_l1' and route.get('read_timeout_seconds') is not None:
         from httpx import Timeout
@@ -289,9 +294,10 @@ async def create_completion(client, *, model, messages, route, temperature, capt
         # DeepSeek Responses lives at /responses, not /v1/responses.
         if base.path.rstrip('/') == '/v1':
             client = client.with_options(base_url=base._replace(path='/', query='', fragment='').geturl())
+        response_text_format = {'type': response_format['type'], **response_format.get('json_schema', {})}
         request = {'model': model, 'input': messages,
                    'max_output_tokens': route['max_tokens'], 'temperature': temperature,
-                   'text': {'format': {'type': 'json_schema', 'name': 'memory_l1', 'schema': schema}}}
+                   'text': {'format': response_text_format}}
         effort = route.get('reasoning_effort')
         if route.get('thinking_mode') == 'disabled':
             effort = 'none'
@@ -316,7 +322,7 @@ async def create_completion(client, *, model, messages, route, temperature, capt
     else:
         request = {'model': model, 'messages': messages,
                    **completion_options(route, temperature=temperature),
-                   'response_format': {'type': 'json_schema', 'json_schema': {'name': 'memory_l1', 'schema': schema}}}
+                   'response_format': response_format}
         if capture is not None:
             capture(request)
         response = await client.chat.completions.create(**request)

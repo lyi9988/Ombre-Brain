@@ -16,7 +16,8 @@ from memory_authority import MemoryAuthorityStore
 from memory_moments import parse_bucket_moments
 from memory_l1_contract import semantic_sha256
 from memory_retrieval_text import (TEXT_PROJECTION_VERSION, SemanticUnitTooLarge,
-                                   l1_retrieval_blocks, l1_retrieval_text, pack_source_units)
+                                   l1_retrieval_blocks, l1_retrieval_text, pack_source_units,
+                                   text_projection_version)
 from prompt_source_registry import fixed_prompt_source, render_factory_body, resolve_fixed_prompt
 from utils import bucket_text_for_embedding
 
@@ -156,7 +157,7 @@ class MemoryProjectionWorker:
                     if upgrade_legacy_indexes and name == "embedding":
                         is_pending = embedding_projection_needs_upgrade(
                             str(status.get("status") or ""), details,
-                            {**expected_embedding_space, **({'text_projection_version': TEXT_PROJECTION_VERSION}
+                            {**expected_embedding_space, **({'text_projection_version': text_projection_version(self._retrieval_document(memory_id, revision))}
                                 if self._retrieval_document(memory_id, revision) is not None else {})},
                         )
                     if is_pending:
@@ -650,11 +651,14 @@ class MemoryProjectionWorker:
                 "source_unit_id": bucket_id,
                 "source_kind": "bucket_seed",
                 "text": seed_text,
-                "text_projection_version": TEXT_PROJECTION_VERSION if document is not None else None,
+                "text_projection_version": text_projection_version(document),
                 **({'semantic_blocks':l1_retrieval_blocks(document, body=bucket.get('content') or '')}
                    if document is not None else {}),
             })
 
+        from memory_l1_v2 import is_v2
+        if is_v2(document):
+            return units
         relevance_options = getattr(self.moment_store, "relevance_options", None)
         annotation_options = getattr(self.moment_store, "annotation_options", None)
         moments = parse_bucket_moments(
@@ -671,7 +675,7 @@ class MemoryProjectionWorker:
                 "source_unit_id": unit_id,
                 "source_kind": "content_moment",
                 "text": l1_retrieval_text(document, body=text) if document is not None else text,
-                "text_projection_version": TEXT_PROJECTION_VERSION if document is not None else None,
+                "text_projection_version": text_projection_version(document),
                 **({'semantic_blocks':l1_retrieval_blocks(document, body=text)} if document is not None else {}),
             })
         return units
@@ -795,7 +799,7 @@ class MemoryProjectionWorker:
             "outdated": not metadata_complete,
             "source_unit_count": len(projected_units),
             "source_units": projected_units,
-            **({'text_projection_version': TEXT_PROJECTION_VERSION}
+            **({'text_projection_version': next(unit['text_projection_version'] for unit in units if unit.get('text_projection_version'))}
                if supports_text_version and any(unit.get('text_projection_version') for unit in units) else {}),
             **space,
         }

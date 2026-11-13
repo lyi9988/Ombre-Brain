@@ -36,7 +36,7 @@ def hold_source_descriptor(content, metadata, *, whisper=False, feel=False):
                 or metadata.get("author") != {"role": "assistant_self", "producer": "skill.web_browse"}
                 or metadata.get("coverage") != {"kind": "external_source_summary", "original_page_stored": False}
                 or not isinstance(scope, dict)
-                or set(scope) != {"schema", "source_kind", "producer", "actor_role", "source_event_id",
+                or set(scope) - {"memory_intent"} != {"schema", "source_kind", "producer", "actor_role", "source_event_id",
                                   "source_ref", "reported_author", "claim_kind"}
                 or scope.get("schema") != "browse-experience-v1"
                 or scope.get("source_kind") != "web_browse"
@@ -46,6 +46,10 @@ def hold_source_descriptor(content, metadata, *, whisper=False, feel=False):
                 or not isinstance(scope.get("source_event_id"), str)
                 or (scope.get("reported_author") is not None and not isinstance(scope["reported_author"], str))):
             raise ValueError("invalid_browse_source")
+        if "memory_intent" in scope and scope["memory_intent"] != {
+                "schema": "browse-memory-intent-v1", "decision": "remember",
+                "draft_sha256": metadata["content_sha256"]}:
+            raise ValueError("invalid_browse_memory_intent")
         ref = scope.get("source_ref")
         if (not isinstance(ref, dict)
                 or set(ref) != {"content_item_id", "source_domain", "content_hash", "summary_hash", "canonical_url"}

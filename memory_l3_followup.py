@@ -323,6 +323,7 @@ class MemoryFollowups:
                                or 'followup_memory_not_currently_delivered', status=409)
 
     async def prepare(self, claimed):
+        from memory_l1_v2 import is_v2
         from memory_l3_sync import prepare_plan, compile_plan
         from memory_semantics import build_annotations, attach_source_links, binding_source_keys
         update = deepcopy(claimed['envelope']['updates'][0])
@@ -344,7 +345,8 @@ class MemoryFollowups:
         for binding in detail['l1']['document']['evidence_bindings']:
             if not (await reader.locate(binding)).get('eligible_source'):
                 raise L1OwnerError('followup_original_source_unavailable', status=409)
-        if claimed['envelope'].get('schema') == 'self-review-followup-v1':
+        v2 = is_v2(detail['l1']['document'])
+        if not v2 and claimed['envelope'].get('schema') == 'self-review-followup-v1':
             from memory_self_review_source import check_native_sources, native_feedback_layer
             _, actual = await check_native_sources(claimed['envelope'], self.engine.config,
                 self.review_source_reader, with_sources=True)
@@ -385,7 +387,8 @@ class MemoryFollowups:
         new_refs = {row['binding']['binding_id'] for row in evidence}
         if any(not new_refs.intersection(patch['evidence_refs']) for patch in plan['patch']):
             raise L1OwnerError('followup_new_evidence_required', field_path='plan.patch')
-        self._check_cognition(update, detail['l1']['document'], compiled['document'], evidence)
+        if not v2:
+            self._check_cognition(update, detail['l1']['document'], compiled['document'], evidence)
         annotations = build_annotations(body=update['content'], proposed=None, sources=sources, proposal_id=claimed['task_id'])
         annotations = attach_source_links(annotations, related, proposal_id=claimed['task_id'])
         draft_fields = claimed.get('draft_fields') or {}

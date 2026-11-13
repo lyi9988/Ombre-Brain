@@ -111,6 +111,9 @@ def related_summary_statements(authority, evidence_bindings):
 def check_summary_coverage(authority, proposal, *, connection=None):
     proposal = proposal.payload() if hasattr(proposal, "payload") else proposal
     doc = proposal["metadata"]["memory_l1"]
+    from memory_l1_v2 import is_v2
+    if is_v2(doc):
+        return _natural_card_coverage(authority, proposal, doc, connection=connection)
     proposed = _facts(doc)
     all_ids = [s["statement_id"] for s in doc.get("statements", [])]
     matches, covered, existing_extras, narrative_hashes = [], set(), set(), set()
@@ -141,6 +144,24 @@ def check_summary_coverage(authority, proposal, *, connection=None):
             "matches": [match for match in matches if match["matched_statement_ids"]] if complete else matches,
             "covered_statement_ids": [sid for sid in all_ids if sid in covered],
             "unmatched_statement_ids": missing}
+
+
+def _natural_card_coverage(authority, proposal, document, *, connection):
+    bindings = document['evidence_bindings']
+    origins = {_origin(binding) for binding in bindings}
+    body_sha = hashlib.sha256(proposal['proposed_body'].strip().encode()).hexdigest()
+    matches, duplicates = [], []
+    for memory_id, revision, existing_sha, existing in _records(authority, bindings, connection):
+        if memory_id == proposal['proposal_id']:
+            continue
+        related = {_origin(binding) for binding in existing['evidence_bindings']}
+        match = {'memory_id': memory_id, 'revision': revision,
+                 'matching_source_count': len(origins.intersection(related)), 'matched_statement_ids': []}
+        matches.append(match)
+        if existing_sha == body_sha and existing.get('kind') == document['kind'] and related == origins:
+            duplicates.append(match)
+    return {'status': 'linked' if duplicates else 'overlap_review' if matches else 'new',
+            'matches': duplicates or matches, 'covered_statement_ids': [], 'unmatched_statement_ids': []}
 
 
 def summary_link_receipt(authority, candidate_id):

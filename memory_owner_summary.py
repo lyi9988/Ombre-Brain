@@ -221,7 +221,7 @@ class OwnerSummaryPreparation(ChatMemoryPreparation):
     def edit(self, mid, payload):
         raise L1OwnerError('owner_summary_edit_at_original_draft', status=409, field_path='draft')
 
-    def enqueue(self, envelope, *, budget):
+    def enqueue(self, envelope, *, budget, generation_protocol=None):
         validate(envelope)
         mid, digest = task_id(envelope['operation_id']), semantic_sha256(envelope)
         with closing(self.authority._connect()) as db, db:
@@ -239,6 +239,8 @@ class OwnerSummaryPreparation(ChatMemoryPreparation):
                     'envelope': copy.deepcopy(envelope), 'windows': None, 'window_budget': budget,
                     'created_at': stamp, 'updated_at': stamp, 'candidate_ids': [], 'attempts': 0,
                     'issue': None, 'lease_until': 0, 'history': [], 'edit_requests': {}}
+                if generation_protocol:
+                    row['generation_protocol'] = generation_protocol
                 db.execute('INSERT INTO authority_meta(key,value) VALUES(?,?)', (PREFIX + mid, canonical_json(row)))
         return self.receipt(mid)
 
@@ -257,6 +259,11 @@ class OwnerSummaryPreparation(ChatMemoryPreparation):
             if memory and memory['state'] == 'active' and memory['active_revision'] > 0:
                 revision = int(memory['active_revision'])
                 memory_ids.append(cid)
+                from memory_l1_v2 import is_v2
+                if candidate and is_v2(candidate['proposal']['metadata'].get('memory_l1')):
+                    detail.update(memory_id=cid, l1_revision=revision, l2_state='ready', presentation_revision=None)
+                    items.append(detail)
+                    continue
                 with closing(self.authority._connect()) as db, db:
                     product = db.execute('SELECT p.presentation_revision,p.first_pass_revision,p.publication FROM memory_l2_heads h '
                         'JOIN memory_l2_revisions p USING(memory_id,presentation_revision) WHERE h.memory_id=?', (cid,)).fetchone()
@@ -287,20 +294,29 @@ class OwnerSummaryPreparation(ChatMemoryPreparation):
                 status, effective_issue = 'disabled', {'code':'memory_source_disabled','field_path':'mode'}
             elif (self.engine.config.get('reflection') or {}).get('chat_memory_jobs_per_run', 1) == 0:
                 status, effective_issue = 'blocked', {'code':'memory_worker_disabled','field_path':'chat_memory_jobs_per_run'}
-            elif not self.engine._memory_l1_prompt('ombre.daily_chat_memory_prompt', runtime_values={'max_candidates':max(1,int(self.engine.daily_chat_memory_max_per_day or 1))})[0].strip():
+            elif not self._active_prompt(row):
                 status, effective_issue = 'blocked', {'code':'memory_prompt_disabled','field_path':'prompt'}
             elif not self.engine._memory_task_route('auto_l1')['configured']:
                 status, effective_issue = 'blocked', {'code':'memory_model_unconfigured','field_path':'auto_l1'}
         code = (effective_issue or {}).get('code', '')
-        retryable = (row['phase'] == 'failed' and code not in ('execution_outcome_unknown', 'memory_source_disabled',
+        retryable = (row['phase'] == 'failed' and code not in ('execution_outcome_unknown',
+            'model_outcome_unknown_requires_retry_decision', 'memory_source_disabled',
             'owner_summary_source_changed', 'source_not_currently_readable', 'statement_source_not_currently_readable')
-            and bool(row.get('windows')) and any(w['state'] != 'prepared' for w in row['windows']))
+            and (row.get('generation_protocol') == 'whole_window_v2' or (bool(row.get('windows'))
+                and any(w['state'] != 'prepared' for w in row['windows']))))
         return {'ok': True, 'operation_id': row['operation_id'], 'task_id': mid, 'status': status,
             'task_revision':row['revision'], 'retryable':retryable,
             'source_kind': 'owner_summary', 'preparation_status': row['phase'], 'candidate_ids': row['candidate_ids'],
             'memory_ids': memory_ids, 'memories': items, 'linked_memories': linked, 'issue': effective_issue,
             'windows': {'completed': len(completed), 'total': len(row.get('windows') or [])},
             'recall_guaranteed': False}
+
+    def _active_prompt(self, row):
+        from memory_l1_v2_generation import PROMPT_ID, PROTOCOL
+        if row.get('generation_protocol') == PROTOCOL:
+            return self.engine._memory_l1_prompt(PROMPT_ID)[0].strip()
+        return self.engine._memory_l1_prompt('ombre.daily_chat_memory_prompt', runtime_values={
+            'max_candidates': max(1, int(self.engine.daily_chat_memory_max_per_day or 1))})[0].strip()
 
     def retry(self, operation_id, expected_revision):
         mid = task_id(operation_id)
@@ -315,11 +331,11 @@ class OwnerSummaryPreparation(ChatMemoryPreparation):
         if not self.receipt(mid)['retryable']:
             raise L1OwnerError('owner_summary_not_retryable', status=409, field_path='status')
         def reset(current):
-            for window in current['windows']:
+            for window in current['windows'] or []:
                 if window['state'] == 'prepared': continue
                 if window.get('output'):
                     window.setdefault('failed_outputs', []).append(window.pop('output'))
-            current.update(phase='queued', issue=None, lease_until=0, claim_token=None)
+            current.update(phase='queued', issue=None, lease_until=0, claim_token=None, manual_generation_retry=True)
             return current
         self.update(mid, expected_revision=expected_revision, transform=reset)
         return self.receipt(mid)
@@ -350,6 +366,7 @@ async def prepare_owner_summary_tasks(engine, bucket_mgr, *, max_jobs=None):
     from memory_model_io import MemoryModelIO, completion_parameters
     from memory_source_identity import source_model_identity
     from memory_l1_api import validate_response
+    from memory_l1_v2_generation import PROTOCOL, enabled, generate
     from memory_summary_coverage import check_summary_coverage, related_summary_statements
     options = task_options(engine.config)
     allowance = options['chat_memory_jobs_per_run'] if max_jobs is None else min(options['chat_memory_jobs_per_run'], max_jobs)
@@ -359,7 +376,8 @@ async def prepare_owner_summary_tasks(engine, bucket_mgr, *, max_jobs=None):
     limit = max(1, int(engine.daily_chat_memory_max_per_day or 1))
     prompt, context = engine._memory_l1_prompt('ombre.daily_chat_memory_prompt', runtime_values={'max_candidates': limit})
     route = engine._memory_task_route('auto_l1')
-    if engine.daily_chat_memory_mode == 'off' or not prompt.strip() or not route['configured']:
+    if engine.daily_chat_memory_mode == 'off' or (not enabled(engine.config)
+            and (not prompt.strip() or not route['configured'])):
         return {'status': 'disabled', 'results': []}
     tasks, io = OwnerSummaryPreparation(engine.memory_authority_store, engine), MemoryModelIO(engine.memory_authority_store)
     reader = OwnerSummarySourceReader(engine.config, engine.memory_authority_store)
@@ -382,6 +400,32 @@ async def prepare_owner_summary_tasks(engine, bucket_mgr, *, max_jobs=None):
                     results.append(tasks.receipt(claimed['task_id']))
                     continue
                 reader.register(claimed['envelope'], sources)
+                if claimed.get('generation_protocol') == PROTOCOL:
+                    summary = claimed['envelope']['summary']
+
+                    def evaluate(proposal):
+                        coverage = check_summary_coverage(engine.memory_authority_store, proposal)
+                        proposal.metadata['owner_summary_coverage'] = coverage
+                        decision = engine.memory_ingestion_policy.evaluate(proposal)
+                        if coverage['status'] == 'overlap_review' and decision.action != 'reject':
+                            return PolicyDecision('queue_review', ('REVIEW_EXISTING_SOURCE_COVERAGE',),
+                                'review', requires_owner_confirmation=True)
+                        return decision
+
+                    result = await generate(engine, bucket_mgr, origin='owner_summary', task_id=claimed['task_id'],
+                        source_type='owner_summary', mode=engine.daily_chat_memory_mode, sources=sources,
+                        context={'owner_selected_summary': {'id': summary['id'], 'revision': summary['revision'],
+                            'title': summary.get('title', ''), 'body': summary['body'], 'evidence': False}},
+                        force=pending.get('manual_generation_retry', False), before_prepare=tasks.guard_claim(claimed),
+                        prepare_policy=evaluate, metadata={'owner_summary': {'operation_id': claimed['operation_id'],
+                            'summary_id': summary['id'], 'draft_revision': claimed['draft_revision']}})
+                    issues = result['adoption_issues']
+                    tasks.finish(claimed, phase='failed' if issues else 'prepared',
+                        candidate_ids=result['candidate_ids'], issue=(issues or [None])[0])
+                    results.append(tasks.receipt(claimed['task_id']))
+                    continue
+                if not prompt.strip():
+                    raise L1OwnerError('prompt_disabled', field_path='generation')
                 for cid in claimed['candidate_ids']:
                     existing = engine.memory_authority_store.get_candidate(cid)
                     if existing and existing['status'] == 'accepted':
@@ -547,7 +591,9 @@ async def owner_summary_response(request, engine, authority):
                 await OwnerSummarySourceReader(engine.config, authority).sources(row['envelope'])
                 receipt = tasks.retry(payload['operation_id'],payload['expected_task_revision'])
             else:
-                receipt = tasks.enqueue(payload, budget=task_options(engine.config)['daily_chat_memory_window_max_input_chars'])
+                from memory_l1_v2_generation import PROTOCOL, enabled
+                receipt = tasks.enqueue(payload, budget=task_options(engine.config)['daily_chat_memory_window_max_input_chars'],
+                    generation_protocol=PROTOCOL if enabled(engine.config) else None)
         else:
             mid = task_id(request.path_params['operation_id'])
             row = tasks.get(mid)

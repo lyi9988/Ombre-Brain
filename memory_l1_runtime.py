@@ -95,22 +95,78 @@ def namespace_local_ids(document, prefix, known_ids=(), catalog=None):
     return doc, {**ids, **{old: ids.get(local, local) for old, local in first_map.items()}}
 
 
+async def _prepare_v2_action(engine, bucket_mgr, tasks, claimed, reader, mode, *, force):
+    from memory_l1_v2_generation import generate
+    from memory_l1_v2_sources import draft_source
+
+    task_id = claimed['task_id']
+    intent = claimed.get('memory_intent')
+    if not intent:
+        tasks.transition(task_id, 'generating', 'prepared', generation_status='l0_only')
+        return {'task_id': task_id, 'status': 'retained_source_only', 'candidate_ids': []}
+    raw_sources, receipts = [draft_source(claimed, engine.config, kind='action')], []
+    for item in intent['sources']:
+        action_id, artifact_id = item['action_id'], item['artifact_id']
+        source = await reader.capture(action_id, artifact_id)
+        if (source.get('state') != 'available' or source.get('eligible_source') is not True
+                or not isinstance(source.get('text'), str) or not source['text'].strip()):
+            raise L1OwnerError('action_source_not_available', status=409, field_path='sources')
+        raw_sources.append({'namespace': 'action_receipt', 'system': 'aizizhu',
+            'conversation_id': reader.options.get('conversation_id', 'conv-jiajia-main'),
+            'profile_id': engine.memory_semantic_profile_id, 'event_id': action_id,
+            'version_id': artifact_id, 'role': 'tool', 'text': source['text'],
+            'recorded_at': source.get('recorded_at')})
+        receipts.append({'source_ref': f'm{len(raw_sources)}', 'coverage': source.get('coverage')})
+    result = await generate(engine, bucket_mgr, origin='action_l1', task_id=task_id, source_type='action_receipt',
+        mode=mode, sources=raw_sources, context={'agent_draft': {'source_ref': 'm1',
+            'activity_id': intent['activity_id'], 'activity_revision': intent['activity_revision']},
+            'action_receipts': receipts}, force=force, metadata={'source_task_id': task_id},
+        required_source_ref='m1', required_any_source_refs={item['source_ref'] for item in receipts})
+    states = {row['candidate_id']: row['status'] for row in result['rows']}
+    issues = result['adoption_issues']
+    phase = 'failed' if issues else 'prepared'
+    tasks.transition(task_id, 'generating', phase, candidate_ids=result['candidate_ids'],
+                     candidate_states=states, adoption_issues=issues, issue=(issues or [None])[0])
+    return {'task_id': task_id, 'status': phase, 'candidate_ids': result['candidate_ids'],
+            'candidate_states': states, 'adoption_issues': issues,
+            'adopted': bool(states) and all(status == 'committed' for status in states.values())}
+
+
 class MemoryL1Runtime:
+    def _memory_l1_action_v2_mode(self, inherited_mode=None):
+        from memory_l1_v2_generation import enabled
+
+        if (not enabled(self.config) or self.memory_ingestion_policy is None
+                or task_options(self.config)['action_l1_jobs_per_run'] == 0):
+            return 'off'
+        return self.memory_ingestion_policy.mode_for('action_receipt', inherited_mode or self.daily_chat_memory_mode)
+
     async def _memory_l1_action_tasks(self, bucket_mgr, *, mode=None):
         """Consume source IDs in an existing daily job, never execute actions."""
         from memory_authority import MemoryProposal
         from memory_l1_source_readers import AizActionSourceReader
         from memory_l1_source_tasks import MemoryL1SourceTasks
         from memory_candidate_preparation import MemoryCandidatePreparation
+        from memory_l1_v2_generation import PROTOCOL
+        from memory_model_io import model_error_details
         tasks = MemoryL1SourceTasks(self.memory_authority_store)
         options = task_options(self.config)
         maximum = options['action_l1_jobs_per_run']
         mode = mode or self.daily_chat_memory_mode
-        if maximum == 0 or mode == 'off' or self._daily_chat_memory_candidate_limit(mode) == 0:
+        v2_mode = self._memory_l1_action_v2_mode(mode)
+        legacy_limit = self._daily_chat_memory_candidate_limit(mode) if mode != 'off' else 0
+        v2_enabled = v2_mode != 'off'
+        if maximum == 0 or not (legacy_limit or v2_enabled):
             return {'status': 'disabled', 'results': []}
-        prompt, context = self._memory_l1_prompt('ombre.daily_chat_memory_prompt',
-            runtime_values={'max_candidates': self._daily_chat_memory_candidate_limit(mode)})
-        if not prompt.strip(): return {'status': 'disabled', 'reason': 'prompt_disabled', 'results': []}
+        waiting = tasks.runnable(limit=maximum, include_legacy=bool(legacy_limit), include_v2=v2_enabled)
+        if not waiting:
+            return {'status': 'completed', 'results': []}
+        prompt, context = '', {}
+        if any(task.get('generation_protocol') != PROTOCOL for task in waiting):
+            prompt, context = self._memory_l1_prompt('ombre.daily_chat_memory_prompt',
+                runtime_values={'max_candidates': legacy_limit})
+        if not prompt.strip() and not v2_enabled:
+            return {'status': 'disabled', 'reason': 'prompt_disabled', 'results': []}
         route = self._memory_task_route('action_l1')
         client, model, use_daily = route['client'], route['model'], route['connection'] == 'daily'
         if not route['configured']: return {'status': 'not_prepared', 'reason': route['unavailable_reason'], 'results': []}
@@ -119,12 +175,20 @@ class MemoryL1Runtime:
         catalog, catalog_revision = service.catalog_provider()
         results = []
         queue = MemoryCandidatePreparation(self.memory_authority_store)
-        candidate_budget = self._daily_chat_memory_candidate_limit(mode)
-        for task in tasks.runnable(limit=maximum):
-            if candidate_budget <= 0: break
-            claimed = tasks.transition(task['task_id'], task['phase'], 'generating')
+        candidate_budget = legacy_limit
+        for task in waiting:
+            if task.get('generation_protocol') != PROTOCOL and candidate_budget <= 0:
+                continue
+            claimed = tasks.transition(task['task_id'], task['phase'], 'generating', manual_generation_retry=False)
             if claimed is None: continue
             try:
+                if claimed.get('generation_protocol') == PROTOCOL:
+                    result = await _prepare_v2_action(self, bucket_mgr, tasks, claimed, reader, v2_mode,
+                                                     force=task.get('manual_generation_retry', False))
+                    results.append(result)
+                    continue
+                if not prompt.strip():
+                    raise L1OwnerError('prompt_disabled', field_path='generation')
                 prep_key = 'action_l1:' + task['task_id']
                 receipt = queue.get(prep_key)
                 replace_failure = bool(receipt and receipt.get('issue') and task['phase'] == 'queued')
@@ -222,10 +286,9 @@ class MemoryL1Runtime:
                     'candidate_states': states, 'adoption_issues': adoption_issues,
                     'adopted': bool(ids) and all(state == 'committed' for state in states.values())})
             except Exception as exc:
-                tasks.transition(task['task_id'], 'generating', 'failed',
-                    issue={'code': getattr(exc, 'code', type(exc).__name__)})
-                results.append({'task_id': task['task_id'], 'status': 'failed',
-                    'issue': {'code': getattr(exc, 'code', type(exc).__name__)}})
+                issue = model_error_details(exc)
+                tasks.transition(task['task_id'], 'generating', 'failed', issue=issue)
+                results.append({'task_id': task['task_id'], 'status': 'failed', 'issue': issue})
         return {'status': 'completed', 'results': results}
 
     def _memory_l1_revisions(self, bucket_mgr=None):
@@ -317,8 +380,10 @@ class MemoryL1Runtime:
         return MemoryL0Sources(self.memory_authority_store, adapters, diary_namespace=namespace)
 
     async def _memory_l1_adopt_candidate(self, row, bucket_mgr, *, edit=None, request_id, owner=False):
+        from memory_authority import MemoryProposal, PolicyDecision
         from memory_candidate_edit import save_owner_candidate
         from memory_diary_l1 import DiaryL1Service
+        from memory_l1_v2 import is_v2, validate_adoptable_kind
         service = self._memory_l1_revisions(bucket_mgr)
         candidate_id = row['candidate_id']
         if row['status'] == 'committed': return {'id': candidate_id, 'status': 'exists'}
@@ -330,8 +395,9 @@ class MemoryL1Runtime:
             row = save_owner_candidate(self.memory_authority_store, candidate_id, edit=edit,
                 expected_revision=row['revision'], request_id=request_id + ':edit', revision_service=service)
         wants_accept = owner and row['status'] in ('pending', 'deferred', 'commit_failed')
-        if row['status'] != 'accepted' and not wants_accept: return {'id': candidate_id, 'status': row['status']}
         proposal = row['proposal']
+        if row['status'] != 'accepted' and not wants_accept:
+            return {'id': candidate_id, 'status': row['status']}
         if 'diary_l1_bundle' in proposal.get('metadata', {}):
             if wants_accept:
                 binding = proposal['metadata']['diary_l1_bundle']['source_binding']
@@ -345,6 +411,20 @@ class MemoryL1Runtime:
         commit_revision = row['revision'] + 1 if wants_accept else row['revision']
         key = 'l1-candidate:' + candidate_id + ':revision:' + str(commit_revision)
         prior_commit = self.memory_authority_store.get_commit_by_idempotency(key)
+        if is_v2(semantic) and not prior_commit:
+            if not owner:
+                decision = self.memory_ingestion_policy.evaluate(MemoryProposal.from_mapping(proposal))
+                if decision.action != 'auto_accept':
+                    pending_policy = PolicyDecision('queue_review', decision.reason_codes, decision.decision_policy,
+                        requires_owner_confirmation=True)
+                    updated = self.memory_authority_store.decide_candidate(candidate_id, action='return_to_review',
+                        expected_revision=row['revision'], request_id=key + ':policy-review',
+                        actor='policy', reason_codes=decision.reason_codes, policy=pending_policy)
+                    return {'id': candidate_id, 'status': updated['status']}
+            try:
+                validate_adoptable_kind(semantic.get('kind'))
+            except ValueError:
+                return {'id': candidate_id, 'status': 'classification_gap'}
         # Check the actual source on a later Review adoption as well as at the
         # authenticated initial capture. A historical copy never grants access.
         source_observations = None
@@ -368,8 +448,12 @@ class MemoryL1Runtime:
                         if key != 'evidence_refs': check_evidence(item, path + '.' + key)
             # Alternatives supporting the same statement need one readable
             # source, not all. Unused window context cannot block adoption.
-            check_evidence(semantic['statements'], 'statements')
-            check_evidence(semantic['attributes'], 'attributes')
+            if is_v2(semantic):
+                if set(semantic['source_refs']) - eligible:
+                    raise L1OwnerError('card_source_not_currently_readable', status=409, field_path='source_refs')
+            else:
+                check_evidence(semantic['statements'], 'statements')
+                check_evidence(semantic['attributes'], 'attributes')
         if not prior_commit and proposal.get('source_type') == 'owner_summary':
             from memory_owner_summary import OwnerSummaryPreparation, OwnerSummarySourceReader, task_id
             from memory_summary_coverage import check_summary_coverage
@@ -378,7 +462,8 @@ class MemoryL1Runtime:
             if not task:
                 raise L1OwnerError('owner_summary_operation_missing', status=409, field_path='operation_id')
             from memory_owner_summary_time import validate_prepared
-            validate_prepared(self.memory_authority_store,proposal)
+            if not is_v2(semantic):
+                validate_prepared(self.memory_authority_store,proposal)
             await OwnerSummarySourceReader(self.config, self.memory_authority_store).sources(task['envelope'])
             coverage = check_summary_coverage(self.memory_authority_store, proposal)
             if coverage['status'] == 'linked':
@@ -399,7 +484,8 @@ class MemoryL1Runtime:
         if source_observations is not None: metadata['source_observations_at_adoption'] = source_observations
         metadata.pop('legacy_candidate', None)
         legacy = proposal['metadata'].get('legacy_candidate') or {}
-        metadata.update({'name': semantic['narrative']['title'], 'tags': legacy.get('tags', []),
+        title = semantic.get('title', (semantic.get('narrative') or {}).get('title', ''))
+        metadata.update({'name': title, 'tags': legacy.get('tags', []),
             'memory_type': proposal['memory_type'], 'source': proposal['source_type']})
         existing = self.memory_authority_store.get_memory(candidate_id)
         if existing is not None:

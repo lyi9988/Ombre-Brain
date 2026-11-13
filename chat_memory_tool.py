@@ -282,7 +282,9 @@ class ChatMemoryTool:
     async def submit(self, envelope):
         if isinstance(envelope, dict) and isinstance(envelope.get('arguments'), dict) and 'narrative' in envelope['arguments']:
             from memory_chat_preparation import ChatMemoryPreparation
-            return ChatMemoryPreparation(self.store).enqueue(envelope)
+            from memory_l1_v2_generation import PROTOCOL, enabled
+            return ChatMemoryPreparation(self.store).enqueue(envelope,
+                generation_protocol=PROTOCOL if enabled(self.engine.config) else None)
         try:
             proposal = self._proposal(envelope)
         except (ValueError, TypeError, KeyError) as exc:

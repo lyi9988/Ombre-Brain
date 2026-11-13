@@ -312,6 +312,8 @@ def configured_source_readers(config, authority=None):
     from memory_self_review_source import AizReviewSourceReader
     reviews = [AizReviewSourceReader(config, kind) for kind in ('daily_review', 'reply_feedback')]
     if authority:
+        from memory_l1_v2_sources import AgentMemoryDraftReader
+        readers.append(AgentMemoryDraftReader(config, authority))
         from memory_owner_summary import OwnerSummarySourceReader
         owner_summary_reader = OwnerSummarySourceReader(config, authority)
         canonical.owner_summary_reader = owner_summary_reader

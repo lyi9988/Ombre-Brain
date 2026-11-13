@@ -14,6 +14,8 @@ WORKDIR /app
 # 先装依赖（利用 Docker 缓存）
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+ENV TIKTOKEN_CACHE_DIR=/usr/local/share/tiktoken
+RUN python -c "import tiktoken; tiktoken.get_encoding('o200k_base')"
 
 # Copy project files / 复制项目文件
 COPY *.py .

@@ -26,6 +26,9 @@ def source_snapshot(source, *, config=None):
     """Only callers holding actual authenticated reader results call this."""
     if not isinstance(source, dict) or not isinstance(source.get('text'), str) or not source['text']:
         raise L1OwnerError('source_text_required', field_path='sources')
+    if source.get('namespace') == 'agent_draft':
+        from memory_l1_v2_sources import snapshot
+        return snapshot(source, config)
     if source.get('namespace') == 'attachment_text':
         from memory_attachment_source import snapshot
         return snapshot(source)
@@ -42,7 +45,9 @@ def source_snapshot(source, *, config=None):
     from memory_source_identity import source_participant, source_group
     participant = source_participant(source, config)
     revision = {'version_id': source.get('version_id'), 'text_sha256': hashlib.sha256(source['text'].encode()).hexdigest()}
-    if config is not None:
+    # Action retention and live source reads bind the same immutable Artifact.
+    # Keep their identity stable when the writing model also receives people.
+    if config is not None and source.get('namespace') != 'action_receipt':
         revision['participant'] = {key: participant[key] for key in ('subject_id', 'kind')}
     return {'state': 'available', 'source_namespace': namespace, 'source_id': canonical_json(locator),
         'source_revision': 'source_sha256:' + hashlib.sha256(canonical_json(revision).encode()).hexdigest(),

@@ -839,7 +839,15 @@ class ReflectionEngine(MemoryL1Runtime):
         if isinstance(metadata.get("memory_l1"), dict):
             from memory_l1_schema import join_document
             candidate["memory_l1"] = metadata["memory_l1"]
-            candidate["l1_document"] = join_document(proposal["proposed_body"], metadata["memory_l1"])
+            candidate["l1_document"] = join_document(proposal["proposed_body"], metadata["memory_l1"],
+                                                       allow_classification_gap=True)
+            from memory_l1_v2 import KINDS, is_v2
+            if is_v2(metadata['memory_l1']):
+                candidate['classification_gap'] = metadata['memory_l1']['kind'] not in KINDS
+                candidate['confidence_source'] = metadata.get('confidence_source')
+                candidate['l1_v2_kinds'] = list(KINDS)
+                if metadata.get('l1_v2_continuation'):
+                    candidate['l1_v2_continuation'] = metadata['l1_v2_continuation']
             candidate["source_bindings"] = metadata["memory_l1"]["evidence_bindings"]
             candidate["generation"] = metadata["memory_l1"]["generation"]
             bundle = metadata.get("diary_l1_bundle") or {}
@@ -1183,6 +1191,9 @@ class ReflectionEngine(MemoryL1Runtime):
         now_local = self._local_now()
         results = []
         chat_candidates: list[dict] = []
+        from memory_l1_v2_generation import PROTOCOL, enabled as daily_v2_enabled
+
+        v2_active = daily_v2_enabled(self.config)
         if self.daily_chat_memory_mode != "off" and now_local.hour >= self.daily_chat_memory_hour:
             chat_date = (now_local - timedelta(days=1)).date()
             profile_id = str(getattr(persona_engine, "profile_id", "") or "default")
@@ -1195,6 +1206,7 @@ class ReflectionEngine(MemoryL1Runtime):
             automatic_reasons = {"window_budget_exhausted", "candidate_budget_exhausted", "source_batch_exhausted",
                                  "candidate_budget_exhausted_prepared", "retained_candidates_need_processing",
                                  "candidate_kind_retry_ready"}
+            v2_recovery = {"candidate_persistence_failed", "l1_v2_daily_cursor_not_persisted"}
             outstanding, unresolved = [], {}
             resume_problem = None
             for date_key, prior in sorted(latest_by_date.items()):
@@ -1208,7 +1220,9 @@ class ReflectionEngine(MemoryL1Runtime):
                 # profile-global cursor must not silently erase an older day.
                 safe = expected if expected is not None else prior.get("source_start_seq", 0)
                 reason = prior.get("error_category") or prior.get("reason") or "partial_requires_review"
-                if prior.get("status") == "needs_review" or current > int(safe or 0) or reason not in automatic_reasons:
+                may_resume = reason in automatic_reasons or (
+                    v2_active and prior.get("prompt_version") == PROTOCOL and reason in v2_recovery)
+                if prior.get("status") == "needs_review" or current > int(safe or 0) or not may_resume:
                     problem = {"status": "needs_review", "reason": "source_cursor_ahead_of_partial" if current > int(safe or 0) else reason,
                         "date": date_key, "profile_id": profile_id, "cursor_updated": False,
                         "expected_processed_until": expected, "current_source_cursor": current}
@@ -1230,6 +1244,7 @@ class ReflectionEngine(MemoryL1Runtime):
                 raw_event_store=raw_event_store,
                 persona_engine=persona_engine,
                 embedding_engine=embedding_engine,
+                chat_windows_only=v2_active,
                 now=chat_target,
             )
             yesterday = (now_local - timedelta(days=1)).date().isoformat()
@@ -1247,6 +1262,14 @@ class ReflectionEngine(MemoryL1Runtime):
                 item for item in (chat_result.get("candidates") or []) if isinstance(item, dict)
                 and str(item.get("date") or chat_result.get("date") or chat_date.isoformat()) == yesterday
             ]
+        if (v2_active and self.memory_authority_enabled and self.memory_authority_store
+                and now_local.hour >= self.daily_chat_memory_hour and self._daily_chat_memory_run_lock_acquire()):
+            try:
+                actions = await self._memory_l1_action_tasks(bucket_mgr)
+                if actions['results'] or actions['status'] not in ('completed', 'disabled'):
+                    results.append({'kind': 'action_memory_preparation', **actions})
+            finally:
+                self._daily_chat_memory_run_lock_release()
         # Daily impression generation is retired. Preserve the existing
         # diary source task, time and its own enablement/review policy.
         if (self.diary_memory_extract_enabled and self.diary_memory_extract_max_per_day > 0
@@ -2631,6 +2654,8 @@ class ReflectionEngine(MemoryL1Runtime):
                     receipt_progress = tuple(sorted((key, len(receipts.get(key)["processed_ids"])) for key in keys))
                 audits = self._load_daily_chat_memory_run_audit()
                 audit = audits[-1] if audits and audits[-1].get("run_id") == result.get("run_id") else {}
+                if result.get("reason") == "l1_v2_daily_window_superseded":
+                    audit = {}
                 next_cursor = {"raw": int(audit.get("processed_until_seq", 0)),
                                "turn": int(audit.get("processed_until_turn_id", 0))}
                 event_progress = audit.get('event_progress') or {}
@@ -2702,20 +2727,33 @@ class ReflectionEngine(MemoryL1Runtime):
         effective_mode = self._normalize_daily_chat_memory_mode(mode or self.daily_chat_memory_mode)
         if effective_mode == "off" or self._daily_chat_memory_candidate_limit(effective_mode) <= 0:
             return {"status": "disabled", "reason": "daily_chat_memory_off", "mode": effective_mode}
-        if not conversation_turn_store:
-            return {"status": "skipped", "reason": "no_conversation_turn_store", "mode": effective_mode}
-
         now_local = self._daily_chat_memory_target(key, now)
         key = now_local.date().isoformat()
         start, end = self._period_window("daily", now_local)
         profile_id = str(getattr(persona_engine, "profile_id", "") or "default")
         turns = []
         turn_source = ""
-        raw_event_cursor_id = 0 if force else self._daily_chat_memory_last_raw_event_id(profile_id)
-        turn_cursor_id = 0 if force else self._daily_chat_memory_last_conversation_turn_id(profile_id)
+        raw_event_cursor_id = self._daily_chat_memory_last_raw_event_id(profile_id)
+        turn_cursor_id = self._daily_chat_memory_last_conversation_turn_id(profile_id)
         if source_cursor is not None:
             raw_event_cursor_id = source_cursor["raw"]
             turn_cursor_id = source_cursor["turn"]
+        if self.memory_authority_enabled and self.memory_authority_store:
+            from memory_l1_v2_generation import enabled, has_daily_window, run_daily
+            if enabled(self.config):
+                if force and source_cursor is None and not has_daily_window(
+                        self.memory_authority_store, profile_id, key, raw_event_cursor_id, turn_cursor_id):
+                    raw_event_cursor_id = turn_cursor_id = 0
+                result = await run_daily(self, bucket_mgr, key=key, start=start, end=end, profile_id=profile_id,
+                    mode=effective_mode, force=force, raw_event_store=raw_event_store,
+                    conversation_turn_store=conversation_turn_store, raw_cursor=raw_event_cursor_id,
+                    turn_cursor=turn_cursor_id)
+                if result is not None:
+                    return result
+        if force and source_cursor is None:
+            raw_event_cursor_id = turn_cursor_id = 0
+        if not conversation_turn_store:
+            return {"status": "skipped", "reason": "no_conversation_turn_store", "mode": effective_mode}
         source_has_more = False
         source_limit = self.daily_chat_memory_turn_limit
         read_limit = source_limit + 1 if source_limit else 0
@@ -3901,6 +3939,11 @@ class ReflectionEngine(MemoryL1Runtime):
     def list_daily_chat_memory_run_audit(self, *, limit: int = 20) -> list[dict]:
         safe_limit = max(1, min(200, int(limit or 20)))
         return self._load_daily_chat_memory_run_audit()[-safe_limit:]
+
+    def daily_chat_memory_diagnostics(self, run_id, *, limit=100):
+        from memory_l1_v2_diagnostics import MemoryV2Diagnostics
+
+        return MemoryV2Diagnostics(self.memory_authority_store).list(run_id, limit=limit)
 
     def daily_chat_memory_run_cursor(self, profile_id: str = "default") -> dict:
         cursor = self._load_daily_chat_memory_cursor()
@@ -6338,6 +6381,10 @@ class ReflectionEngine(MemoryL1Runtime):
         if self.memory_authority_enabled and self.memory_authority_store:
             if self.daily_chat_memory_mode == "off":
                 return {"status": "disabled", "reason": "memory_ingestion_off"}
+            from memory_l1_v2_generation import enabled
+            if enabled(self.config) and not self.memory_authority_store.list_projection_status(
+                    "diary_task_" + key, revision=0):
+                return {"status": "not_applicable", "reason": "private_diary_retained_in_diary_system"}
             try:
                 if retry_failed or retry_timed_out:
                     return await self._memory_l1_diary_task(key, bucket_mgr, retry_failed=retry_failed,

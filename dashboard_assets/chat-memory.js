@@ -468,12 +468,24 @@
       event_date: time.precision === 'day' ? (time.value || '') : '' };
   }
 
+  function l1IsV2(document) {
+    return Boolean(document && document.schema_version === 'memory-l1-v2');
+  }
+
+  function l1Narrative(document) {
+    return l1IsV2(document) ? document : document && document.narrative || {};
+  }
+
   function itemL1Document(item) {
     var candidate = item && item.candidate && typeof item.candidate === 'object' ? item.candidate : {};
     var document = candidate.l1_document || candidate.memory_l1_document ||
       item && item.l1_document || candidate.memory_l1 || item && item.memory_l1;
     if (!document || typeof document !== 'object' || Array.isArray(document)) return null;
     try { document = cloneValue(document); } catch (_) { return null; }
+    if (l1IsV2(document)) {
+      if (typeof document.body !== 'string') document.body = String(candidate.proposed_memory || candidate.content || item.body || '');
+      return document;
+    }
     if (!document.narrative || typeof document.narrative !== 'object' || Array.isArray(document.narrative)) return null;
     if (typeof document.narrative.body !== 'string') {
       document.narrative.body = String(candidate.proposed_memory || candidate.content || item.body || '');
@@ -677,7 +689,7 @@
         try {
           var parsed = JSON.parse(rawJson);
           if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
-              !parsed.narrative || typeof parsed.narrative !== 'object' || typeof parsed.narrative.body !== 'string') {
+              typeof l1Narrative(parsed).body !== 'string') {
             throw new Error('invalid_l1_document');
           }
           document = parsed;
@@ -685,8 +697,10 @@
       } else {
         var titleInput = card.querySelector('[data-l1-title]');
         var bodyInput = card.querySelector('[data-l1-body]');
-        if (titleInput) document.narrative.title = String(titleInput.value || '');
-        if (bodyInput) document.narrative.body = String(bodyInput.value || '');
+        if (titleInput) l1Narrative(document).title = String(titleInput.value || '');
+        if (bodyInput) l1Narrative(document).body = String(bodyInput.value || '');
+        var kindInput = card.querySelector('[data-l1-v2-kind]');
+        if (kindInput && l1IsV2(document) && kindInput.value) document.kind = kindInput.value;
         captureL1CognitionForm(card, document, cognitionStatementIndex);
         rawJson = JSON.stringify(document, null, 2);
       }
@@ -762,7 +776,7 @@
     document.querySelectorAll('.chat-memory-card').forEach(function (card) {
       var id = card.getAttribute('data-candidate-id');
       var locked = memoryRequests.has('edit:' + id) || Boolean(pendingMemoryAction(id));
-      card.querySelectorAll('input[data-field], textarea[data-field], [data-l1-title], [data-l1-body], [data-l1-json], [data-scene-body]').forEach(function (el) {
+      card.querySelectorAll('input[data-field], textarea[data-field], [data-l1-title], [data-l1-body], [data-l1-v2-kind], [data-l1-json], [data-scene-body]').forEach(function (el) {
         if (locked) { el.disabled = true; el.setAttribute('data-uncertain-lock', 'true'); }
         else if (el.hasAttribute('data-uncertain-lock')) { el.disabled = false; el.removeAttribute('data-uncertain-lock'); }
       });
@@ -805,6 +819,11 @@
   }
 
   function l1ReadbackMatches(submitted, readback) {
+    if (l1IsV2(submitted) && l1IsV2(readback)) {
+      var expectedCard = cloneValue(submitted);
+      expectedCard.generation = cloneValue(readback.generation);
+      return sameValue(expectedCard, readback);
+    }
     if (!submitted || !readback || !submitted.narrative || !readback.narrative) return false;
     var expected = cloneValue(submitted);
     var mapping = {};
@@ -856,7 +875,7 @@
     nextDocument = remapL1IdentityReferences(nextDocument, mapping);
     nextDocument.generation = cloneValue(savedDocument.generation);
     nextDocument.evidence_bindings = cloneValue(savedDocument.evidence_bindings);
-    nextDocument.entry = cloneValue(savedDocument.entry);
+    if (!l1IsV2(savedDocument)) nextDocument.entry = cloneValue(savedDocument.entry);
 
     var savedSceneBodies = itemSceneBodies(savedItem);
     var nextSceneBodies = cloneValue(savedSceneBodies);
@@ -889,8 +908,8 @@
     if (l1Document) {
       var bodyEl = card.querySelector('.chat-memory-card-body');
       var titleEl = card.querySelector('.chat-memory-card-head strong');
-      if (bodyEl) bodyEl.textContent = l1Document.narrative.body;
-      if (titleEl) titleEl.textContent = l1Document.narrative.title;
+      if (bodyEl) bodyEl.textContent = l1Narrative(l1Document).body;
+      if (titleEl) titleEl.textContent = l1Narrative(l1Document).title;
       var semantics = card.querySelector('.chat-memory-semantics');
       if (semantics) semantics.innerHTML = renderL1ReviewDetails(item, l1Document);
       var editor = card.querySelector('.chat-memory-l1-editor');
@@ -1188,6 +1207,26 @@
   }
 
   function renderL1ReviewDetails(item, document) {
+    if (l1IsV2(document)) {
+      var stabilityNames = {episode: '当次经历', phase: '阶段适用', stable: '持续适用', unknown: '持续性待明确'};
+      var peopleNames = (document.people || []).map(function (person) { return person.name; }).join('、');
+      var topics = [document.primary_topic, document.secondary_topic].filter(Boolean).join('、');
+      var notes = (document.scope_notes || []).map(function (note) {
+        return '<li>' + esc(note.focus) + ' · ' + esc(note.rule) + '</li>';
+      }).join('');
+      var sourceDetails = (document.evidence_bindings || []).map(function (binding, index) {
+        return '<details data-l1-source-binding><summary>来源材料 ' + (index + 1) + '</summary><pre>' +
+          esc(JSON.stringify(binding, null, 2)) + '</pre></details>';
+      }).join('');
+      return '<details class="chat-memory-excerpt-details chat-memory-l1-details"><summary>记忆索引</summary>' +
+        '<p>' + esc(document.kind) + ' · ' + esc(stabilityNames[document.stability] || document.stability) + '</p>' +
+        '<p>关键词 ' + esc((document.keywords || []).join('、')) + '</p>' +
+        (topics ? '<p>主题 ' + esc(topics) + '</p>' : '') +
+        (peopleNames ? '<p>涉及人物 ' + esc(peopleNames) + '</p>' : '') +
+        (document.event_time ? '<p>发生时间 ' + esc(document.event_time.start) +
+          (document.event_time.end ? ' 至 ' + esc(document.event_time.end) : '') + '</p>' : '') +
+        (notes ? '<ul>' + notes + '</ul>' : '') + sourceDetails + '</details>';
+    }
     var candidate = item && item.candidate && typeof item.candidate === 'object' ? item.candidate : {};
     var metadata = candidate.metadata && typeof candidate.metadata === 'object' ? candidate.metadata : {};
     var bundle = candidate.diary_l1_bundle || metadata.diary_l1_bundle || item && item.diary_l1_bundle || {};
@@ -1317,6 +1356,7 @@
   }
 
   function renderL1CognitionEditor(item, document, draft) {
+    if (l1IsV2(document)) return '';
     var statements = Array.isArray(document && document.statements) ? document.statements : [];
     var selectedIndex = draft && Number.isInteger(draft.cognitionStatementIndex) ? draft.cognitionStatementIndex : 0;
     if (selectedIndex < 0 || selectedIndex >= statements.length) selectedIndex = 0;
@@ -1361,16 +1401,25 @@
     var rawJson = draft && draft.type === 'l1' ? draft.rawJson : JSON.stringify(current, null, 2);
     var sceneBodies = draft && draft.type === 'l1' ? draft.sceneBodies : itemSceneBodies(item);
     var bodyFields = '<label class="chat-memory-edit-field">L1标题' +
-      '<input type="text" data-l1-title value="' + escAttr((current.narrative || {}).title || '') + '" />' +
+      '<input type="text" data-l1-title value="' + escAttr(l1Narrative(current).title || '') + '" />' +
       '</label>' +
       '<label class="chat-memory-edit-field">第一遍完整正文' +
-      '<textarea data-l1-body rows="9">' + esc((current.narrative || {}).body || '') + '</textarea>' +
+      '<textarea data-l1-body rows="9">' + esc(l1Narrative(current).body || '') + '</textarea>' +
       '</label>';
+    if (l1IsV2(current)) {
+      var kinds = item.candidate && item.candidate.l1_v2_kinds || [];
+      var kindOptions = kinds.map(function (kind) {
+        return '<option value="' + escAttr(kind) + '"' + (kind === current.kind ? ' selected' : '') + '>' + esc(kind) + '</option>';
+      }).join('');
+      if (kindOptions) bodyFields += '<label class="chat-memory-edit-field">记忆类别<select data-l1-v2-kind>' +
+        '<option value="" disabled' + (kinds.includes(current.kind) ? '' : ' selected') + '>选择适用类别</option>' +
+        kindOptions + '</select></label>';
+    }
     bodyFields += renderL1CognitionEditor(item, current, draft);
     var scenes = itemIsDiary(item) ? renderDiarySceneBodies(current, sceneBodies) : '';
     return '<div class="chat-memory-l1-editor" data-l1-editor-mode="' + escAttr(mode) + '">' +
       '<div class="chat-memory-card-actions">' +
-        '<button type="button" onclick="toggleDailyChatMemoryL1Mode(this, \'body\')">正文与场景</button>' +
+        '<button type="button" onclick="toggleDailyChatMemoryL1Mode(this, \'body\')">记忆正文</button>' +
         '<button type="button" onclick="toggleDailyChatMemoryL1Mode(this, \'json\')">完整L1 JSON</button>' +
       '</div>' +
       '<p class="chat-memory-edit-needed">完整L1与正文共用一份草稿。来源绑定、身份、父子引用和generation由服务端保护；修改这些字段会返回明确错误。</p>' +
@@ -1378,7 +1427,8 @@
       '<div data-l1-body-view' + (mode === 'json' ? ' hidden' : '') + '>' + bodyFields + '</div>' +
       '<label class="chat-memory-edit-field" data-l1-json-view' + (mode === 'json' ? '' : ' hidden') + '>完整L1 JSON' +
         '<textarea data-l1-json rows="22" spellcheck="false" style="font-family:ui-monospace,Consolas,monospace;white-space:pre">' + esc(rawJson || '') + '</textarea>' +
-        '<small>JSON包含正文、主体、场景、陈述、分类、时间条件、关系、属性与检索字段。保存会完整提交，服务端校验受保护的机器字段。</small>' +
+        '<small>' + (l1IsV2(current) ? '可编辑正文、关键词、类别、稳定性、主题和时间备注。人物身份与来源版本由服务端维护。' :
+          'JSON包含正文、主体、场景、陈述、分类、时间条件、关系、属性与检索字段。保存会完整提交，服务端校验受保护的机器字段。') + '</small>' +
       '</label>' +
       (scenes ? '<div class="chat-memory-l1-scenes"><strong>日记场景正文</strong><div data-l1-scenes>' + scenes + '</div></div>' : '') +
     '</div>';
@@ -1426,8 +1476,12 @@
   function syncL1Form(card, document, sceneBodies, cognitionStatementIndex) {
     var title = card.querySelector('[data-l1-title]');
     var body = card.querySelector('[data-l1-body]');
-    if (title) title.value = String((document.narrative || {}).title || '');
-    if (body) body.value = String((document.narrative || {}).body || '');
+    if (title) title.value = String(l1Narrative(document).title || '');
+    if (body) body.value = String(l1Narrative(document).body || '');
+    var kind = card.querySelector('[data-l1-v2-kind]');
+    if (kind && l1IsV2(document)) {
+      kind.value = Array.from(kind.options).some(function (option) { return option.value === document.kind; }) ? document.kind : '';
+    }
     refreshDiarySceneBodies(card, document, sceneBodies);
     syncL1CognitionForm(card, document, cognitionStatementIndex == null ? 0 : cognitionStatementIndex);
   }
@@ -2283,6 +2337,12 @@
         ' · 原版本 ' + esc(String(backfill.expected_revision || '')) +
         '。确认后保存为同一条记忆的新版本；原稿、历史版本和主人手编的第二遍稿保留。</p>';
     }
+    var continuations = candidate.l1_v2_continuation || [];
+    if (continuations.length) {
+      summaryNote += '<details><summary>核对跨日续接</summary><p>' + esc(continuations.map(function (row) {
+        return (row.previous_title || row.previous_candidate_id) + ' · ' + row.shared_source_refs.length + ' 项共同来源';
+      }).join('、')) + '</p></details>';
+    }
     var id = item.id || '';
     var followup = candidate.l3_followup;
     var modelIoId = modelIoMemoryId(followup && followup.memory_id || backfill && backfill.memory_id || id);
@@ -2301,12 +2361,10 @@
     var excerpt = String(candidate.original_excerpt || '').trim() || (bindings.length
       ? '已绑定 ' + bindings.length + ' 项来源材料，未提供单独摘录。点击“查看完整原文”读取来源。'
       : (legacy ? '历史候选无原文摘录' : '（无来源片段）'));
-    var proposed = String((l1Draft ? l1Draft.document : l1Document || {}).narrative
-      ? (l1Draft ? l1Draft.document : l1Document).narrative.body
-      : (candidate.proposed_memory || candidate.content || '')).trim() || '（缺少建议记忆）';
-    var cardTitle = String((l1Draft ? l1Draft.document : l1Document || {}).narrative
-      ? (l1Draft ? l1Draft.document : l1Document).narrative.title
-      : (candidate.title || id));
+    var displayedDocument = l1Draft ? l1Draft.document : l1Document;
+    var proposed = String(displayedDocument ? l1Narrative(displayedDocument).body :
+      candidate.proposed_memory || candidate.content || '').trim() || '（缺少建议记忆）';
+    var cardTitle = String(displayedDocument ? l1Narrative(displayedDocument).title : candidate.title || id);
     var flags = (item.display && item.display.soft_flags) || candidate.soft_flags || [];
     var sourceParts = [];
     if (candidate.source_event_ids && candidate.source_event_ids.length) {
@@ -2364,7 +2422,8 @@
             '</details>' +
             '<div class="chat-memory-card-source">' + esc(sourceText) + '</div>' +
             '<div class="chat-memory-card-meta">' +
-              esc((candidate.kind || candidate.candidate_type || 'memory') + ' · ' + (item.date || '') + ' · confidence ' + (candidate.confidence == null ? '' : candidate.confidence)) +
+              esc((candidate.classification_gap ? '待选记忆类别' : candidate.kind || candidate.candidate_type || 'memory') + ' · ' + (item.date || '') +
+                (l1IsV2(l1Document) && candidate.confidence_source !== 'model_review' ? '' : ' · confidence ' + (candidate.confidence == null ? '' : candidate.confidence))) +
               (sourceHash ? ' · src ' + esc(sourceHash) : '') +
             '</div>' +
           '</div>' +
@@ -2704,7 +2763,7 @@
       var results = data.results || [];
       var applied = results.filter(function (r) { return expected.includes(r.status); });
       var complete = results.length === ids.length && new Set(results.map(function (r) { return r.id; })).size === ids.length && results.every(function (r) {
-        return ids.includes(r.id) && (expected.includes(r.status) || ['revision_conflict', 'needs_owner_edit', 'invalid_source', 'missing', 'rejected', 'deferred', 'commit_failed'].includes(r.status));
+        return ids.includes(r.id) && (expected.includes(r.status) || ['revision_conflict', 'needs_owner_edit', 'classification_gap', 'invalid_source', 'missing', 'rejected', 'deferred', 'commit_failed'].includes(r.status));
       });
       if (complete) {
         memoryRequests.delete(key);
@@ -2713,6 +2772,7 @@
       }
       var failed = results.filter(function (r) { return !expected.includes(r.status); });
       var detail = failed.some(function (r) { return r.status === 'revision_conflict'; }) ? '版本已变化，请载入新版核对。'
+        : failed.some(function (r) { return r.status === 'classification_gap'; }) ? '请先为待分类的稿件选择一个适用类别。'
         : failed.some(function (r) { return r.status === 'needs_owner_edit'; }) ? '部分候选需要实际修改正文后才能采用。'
         : '其余未成功或结果未确认，请核对；已保存的修改仍然保留。';
       setDailyChatMemoryMessage(verb + '成功 ' + applied.length + '／' + ids.length + ' 条。' + (applied.length === ids.length ? '' : detail), applied.length === ids.length ? 'ok' : 'error');
@@ -2763,6 +2823,10 @@
             esc(progressText) + (run.error_category ? ' · 原因 ' + esc(run.error_category) : '') +
           '</div>' + (retryDate ? '<button type="button" class="chat-memory-rerun-btn" data-memory-retry-date="' + escAttr(run.date) +
             '" onclick="rerunDailyChatMemory(this)">重试该日期未完成部分</button>' : '') +
+          (run.prompt_version === 'whole_window_v2' && run.run_id ?
+            '<button type="button" class="chat-memory-rerun-btn" data-memory-run-id="' + escAttr(run.run_id) +
+            '" data-memory-generation-id="' + escAttr(run.generation_task_id || run.run_id) +
+            '" onclick="loadMemoryRunDiagnostics(this)">查看本次诊断</button><pre data-memory-run-diagnostics hidden></pre>' : '') +
         '</div>';
       }).join('');
     }
@@ -2788,6 +2852,26 @@
       target.innerHTML = renderDailyChatMemoryRuns(data);
     } catch (e) {
       target.innerHTML = '<div class="chat-memory-runs"><div class="chat-memory-run-empty">运行信息读取失败: ' + esc(e.message) + '</div></div>';
+    }
+  }
+
+  async function loadMemoryRunDiagnostics(button) {
+    var target = button.parentElement.querySelector('[data-memory-run-diagnostics]');
+    target.hidden = false;
+    button.disabled = true;
+    try {
+      var ids = [...new Set([button.dataset.memoryRunId, button.dataset.memoryGenerationId])];
+      var pages = await Promise.all(ids.map(async function (id) {
+        var res = await authFetch(dailyChatMemoryApiBase() + '/api/daily-chat-memory/runs/' + encodeURIComponent(id) + '/diagnostics');
+        if (!res || !res.ok) throw new Error('诊断读取失败');
+        return (await res.json()).items || [];
+      }));
+      var items = pages.flat().sort(function (a, b) { return a.created_at.localeCompare(b.created_at); });
+      target.textContent = items.length ? JSON.stringify(items, null, 2) : '七天内无留存诊断。';
+    } catch (e) {
+      target.textContent = e.message;
+    } finally {
+      button.disabled = false;
     }
   }
 
@@ -2845,6 +2929,7 @@
   window.toggleDailyChatMemoryModelIo = toggleDailyChatMemoryModelIo;
   window.loadDailyChatMemorySourceMore = loadDailyChatMemorySourceMore;
   window.loadDailyChatMemoryRuns = loadDailyChatMemoryRuns;
+  window.loadMemoryRunDiagnostics = loadMemoryRunDiagnostics;
   window.rerunDailyChatMemory = rerunDailyChatMemory;
   window.initDailyChatMemoryTab = initDailyChatMemoryTab;
 

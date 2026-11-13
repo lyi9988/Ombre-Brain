@@ -27,9 +27,11 @@ class MemoryL1RevisionService:
         self.buckets = bucket_manager
         self.catalog_provider = catalog_provider
 
-    def schema(self):
+    def schema(self, *, generation_enabled=False, source_modes=None):
         catalog, revision = self.catalog_provider()
         from memory_l1_wire_schema import MODEL_DOCUMENT_SCHEMA, tool_parameters
+        from memory_l1_v2 import SCHEMA_VERSION as V2_SCHEMA_VERSION, catalog as v2_catalog
+        vocabulary = v2_catalog()
         return {"status": "ok", "schema_version": "memory-l1-v1", "catalog_revision": revision, "catalog": catalog_with_defaults(catalog),
                 "model_document_schema": MODEL_DOCUMENT_SCHEMA, "native_tool_schema": tool_parameters(),
                 "template": document_template(catalog=catalog, catalog_revision=revision),
@@ -40,7 +42,10 @@ class MemoryL1RevisionService:
                                    "entry.scene_ref", "entry.shared_statement_refs",
                                    "entities.*.entity_id", "statements.*.statement_id", "statements.*.statement_revision_id",
                                    "scenes.*.scene_id", "scenes.*.scene_revision_id", "scenes.*.generation", "relations.*.relation_id", "relations.*.origin"],
-                "limits": {"request_bytes": 524288, "request_id_characters": 128}}
+                 "limits": {"request_bytes": 524288, "request_id_characters": 128},
+                 "l1_v2": {"schema_version": V2_SCHEMA_VERSION, "generation_enabled": generation_enabled,
+                           "catalog": vocabulary, "catalog_revision": vocabulary['version'],
+                           "source_modes": dict(source_modes or {})}}
 
     async def detail(self, memory_id, revision=None):
         memory = self.authority.get_memory(memory_id)
@@ -87,12 +92,28 @@ class MemoryL1RevisionService:
                        "coverage": (metadata.get("diary_l1_bundle") or {}).get("coverage"),
                        "semantic_sha256": metadata.get("memory_l1_semantic_sha256"),
                        "l1_content_sha256": metadata.get("memory_l1_content_sha256"),
-                       "preparation": {"l2": {"state": "tracked" if state == "current" else "not_prepared",
+                       "preparation": {"l2": {"state": "direct_l1" if isinstance(document, dict) and document.get("schema_version") == "memory-l1-v2" else "tracked" if state == "current" else "not_prepared",
                                               "status_url": "/api/memory-authority/memories/" + memory_id + "/presentation"}}}}
 
-    def _owner_document(self, submitted, previous, *, memory_id, request_id, catalog, catalog_revision, revision):
+    def _owner_document(self, submitted, previous, *, memory_id, request_id, catalog, catalog_revision, revision,
+                        candidate_draft=False):
         doc = copy.deepcopy(submitted)
         if not isinstance(doc, dict): raise L1OwnerError("object_required", field_path="document")
+        from memory_l1_v2 import KINDS, catalog as v2_catalog, is_v2, validate_adoptable_kind, validate_document
+        if is_v2(previous):
+            if not is_v2(doc):
+                raise L1OwnerError("schema_version_changed", field_path="document.schema_version")
+            for field in ("generation", "evidence_bindings", "source_refs", "people"):
+                if doc.get(field) != previous.get(field):
+                    raise L1OwnerError("managed_field_changed", field_path="document." + field)
+            doc["generation"] = {**doc["generation"], "origin": "owner_edit", "task_id": request_id}
+            kind = doc.get('kind')
+            if candidate_draft and kind == previous.get('kind') and (kind is None or isinstance(kind, str) and kind not in KINDS):
+                return validate_document(doc, allow_classification_gap=True)
+            validate_adoptable_kind(kind)
+            vocabulary = v2_catalog()
+            doc['generation'].update(catalog_snapshot=vocabulary, catalog_revision=vocabulary['version'])
+            return validate_document(doc)
         for key in ("generation", "evidence_bindings"):
             if doc.get(key) != previous.get(key): raise L1OwnerError("managed_field_changed", field_path="document." + key)
         if not isinstance(doc.get("entry"), dict):
@@ -219,7 +240,8 @@ class MemoryL1RevisionService:
             prepared = prior["payload"]
             result = await self.commit.commit_memory(**{key: prepared[key] for key in
                 ("memory_id", "bucket_id", "expected_revision", "metadata", "source_refs", "decision_source", "actor", "memory_state", "recall_policy")},
-                body=payload["document"]["narrative"]["body"], idempotency_key=idem, l1_write_intent=True)
+                body=payload["document"].get("body", (payload["document"].get("narrative") or {}).get("body")),
+                idempotency_key=idem, l1_write_intent=True)
             return await self._receipt(memory_id, request_id, result, replayed=True)
         memory = self.authority.get_memory(memory_id)
         if not memory: raise MemoryNotFound(memory_id)
@@ -235,7 +257,10 @@ class MemoryL1RevisionService:
         record = self.authority.get_memory_revision(memory_id, expected)
         metadata = copy.deepcopy(record["metadata"])
         metadata["memory_l1"] = semantic
-        metadata["name"] = document["narrative"]["title"]
+        metadata["name"] = document.get("title", (document.get("narrative") or {}).get("title", ""))
+        from memory_l1_v2 import is_v2
+        if is_v2(document):
+            metadata['memory_type'] = document['kind']
         from memory_relation_dependencies import owner_adoption_ids
         try:
             adopted = owner_adoption_ids(previous, document, payload.get('owner_relation_adoptions', []))
@@ -256,6 +281,7 @@ class MemoryL1RevisionService:
         never relabelled as the old L0. Follow-up model content retains its model
         provenance and policy; this method does not approve a candidate.
         """
+        from memory_l1_v2 import is_v2
         allowed = {'expected_revision', 'request_id', 'document', 'edit_note', 'owner_relation_adoptions'}
         if (not isinstance(payload, dict) or set(payload) - allowed
                 or not {'expected_revision', 'request_id', 'document'} <= set(payload)
@@ -303,6 +329,12 @@ class MemoryL1RevisionService:
                 source_bindings=source_bindings, source_snapshots=source_snapshots)
         from memory_l1_contract import verify_text_anchor
         from memory_l0_sources import MemoryL0Sources
+        if is_v2(payload['document']):
+            current_record = self.authority.get_memory_revision(memory_id, payload['expected_revision'])
+            old_bindings = (current_record['metadata'].get('memory_l1') or {}).get('evidence_bindings', [])
+            for binding in old_bindings:
+                if not (await source_reader.locate(binding))['eligible_source']:
+                    raise L1OwnerError('followup_original_source_unavailable', status=409, field_path='sources')
         for snapshot, binding in zip(source_snapshots, source_bindings):
             identity = {key: binding.get(key) for key in ('source_namespace', 'source_id', 'source_revision')}
             if any(snapshot.get(key) != value for key, value in identity.items()):
@@ -333,7 +365,8 @@ class MemoryL1RevisionService:
             prepared = prior['payload']
             result = await self.commit.commit_memory(**{key: prepared[key] for key in
                 ('memory_id', 'bucket_id', 'expected_revision', 'metadata', 'source_refs', 'decision_source',
-                 'actor', 'memory_state', 'recall_policy')}, body=payload['document']['narrative']['body'],
+                 'actor', 'memory_state', 'recall_policy')},
+                body=payload['document']['body'] if is_v2(payload['document']) else payload['document']['narrative']['body'],
                 idempotency_key=idem, l1_write_intent=True)
         else:
             base = await self.detail(memory_id, payload['expected_revision'])
@@ -353,11 +386,16 @@ class MemoryL1RevisionService:
             submitted['evidence_bindings'] = current_bindings
             extended_previous = copy.deepcopy(previous)
             extended_previous['evidence_bindings'] = current_bindings
+            v2 = is_v2(previous)
+            if v2:
+                extended_previous['source_refs'] = [binding['binding_id'] for binding in current_bindings]
             catalog, catalog_revision = self.catalog_provider()
             document = self._owner_document(submitted, extended_previous, memory_id=memory_id,
                 request_id=request_id, catalog=catalog, catalog_revision=catalog_revision,
                 revision=payload['expected_revision'] + 1)
-            if not owner:
+            if v2:
+                document['generation'].update(origin='followup_revision', actor=actor)
+            elif not owner:
                 generation = generation_template(document['generation']['catalog_snapshot'], catalog_revision, 'first_pass_model')
                 generation['actor'] = actor
                 document['generation'] = generation
@@ -371,9 +409,14 @@ class MemoryL1RevisionService:
             body, semantic = split_document(document)
             record = self.authority.get_memory_revision(memory_id, payload['expected_revision'])
             metadata = copy.deepcopy(record['metadata'])
-            metadata.update(memory_l1=semantic, name=document['narrative']['title'],
+            metadata.update(memory_l1=semantic, name=document['title'] if v2 else document['narrative']['title'],
                 memory_l1_program_context=copy.deepcopy(program_context),
                 memory_l1_program_request={'request_id': request_id, 'request_sha256': fingerprint})
+            refs = record['source_refs']
+            if v2:
+                metadata['memory_type'] = document['kind']
+                refs = list(dict.fromkeys([*refs, *(binding['source_namespace'] + ':' + binding['source_id'] + '@' +
+                    str(binding['source_revision']) for binding in source_bindings)]))
             from memory_relation_dependencies import owner_adoption_ids
             if owner:
                 adopted = owner_adoption_ids(previous, document, payload.get('owner_relation_adoptions', []))
@@ -381,7 +424,7 @@ class MemoryL1RevisionService:
                     'request_sha256': fingerprint, 'owner_relation_adoptions': adopted}
             result = await self.commit.commit_memory(memory_id=memory_id, bucket_id=memory['bucket_id'],
                 expected_revision=payload['expected_revision'], body=body, metadata=metadata,
-                source_refs=record['source_refs'], decision_source=decision_source, idempotency_key=idem,
+                source_refs=refs, decision_source=decision_source, idempotency_key=idem,
                 actor=actor, memory_state=memory['state'], recall_policy=memory['recall_policy'], l1_write_intent=True)
         receipt = await self._receipt(memory_id, request_id, result, replayed=bool(prior))
         actual = self.authority.get_memory_revision(memory_id, result['revision'])

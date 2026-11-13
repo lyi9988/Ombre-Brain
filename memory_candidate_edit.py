@@ -34,7 +34,7 @@ def _owner_l1_edit_payload(row, edit, *, revision_service, request_id):
     if not isinstance(semantic, dict):
         raise ValueError("l1_document_unavailable")
     try:
-        previous = join_document(str(payload.get("proposed_body") or ""), semantic)
+        previous = join_document(str(payload.get("proposed_body") or ""), semantic, allow_classification_gap=True)
     except Exception as exc:
         raise ValueError("l1_candidate_invalid") from exc
 
@@ -66,14 +66,16 @@ def _owner_l1_edit_payload(row, edit, *, revision_service, request_id):
         catalog=catalog,
         catalog_revision=catalog_revision,
         revision=base_revision + 1,
+        candidate_draft=True,
     )
     body, stored_semantic = split_document(
         normalized,
         catalog=normalized.get("generation", {}).get("catalog_snapshot"),
+        allow_classification_gap=True,
     )
 
-    submitted_scenes = submitted.get("scenes")
-    normalized_scenes = normalized.get("scenes")
+    submitted_scenes = submitted.get("scenes", [])
+    normalized_scenes = normalized.get("scenes", [])
     if not isinstance(submitted_scenes, list) or not isinstance(normalized_scenes, list):
         raise ValueError("invalid_l1_scenes")
     scene_id_map = {
@@ -104,13 +106,19 @@ def _owner_l1_edit_payload(row, edit, *, revision_service, request_id):
 
     payload["proposed_body"] = body
     metadata["memory_l1"] = stored_semantic
-    metadata["name"] = stored_semantic["narrative"]["title"]
+    title = stored_semantic.get("title", (stored_semantic.get("narrative") or {}).get("title", ""))
+    metadata["name"] = title
+    from memory_l1_v2 import is_v2
+    if is_v2(stored_semantic):
+        payload["memory_type"] = stored_semantic["kind"] or "classification_gap"
     legacy = metadata.setdefault("legacy_candidate", {})
     legacy.update({
-        "title": stored_semantic["narrative"]["title"],
+        "title": title,
         "content": body,
         "proposed_memory": body,
     })
+    if is_v2(stored_semantic):
+        legacy['kind'] = stored_semantic['kind']
     # The complete L1 document supersedes the old bounded annotation projection.
     # Removing it prevents legacy readers from presenting stale semantics.
     legacy.pop("semantic_annotations", None)
@@ -122,7 +130,10 @@ def owner_edit_payload(row, edit, *, revision_service=None, request_id=""):
     if not isinstance(edit, dict) or not edit or set(edit) - (FIELDS | L1_FIELDS):
         raise ValueError("invalid_owner_edit")
     payload = copy.deepcopy(row["proposal"])
-    if payload.get("source_type") not in {"daily_chat", "chat_tool", "diary", "action_receipt", "owner_summary", "legacy_backfill"}:
+    from memory_l1_v2 import is_v2
+    if (payload.get("source_type") not in {"daily_chat", "chat_tool", "diary", "action_receipt", "owner_summary", "legacy_backfill"}
+            and not (payload.get('source_type') in {'hold', 'attachment_document'}
+                     and is_v2((payload.get('metadata') or {}).get('memory_l1')))):
         raise ValueError("unsupported_candidate_source")
     has_l1 = isinstance((payload.get("metadata") or {}).get("memory_l1"), dict)
     if payload.get("source_type") == "owner_summary" and not has_l1:

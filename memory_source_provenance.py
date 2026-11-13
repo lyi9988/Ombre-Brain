@@ -132,7 +132,7 @@ def raw_event_source(event: dict, *, profile_id: str) -> dict:
                       "bridge_status": "unresolved"})
 
 
-def daily_sources(turns: list[dict], *, profile_id: str) -> list[dict]:
+def daily_sources(turns: list[dict], *, profile_id: str, limit: int | None = 80) -> list[dict]:
     found = {}
     for turn in turns:
         archived = turn.get("_semantic_sources")
@@ -149,4 +149,4 @@ def daily_sources(turns: list[dict], *, profile_id: str) -> list[dict]:
         for source in sources:
             if source.get("text") and source.get("event_id"):
                 found[source["source_key"]] = source
-    return list(found.values())[:80]
+    return list(found.values())[:limit]

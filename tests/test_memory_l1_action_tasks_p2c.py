@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+from datetime import datetime
 from types import SimpleNamespace as NS
 
 import pytest
@@ -85,6 +86,34 @@ def test_queue_is_identifiers_only_idempotent_and_conflicting_request_is_not_rep
     assert 'text' not in tasks.list()[0] and 'body' not in tasks.list()[0]
     with pytest.raises(IdempotencyConflict): tasks.enqueue_action({**payload, 'artifact_id': 'artifact-other'})
     assert len(tasks.list()) == 1 and engine.memory_authority_store.list_memories() == []
+
+
+@pytest.mark.parametrize('action_mode', ['review', 'off'])
+def test_daily_due_respects_v2_action_mode_when_chat_memory_is_off(tmp_path, monkeypatch, action_mode):
+    engine, buckets, tasks, payload, calls, _ = setup(tmp_path, monkeypatch, mode='off')
+    engine.enabled = engine.auto_enabled = True
+    engine.config['reflection']['daily_chat_memory_extraction_mode'] = 'whole_window_v2'
+    engine.memory_ingestion_policy.source_modes['action_receipt'] = action_mode
+    engine.daily_chat_memory_review_max_per_day = 0
+    engine.daily_chat_memory_hour = 0
+    engine._local_now = lambda: datetime(2026, 11, 14, 8, tzinfo=engine.tz)
+    legacy = tasks.enqueue_action(payload)['task_id']
+    action = tasks.enqueue_action({**payload, 'request_id': 'v2-action', 'memory_intent': {
+        'activity_id': 'activity-a', 'activity_revision': 1,
+        'decision': 'remember', 'draft': '我读完了那份资料。',
+        'sources': [{'action_id': 'action-a', 'artifact_id': 'artifact-a'}],
+    }}, generation_protocol='whole_window_v2')['task_id']
+    prepared = []
+
+    async def prepare(_engine, _buckets, _tasks, claimed, _reader, mode, *, force):
+        prepared.append((claimed['task_id'], mode))
+        return {'candidate_ids': ['fixture-action-candidate']}
+
+    monkeypatch.setattr('memory_l1_runtime._prepare_v2_action', prepare)
+    run(engine.run_due(buckets))
+    assert prepared == ([(action, 'review')] if action_mode == 'review' else [])
+    assert tasks.get(legacy)['phase'] == 'queued'
+    assert calls == []
 
 
 def test_action_semantic_draft_assembles_full_l1_with_original_receipt_and_route(tmp_path, monkeypatch):

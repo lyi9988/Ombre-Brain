@@ -68,7 +68,20 @@ def project(conn, memory_id, revision, metadata):
     conn.execute("DELETE FROM memory_l1_index_revisions WHERE memory_id=? AND revision=?", (memory_id, revision))
     conn.execute("INSERT INTO memory_l1_index_revisions VALUES(?,?,?,?,?,?)",
                  (memory_id, revision, digest, metadata["memory_l1_semantic_sha256"], INDEX_VERSION,
-                  canonical_json(semantic["entry"])))
+                  canonical_json(semantic.get("entry", {"schema_version": semantic.get("schema_version")}))))
+    from memory_l1_v2 import is_v2
+    if is_v2(semantic):
+        for module, identity_key in (("evidence_bindings", "binding_id"), ("people", "person_id")):
+            for ordinal, item in enumerate(semantic[module]):
+                conn.execute("INSERT INTO memory_l1_members VALUES(?,?,?,?,?,?,?)",
+                             (memory_id, revision, module, ordinal, item[identity_key], None, canonical_json(item)))
+        for item in semantic["evidence_bindings"]:
+            conn.execute("INSERT INTO memory_l1_source_members VALUES(?,?,?,?,?,?)",
+                         (memory_id, revision, item["binding_id"], item["source_namespace"],
+                          item["source_id"], canonical_json(item["source_revision"])))
+        from memory_l1_features import project as project_features
+        project_features(conn, memory_id, revision, semantic)
+        return
     for module, key, version_key in (("statements", "statement_id", "statement_revision_id"),
                                     ("scenes", "scene_id", "scene_revision_id"),
                                     ("evidence_bindings", "binding_id", None),

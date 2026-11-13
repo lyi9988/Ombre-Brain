@@ -164,6 +164,7 @@ class MemoryL3Records:
             'note': note_projection(self._ring(memory_id, ring_id))})
 
     def timeline(self, memory_id, *, offset=0, limit=50):
+        from memory_l1_v2 import is_v2
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 200:
             raise L1OwnerError('invalid_evolution_pagination')
         take = offset + limit
@@ -174,6 +175,8 @@ class MemoryL3Records:
                 raise MemoryNotFound(memory_id)
             revisions = conn.execute('SELECT * FROM memory_revisions WHERE memory_id=? ORDER BY revision DESC LIMIT ?',
                                      (memory_id, take)).fetchall()
+            active = next((row for row in revisions if row['revision'] == memory['active_revision']), None)
+            v2 = active is not None and is_v2(json.loads(active['metadata_json']).get('memory_l1'))
             presentations = conn.execute('SELECT * FROM memory_l2_revisions WHERE memory_id=? ORDER BY presentation_revision DESC LIMIT ?',
                                          (memory_id, take)).fetchall()
             rings = conn.execute('SELECT * FROM memory_rings WHERE memory_id=? ORDER BY created_at DESC,ring_id DESC LIMIT ?',
@@ -197,6 +200,8 @@ class MemoryL3Records:
                     'edit_note': ((meta.get('memory_l1_legacy_backfill') or {}).get('reason', '')
                         if row['decision_source'] == 'owner_backfill_review'
                         else (meta.get('memory_l1_owner_request') or {}).get('edit_note', ''))}})
+            if v2:
+                items[-1]['details']['display_scope'] = 'revision_history'
         for row in presentations:
             items.append({'event_id': 'l2:' + str(row['presentation_revision']), 'kind': 'l2_revision',
                 'presentation_revision': row['presentation_revision'], 'revision': row['first_pass_revision'],
@@ -227,6 +232,15 @@ class MemoryL3Records:
                     'issue': row.get('issue'), 'candidate_ids': row['candidate_ids'], 'receipt': receipt,
                     'allowed_actions': ['retry'] if row['phase'] == 'failed' else [],
                     'kind': update['kind'], 'long_term_value': update['long_term_value']}})
+            if v2 and candidates and candidates[0] and candidates[0]['status'] == 'committed':
+                proof = receipt or {}
+                result = proof.get('result') or {}
+                revision = proof.get('revision', result.get('revision'))
+                record = self.authority.get_memory_revision(memory_id, revision) if type(revision) is int else None
+                if (record and record['operation_id'] == proof.get('operation_id')
+                        and update['kind'] in {'understanding', 'new_experience'} and source_refs
+                        and update['long_term_value'] != 'explicit_owner_correction'):
+                    items[-1]['details']['display_scope'] = 'evolution'
         def order(item):
             return (datetime.fromisoformat(item['created_at'].replace('Z', '+00:00')).timestamp(), item['event_id'])
         items.sort(key=order, reverse=True)

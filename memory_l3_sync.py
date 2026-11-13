@@ -134,6 +134,33 @@ class SyncProposals:
 _FIELDS = {'statements': {'content', 'subject_ref', 'classification', 'time', 'conditions', 'property', 'attributes', 'cognition', 'evidence_refs'},
     'entities': {'name', 'aliases', 'entity_type'}, 'scenes': {'title', 'statement_refs', 'attributes'},
     'retrieval': {'keywords', 'tags'}, 'narrative': {'title', 'body'}}
+_V2_FIELDS = {'title', 'body', 'kind', 'stability', 'keywords', 'event_time', 'scope_notes', 'primary_topic', 'secondary_topic'}
+
+
+def _apply_v2_patch(document, plan, evidence_ids):
+    result = copy.deepcopy(document)
+    for patch in plan['patch']:
+        if (not isinstance(patch, dict) or set(patch) != {'op', 'path', 'old', 'value', 'evidence_refs'}
+                or not isinstance(patch['path'], str) or not patch['path'].startswith('/')
+                or patch['path'][1:] not in _V2_FIELDS or not isinstance(patch['evidence_refs'], list)
+                or not patch['evidence_refs'] or any(not isinstance(ref, str) or ref not in evidence_ids
+                    for ref in patch['evidence_refs'])):
+            raise L1OwnerError('invalid_v2_followup_patch', field_path='plan.patch')
+        field = patch['path'][1:]
+        old, value = patch['old'], patch['value']
+        if field == 'body':
+            if (patch['op'] != 'replace_text' or not isinstance(old, str) or not old.strip()
+                    or not isinstance(value, str) or old == value or result['body'].count(old) != 1):
+                raise L1OwnerError('l3_text_patch_not_unambiguous', field_path=patch['path'])
+            result['body'] = result['body'].replace(old, value, 1)
+        else:
+            if patch['op'] != 'replace' or result.get(field) != old or old == value:
+                raise L1OwnerError('l3_patch_preimage_changed', status=409, field_path=patch['path'])
+            if value is None:
+                result.pop(field, None)
+            else:
+                result[field] = copy.deepcopy(value)
+    return result
 
 
 def apply_local_patch(document, plan, *, evidence_ids=()):
@@ -205,26 +232,36 @@ def apply_local_patch(document, plan, *, evidence_ids=()):
 
 
 def validate_plan(material, plan, *, evidence_ids=()):
-    if (not isinstance(plan, dict) or set(plan) - {'confidence'} != {'decision', 'reason', 'affected_statement_ids', 'patch'}
+    from memory_l1_v2 import is_v2
+    document = material['l1_document']
+    v2 = is_v2(document)
+    required = {'decision', 'reason', 'patch'} | (set() if v2 else {'affected_statement_ids'})
+    if (not isinstance(plan, dict) or set(plan) - {'confidence'} != required
             or plan['decision'] not in {'l1_already_correct', 'revise_l1', 'ambiguous'}
             or not isinstance(plan['reason'], str) or not plan['reason'].strip()
-            or not isinstance(plan['affected_statement_ids'], list) or not isinstance(plan['patch'], list)):
+            or (not v2 and not isinstance(plan['affected_statement_ids'], list)) or not isinstance(plan['patch'], list)):
         raise L1OwnerError('invalid_l3_sync_plan', field_path='plan')
-    known = {row['statement_id'] for row in material['l1_document']['statements']}
     if plan.get('confidence') is not None and (type(plan['confidence']) not in (float, int)
             or not math.isfinite(plan['confidence']) or not 0 <= plan['confidence'] <= 1):
         raise L1OwnerError('invalid_l3_plan_confidence', field_path='plan.confidence')
-    if any(not isinstance(ref, str) or ref not in known for ref in plan['affected_statement_ids']):
-        raise L1OwnerError('l3_affected_member_unknown', field_path='plan.affected_statement_ids')
     if plan['decision'] != 'revise_l1' and plan['patch']:
         raise L1OwnerError('l3_unexpected_patch', field_path='plan.patch')
     if plan['decision'] == 'revise_l1' and not plan['patch']:
         raise L1OwnerError('l3_patch_required', field_path='plan.patch')
-    return apply_local_patch(material['l1_document'], plan, evidence_ids=evidence_ids)
+    if v2:
+        return _apply_v2_patch(document, plan, set(evidence_ids))
+    known = {row['statement_id'] for row in document['statements']}
+    if any(not isinstance(ref, str) or ref not in known for ref in plan['affected_statement_ids']):
+        raise L1OwnerError('l3_affected_member_unknown', field_path='plan.affected_statement_ids')
+    return apply_local_patch(document, plan, evidence_ids=evidence_ids)
 
 
 def compile_plan(revisions, memory_id, base_detail, plan, source_evidence, *, request_id):
+    from memory_l1_v2 import is_v2
     base = base_detail['l1']['document']
+    if is_v2(base):
+        used = {ref for patch in plan['patch'] for ref in patch['evidence_refs']}
+        source_evidence = [row for row in source_evidence if row['binding']['binding_id'] in used]
     evidence_ids = [row['binding_id'] for row in base['evidence_bindings']] + [row['binding']['binding_id'] for row in source_evidence]
     document = validate_plan({'l1_document': base}, plan, evidence_ids=evidence_ids)
     snapshots = [copy.deepcopy(row['source']) for row in source_evidence]
@@ -237,13 +274,15 @@ def compile_plan(revisions, memory_id, base_detail, plan, source_evidence, *, re
         if binding['binding_id'] not in by_id:
             extended['evidence_bindings'].append(binding)
     document['evidence_bindings'] = copy.deepcopy(extended['evidence_bindings'])
+    if is_v2(base):
+        document['source_refs'] = extended['source_refs'] = [row['binding_id'] for row in extended['evidence_bindings']]
     catalog, revision = revisions.catalog_provider()
     # Preview the complete existing validator; normalization allocates only
     # program identities. No file, candidate or adopted revision is written.
     revisions._owner_document(document, extended, memory_id=memory_id, request_id=request_id,
         catalog=catalog, catalog_revision=revision, revision=base_detail['current_revision'] + 1)
-    touched = set(plan['affected_statement_ids'])
-    unknown = False
+    touched = set(plan.get('affected_statement_ids', []))
+    unknown = is_v2(base)
     for patch in plan['patch']:
         parts = patch['path'].split('/')
         if len(parts) > 3 and parts[1] == 'statements':
@@ -264,9 +303,12 @@ async def commit_plan(revisions, memory_id, compiled, *, expected_revision, requ
 
 async def prepare_plan(engine, material, proposal_text, kind, source_evidence, *, memory_id, task_id, attempt=1):
     from memory_model_io import MemoryModelIO, completion_parameters
+    from memory_l1_v2 import is_v2
     if kind not in {'owner_l2', 'followup'}:
         raise L1OwnerError('invalid_l3_origin', field_path='kind')
-    prompt, prompt_context = engine._memory_l1_prompt('ombre.memory_l3_sync_prompt')
+    v2 = is_v2(material['l1_document'])
+    prompt_id = 'ombre.memory_l1_v2_revision_prompt' if v2 else 'ombre.memory_l3_sync_prompt'
+    prompt, prompt_context = engine._memory_l1_prompt(prompt_id)
     if not prompt.strip():
         raise L1OwnerError('l3_sync_prompt_disabled', field_path='prompt')
     route = engine._memory_task_route('chat_l1')
@@ -283,6 +325,13 @@ async def prepare_plan(engine, material, proposal_text, kind, source_evidence, *
                 'add permits a complete semantic-v1 Statement with all classification/time/conditions judgments',
                 'never modify identity, generation, source bindings, entry or cross-memory relations',
                 'interpretation/question remains cognition; no promotion to objective fact']}}
+    if v2:
+        payload['output_contract'] = {
+            'decision': 'l1_already_correct|revise_l1|ambiguous', 'reason': '具体依据',
+            'confidence': '0 到 1，只用于原采用审核；不足可省略',
+            'patch': [{'op': 'replace_text|replace', 'path': '/body 或允许的卡级字段',
+                'old': '待改原值', 'value': '有依据的替换值', 'evidence_refs': ['实际新证据的 binding_id']}],
+            'fields': sorted(_V2_FIELDS)}
     payload = copy.deepcopy(payload)
     # Custody tokens stay in the program material and its pre/post checks.
     # They carry no semantic meaning for the model and change on task claims.

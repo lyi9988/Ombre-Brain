@@ -84,11 +84,14 @@ class MemoryCandidatePreparation:
         return True
 
     def prepare(self, key, proposals, policy, *, scope, source_fingerprint, generated_count=None,
-                issue=None, generation_fingerprint=None, replace_failure=False, rejected_drafts=None):
+                issue=None, generation_fingerprint=None, replace_failure=False, rejected_drafts=None,
+                guard=None):
         """Save every validated draft and its ID receipt in one transaction."""
         db = self.authority._connect()
         try:
             db.execute('BEGIN IMMEDIATE')
+            if guard is not None:
+                guard(db)
             prior = db.execute('SELECT value FROM authority_meta WHERE key=?', (PREFIX + key,)).fetchone()
             if prior:
                 receipt = json.loads(prior['value'])

@@ -22,7 +22,7 @@ class BrowseMemoryPreparation(ChatMemoryPreparation):
     def public(row):
         return {**ChatMemoryPreparation.public(row), 'source_kind': 'web_browse'}
 
-    def enqueue(self, *, operation_key, content, descriptor, metadata):
+    def enqueue(self, *, operation_key, content, descriptor, metadata, generation_protocol=None):
         if not operation_key or not operation_key.strip():
             raise L1OwnerError('browse_operation_identity_required', field_path='idempotency_key')
         from memory_hold_source import hold_source_descriptor
@@ -44,11 +44,15 @@ class BrowseMemoryPreparation(ChatMemoryPreparation):
                 if json.loads(prior['value'])['submission_hash'] != digest:
                     raise IdempotencyConflict('browse operation payload changed')
             elif not candidate and not memory and not old_commit:
+                if checked['source_scope'].get('memory_intent') and generation_protocol != 'whole_window_v2':
+                    raise L1OwnerError('l1_v2_not_enabled', status=409, field_path='source_scope.memory_intent')
                 stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
                 row = {'task_id': memory_id, 'operation_id': operation_key, 'phase': 'queued',
                     'draft_revision': 1, 'revision': 1, 'submission_hash': digest, 'envelope': envelope,
                     'created_at': stamp, 'updated_at': stamp, 'candidate_ids': [], 'attempts': 0,
                     'issue': None, 'lease_until': 0, 'history': [], 'edit_requests': {}}
+                if generation_protocol:
+                    row['generation_protocol'] = generation_protocol
                 db.execute('INSERT INTO authority_meta(key,value) VALUES(?,?)', (self.prefix + memory_id, canonical_json(row)))
             db.commit()
         except Exception:
@@ -174,6 +178,7 @@ async def prepare_browse_tasks(engine, bucket_mgr, *, max_jobs=None):
     from memory_l1_semantic_wire import assemble_document, semantic_contract
     from memory_l1_schema import split_document
     from memory_l1_runtime import task_options
+    from memory_l1_v2_generation import PROTOCOL, enabled, generate
     from memory_l1_source_readers import AizBrowseSourceReader
     from memory_model_io import MemoryModelIO, completion_parameters
     from memory_source_identity import source_model_identity
@@ -184,10 +189,10 @@ async def prepare_browse_tasks(engine, bucket_mgr, *, max_jobs=None):
     if getattr(engine, '_browse_preparation_running', False):
         return {'status': 'locked'}
     prompt, prompt_context = engine._memory_l1_prompt('ombre.chat_memory_prepare_prompt')
-    if not prompt.strip():
+    if not prompt.strip() and not enabled(engine.config):
         return {'status': 'disabled', 'reason': 'prompt_disabled'}
     route = engine._memory_task_route('chat_l1')
-    if not route['configured']:
+    if not route['configured'] and not enabled(engine.config):
         return {'status': 'not_prepared', 'reason': route['unavailable_reason']}
     tasks, io = BrowseMemoryPreparation(engine.memory_authority_store), MemoryModelIO(engine.memory_authority_store)
     engine._browse_preparation_running = True
@@ -219,6 +224,43 @@ async def prepare_browse_tasks(engine, bucket_mgr, *, max_jobs=None):
                 if values[0]['source_revision'] != values[1]['source_revision']:
                     raise L1OwnerError('browse_reading_revision_changed', status=409, field_path='sources')
                 sources = [model_source(value, engine.config) for value in values]
+                if claimed.get('generation_protocol') == PROTOCOL:
+                    from memory_l1_v2_sources import draft_source
+                    intent = descriptor['source_scope'].get('memory_intent')
+                    if intent and any(value.get('memory_intent') != intent for value in values):
+                        raise L1OwnerError('browse_memory_intent_source_changed', status=409, field_path='sources')
+
+                    def evaluate(proposal):
+                        decision = engine.memory_ingestion_policy.evaluate(proposal)
+                        if (not intent and decision.action == 'auto_accept'):
+                            return PolicyDecision('auto_accept', ('ACCEPT_EXPLICIT_MEMORY_TOOL',),
+                                'explicit_tool', alias_trust='weak')
+                        return decision
+
+                    provenance = {'contract': 'browse-l1-submission-v2', 'task_id': memory_id,
+                        'operation_id': claimed['operation_id'],
+                        'original_content_sha256': original['descriptor']['content_sha256'],
+                        'draft_revision': claimed['draft_revision']}
+                    result = await generate(engine, bucket_mgr, origin='browse_l1',
+                        task_id=memory_id + ':' + str(claimed['draft_revision']), source_type='hold', mode='auto',
+                        sources=[draft_source(claimed, engine.config, kind='browse'), *sources],
+                        context={'agent_draft': {'source_ref': 'm1', 'title': envelope['metadata'].get('name') or '',
+                            'draft_revision': claimed['draft_revision']},
+                            'read_coverage': [{'source_ref': f'm{index + 2}', 'coverage': value.get('coverage'),
+                                'limitations': value.get('limitations', [])} for index, value in enumerate(values)]},
+                        candidate_id=memory_id, force=pending.get('manual_generation_retry', False), allow_empty=False,
+                        prepare_policy=evaluate, owner_explicit=not bool(intent), before_prepare=tasks.guard_claim(claimed),
+                        required_source_ref='m1', required_any_source_refs={'m2', 'm3'},
+                        metadata={'aiz_source_descriptor': {'descriptor': descriptor, 'observation': 'verified',
+                            'eligible_source': True}, 'browse_preparation': provenance,
+                            'name': envelope['metadata'].get('name') or '',
+                            'pinned': envelope['metadata'].get('pinned', False)})
+                    tasks.finish(claimed, phase='failed' if result['adoption_issues'] else 'prepared',
+                        candidate_ids=result['candidate_ids'], issue=(result['adoption_issues'] or [None])[0])
+                    results.append(tasks.receipt(memory_id))
+                    continue
+                if not prompt.strip():
+                    raise L1OwnerError('prompt_disabled', field_path='generation')
                 snapshots, bindings = bind_sources(sources, config=engine.config)
                 readers = engine._memory_l1_sources()
                 for value in snapshots:

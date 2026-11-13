@@ -217,7 +217,10 @@ def _conditions(value, definitions, path, entity_ids, *, exception=False):
         for i, item in enumerate(value["exceptions"]): _conditions(item, definitions, f"{path}.exceptions[{i}]", entity_ids, exception=True)
 
 
-def validate_l1_document(document: Any, *, catalog=None) -> dict:
+def validate_l1_document(document: Any, *, catalog=None, allow_classification_gap=False) -> dict:
+    from memory_l1_v2 import is_v2, validate_document
+    if is_v2(document):
+        return validate_document(document, allow_classification_gap=allow_classification_gap)
     """Validate every semantic module; source/owner authorization is separate."""
     canonical_json(document)
     shape(document, TOP_FIELDS, "document")
@@ -376,14 +379,23 @@ def validate_l1_document(document: Any, *, catalog=None) -> dict:
     return d
 
 
-def split_document(document, *, catalog=None):
-    value = validate_l1_document(document, catalog=catalog)
+def split_document(document, *, catalog=None, allow_classification_gap=False):
+    value = validate_l1_document(document, catalog=catalog, allow_classification_gap=allow_classification_gap)
+    from memory_l1_v2 import is_v2
+    if is_v2(value):
+        return canonical_l1_body(value.pop("body")), value
     body = canonical_l1_body(value["narrative"].pop("body"))
     return body, value
 
 
-def join_document(body, semantic):
+def join_document(body, semantic, *, allow_classification_gap=False):
     value = copy.deepcopy(semantic)
+    from memory_l1_v2 import is_v2
+    if is_v2(value):
+        if "body" in value:
+            fail("duplicate_body_authority", "body")
+        value["body"] = body
+        return validate_l1_document(value, allow_classification_gap=allow_classification_gap)
     if not isinstance(value.get("narrative"), dict): fail("invalid_narrative", "narrative")
     if "body" in value["narrative"]: fail("duplicate_body_authority", "narrative.body")
     value["narrative"]["body"] = body
@@ -399,6 +411,9 @@ def bind_l1_metadata(body, metadata):
     document = join_document(body, result["memory_l1"])
     _, semantic = split_document(document)
     result["memory_l1"] = semantic
+    from memory_l1_v2 import is_v2, SCHEMA_VERSION as V2_SCHEMA_VERSION
+    if is_v2(semantic):
+        result["memory_l1_schema_version"] = V2_SCHEMA_VERSION
     result["memory_l1_semantic_sha256"] = semantic_sha256(semantic)
     result["memory_l1_content_sha256"] = l1_content_sha256(body, semantic)
     return result

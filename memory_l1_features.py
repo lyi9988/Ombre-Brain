@@ -29,6 +29,23 @@ def project(conn, memory_id, revision, semantic):
     def attributes(kind, ident, values):
         for index, item in enumerate(values):
             put(kind, ident, 'attributes.' + item['definition_id'], item['value'], index)
+    from memory_l1_v2 import is_v2
+    if is_v2(semantic):
+        for field in ('kind', 'stability', 'primary_topic', 'secondary_topic', 'event_time'):
+            if field in semantic:
+                put('memory', memory_id, field, semantic[field])
+        for ordinal, value in enumerate(semantic['keywords']):
+            put('memory', memory_id, 'retrieval.keywords', value, ordinal)
+        for person in semantic['people']:
+            for field in ('name', 'kind'):
+                put('person', person['person_id'], field, person[field])
+            for ordinal, alias in enumerate(person.get('aliases', [])):
+                put('person', person['person_id'], 'aliases', alias, ordinal)
+        for ordinal, note in enumerate(semantic.get('scope_notes', [])):
+            put('memory', memory_id, 'scope_notes', note, ordinal)
+        for ordinal, link in enumerate(semantic.get('people_links', [])):
+            put('memory', memory_id, 'people_links', link, ordinal)
+        return
     for field in ('keywords', 'tags'):
         for ordinal, value in enumerate(semantic['retrieval'][field]):
             put('memory', memory_id, 'retrieval.' + field, value, ordinal)

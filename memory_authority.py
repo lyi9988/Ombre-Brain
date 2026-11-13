@@ -155,7 +155,7 @@ class MemoryIngestionPolicy:
     DEFAULT_AUTO_TYPES = frozenset({
         "durable_fact", "preference", "stable_preference", "relationship_event",
         "shared_experience", "key_event", "boundary", "signal", "commitment",
-        "project_state", "relationship_anchor", "daily_impression", "reflection",
+        "project_state", "relationship_anchor", "daily_impression", "reflection", "self_insight",
         "diary_memory", "import_memory",
     })
     OWNER_REVIEW_TYPES = frozenset({
@@ -169,18 +169,23 @@ class MemoryIngestionPolicy:
             str(key): str(value).strip().lower()
             for key, value in dict(cfg.get("source_modes") or {}).items()
         }
+        configured_auto_types = cfg.get("auto_types")
         self.auto_types = frozenset(str(item) for item in (
-            cfg.get("auto_types") or self.DEFAULT_AUTO_TYPES
+            self.DEFAULT_AUTO_TYPES if configured_auto_types is None else configured_auto_types
         ))
         self.owner_review_types = frozenset(str(item) for item in (
             cfg.get("owner_review_types") or self.OWNER_REVIEW_TYPES
         ))
         self.auto_confidence = max(0.0, min(1.0, float(cfg.get("auto_confidence", 0.68))))
 
-    def evaluate(self, proposal: MemoryProposal) -> PolicyDecision:
-        mode = self.source_modes.get(proposal.source_type, proposal.requested_mode or self.default_mode)
+    def mode_for(self, source_type, requested_mode=None):
+        mode = self.source_modes.get(source_type, requested_mode or self.default_mode)
         if mode not in {"auto", "review", "off"}:
             mode = self.default_mode if self.default_mode in {"auto", "review", "off"} else "review"
+        return mode
+
+    def evaluate(self, proposal: MemoryProposal) -> PolicyDecision:
+        mode = self.mode_for(proposal.source_type, proposal.requested_mode)
 
         if not proposal.proposal_id or not proposal.proposed_body:
             return PolicyDecision("reject", ("REJECT_EMPTY_PROPOSAL",), mode)
@@ -192,12 +197,24 @@ class MemoryIngestionPolicy:
             return PolicyDecision("reject", ("REJECT_SOURCE_MISSING",), mode)
         if mode == "off":
             return PolicyDecision("reject", ("REJECT_SOURCE_DISABLED",), mode)
+        from memory_l1_v2 import KINDS, current_kind, is_v2
+        card = proposal.metadata.get("memory_l1")
+        kind = proposal.memory_type
+        allowed_auto_types = self.auto_types
+        owner_review_types = self.owner_review_types
+        if is_v2(card):
+            kind = current_kind(card.get("kind"))
+            if not isinstance(kind, str) or kind not in KINDS:
+                return PolicyDecision("queue_review", ("classification_gap",), mode,
+                    requires_owner_confirmation=True)
+            allowed_auto_types = {current_kind(value) for value in self.auto_types}
+            owner_review_types = {current_kind(value) for value in self.owner_review_types}
         if proposal.owner_explicit:
             return PolicyDecision(
                 "auto_accept", ("ACCEPT_EXPLICIT_OWNER",), "explicit_owner",
                 alias_trust="owner", requires_owner_confirmation=False,
             )
-        if proposal.sensitive or proposal.memory_type in self.owner_review_types:
+        if proposal.sensitive or kind in owner_review_types:
             reason = "REVIEW_SENSITIVE" if proposal.sensitive else "REVIEW_OWNER_AUTHORITY_REQUIRED"
             return PolicyDecision(
                 "queue_review", (reason,), mode,
@@ -210,7 +227,8 @@ class MemoryIngestionPolicy:
             )
         if (
             mode == "auto"
-            and proposal.memory_type in self.auto_types
+            and kind in allowed_auto_types
+            and (not is_v2(card) or proposal.metadata.get("confidence_source") == "model_review")
             and proposal.confidence >= self.auto_confidence
         ):
             return PolicyDecision(
@@ -522,6 +540,15 @@ class MemoryAuthorityStore:
         conn.close()
         return self._candidate_row(row)
 
+    def get_candidate_revision(self, candidate_id: str, revision: int) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute('SELECT * FROM candidate_revisions WHERE candidate_id=? AND revision=?',
+                               (candidate_id, revision)).fetchone()
+            return self._candidate_row(row)
+        finally:
+            conn.close()
+
     @staticmethod
     def _index_candidate_sources(conn, proposal: dict) -> None:
         """Derived references only, in the same transaction as the proposal.
@@ -698,10 +725,12 @@ class MemoryAuthorityStore:
         request_id: str,
         actor: str,
         reason_codes: Sequence[str] = (),
+        policy: PolicyDecision | None = None,
     ) -> dict[str, Any]:
         target = {
             "accept": "accepted", "reject": "rejected", "defer": "deferred", "reopen": "pending",
             "commit": "committed", "commit_failed": "commit_failed", "link": "linked",
+            "return_to_review": "pending",
         }.get(
             str(action or "").strip().lower()
         )
@@ -711,6 +740,10 @@ class MemoryAuthorityStore:
             "candidate_id": str(candidate_id), "action": action,
             "expected_revision": int(expected_revision), "reason_codes": list(reason_codes),
         }
+        if policy is not None:
+            if action != 'return_to_review' or policy.action != 'queue_review':
+                raise InvalidTransition('invalid_review_policy_change')
+            payload['policy'] = policy.payload()
         fingerprint = self.fingerprint(payload)
         conn = self._connect()
         try:
@@ -732,6 +765,12 @@ class MemoryAuthorityStore:
                 raise RevisionConflict(f"expected {expected_revision}, current {current['revision']}")
             allowed = self.CANDIDATE_TRANSITIONS.get(str(current["status"]), set())
             linked = []
+            if action == 'return_to_review':
+                if (policy is None or actor != 'policy' or current['status'] != 'accepted' or conn.execute(
+                        "SELECT 1 FROM commit_log WHERE idempotency_key=? LIMIT 1",
+                        (f"l1-candidate:{candidate_id}:revision:{expected_revision}",)).fetchone()):
+                    raise InvalidTransition('policy_review_requires_unstarted_commit')
+                allowed = allowed | {'pending'}
             if target == "linked" and current["status"] != "linked":
                 if (current["proposal"].get("source_type") != "owner_summary"
                         or current["status"] not in {"pending", "deferred", "accepted", "commit_failed"}):
@@ -749,14 +788,16 @@ class MemoryAuthorityStore:
                 raise InvalidTransition(f"{current['status']}->{target}")
             next_revision = int(current["revision"]) + 1
             now = _now()
+            recorded_policy = policy.payload() if policy is not None else current['policy']
             conn.execute(
-                "UPDATE candidates SET status=?,revision=?,updated_at=? WHERE candidate_id=?",
-                (target, next_revision, now, candidate_id),
+                "UPDATE candidates SET status=?,revision=?,policy_json=?,updated_at=? WHERE candidate_id=?",
+                (target, next_revision, _json(recorded_policy), now, candidate_id),
             )
             result = {
                 **current,
                 "status": target,
                 "revision": next_revision,
+                "policy": recorded_policy,
                 "updated_at": now,
             }
             if linked:
@@ -765,7 +806,7 @@ class MemoryAuthorityStore:
                 "INSERT INTO candidate_revisions(candidate_id,revision,status,proposal_sha256,proposal_json,"
                 "policy_json,actor,created_at) VALUES(?,?,?,?,?,?,?,?)",
                 (candidate_id, next_revision, target, current["proposal_sha256"],
-                 _json(current["proposal"]), _json(current["policy"]), actor, now),
+                 _json(current["proposal"]), _json(recorded_policy), actor, now),
             )
             conn.execute(
                 "INSERT INTO candidate_decisions(decision_id,candidate_id,from_status,to_status,candidate_revision,"
@@ -971,10 +1012,14 @@ class MemoryAuthorityStore:
             if "memory_l1" in payload["metadata"]:
                 outbox_payload.update({key: payload["metadata"][key] for key in
                     ("memory_l1_semantic_sha256", "memory_l1_content_sha256")})
-                from memory_l2_store import enqueue_in_transaction
-                l2_task = enqueue_in_transaction(conn, memory_id, revision)
-                outbox_payload["l2_preparation"] = {"state": "pending", "task_id": l2_task,
-                    "dependency": payload["metadata"]["memory_l1_content_sha256"]}
+                from memory_l1_v2 import is_v2
+                if is_v2(payload["metadata"]["memory_l1"]):
+                    outbox_payload["l2_preparation"] = {"state": "direct_l1"}
+                else:
+                    from memory_l2_store import enqueue_in_transaction
+                    l2_task = enqueue_in_transaction(conn, memory_id, revision)
+                    outbox_payload["l2_preparation"] = {"state": "pending", "task_id": l2_task,
+                        "dependency": payload["metadata"]["memory_l1_content_sha256"]}
             conn.execute(
                 "INSERT INTO outbox(event_id,operation_id,event_type,aggregate_id,aggregate_revision,payload_json,"
                 "status,attempts,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,'pending',0,'',?,?)",

@@ -45,10 +45,12 @@ class ChatSegmentProgress:
             row = db.execute('SELECT * FROM memory_chat_segment_progress WHERE task_id=?', (task_id,)).fetchone()
             return {'revision': row['revision'], 'progress': json.loads(row['payload'])} if row else None
 
-    def save(self, task_id, scope, progress, expected_revision, *, dispatch=False):
+    def save(self, task_id, scope, progress, expected_revision, *, dispatch=False, guard=None):
         db = self.authority._connect()
         try:
             db.execute('BEGIN IMMEDIATE')
+            if guard is not None:
+                guard(db)
             row = db.execute('SELECT revision FROM memory_chat_segment_progress WHERE task_id=?', (task_id,)).fetchone()
             if (row['revision'] if row else 0) != expected_revision:
                 raise RevisionConflict('chat segment progress changed')

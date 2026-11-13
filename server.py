@@ -8810,10 +8810,13 @@ async def hold(
         if memory_authority_store is None or memory_commit_service is None:
             return json.dumps({'ok': False, 'memory_status': 'preparation_unavailable', 'adopted': False, 'source_kind': 'web_browse'})
         from memory_browse_preparation import BrowseMemoryPreparation
+        from memory_l1_v2_generation import PROTOCOL, enabled as l1_v2_enabled
+        memory_engine = globals().get('reflection_engine')
         try:
             result = BrowseMemoryPreparation(memory_authority_store).enqueue(
                 operation_key=_memory_operation_key('memory:hold', idempotency_key) if idempotency_key else '',
                 content=content, descriptor=source_descriptor['descriptor'],
+                generation_protocol=PROTOCOL if memory_engine and l1_v2_enabled(memory_engine.config) else None,
                 metadata={'name': title.strip(), 'tags': extra_tags, 'importance': 10 if pinned else importance,
                     'pinned': pinned, 'date': event_date or None, 'domain': requested_domain,
                     **(browse_classification(source_descriptor) or {}),
@@ -13017,16 +13020,18 @@ async def api_memory_l1_source_tasks(request):
                     await OwnerSummarySourceReader(config, memory_authority_store).sources(current['envelope'])
                     return JSONResponse(chat_tasks.retry(current['operation_id'], current['revision']), headers=headers)
                 def retry(row):
-                    row.update(phase='queued', lease_until=0, claim_token=None, issue=None)
+                    row.update(phase='queued', lease_until=0, claim_token=None, issue=None,
+                               manual_generation_retry=True)
                     return row
                 updated = chat_tasks.update(str(task_id), expected_revision=current['revision'], transform=retry)
                 return JSONResponse({'status': 'queued', 'task': chat_tasks.public(updated)}, headers=headers)
             if getattr(reflection_engine, "_daily_chat_memory_run_lock", False):
                 raise L1OwnerError("memory_preparation_in_progress", status=409, field_path="task_id")
-            row = tasks.transition(str(task_id), payload["expected_phase"], "queued")
+            row = tasks.transition(str(task_id), payload["expected_phase"], "queued", manual_generation_retry=True)
             if row is None: raise L1OwnerError("task_phase_changed", status=409, field_path="expected_phase")
             return JSONResponse({"status": "queued", "task": row, "action_reexecuted": False}, headers=headers)
-        result = tasks.enqueue_action(payload)
+        from memory_l1_v2_generation import PROTOCOL, enabled as l1_v2_enabled
+        result = tasks.enqueue_action(payload, generation_protocol=PROTOCOL if l1_v2_enabled(reflection_engine.config) else None)
         from memory_l1_source_readers import AizActionSourceReader
         try:
             result['retention'] = await tasks.retain_action(result['task_id'],
@@ -13098,7 +13103,13 @@ async def api_memory_l1_revision(request):
     try:
         service = _memory_l1_revision_service()
         if request.method == "GET" and not memory_id:
-            result = service.schema()
+            from memory_l1_v2_generation import enabled as l1_v2_enabled
+            engine = reflection_engine
+            result = service.schema(generation_enabled=bool(engine and l1_v2_enabled(engine.config)),
+                source_modes={
+                    'browse_l1': engine.memory_ingestion_policy.mode_for('hold', 'auto'),
+                    'action_l1': engine._memory_l1_action_v2_mode(),
+                } if engine else {})
         elif request.method == "GET":
             revision = str(request.path_params.get("revision") or "")
             if not revision.isdigit() or int(revision) <= 0: raise L1OwnerError("invalid_revision", field_path="revision")
@@ -13321,6 +13332,23 @@ async def api_daily_chat_memory_runs(request):
             "runs": reflection_engine.list_daily_chat_memory_run_audit(limit=limit),
         }
     )
+
+
+@mcp.custom_route('/api/daily-chat-memory/runs/{run_id}/diagnostics', methods=['GET'])
+async def api_daily_chat_memory_diagnostics(request):
+    from starlette.responses import JSONResponse
+
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    headers = {'Cache-Control': 'no-store'}
+    if reflection_engine is None or memory_authority_store is None:
+        return JSONResponse({'error': 'memory_authority_unavailable'}, status_code=503, headers=headers)
+    run_id = str(request.path_params.get('run_id') or '')
+    if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', run_id):
+        return JSONResponse({'error': 'invalid_run_id'}, status_code=400, headers=headers)
+    return JSONResponse({'status': 'ok', 'items': reflection_engine.daily_chat_memory_diagnostics(run_id)},
+                        headers=headers)
 
 
 @mcp.custom_route("/api/daily-chat-memory/confirm", methods=["POST"])
@@ -13867,7 +13895,7 @@ async def api_config_update(request):
         return JSONResponse({"error": "invalid config object"}, status_code=400)
     if (isinstance(body.get('reflection'), dict)
             and 'daily_chat_memory_extraction_mode' in body['reflection']
-            and body['reflection']['daily_chat_memory_extraction_mode'] not in ('single_pass', 'event_first')):
+            and body['reflection']['daily_chat_memory_extraction_mode'] not in ('single_pass', 'event_first', 'whole_window_v2')):
         return JSONResponse({'error': 'invalid_daily_chat_memory_extraction_mode',
                              'field_path': 'reflection.daily_chat_memory_extraction_mode'}, status_code=400)
     if isinstance(body.get('reflection'), dict) and 'diary_l1_read_timeout_seconds' in body['reflection']:

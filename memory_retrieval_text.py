@@ -5,6 +5,13 @@ import re
 TEXT_PROJECTION_VERSION = 'memory-l1-retrieval-text-v1'
 
 
+def text_projection_version(document):
+    from memory_l1_v2 import is_v2, TEXT_PROJECTION_VERSION as V2_TEXT_PROJECTION_VERSION
+    if is_v2(document):
+        return V2_TEXT_PROJECTION_VERSION
+    return TEXT_PROJECTION_VERSION if document is not None else None
+
+
 def value_text(value, names=None):
     if isinstance(value, dict):
         state = value.get('state')
@@ -49,6 +56,11 @@ def l1_retrieval_blocks(document, *, body=None, title=None):
     statements). ``body`` can select a committed content moment without losing
     its parent's factual qualifiers. Units remain whole; consumers own budgets.
     """
+    from memory_l1_v2 import is_v2
+    if is_v2(document):
+        card_title = document.get('title', '') if title is None else title
+        card_body = document.get('body', '') if body is None else body
+        return [str(part).strip() for part in (card_title, card_body) if str(part or '').strip()]
     narrative = document.get('narrative') or {}
     title = narrative.get('title') if title is None else title
     body = narrative.get('body') if body is None else body

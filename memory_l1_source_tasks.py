@@ -74,15 +74,31 @@ class MemoryL1SourceTasks:
         finally: db.close()
         return receipt
 
-    def enqueue_action(self, payload):
-        if not isinstance(payload, dict) or set(payload) != {'action_id', 'artifact_id', 'request_id'}:
+    def enqueue_action(self, payload, *, generation_protocol=None):
+        fields = {'action_id', 'artifact_id', 'request_id'}
+        if not isinstance(payload, dict) or set(payload) - {'memory_intent'} != fields:
             raise L1OwnerError('invalid_action_source_request', field_path='source_task')
-        for key, value in payload.items():
+        for key in fields:
+            value = payload[key]
             if not isinstance(value, str) or not _ID.fullmatch(value):
                 raise L1OwnerError('invalid_source_identity', field_path='source_task.' + key)
         source = {'action_id': payload['action_id'], 'artifact_id': payload['artifact_id']}
-        digest = hashlib.sha256(canonical_json(source).encode()).hexdigest()
-        task_id = 'action_source_' + digest[:40]
+        intent = payload.get('memory_intent')
+        if intent is not None:
+            if (not isinstance(intent, dict) or set(intent) != {
+                    'decision', 'draft', 'activity_id', 'activity_revision', 'sources'}
+                    or intent['decision'] != 'remember' or not isinstance(intent['draft'], str)
+                    or not intent['draft'].strip() or not isinstance(intent['activity_id'], str)
+                    or not _ID.fullmatch(intent['activity_id']) or not _ID.fullmatch(str(intent['activity_revision']))
+                    or not isinstance(intent['sources'], list) or source not in intent['sources']
+                    or any(not isinstance(item, dict) or set(item) != {'action_id', 'artifact_id'}
+                           or any(not isinstance(value, str) or not _ID.fullmatch(value) for value in item.values())
+                           for item in intent['sources'])):
+                raise L1OwnerError('invalid_action_memory_intent', field_path='source_task.memory_intent')
+        digest = hashlib.sha256(canonical_json({**source, **({'memory_intent': intent} if intent else {})}).encode()).hexdigest()
+        task_identity = ({'activity_id': intent['activity_id'], 'activity_revision': str(intent['activity_revision'])}
+                         if intent else source)
+        task_id = 'action_source_' + hashlib.sha256(canonical_json(task_identity).encode()).hexdigest()[:40]
         key = PREFIX + task_id
         request_key = PREFIX + 'request:' + hashlib.sha256(payload['request_id'].encode()).hexdigest()
         db = self.authority._connect()
@@ -92,16 +108,32 @@ class MemoryL1SourceTasks:
             if prior_request and json.loads(prior_request['value']) != digest:
                 raise IdempotencyConflict('action source request_id payload changed')
             prior = db.execute('SELECT value FROM authority_meta WHERE key=?', (key,)).fetchone()
+            if not prior and intent and generation_protocol != 'whole_window_v2':
+                raise L1OwnerError('l1_v2_not_enabled', status=409, field_path='source_task.memory_intent')
+            if prior and intent:
+                current = json.loads(prior['value'])
+                if current.get('memory_intent') != intent or any(current.get(k) != v for k, v in source.items()):
+                    raise IdempotencyConflict('action memory intent changed')
             status = 'exists' if prior else 'queued'
             if not prior:
                 value = {**source, 'task_id': task_id, 'request_id': payload['request_id'],
                     'phase': 'queued', 'created_at': _stamp(), 'updated_at': _stamp(), 'candidate_ids': []}
+                if generation_protocol:
+                    value['generation_protocol'] = generation_protocol
+                    if intent:
+                        value['memory_intent'] = intent
+                    else:
+                        value['phase'] = 'prepared'
+                        value['generation_status'] = 'l0_only'
                 db.execute('INSERT INTO authority_meta(key,value) VALUES(?,?)', (key, canonical_json(value)))
             if not prior_request:
                 db.execute('INSERT INTO authority_meta(key,value) VALUES(?,?)', (request_key, canonical_json(digest)))
             db.commit()
-            return {'status': status, 'receipt_status': 'source_queued', 'adopted': False,
+            receipt = {'status': status, 'receipt_status': 'source_queued', 'adopted': False,
                 'task_id': task_id, 'source_id': payload['action_id'], 'source_revision': payload['artifact_id']}
+            if intent:
+                receipt.update(request_id=payload['request_id'], memory_intent_sha256=digest)
+            return receipt
         except Exception:
             db.rollback()
             raise
@@ -147,16 +179,24 @@ class MemoryL1SourceTasks:
         return {'tasks': values, 'limit': limit, 'offset': offset, 'total': total,
                 'has_more': next_offset < total, 'next_offset': next_offset if next_offset < total else None}
 
-    def runnable(self, *, limit=100):
+    def runnable(self, *, limit=100, include_legacy=True, include_v2=True):
         """Select waiting work in SQL, independent of owner history pages."""
         if type(limit) is not int or not 1 <= limit <= 200:
             raise L1OwnerError('invalid_task_page_limit', field_path='limit')
+        if not (include_legacy or include_v2):
+            return []
+        protocol = "COALESCE(json_extract(value,'$.generation_protocol'),'')"
+        generation_filter = ''
+        if not include_legacy:
+            generation_filter = f" AND {protocol}='whole_window_v2'"
+        elif not include_v2:
+            generation_filter = f" AND {protocol}!='whole_window_v2'"
         db = self.authority._connect()
         try:
             rows = db.execute("SELECT value FROM authority_meta WHERE key LIKE ? AND "
                 "(json_extract(value,'$.phase')='queued' OR (json_extract(value,'$.phase')='prepared' "
-                "AND json_array_length(value,'$.remaining_candidate_ids')>0)) "
-                "ORDER BY CASE json_extract(value,'$.phase') WHEN 'prepared' THEN 0 ELSE 1 END,"
+                "AND json_array_length(value,'$.remaining_candidate_ids')>0))" + generation_filter +
+                " ORDER BY CASE json_extract(value,'$.phase') WHEN 'prepared' THEN 0 ELSE 1 END,"
                 "json_extract(value,'$.created_at'),key LIMIT ?", (PREFIX + 'action_source_%', limit)).fetchall()
             return [json.loads(row['value']) for row in rows]
         finally: db.close()

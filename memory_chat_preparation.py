@@ -22,7 +22,7 @@ def issue(exc):
     return {'code': details['code'], 'field_path': details['field_path']}
 
 
-def validate_submission(envelope):
+def validate_submission(envelope, *, generation_protocol=None):
     from chat_memory_tool import candidate_id
     from jsonschema import Draft202012Validator
     if not isinstance(envelope, dict) or set(envelope) != {'operation_id', 'arguments', 'context'}:
@@ -38,7 +38,8 @@ def validate_submission(envelope):
            for k in ('conversation_id', 'request_id', 'turn_id')):
         raise L1OwnerError('invalid_source_identity', field_path='context')
     sources = context['sources']
-    if not isinstance(sources, list) or not 1 <= len(sources) <= 16:
+    v2 = generation_protocol == 'whole_window_v2'
+    if not isinstance(sources, list) or not (0 if v2 else 1) <= len(sources) <= 16:
         raise L1OwnerError('source_missing', field_path='context.sources')
     seen = set()
     for source in sources:
@@ -55,8 +56,8 @@ def validate_submission(envelope):
         if stamp.tzinfo is None:
             raise L1OwnerError('source_timezone_missing', field_path='context.sources')
         seen.add(source['event_id'])
-    if (sources[-1]['event_id'] != context['turn_id'] or sources[-1]['role'] != 'user'
-            or sum(len(s['text']) for s in sources) > 60000):
+    if (sources and (sources[-1]['event_id'] != context['turn_id'] or sources[-1]['role'] != 'user'
+            or sum(len(s['text']) for s in sources) > 60000)):
         raise L1OwnerError('source_coverage_invalid', field_path='context.sources')
     # Validate the optional transport field independently of model arguments.
     # The worker later rechecks its exact source through the live reader.
@@ -91,9 +92,9 @@ class ChatMemoryPreparation:
             'candidate_ids', 'issue', 'attempts', 'generation', 'usage', 'duration_ms',
             'output_shape', 'input_metrics')} | {'source_kind': 'chat_submission'}
 
-    def enqueue(self, envelope):
+    def enqueue(self, envelope, *, generation_protocol=None):
         from chat_memory_tool import candidate_id
-        validate_submission(envelope)
+        validate_submission(envelope, generation_protocol=generation_protocol)
         memory_id = candidate_id(envelope['operation_id'])
         digest = semantic_sha256(envelope)
         db = self.authority._connect()
@@ -110,6 +111,8 @@ class ChatMemoryPreparation:
                     'envelope': copy.deepcopy(envelope), 'created_at': stamp, 'updated_at': stamp,
                     'candidate_ids': [], 'attempts': 0, 'issue': None, 'lease_until': 0,
                     'history': [], 'edit_requests': {}}
+                if generation_protocol:
+                    row['generation_protocol'] = generation_protocol
                 db.execute('INSERT INTO authority_meta(key,value) VALUES(?,?)', (self.prefix + memory_id, canonical_json(row)))
             db.commit()
         except Exception:
@@ -167,9 +170,20 @@ class ChatMemoryPreparation:
             if current['phase'] != 'queued' and not (current['phase'] == 'generating' and current['lease_until'] < time.time()):
                 raise L1OwnerError('task_not_queued', status=409, field_path='phase')
             current.update(phase='generating', lease_until=time.time() + lease_seconds,
-                           claim_token=uuid.uuid4().hex, attempts=current['attempts'] + 1, issue=None)
+                           claim_token=uuid.uuid4().hex, attempts=current['attempts'] + 1, issue=None,
+                           manual_generation_retry=False)
             return current
         return self.update(row['task_id'], expected_revision=row['revision'], transform=change)
+
+    def guard_claim(self, claimed):
+        def guard(db):
+            record = db.execute('SELECT value FROM authority_meta WHERE key=?',
+                                (self.prefix + claimed['task_id'],)).fetchone()
+            current = json.loads(record['value']) if record else None
+            if (current is None or current['revision'] != claimed['revision']
+                    or current.get('claim_token') != claimed.get('claim_token') or current['phase'] != 'generating'):
+                raise L1OwnerError('submission_revision_conflict', status=409, field_path='revision')
+        return guard
 
     def finish(self, claimed, *, phase, **result):
         def change(current):
@@ -206,7 +220,7 @@ class ChatMemoryPreparation:
         def change(row):
             envelope = copy.deepcopy(row['envelope'])
             envelope['arguments'] = payload['draft']
-            validate_submission(envelope)
+            validate_submission(envelope, generation_protocol=row.get('generation_protocol'))
             row['history'].append({'draft_revision': row['draft_revision'], 'draft': row['envelope']['arguments'],
                                    'updated_at': row['updated_at'], 'issue': row.get('issue')})
             row.update(envelope=envelope, draft_revision=row['draft_revision'] + 1,
@@ -247,11 +261,11 @@ async def prepare_chat_tasks(engine, bucket_mgr, *, max_jobs=None):
     if engine.daily_chat_memory_mode == 'off':
         return {'status': 'disabled', 'reason': 'memory_policy_off'}
     prompt, prompt_context = engine._memory_l1_prompt('ombre.chat_memory_prepare_prompt')
-    if not prompt.strip():
+    if not prompt.strip() and not tasks_v2_enabled(engine.config):
         return {'status': 'disabled', 'reason': 'prompt_disabled'}
     route = engine._memory_task_route('chat_l1')
     client, model, use_daily = route['client'], route['model'], route['connection'] == 'daily'
-    if not route['configured']:
+    if not route['configured'] and not tasks_v2_enabled(engine.config):
         return {'status': 'not_prepared', 'reason': route['unavailable_reason']}
     engine._chat_preparation_running = True
     tasks = ChatMemoryPreparation(engine.memory_authority_store)
@@ -278,6 +292,15 @@ async def prepare_chat_tasks(engine, bucket_mgr, *, max_jobs=None):
                 envelope = claimed['envelope']
                 from chat_memory_tool import chat_evidence_sources
                 sources = chat_evidence_sources(envelope['context'], profile_id=engine.memory_semantic_profile_id)
+                if claimed.get('generation_protocol') == 'whole_window_v2':
+                    result = await _prepare_v2_chat(engine, bucket_mgr, tasks, claimed, sources,
+                                                    force=pending.get('manual_generation_retry', False))
+                    tasks.finish(claimed, phase='failed' if result['adoption_issues'] else 'prepared',
+                        candidate_ids=result['candidate_ids'], issue=(result['adoption_issues'] or [None])[0])
+                    results.append(tasks.receipt(memory_id))
+                    continue
+                if not prompt.strip():
+                    raise L1OwnerError('prompt_disabled', field_path='generation')
                 snapshots, bindings = bind_sources(sources, config=engine.config)
                 for source, snapshot in zip(sources, snapshots):
                     source['_participant_revision'] = snapshot['source_revision']
@@ -418,3 +441,35 @@ async def prepare_chat_tasks(engine, bucket_mgr, *, max_jobs=None):
         return {'status': 'completed', 'results': results}
     finally:
         engine._chat_preparation_running = False
+
+
+def tasks_v2_enabled(config):
+    from memory_l1_v2_generation import enabled
+
+    return enabled(config)
+
+
+async def _prepare_v2_chat(engine, bucket_mgr, tasks, claimed, sources, *, force):
+    from memory_l1_ingestion import bind_sources
+    from memory_l1_v2_generation import generate
+    from memory_l1_v2_sources import draft_source
+
+    draft = claimed['envelope']['arguments']['narrative']
+    memory_id, draft_revision = claimed['task_id'], claimed['draft_revision']
+    primary = draft_source(claimed, engine.config)
+    reader = engine._memory_l1_sources()
+    readable = []
+    if sources:
+        snapshots, bindings = bind_sources(sources, config=engine.config)
+        for source, snapshot, binding in zip(sources, snapshots, bindings, strict=True):
+            reader.retain_copy(snapshot)
+            if (await reader.locate(binding, verify_only=True))['eligible_source']:
+                readable.append(source)
+    return await generate(engine, bucket_mgr, origin='chat_l1', task_id=memory_id + ':' + str(draft_revision),
+        source_type='chat_tool', mode=engine.daily_chat_memory_mode, sources=[primary, *readable],
+        context={'agent_draft': {'source_ref': 'm1', 'title': draft.get('title') or '',
+                                 'draft_revision': draft_revision}},
+        candidate_id=memory_id, force=force, allow_empty=False, required_source_ref='m1',
+        before_prepare=tasks.guard_claim(claimed), metadata={'tool_operation_id': claimed['operation_id'],
+            'chat_submission': {'operation_id': claimed['operation_id'], 'task_id': memory_id,
+                                'draft_revision': draft_revision}})
