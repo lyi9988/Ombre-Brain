@@ -411,8 +411,10 @@ class MemoryL1Runtime:
         commit_revision = row['revision'] + 1 if wants_accept else row['revision']
         key = 'l1-candidate:' + candidate_id + ':revision:' + str(commit_revision)
         prior_commit = self.memory_authority_store.get_commit_by_idempotency(key)
+        approved = owner
         if is_v2(semantic) and not prior_commit:
-            if not owner:
+            approved = owner or self.memory_authority_store.candidate_accepted_by_owner(candidate_id, row['revision'])
+            if not approved:
                 decision = self.memory_ingestion_policy.evaluate(MemoryProposal.from_mapping(proposal))
                 if decision.action != 'auto_accept':
                     pending_policy = PolicyDecision('queue_review', decision.reason_codes, decision.decision_policy,
@@ -473,7 +475,7 @@ class MemoryL1Runtime:
                 return {'id': candidate_id, 'status': 'linked', 'linked_memories': link['linked_memories']}
             if coverage['covered_statement_ids']:
                 raise L1OwnerError('summary_contains_already_adopted_statements', status=409, field_path='document.statements')
-            if coverage['status'] == 'overlap_review' and not owner:
+            if coverage['status'] == 'overlap_review' and not approved:
                 raise L1OwnerError('summary_source_overlap_requires_review', status=409, field_path='document.statements')
         if wants_accept:
             row = self.memory_authority_store.decide_candidate(candidate_id, action='accept', expected_revision=row['revision'],
@@ -499,8 +501,8 @@ class MemoryL1Runtime:
             decision_source = original['decision_source']
         else:
             body = proposal['proposed_body']
-            actor = 'owner' if owner else proposal['source_type']
-            decision_source = 'owner' if owner else 'auto'
+            actor = 'owner' if approved else proposal['source_type']
+            decision_source = 'owner' if approved else 'auto'
         committed = await service.commit.commit_memory(memory_id=candidate_id, bucket_id=candidate_id,
             expected_revision=0, body=body, metadata=metadata,
             source_refs=proposal['source_refs'], decision_source=decision_source,

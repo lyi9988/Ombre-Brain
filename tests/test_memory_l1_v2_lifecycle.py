@@ -112,6 +112,31 @@ def test_retained_v2_auto_candidate_returns_to_review_after_permission_removed(t
     assert authority.get_memory('waiting-auto') is None
 
 
+def test_v2_retry_honors_saved_owner_acceptance_when_auto_is_disallowed(tmp_path):
+    from reflection_engine import ReflectionEngine
+
+    config, authority, buckets, _, document, _ = setup_v2(tmp_path)
+    config['memory_authority'] = {'enabled': True}
+    engine = ReflectionEngine(config)
+    body, semantic = split_document(document)
+    proposal = MemoryProposal.from_mapping({'proposal_id': 'owner-accepted', 'source_type': 'daily_chat',
+        'proposed_body': body, 'source_status': 'verified', 'source_refs': ['test-source'],
+        'memory_type': 'project_state', 'metadata': {'memory_l1': semantic}})
+    row = authority.put_candidate(proposal, engine.memory_ingestion_policy.evaluate(proposal))
+    row = authority.decide_candidate(row['candidate_id'], action='accept', expected_revision=row['revision'],
+        request_id='owner-accept', actor='owner')
+
+    class Reader:
+        async def locate(self, binding):
+            return {'state': 'available', 'eligible_source': True}
+
+    engine._memory_l1_sources = lambda: Reader()
+    result = asyncio.run(engine._memory_l1_adopt_candidate(row, buckets, request_id='recover'))
+    assert result['status'] == 'created'
+    commit = authority.get_commit_by_idempotency('l1-candidate:owner-accepted:revision:2')
+    assert commit['payload']['decision_source'] == 'owner'
+
+
 def test_v2_owner_candidate_edit_keeps_source_and_updates_type(tmp_path):
     _, authority, _, service, document, _ = setup_v2(tmp_path)
     body, semantic = split_document(document)

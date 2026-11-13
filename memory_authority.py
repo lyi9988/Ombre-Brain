@@ -6,6 +6,8 @@ SQLite transaction boundaries that surround file-backed Bucket commits.
 """
 from __future__ import annotations
 
+from contextlib import closing
+
 import hashlib
 import json
 import os
@@ -549,6 +551,12 @@ class MemoryAuthorityStore:
         finally:
             conn.close()
 
+    def candidate_accepted_by_owner(self, candidate_id: str, revision: int) -> bool:
+        with closing(self._connect()) as conn:
+            return bool(conn.execute("SELECT 1 FROM candidate_decisions WHERE candidate_id=? "
+                "AND candidate_revision=? AND to_status='accepted' AND actor='owner' LIMIT 1",
+                (candidate_id, revision)).fetchone())
+
     @staticmethod
     def _index_candidate_sources(conn, proposal: dict) -> None:
         """Derived references only, in the same transaction as the proposal.
@@ -767,8 +775,11 @@ class MemoryAuthorityStore:
             linked = []
             if action == 'return_to_review':
                 if (policy is None or actor != 'policy' or current['status'] != 'accepted' or conn.execute(
-                        "SELECT 1 FROM commit_log WHERE idempotency_key=? LIMIT 1",
-                        (f"l1-candidate:{candidate_id}:revision:{expected_revision}",)).fetchone()):
+                        "SELECT 1 FROM commit_log WHERE idempotency_key=? "
+                        "UNION ALL SELECT 1 FROM candidate_decisions WHERE candidate_id=? "
+                        "AND candidate_revision=? AND to_status='accepted' AND actor='owner' LIMIT 1",
+                        (f"l1-candidate:{candidate_id}:revision:{expected_revision}",
+                         candidate_id, expected_revision)).fetchone()):
                     raise InvalidTransition('policy_review_requires_unstarted_commit')
                 allowed = allowed | {'pending'}
             if target == "linked" and current["status"] != "linked":
