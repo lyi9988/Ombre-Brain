@@ -46,6 +46,10 @@ _GATEWAY_SOURCES = frozenset(
     | set(FIXED_PROMPT_SOURCES)
     | set(OWNER_AUTHORED_PROMPT_SOURCES)
 )
+_L1_V2_PROMPT_SCOPES = {
+    'ombre.memory_l1_v2_generation_prompt': 'memory.l1_v2_generation',
+    'ombre.memory_l1_v2_revision_prompt': 'memory.reflection',
+}
 
 
 class PromptPlanMirrorError(RuntimeError):
@@ -114,6 +118,8 @@ def normalize_gateway_slice(value: Any) -> dict:
                 f"blocks[{index}] is not a Gateway source")
         if internal_spec is not None and str(raw.get("scope") or "") != internal_spec.scope:
             raise PromptPlanMirrorValidationError("internal source cannot enter main chat scope")
+        if source_id in _L1_V2_PROMPT_SCOPES and raw.get('scope') != _L1_V2_PROMPT_SCOPES[source_id]:
+            raise PromptPlanMirrorValidationError('memory L1 prompt scope mismatch')
         if block_id in seen:
             raise PromptPlanMirrorValidationError("block_id must be unique")
         seen.add(block_id)
