@@ -85,6 +85,20 @@ def test_provider_failure_preserves_actual_input_without_exception_secret(tmp_pa
     assert secret not in json.dumps([record, receipt, result])
 
 
+def test_wrapped_litellm_rejection_keeps_safe_trace_and_provider_code():
+    from memory_model_io import model_error_details
+
+    trace = 'trace_9db4cbdd-44c0-442c-9b5a-3575a7c917eb'
+    body = {'error': {'code': 'LITELLM_ERROR', 'traceId': trace, 'message': 'private provider details'}}
+    response = httpx.Response(400, request=httpx.Request('POST', 'https://example.test/v1'), json=body)
+    error = BadRequestError('private provider details', response=response, body=body)
+    details = model_error_details(error)
+    assert details['http_status'] == 400
+    assert details['provider_code'] == 'LITELLM_ERROR'
+    assert details['provider_trace_id'] == trace
+    assert 'private provider details' not in json.dumps(details)
+
+
 @pytest.mark.parametrize('finish', ['stop', 'length'])
 def test_l2_actual_wire_and_unmodified_visible_json_survive_success_or_length(tmp_path, finish):
     from test_memory_l2_p4 import setup as setup_l2

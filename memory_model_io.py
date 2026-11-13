@@ -54,6 +54,16 @@ def model_error_details(error):
         status = getattr(getattr(error, 'response', None), 'status_code', None)
     if type(status) is int and 100 <= status <= 599:
         details['http_status'] = status
+        body = getattr(error, 'body', None)
+        provider = body.get('error', body) if isinstance(body, dict) else {}
+        if isinstance(provider, dict):
+            provider_code = provider.get('code')
+            if (type(provider_code) is str and re.fullmatch(r'[A-Z][A-Z0-9_]{2,79}', provider_code)
+                    and provider_code != code):
+                details['provider_code'] = provider_code
+            trace = provider.get('traceId')
+            if type(trace) is str and re.fullmatch(r'trace_[0-9a-fA-F-]{16,50}', trace):
+                details['provider_trace_id'] = trace
     return details
 
 
