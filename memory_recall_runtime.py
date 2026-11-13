@@ -2,15 +2,16 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+import re
 import time
 
 import httpx
 
-from memory_recall_semantics import (apply_relations, known, lexical_features, resolve_document,
+from memory_recall_semantics import (apply_relations, interval, known, lexical_features, resolve_document,
                                      score_document, temporal_features, statement_context)
 from memory_system_config import REQUEST_CONFIGURATION, values_from_config
 from memory_inner_affinity import (build_inner_context, document_inner_affinity, local_inner_candidates)
@@ -37,6 +38,47 @@ def authority_stamp(service):
         return None
 
 
+def l1_v2_lexical_features(query, document):
+    from memory_l1_v2 import TOPICS
+
+    query = str(query or "").casefold()
+
+    def matches(values):
+        for value in values:
+            if not value:
+                continue
+            term = value.casefold()
+            if term.isascii():
+                if re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", query):
+                    return 1.0
+            elif term in query:
+                return 1.0
+        return 0.0
+
+    topics = []
+    for code in (document.get("primary_topic"), document.get("secondary_topic")):
+        if code and code in TOPICS:
+            topic = TOPICS[code]
+            topics.extend((code, topic["name"], *topic.get("aliases", [])))
+    return {
+        "title_match": matches([document.get("title")]),
+        "keyword_match": matches(document.get("keywords") or []),
+        "entity_match": matches(value for person in document.get("people") or []
+                                for value in [person.get("name"), *(person.get("aliases") or [])]),
+        "topic_match": matches(topics),
+    }
+
+
+def l1_v2_event_matches_day(document, target):
+    event = document.get("event_time") or {}
+    # Year/month-only evidence cannot locate an event on a particular day.
+    if not target or event.get("precision") not in {"day", "minute", "second"}:
+        return False
+    start = interval({"state": "known", "value": event.get("start")}, target.tzinfo)
+    end = interval({"state": "known", "value": event.get("end")}, target.tzinfo) or start
+    return bool(start and start[0] < target + timedelta(days=1) and end[1] > target)
+
+
 async def snapshot_sources_current(service, entry, request):
     """Cached prose cannot outlive the source qualification that produced it."""
     guard = entry.get("memory_guard")
@@ -57,7 +99,13 @@ async def snapshot_sources_current(service, entry, request):
            or metadata[bid].get("memory_id") != old["memory_id"]
            or metadata[bid].get("body_sha256") != old["body_sha256"]
            or metadata[bid].get('dependency_token') != old.get('dependency_token')
+           or metadata[bid].get('semantic_sha256') != old.get('semantic_sha256')
            for bid, old in guard["records"].items()):
+        return False
+    if any(old.get("semantic_sha256") and (
+            records.get(bid, {}).get("state") != "l1_v2"
+            or records[bid].get("semantic_sha256") != old["semantic_sha256"])
+            for bid, old in guard["records"].items()):
         return False
     sub = {"_semantic_records": records, "_deadline": deadline(service, request),
            "recall_io": request.setdefault("recall_io", {}), "_chain_projection": True}
@@ -94,7 +142,8 @@ def snapshot_guard(service, request, *, complete):
         if not row:
             complete = False
             continue
-        records[bid] = {key: row.get(key) for key in ("memory_id", "revision", "body_sha256", 'dependency_token')}
+        records[bid] = {key: row.get(key) for key in
+                        ("memory_id", "revision", "body_sha256", "dependency_token", "semantic_sha256")}
         records[bid]['narrative_allowed'] = request.get('usage_by_bucket', {}).get(bid, {}).get('narrative_allowed', True)
         records[bid]["statement_uses"] = {use["statement_id"]: use["usage"] for use in
             request.get("usage_by_bucket", {}).get(bid, {}).get("items", [])}
@@ -299,6 +348,35 @@ def score_pool(service, request, query, pool, *, after_rerank=False):
         semantic = item.get("semantic_score")
         if request.get("local_only") or request.get("allow_semantic") is False:
             semantic = None
+        if record.get("state") == "l1_v2":
+            calculation = {
+                "state": "computed",
+                "score": base,
+                "reason_codes": ["card_time_policy_pending"],
+                "window_score": None,
+                "card_features": {
+                    "kind": document["kind"],
+                    "stability": document["stability"],
+                    "event_time": {key: value for key, value in (document.get("event_time") or {}).items()
+                                   if key in {"start", "end", "precision"}} or None,
+                    "query_purpose": use_context.get("purpose"),
+                    "target_time": (use_context["target_time"].isoformat()
+                                    if use_context.get("target_time") else None),
+                    "event_date_match": bool(item.get("l1_v2_event_date_match")),
+                    "keyword_score": item.get("keyword_score"),
+                    "semantic_score": semantic,
+                    "rerank_score": item.get("rerank_score"),
+                    "lexical": item.get("l1_local_match") or l1_v2_lexical_features(query, document),
+                },
+                "inner_state_affinity": {"state": "unknown", "reason": "card_affect_evidence_unavailable"},
+            }
+            item["_configured_score"] = calculation
+            if not after_rerank:
+                item["_configured_score_before_rerank"] = calculation
+            else:
+                item["combined_score"] = base
+            item["score"] = base
+            continue
         calculation = score_document(document, settings, use_context, {
             "relevance": base, "keyword_score": item.get("keyword_score"),
             "semantic_score": semantic, "rerank_score": item.get("rerank_score"),
@@ -489,7 +567,7 @@ async def verify_sources(service, request, query, items, *, refresh=False):
         bid = str(item["bucket"]["id"])
         record = records.get(bid) or {}
         document = record.get("document")
-        if record.get("state") == "l1" and document:
+        if record.get("state") in {"l1", "l1_v2"} and document:
             referenced = semantic_source_refs(document)
             bindings = [binding["binding_id"] for binding in document.get("evidence_bindings", [])
                         if not referenced or binding["binding_id"] in referenced]
@@ -559,7 +637,7 @@ async def verify_sources(service, request, query, items, *, refresh=False):
         bid = str(item["bucket"]["id"])
         usage_by_bucket[bid] = {"state": "excluded", "items": [], "narrative_allowed": False}
         record = records.get(bid)
-        if record and record.get("state") not in {"legacy", "l1"}:
+        if record and record.get("state") not in {"legacy", "l1", "l1_v2"}:
             item["admission_reason"] = "l1_" + record["state"]
             request.setdefault("incomplete_reasons", []).append(item["admission_reason"])
             continue
@@ -585,6 +663,25 @@ async def verify_sources(service, request, query, items, *, refresh=False):
         source_states = {key: "available" if value.get("eligible_source") is True
                          else "revoked" if value.get("state") in {"withdrawn", "revoked"}
                          else "unavailable" for key, value in statuses.items()}
+        if record["state"] == "l1_v2":
+            dates = request.get("_l1_v2_required_event_days") or []
+            if dates and not any(l1_v2_event_matches_day(document, target) for target in dates):
+                item["admission_reason"] = "l1_v2_event_date_mismatch"
+                continue
+            bindings = bindings_by_bucket.get(bid) or []
+            if not bindings or set(bindings) != semantic_source_refs(document):
+                item["admission_reason"] = "l1_v2_source_bindings_invalid"
+                continue
+            if (check or {}).get("sync_scope") or record.get("sync_scope"):
+                item["admission_reason"] = "l1_sync_required"
+                continue
+            if not all(source_states.get(key) == "available" for key in bindings):
+                item["admission_reason"] = "l0_source_not_eligible"
+                continue
+            usage_by_bucket[bid] = {"state": "l1_v2", "items": [], "narrative_allowed": True,
+                                    "record": record, "source_states": source_states}
+            result.append(item)
+            continue
         item_context = {**use_context, "purpose": "history"} if record.get("historical") else use_context
         uses = resolve_document(document, item_context, settings["time_profiles"], source_states=source_states)
         allowed = [use for use in uses if use["usage"] != "excluded"]
@@ -1246,7 +1343,13 @@ async def _project_sections(service, request, query, buckets, sections):
     else:
         reader = getattr(view, "memory_l1_recall_map", None)
         if callable(reader):
-            request["_semantic_records"].update(reader([b["id"] for b in valid]))
+            current = reader([b["id"] for b in valid])
+            for bucket in valid:
+                bid = str(bucket["id"])
+                if bid in current:
+                    request["_semantic_records"][bid] = current[bid]
+                elif getattr(view, "enabled", False):
+                    request["_semantic_records"][bid] = {"state": "semantic_unavailable"}
     candidates = [{"bucket": bucket, "score": 0.0} for bucket in valid]
     final_check = request.setdefault("recall_io", {}).setdefault(
         "final_source_recheck", {"passes": 0, "calls": 0, "duration_ms": 0})
@@ -1279,7 +1382,13 @@ async def _project_sections(service, request, query, buckets, sections):
     for bid, key in planned_section.items():
         usage = uses[bid]
         record = records.get(bid) or {}
-        if key == "targeted":
+        if usage["state"] == "l1_v2":
+            trace_by_bucket[bid] = {
+                "bucket_id": bid, "memory_id": record["memory_id"],
+                "l1_revision": record["revision"], "presentation_revision": None,
+                "source": "l1_v2", "resolver_state": None, "fallback_reason": None,
+            }
+        elif key == "targeted":
             trace_by_bucket[bid] = {
                 "bucket_id": bid, "memory_id": record.get("memory_id"),
                 "l1_revision": record.get("revision"), "presentation_revision": None,
@@ -1369,7 +1478,20 @@ async def _project_sections(service, request, query, buckets, sections):
                 if uses[bid]['state'] == 'legacy' and callable(comments_reader):
                     original = comments_reader(bucket)
                 presentation = presentations.get(bid)
-                if presentation:
+                if uses[bid]["state"] == "l1_v2":
+                    from memory_readable_projection import fit_units
+
+                    text = fit_units([original], remaining, wrap=lambda narrative:
+                        service._resolve_gateway_fixed_prompt("ombre.memory_usage_card_prompt",
+                            runtime_values={"header": "", "statements": "", "narrative": narrative}))
+                    if text.count(original) != 1:
+                        text = ""
+                    if text:
+                        row["body_sha256"] = hashlib.sha256(original.encode()).hexdigest()
+                        row["body_chars"] = len(original)
+                    else:
+                        row.update(source="none", render_reason="l1_v2_body_not_adopted")
+                elif presentation:
                     text, render_reason, selected_unit_ids, partial_presentation = render_presentation(
                         service, uses[bid], header, presentation, remaining, trace=row,
                     )
@@ -1432,8 +1554,11 @@ async def _project_sections(service, request, query, buckets, sections):
                     else:
                         row["source"] = "none"
                         row.setdefault("render_reason", "usage_card_prompt_unavailable")
-                text, main_text, support_spans = _relation_render_support(service, request, query,
-                    bid, text, original, remaining, row)
+                if uses[bid]["state"] == "l1_v2":
+                    main_text, support_spans = (original if text else ""), []
+                else:
+                    text, main_text, support_spans = _relation_render_support(service, request, query,
+                        bid, text, original, remaining, row)
                 if text:
                     parts.append(text)
                     if main_text:

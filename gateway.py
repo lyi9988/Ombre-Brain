@@ -73,6 +73,7 @@ from memory_system_config import (
 from canonical_continuation import CanonicalContinuationAdapter, ContinuationBatch
 import memory_recall_runtime as memory_use
 from memory_retrieval_text import l1_retrieval_text
+from memory_l1_v2 import SCHEMA_VERSION as L1_V2_SCHEMA_VERSION, retrieval_text as l1_v2_retrieval_text
 from dehydrator import Dehydrator
 from dream_engine import DreamEngine
 from embedding_engine import EmbeddingEngine
@@ -5167,6 +5168,7 @@ class GatewayService:
                 mark_step("just_now_context", stage_started_at)
             elif date_recall_requested:
                 query_planner_debug["skip_reason"] = "date_recall"
+                natural_input["date_recall_requested"] = True
                 stage_started_at = time.perf_counter()
                 date_recall, date_recall_debug, date_recall_bucket_ids = self._build_date_recall_context(
                     current_user_query,
@@ -12368,6 +12370,7 @@ class GatewayService:
         core_buckets = [
             bucket for bucket in all_buckets
             if not self._is_self_anchor_recall_excluded_bucket(bucket)
+            and not self._bucket_has_l1_v2_marker(bucket)
             and (bucket.get("metadata", {}).get("pinned") or bucket.get("metadata", {}).get("protected"))
         ]
         core_buckets.sort(
@@ -12798,8 +12801,15 @@ class GatewayService:
         topic_terms: list[str],
     ) -> list[dict]:
         selected = []
+        view = getattr(self, "memory_authority_view", None)
+        reader = getattr(view, "memory_index_metadata_map", None)
+        authority = reader([bucket["id"] for bucket in all_buckets
+                            if isinstance(bucket, dict) and bucket.get("id")]) if callable(reader) else {}
         for bucket in all_buckets or []:
             if not isinstance(bucket, dict) or self._is_self_anchor_recall_excluded_bucket(bucket):
+                continue
+            if (self._bucket_has_l1_v2_marker(bucket)
+                    or authority.get(bucket.get("id"), {}).get("l1_schema_version") == L1_V2_SCHEMA_VERSION):
                 continue
             if not can_bucket_be_recent_context(bucket, explicit_lookup=True):
                 continue
@@ -12813,6 +12823,10 @@ class GatewayService:
             selected.append(bucket)
         selected.sort(key=self._date_recall_bucket_sort_key, reverse=True)
         return selected
+
+    @staticmethod
+    def _bucket_has_l1_v2_marker(bucket: dict) -> bool:
+        return (bucket.get("metadata") or {}).get("memory_l1_schema_version") == L1_V2_SCHEMA_VERSION
 
     def _format_date_recall_turn_lines(self, turn: dict[str, Any]) -> list[str]:
         created = self._format_conversation_turn_time(turn.get("created_at"))
@@ -13380,7 +13394,7 @@ class GatewayService:
         recent_ids = self.state_store.get_recent_bucket_ids(session_id, self.skip_recent_rounds)
         candidates = []
         for bucket in all_buckets:
-            if self._is_self_anchor_recall_excluded_bucket(bucket):
+            if self._is_self_anchor_recall_excluded_bucket(bucket) or self._bucket_has_l1_v2_marker(bucket):
                 continue
             meta = bucket.get("metadata", {})
             tags = [str(tag) for tag in meta.get("tags", [])]
@@ -17936,7 +17950,8 @@ class GatewayService:
             if (bid in eligible_ids and hit.get("index_status") == "verified"
                     and old.get("memory_id") and old.get("body_sha256")
                     and all(old.get(key) == new.get(key)
-                            for key in ("memory_id", "revision", "body_sha256"))):
+                            for key in ("memory_id", "revision", "body_sha256", "text_projection_version",
+                                        "semantic_sha256", "dependency_token"))):
                 retained[bid] = dict(hit)
         recall_input["semantic_hits"] = retained
         return {bid: self._clamp(hit["score"]) for bid, hit in retained.items()}
@@ -18004,6 +18019,26 @@ class GatewayService:
             valid.append(bucket)
         self._add_timing_ms(timings, "natural.authority_validation", validation_started)
         memory_use.prepare(self, recall_input, query, valid)
+        date_context = recall_input.get("_use_context") or {}
+        date_parts = date_context.get("query_part_contexts") or []
+        date_targets = [part["target_time"] for part in date_parts if part.get("target_time")]
+        if date_context.get("target_time"):
+            date_targets.append(date_context["target_time"])
+        require_event_day = bool(recall_input.get("date_recall_requested") and date_targets
+                                 and (not date_parts or all(part.get("target_time") for part in date_parts)))
+        if require_event_day:
+            records = recall_input["_semantic_records"]
+            valid = [bucket for bucket in valid
+                     if records.get(str(bucket["id"]), {}).get("state") != "l1_v2"
+                     or any(memory_use.l1_v2_event_matches_day(records[str(bucket["id"])]["document"], target)
+                            for target in date_targets)]
+            eligible_ids = {str(bucket["id"]) for bucket in valid}
+            recall_input["_semantic_records"] = {bid: row for bid, row in records.items() if bid in eligible_ids}
+            recall_input["_semantic_buckets"] = {bid: bucket for bid, bucket in recall_input["_semantic_buckets"].items()
+                                                   if bid in eligible_ids}
+            recall_input["_l1_v2_required_event_days"] = date_targets
+        else:
+            recall_input.pop("_l1_v2_required_event_days", None)
         # Keep the last *complete* candidate pool before the remote reranker.
         # A deadline must not discard finished Planner/moment work and then
         # rescan the whole library. Reuse is confined to this request and only
@@ -18189,7 +18224,10 @@ class GatewayService:
         for item in pool:
             bid = str(item['bucket']['id'])
             record = recall_input.get('_semantic_records', {}).get(bid) or {}
-            if record.get('state') == 'l1' and record.get('document'):
+            if record.get("state") == "l1_v2":
+                documents[bid] = l1_v2_retrieval_text(
+                    item["bucket"]["content"], record["document"])
+            elif record.get('state') == 'l1' and record.get('document'):
                 moment = item.get('matched_moment') or {}
                 documents[bid] = l1_retrieval_text(record['document'],
                     body=(moment.get('text') or moment.get('content')) if moment else item['bucket'].get('content') or '')
@@ -18261,9 +18299,13 @@ class GatewayService:
                                 or any((item.get("l1_local_match") or {}).values()))
             local_admit = local_threshold is not None and local_signal and item["score"] >= local_threshold
             correction = bool(item.get("matched_correction_background"))
-            admit = bool(hard or local_admit or correction or (rerank is not None and self._safe_float(rerank, 0) >= rerank_threshold)
+            date_match = item.get("l1_v2_exact_date_evidence")
+            admit = bool(hard or date_match or local_admit or correction or (rerank is not None and self._safe_float(rerank, 0) >= rerank_threshold)
                          or (rerank is None and semantic_verified and semantic >= semantic_threshold))
-            item["admission_reason"] = "verified_local_evidence" if hard else "configured_local_score" if local_admit else "matched_correction_background" if correction else "strong_rerank" if admit and rerank is not None else "strong_semantic" if admit else "insufficient_contextual_relevance"
+            item["admission_reason"] = ("verified_local_evidence" if hard else "verified_card_event_date" if date_match
+                                        else "configured_local_score" if local_admit else "matched_correction_background" if correction
+                                        else "strong_rerank" if admit and rerank is not None else "strong_semantic" if admit
+                                        else "insufficient_contextual_relevance")
             item["evidence_labels"] = labels
             item["hard_evidence_labels"] = self._hard_bucket_evidence_labels(labels)
             item["identity_evidence_status"] = (
@@ -21601,6 +21643,7 @@ class GatewayService:
             and not str(search_query or "").strip()
             and not allow_raw_semantic_for_auto_vague
             and not named_exact_anchor_match
+            and not (natural_input or {}).get("date_recall_requested")
         ):
             return [], []
 
@@ -21732,11 +21775,45 @@ class GatewayService:
             normalized_query = self._normalized_recall_query(raw_query)
         stage_started_at = time.perf_counter()
         keyword_scores = self._get_keyword_candidates(normalized_query, eligible) if normalized_query else {}
+        semantic_records = (natural_input or {}).get("_semantic_records") or {}
+        v2_documents = {bid: row["document"] for bid, row in semantic_records.items()
+                        if bid in eligible_map and row.get("state") == "l1_v2"}
+        card_lexical = {}
+        card_date_matches, card_date_evidence = set(), set()
+        if v2_documents:
+            weights = memory_use.values(self)["recall"]["local_match_weights"]
+            temporal = natural_input.get("_use_context") or {}
+            date_scoped = natural_input.get("date_recall_requested")
+
+            def merge_card_matches(text, scores, target=None):
+                date_topic = self._strip_date_recall_query_shell(text) if target else None
+                for bid, document in v2_documents.items():
+                    features = memory_use.l1_v2_lexical_features(text, document)
+                    strength = max(value * weights["keyword_match" if key == "title_match" else key]
+                                   for key, value in features.items())
+                    if memory_use.l1_v2_event_matches_day(document, target):
+                        card_date_matches.add(bid)
+                        if not date_topic or features["title_match"] or features["keyword_match"]:
+                            card_date_evidence.add(bid)
+                        strength = max(strength, weights["keyword_match"])
+                    if strength > 0:
+                        scores[bid] = max(scores.get(bid, 0.0), strength)
+                        merged = card_lexical.setdefault(bid, {})
+                        merged.update({key: value for key, value in features.items() if value})
+                return dict(sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:self.dynamic_top_k])
+
+            keyword_scores = merge_card_matches(normalized_query, keyword_scores,
+                temporal.get("target_time") if date_scoped else None)
         parts = (natural_input or {}).get("_query_parts") or []
         if len(parts) > 1:
             keyword_views = []
-            for part in parts:
+            part_contexts = (natural_input.get("_use_context") or {}).get("query_part_contexts") or []
+            for index, part in enumerate(parts):
                 scores = self._get_keyword_candidates(part, eligible)
+                if v2_documents:
+                    target = (part_contexts[index].get("target_time")
+                              if date_scoped and index < len(part_contexts) else None)
+                    scores = merge_card_matches(part, scores, target)
                 ranked = sorted(scores, key=lambda bid: (-scores[bid], bid))
                 keyword_views.append({bid: rank for rank, bid in enumerate(ranked, 1)})
                 for bid, score in scores.items():
@@ -21944,8 +22021,11 @@ class GatewayService:
             if not bucket:
                 continue
             meta = bucket.get("metadata", {})
-            freshness_score = self._clamp(self.bucket_mgr._calc_time_score(meta))
-            importance_score = self._clamp(float(meta.get("importance", 5)) / 10.0)
+            if bucket_id in v2_documents:
+                freshness_score = importance_score = None
+            else:
+                freshness_score = self._clamp(self.bucket_mgr._calc_time_score(meta))
+                importance_score = self._clamp(float(meta.get("importance", 5)) / 10.0)
             semantic_score = self._clamp(semantic_scores.get(bucket_id, 0.0))
             keyword_score = self._clamp(keyword_scores.get(bucket_id, 0.0))
             exact_score = self._clamp(exact_scores.get(bucket_id, 0.0))
@@ -22029,7 +22109,7 @@ class GatewayService:
             cooldown_penalty = 0.0
             if self.recall_fusion_mode == "dynamic":
                 fusion_score = self._clamp((alpha * vector_norm + (1.0 - alpha) * keyword_norm) * relevance_score)
-                metadata_adjustment = round(0.02 * importance_score + 0.02 * freshness_score, 4)
+                metadata_adjustment = round(0.02 * (importance_score or 0.0) + 0.02 * (freshness_score or 0.0), 4)
                 cooldown_penalty = round((1.0 - self._clamp(cooldown_multiplier)) * 0.03, 4)
                 final_score = round(
                     self._clamp(
@@ -22046,8 +22126,8 @@ class GatewayService:
                     + keyword_score * self.keyword_weight
                     + word_map_adjustment
                     + entity_edge_score * 0.08
-                    + importance_score * self.importance_weight
-                    + freshness_score * self.freshness_weight
+                    + (importance_score or 0.0) * self.importance_weight
+                    + (freshness_score or 0.0) * self.freshness_weight
                 ) * relevance_score
                 final_score = round(fusion_score * cooldown_multiplier, 4)
             if entity_edge_score > 0:
@@ -22055,6 +22135,7 @@ class GatewayService:
             if (
                 planner_lexical_direct_match
                 or exact_match
+                or bucket_id in card_date_evidence
                 or dynamic_anchor.get("short_cjk_identity_title_match")
                 or dynamic_anchor.get("distinctive_anchor_match")
                 or dynamic_anchor.get("category_overview_item")
@@ -22066,6 +22147,10 @@ class GatewayService:
                     "score": final_score,
                     "semantic_score": semantic_score,
                     "keyword_score": keyword_score,
+                    **({"l1_local_match": card_lexical[bucket_id]} if bucket_id in card_lexical else {}),
+                    **({"l1_v2_event_date_match": True,
+                        "l1_v2_exact_date_evidence": bucket_id in card_date_evidence}
+                       if bucket_id in card_date_matches else {}),
                     "exact_anchor_score": exact_score,
                     "exact_anchor_match": exact_match,
                     "exact_anchor_terms": list((exact_debug.get(bucket_id) or {}).get("terms") or []),
@@ -24910,6 +24995,8 @@ class GatewayService:
                 logger.warning("Dream source bucket read failed | bucket=%s error=%s", bucket_id, exc)
                 bucket = None
             if not bucket:
+                continue
+            if self._bucket_has_l1_v2_marker(bucket):
                 continue
             summary = await self._summarize_bucket(bucket)
             line = f"- [bucket_id:{bucket_id}] {self._clip_text(summary, 260)}"

@@ -10,6 +10,7 @@ from typing import Any, Iterable
 import yaml
 
 from memory_authority import normalize_alias
+from memory_l1_v2 import SCHEMA_VERSION as L1_V2_SCHEMA_VERSION, TEXT_PROJECTION_VERSION as L1_V2_TEXT_VERSION
 
 
 class MemoryAuthorityRecallView:
@@ -462,7 +463,8 @@ class MemoryAuthorityRecallView:
                 placeholders = ",".join("?" for _ in chunk)
                 rows.extend(conn.execute(
                     "SELECT m.memory_id,COALESCE(NULLIF(m.bucket_id,''),m.memory_id),"
-                    "m.active_revision,COALESCE(r.body_sha256,''),json_extract(r.metadata_json,'$.memory_l1.schema_version') "
+                    "m.active_revision,COALESCE(r.body_sha256,''),json_extract(r.metadata_json,'$.memory_l1.schema_version'),"
+                    "json_extract(r.metadata_json,'$.memory_l1_semantic_sha256') "
                     "FROM memories AS m LEFT JOIN memory_revisions AS r "
                     "ON r.memory_id=m.memory_id AND r.revision=m.active_revision "
                     "WHERE m.state='active' AND m.recall_policy='enabled' "
@@ -500,7 +502,12 @@ class MemoryAuthorityRecallView:
                 "body_sha256": str(row[3] or ""),
                 'dependency_token': dependency_versions.get(str(row[0])),
             }
-            if row[4]:
+            if row[4] == L1_V2_SCHEMA_VERSION:
+                result[bucket_id].update(
+                    l1_schema_version=row[4], semantic_sha256=row[5],
+                    text_projection_version=L1_V2_TEXT_VERSION,
+                )
+            elif row[4]:
                 from memory_retrieval_text import TEXT_PROJECTION_VERSION
                 result[bucket_id]['text_projection_version'] = TEXT_PROJECTION_VERSION
         return result
@@ -539,6 +546,8 @@ database during chat. Source readability is verified separately, per binding.
                         semantic = json.loads(raw)
                         if semantic_sha256(semantic) != semantic_sha:
                             row["state"] = "semantic_mismatch"
+                        elif semantic.get("schema_version") == L1_V2_SCHEMA_VERSION:
+                            row.update(document=semantic, state="l1_v2", semantic_sha256=semantic_sha)
                         else:
                             row.update(document=semantic, state="l1")
                             entry = semantic.get("entry") or {}
