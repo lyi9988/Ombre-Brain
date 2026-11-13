@@ -15,7 +15,7 @@ import time
 import asyncio
 import threading
 import uuid
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from copy import copy, deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -4231,7 +4231,11 @@ class GatewayService:
         cached = self._bucket_list_cache.get(key)
         ledger_path = getattr(getattr(self.bucket_mgr, 'activation_ledger', None), 'path', '')
         activation_stamp = self._path_stamp(ledger_path) if ledger_path else None
-        if ttl > 0 and cached and cached.get('activation_stamp') == activation_stamp and now < float(cached.get("expires_at", 0.0)):
+        l1_heads = getattr(getattr(self, "memory_authority_view", None), "l1_v2_head_stamp", None)
+        v2_stamp = l1_heads() if callable(l1_heads) else ()
+        if (ttl > 0 and cached and cached.get('activation_stamp') == activation_stamp
+                and cached.get('v2_stamp') == v2_stamp and v2_stamp is not None
+                and now < float(cached.get("expires_at", 0.0))):
             return cached["buckets"]
 
         buckets = await self.bucket_mgr.list_all(include_archive=include_archive)
@@ -4241,6 +4245,7 @@ class GatewayService:
                 "expires_at": now + ttl,
                 "loaded_at": now,
                 "activation_stamp": activation_stamp,
+                "v2_stamp": v2_stamp,
             }
         return buckets
 
@@ -4852,12 +4857,15 @@ class GatewayService:
                 "base_recall_policy": self.recall_policy,
             })
         try:
-            with use_clock(request, enabled=scope == "chat") as clock, capture_carriers():
+            async with AsyncExitStack() as cleanup:
+                cleanup.enter_context(use_clock(request, enabled=scope == "chat"))
+                cleanup.enter_context(capture_carriers())
                 result = await self._prepare_payload_with_clock(
                     payload, session_id, include_favorite_memory=include_favorite_memory,
                     include_debug=include_debug, debug_detail=debug_detail,
                     continuation_phase=continuation_phase, prompt_plan=prompt_plan,
-                    request=request, snapshot_identity=snapshot_identity, autonomy_context=autonomy_context)
+                    request=request, snapshot_identity=snapshot_identity, autonomy_context=autonomy_context,
+                    cleanup=cleanup)
                 if include_debug and len(result) == 3:
                     result[2]["time_context"] = clock_metadata(result[0].get("messages") or [])
                 return result
@@ -4878,6 +4886,7 @@ class GatewayService:
         request: Request | None = None,
         snapshot_identity: dict[str, Any] | None = None,
         autonomy_context: dict[str, Any] | None = None,
+        cleanup: AsyncExitStack,
     ) -> tuple[dict, list[str] | None] | tuple[dict, list[str] | None, dict[str, Any]]:
         self._maybe_reload_runtime_overlay()
         prepare_started_at = time.perf_counter()
@@ -5015,9 +5024,14 @@ class GatewayService:
         else:
             handoff_skip_reason = ""
         needs_handoff_first = bool(handoff_skip_reason)
+        diary_questions = []
+        if (not pure_clock and self.date_recall_enabled and autonomy_context is None
+                and getattr(self, "date_recall_budget", 0) > 0 and self._composer_live_date_enabled(prompt_plan)):
+            from private_diary_recall import queries as dated_diary_questions
+            diary_questions = dated_diary_questions(current_user_query, tz=getattr(self, "gateway_tz", timezone.utc))
         date_recall_requested = (
             not pure_clock and self.date_recall_enabled
-            and self._query_requests_date_recall(current_user_query)
+            and (bool(diary_questions) or self._query_requests_date_recall(current_user_query))
         )
         low_signal_auto_recall = self._auto_recall_low_signal_query(recall_query)
         mark_step("classify_request", stage_started_at)
@@ -5078,6 +5092,7 @@ class GatewayService:
         domain_sentinel_debug: dict[str, Any] = self._domain_sentinel_rule_plan(current_user_query)
         skip_broad_dynamic_recall = False
         date_persona_trace_requested = False
+        diary_task = None
 
         if is_new_user_turn:
             stage_started_at = time.perf_counter()
@@ -5175,6 +5190,20 @@ class GatewayService:
                     all_buckets,
                 )
                 mark_step("date_recall", stage_started_at)
+                if diary_questions:
+                    adapter = getattr(self, "canonical_adapter", None)
+                    conversation_id = self._trace_from_payload(payload).get("conversation_id")
+                    # Only the owner conversation and the existing explicitly
+                    # mapped bridge channel may read this private source.
+                    if (adapter and adapter.enabled and self._canonical_continuation_active(session_id)
+                            and (not conversation_id or conversation_id == adapter.conversation_id)):
+                        from private_diary_recall import read_all as read_dated_diary
+                        diary_task = asyncio.create_task(read_dated_diary(adapter, diary_questions,
+                            budget=min(self.date_recall_budget, self.inject_total_budget),
+                            timeout=memory_use.remaining(self, natural_input)))
+                        cleanup.push_async_callback(self._cancel_diary_read, diary_task)
+                    else:
+                        date_recall_debug["private_diary"] = [{"state": "unavailable", "reason": "diary_scope_unavailable"}]
             elif sentinel_skip_broad:
                 query_planner_debug["skip_reason"] = f"memory_sentinel_{sentinel_route}"
             elif domain_sentinel_skip_broad:
@@ -5591,6 +5620,20 @@ class GatewayService:
         stage_started_at = time.perf_counter()
         portrait_memory, portrait_memory_debug, portrait_guard = await self._chat_portrait_input(portrait_plan)
         mark_step("portrait_memory", stage_started_at)
+        dated_chat = date_recall
+        private_diary = ""
+        if diary_task is not None:
+            stage_started_at = time.perf_counter()
+            private_diary, diary_debug = await diary_task
+            date_recall_debug["private_diary"] = diary_debug
+            if private_diary:
+                # The two sources have separate budgets. For a diary question
+                # the adopted diary gets first use of the date carrier.
+                date_recall = private_diary
+                if dated_chat and count_tokens_approx(private_diary + "\n\n" + dated_chat) <= self.date_recall_budget:
+                    date_recall += "\n\n" + dated_chat
+            mark_step("private_diary_recall", stage_started_at)
+        stage_started_at = time.perf_counter()
         context_args = {
             "persona_block": persona_block,
             "core_memory": core_memory,
@@ -5704,6 +5747,26 @@ class GatewayService:
             retired_ids=(natural_input.get("projection_recovery") or {}).get("rejected_bucket_ids") or [])
         self._apply_prompt_cache_hints(forward_payload, session_id)
         forward_payload["stream"] = payload.get("stream") is True
+        diary_compiled_blocks = []
+        if private_diary:
+            from memory_delivery import payload_texts
+            diary_compiled_blocks = [block["content"] for block in memory_recall_projection.get("compiled_memory_blocks") or []
+                                     if block.get("source_id") == "ombre.date_recall" and private_diary in block["content"]]
+            diary_adopted = any(block in message for message in payload_texts(forward_payload)
+                                for block in diary_compiled_blocks)
+            wire_trace = forward_payload.setdefault("_ombre_trace_context", {})
+            wire_trace["private_diary_delivery"] = {"blocks": diary_compiled_blocks,
+                "sources": [row for row in date_recall_debug["private_diary"] if row["state"] == "qualified"]}
+            for row in date_recall_debug["private_diary"]:
+                if row["state"] == "qualified":
+                    row["compiled_for_delivery"] = diary_adopted
+            if diary_adopted:
+                date_recall_debug.update(status="injected", skip_reason="")
+            # Normal debug keeps the source identities/range and digest. Exact
+            # physical requests already have their existing owner trace policy.
+            stable_context = stable_context.replace(private_diary, "")
+            dynamic_context = dynamic_context.replace(private_diary, "")
+            date_recall = dated_chat if dated_chat in date_recall else ""
         mark_step("finalize_forward_payload", stage_started_at)
 
         prepare_total_ms = max(0, int((time.perf_counter() - prepare_started_at) * 1000))
@@ -5763,7 +5826,7 @@ class GatewayService:
             "active_reminder_count": len(active_reminder_ids),
             "recalled_chars": len(recalled_memory),
             "diffused_chars": len(related_memory),
-            "date_recall_chars": len(date_recall),
+            "date_recall_chars": len(date_recall) + len(private_diary),
             "date_trace_chars": len(date_persona_trace),
             "targeted_detail_chars": len(targeted_memory_detail),
             "stable_context_chars": len(stable_context),
@@ -5776,7 +5839,7 @@ class GatewayService:
 
         if snapshot_meta is not None:
             memory_guard = memory_use.snapshot_guard(self, natural_input, complete=not (
-                core_memory or relationship_weather or favorite_memory or date_recall
+                core_memory or relationship_weather or favorite_memory or date_recall or diary_questions
                 or date_persona_trace or dream_context
                 or (natural_input.get("cognition_chain") or {}).get("rendered_versions")))
             memory_guard["user_portrait"] = portrait_guard
@@ -5863,6 +5926,15 @@ class GatewayService:
                 for key, value in memory_recall_projection.items()
                 if key not in {"body", "fact_body"}
             }
+            if diary_compiled_blocks:
+                # Freeze carrier evidence against the full block. The debug
+                # record does not need another copy of adopted diary prose.
+                debug_payload["memory_recall_projection"]["compiled_memory_blocks"] = [
+                    {**block, "content": block["content"].replace(private_diary, "")}
+                    if block["content"] in diary_compiled_blocks else block
+                    for block in memory_recall_projection.get("compiled_memory_blocks") or []]
+                debug_payload["date_recall_injected"] |= any(
+                    row.get("compiled_for_delivery") for row in date_recall_debug["private_diary"])
             debug_payload["post_injection_presence"] = {
                 "persona": bool(str(persona_block or "").strip()),
                 "emotion_relationship": bool(str(relationship_weather or "").strip()),
@@ -5889,21 +5961,22 @@ class GatewayService:
                 )
                 prepare_timing_debug["prepare_snapshot_cache"] = snapshot_debug
                 debug_payload["prepare_snapshot_cache"] = snapshot_debug
-                self._prepare_snapshot_store(
-                    snapshot_meta,
-                    prepared_payload=forward_payload,
-                    base_forward_messages=messages_for_forward,
-                    stable_context=stable_context,
-                    dynamic_context=dynamic_context,
-                    injected_ids=injected_ids,
-                    debug_payload=debug_payload,
-                    composed_messages=composed_messages,
-                    memory_guard=memory_guard,
-                )
+                if not diary_questions:
+                    self._prepare_snapshot_store(
+                        snapshot_meta,
+                        prepared_payload=forward_payload,
+                        base_forward_messages=messages_for_forward,
+                        stable_context=stable_context,
+                        dynamic_context=dynamic_context,
+                        injected_ids=injected_ids,
+                        debug_payload=debug_payload,
+                        composed_messages=composed_messages,
+                        memory_guard=memory_guard,
+                    )
             log_prepare_timing()
             return forward_payload, injected_ids, debug_payload
         log_prepare_timing()
-        if snapshot_meta is not None:
+        if snapshot_meta is not None and not diary_questions:
             self._prepare_snapshot_store(
                 snapshot_meta,
                 prepared_payload=forward_payload,
@@ -7069,7 +7142,12 @@ class GatewayService:
         except ValueError:
             return
         projection = debug.get('memory_recall_projection') or {}
-        frozen = compiled_candidates(projection, projection.get('delivery_candidates') or [])
+        private_carriers = (trace.get('private_diary_delivery') or {}).get('blocks') or []
+        compiled_projection = ({**projection, 'compiled_memory_blocks': [
+            *(block for block in projection.get('compiled_memory_blocks') or [] if block['source_id'] != 'ombre.date_recall'),
+            *({'source_id': 'ombre.date_recall', 'content': block} for block in private_carriers)]}
+            if private_carriers else projection)
+        frozen = compiled_candidates(compiled_projection, projection.get('delivery_candidates') or [])
         ref = {'scope': scope, 'trace_id': trace.get('trace_id', ''),
                'configuration_revision': projection.get('configuration_revision'),
                'prompt_preset_revision': (debug.get('prompt_composer') or {}).get('preset_revision')}
@@ -7079,17 +7157,24 @@ class GatewayService:
 
     def _begin_memory_delivery(self, payload, provider_payload):
         store = getattr(self, 'memory_delivery', None)
-        manifest = self._trace_from_payload(payload).get('memory_delivery_manifest')
+        trace = self._trace_from_payload(payload)
+        manifest = trace.get('memory_delivery_manifest')
         if not store or not manifest:
             return
-        from memory_delivery import final_fragments, digest
-        trace = self._trace_from_payload(payload)
+        from memory_delivery import final_fragments, digest, payload_texts
+        diary = trace.get('private_diary_delivery') or {}
+        diary_sources = []
+        if diary.get('blocks') and any(block in wire for wire in payload_texts(provider_payload)
+                                      for block in diary['blocks']):
+            diary_sources = [{key: value for key, value in row.items() if key != 'compiled_for_delivery'}
+                             for row in diary['sources']]
         attempt = store.begin(manifest['scope'], trace.get('trace_id', ''),
             final_fragments(manifest['fragments'], provider_payload), request={
                 'logical_request_id': trace.get('logical_request_id'), 'request_id': trace.get('request_id'),
                 'request_ordinal': trace.get('request_ordinal'), 'provider_payload_sha256': digest(provider_payload),
                 'configuration_revision': manifest['request'].get('configuration_revision'),
-                'prompt_preset_revision': manifest['request'].get('prompt_preset_revision')})
+                'prompt_preset_revision': manifest['request'].get('prompt_preset_revision'),
+                **({'private_diary_sources': diary_sources} if diary_sources else {})})
         manifest['request']['attempt_id'] = attempt
 
     def _succeed_memory_delivery(self, payload):
@@ -7114,7 +7199,7 @@ class GatewayService:
         legacy = [f for f in fragments if f not in modern]
         view = getattr(self, 'memory_authority_view', None)
         reader = getattr(view, 'memory_index_metadata_map', None)
-        current = reader([f['bucket_id'] for f in legacy]) if callable(reader) else {}
+        current = reader([f['bucket_id'] for f in legacy]) if callable(reader) and legacy else {}
         authority_enabled = bool(getattr(self, 'memory_authority_enabled', False) or getattr(view, 'enabled', False))
         for fragment in legacy:
             try:
@@ -7143,19 +7228,70 @@ class GatewayService:
                 reject(fragment, 'unavailable', 'legacy_validation_unavailable')
         if not modern:
             return list(states.values())
-        items = list({(f['memory_id'], f['l1_revision']): {'memory_id': f['memory_id'],
-            'revision': f['l1_revision'], 'binding_ids': [r['binding_id'] for r in f['source_refs']]}
-            for f in modern}.values())
+        v2 = [f for f in modern if f['coverage'].get('l1_schema_version') == L1_V2_SCHEMA_VERSION]
+        v2_fragment_ids = {f['fragment_id'] for f in v2}
+        v2_ids = {f['bucket_id'] for f in v2}
+
+        def check_v2_records(*, require_current=False):
+            get_records = getattr(view, 'memory_l1_recall_map', None)
+            records = get_records(v2_ids) if callable(get_records) and v2_ids else {}
+            for fragment in v2:
+                if states[fragment['fragment_id']]['state'] != 'available':
+                    continue
+                row = records.get(fragment['bucket_id']) or {}
+                coverage = fragment['coverage']
+                if not row:
+                    # Brain distinguishes a missing/disabled head from a
+                    # temporary local view failure in the source check below.
+                    if require_current:
+                        reject(fragment, 'unavailable', 'memory_authority_not_available')
+                    continue
+                if row.get('state') != 'l1_v2':
+                    reject(fragment, 'withdrawn' if row.get('state') == 'legacy' else 'unavailable',
+                           'memory_authority_not_available')
+                    continue
+                if (row['memory_id'] != fragment['memory_id'] or row['revision'] != fragment['l1_revision']
+                        or row['body_sha256'] != coverage.get('l1_body_sha256')
+                        or row['semantic_sha256'] != coverage.get('l1_semantic_sha256')):
+                    reject(fragment, 'changed', 'memory_revision_changed')
+                    continue
+                bindings = row['document']['evidence_bindings']
+                if not bindings or len(bindings) != len(fragment['source_refs']) or any(
+                    any(ref.get(key) != binding.get(key) for key in
+                        ('binding_id', 'source_namespace', 'source_id', 'source_revision', 'anchors'))
+                    for ref, binding in zip(fragment['source_refs'], bindings)
+                ):
+                    reject(fragment, 'changed', 'memory_source_bindings_changed')
+
         try:
+            check_v2_records()
+            items = {}
+            for fragment in modern:
+                if states[fragment['fragment_id']]['state'] != 'available':
+                    continue
+                key = (fragment['memory_id'], fragment['l1_revision'])
+                item = items.setdefault(key, {'memory_id': key[0], 'revision': key[1], 'binding_ids': []})
+                for ref in fragment['source_refs']:
+                    if ref['binding_id'] not in item['binding_ids']:
+                        item['binding_ids'].append(ref['binding_id'])
+            if not items:
+                return list(states.values())
             request = {}
             result = await memory_use.read_batch(self, request, 'delivery_source_validation',
-                '/api/memory-authority/recall-sources', {'items': items})
+                '/api/memory-authority/recall-sources', {'items': list(items.values())})
             rows = {(row['memory_id'], row['revision']): row for row in result['items']}
             for fragment in modern:
+                if states[fragment['fragment_id']]['state'] != 'available':
+                    continue
                 row = rows.get((fragment['memory_id'], fragment['l1_revision']))
                 if not row or row.get('state') != 'ok':
                     state = 'withdrawn' if row and row.get('state') == 'memory_not_current_or_eligible' else 'changed'
                     reject(fragment, state, 'memory_source_no_longer_current')
+                    continue
+                if fragment['fragment_id'] in v2_fragment_ids and (row.get('sync_scope') or any(
+                        not (guard.get('scope') or {}).get('historical_only')
+                        for guard in row.get('relation_guards') or [])):
+                    reject(fragment, 'changed', 'memory_source_requires_current_revision')
                     continue
                 for ref in fragment['source_refs']:
                     source = (row.get('sources') or {}).get(ref['binding_id'])
@@ -7177,6 +7313,7 @@ class GatewayService:
                     row = rows.get(fragment['memory_id']) or {}
                     if row.get('state') != 'ready' or row.get('presentation_revision') != fragment['l2_revision']:
                         reject(fragment, 'changed', 'memory_presentation_no_longer_current')
+            check_v2_records(require_current=True)
         except (httpx.HTTPError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
             for fragment in modern:
                 if states[fragment['fragment_id']]['state'] == 'available':
@@ -17878,7 +18015,15 @@ class GatewayService:
         # expansion without paying for two vectors on every ordinary turn.
         query = recall_input.get("q_context") or recall_input.get("q_current") or ""
         parts = recall_input.get("_query_parts") or [query]
-        semantic_queries = parts if query == recall_input.get("q_current") and len(parts) > 1 else [query]
+        current = recall_input.get("q_current") or ""
+        semantic_queries = [query]
+        if len(parts) > 1:
+            if query == current:
+                semantic_queries = parts
+            elif (query.startswith(current) and recall_input.get("_has_l1_v2")
+                    and (memory_use.option(self, "mode", "inherit") == "fast_hybrid"
+                         or memory_use.option(self, "l1_v2_trial", False))):
+                semantic_queries = [part + query[len(current):] for part in parts]
         recall_input["_semantic_query_parts"] = len(semantic_queries) > 1
         semantic_hashes = {hashlib.sha256(text.encode()).hexdigest() for text in semantic_queries}
         views = recall_input.setdefault("metadata", {}).setdefault("query_views", [])
@@ -18019,6 +18164,8 @@ class GatewayService:
             valid.append(bucket)
         self._add_timing_ms(timings, "natural.authority_validation", validation_started)
         memory_use.prepare(self, recall_input, query, valid)
+        recall_input["_has_l1_v2"] = any(row.get("state") == "l1_v2" for row in recall_input["_semantic_records"].values())
+        trial = memory_use.option(self, "l1_v2_trial", False)
         date_context = recall_input.get("_use_context") or {}
         date_parts = date_context.get("query_part_contexts") or []
         date_targets = [part["target_time"] for part in date_parts if part.get("target_time")]
@@ -18127,6 +18274,7 @@ class GatewayService:
             # Planner. Expansion is based on candidate uncertainty, not a magic
             # phrase in the user's message, and happens before the final rerank.
             planner_eligible = (not recall_input.get("local_only")
+                                and memory_use.option(self, "mode", "inherit") != "fast_hybrid"
                                 and recall_input.get("allow_query_planner", True)
                                 and getattr(self, "query_planner_enabled", False) and bool(pool))
             with self._timed_candidate_stage(timings, stages, "natural.planner_eligibility", len(pool)) as stage:
@@ -18288,6 +18436,9 @@ class GatewayService:
             local_threshold = self.first_card_min_score
         accepted = []
         for item in pool:
+            bid = str(item["bucket"]["id"])
+            record = recall_input["_semantic_records"].get(bid) or {}
+            card_trial = trial and record.get("state") == "l1_v2"
             labels = self._bucket_evidence_labels(query, item)
             hard = [label for label in self._hard_bucket_evidence_labels(labels)
                     if label in {"owner_alias", "exact_anchor", "source_record_exact",
@@ -18300,8 +18451,12 @@ class GatewayService:
             local_admit = local_threshold is not None and local_signal and item["score"] >= local_threshold
             correction = bool(item.get("matched_correction_background"))
             date_match = item.get("l1_v2_exact_date_evidence")
-            admit = bool(hard or date_match or local_admit or correction or (rerank is not None and self._safe_float(rerank, 0) >= rerank_threshold)
-                         or (rerank is None and semantic_verified and semantic >= semantic_threshold))
+            independent = card_trial and any((item.get("l1_local_match") or {}).get(key)
+                                             for key in ("title_match", "keyword_match", "entity_match"))
+            strong_rerank = rerank is not None and self._safe_float(rerank, 0) >= (.60 if card_trial else rerank_threshold)
+            strong_semantic = (rerank is None and semantic_verified and semantic >=
+                               (.62 if card_trial else semantic_threshold) and (not card_trial or independent))
+            admit = bool(hard or date_match or local_admit or correction or strong_rerank or strong_semantic)
             item["admission_reason"] = ("verified_local_evidence" if hard else "verified_card_event_date" if date_match
                                         else "configured_local_score" if local_admit else "matched_correction_background" if correction
                                         else "strong_rerank" if admit and rerank is not None else "strong_semantic" if admit
@@ -18331,7 +18486,14 @@ class GatewayService:
         admitted_before_hierarchy = {str(item["bucket"]["id"]) for item in accepted}
         accepted = memory_use.hierarchy_pool(self, recall_input, accepted)
         accepted = memory_use.apply_inner_ranking(self, recall_input, query, accepted)
-        if any(item.get("_configured_score", {}).get("window_score") is not None for item in accepted):
+        time_ranked = any((item.get("_configured_score", {}).get("card_features") or {}).get("time_weight", 1) < 1
+                          for item in accepted)
+        if time_ranked:
+            # The provisional age factor changes order only; admission and
+            # selection confidence continue to use the original scores.
+            accepted.sort(key=lambda item: item.get("_configured_score", {}).get("ranking_score", item["score"]),
+                          reverse=True)
+        elif any(item.get("_configured_score", {}).get("window_score") is not None for item in accepted):
             accepted.sort(key=lambda item: item["score"], reverse=True)
         selection_diagnostics = {}
         selected = self._pick_dynamic_cards(accepted, query=query, diagnostics=selection_diagnostics)
@@ -18364,6 +18526,8 @@ class GatewayService:
                 "second_card_min_score": getattr(self, "second_card_min_score", None),
                 "second_card_relative_score": getattr(self, "second_card_relative_score", None),
                 "rerank_score_weight": getattr(getattr(self, "reranker_engine", None), "score_weight", None),
+                "l1_v2_trial": {"semantic_threshold": .62, "rerank_threshold": .60,
+                                "semantic_requires_independent_evidence": True} if trial else None,
             },
             "signal_sources": (recall_input.get("_use_context") or {}).get("signals", {}),
             "hierarchy_suppressed": list(recall_input.get("hierarchy_suppressed") or []),
@@ -25375,6 +25539,24 @@ class GatewayService:
                                      for b in legacy)
         return any(b.get("enabled", True) and b.get("mode", "live_source") == "live_source"
                    for b in configured)
+
+    def _composer_live_date_enabled(self, gateway_plan: dict | None) -> bool:
+        if not gateway_plan:
+            return True
+        if gateway_plan.get("fallback_legacy"):
+            return not gateway_plan.get("requested_identity")
+        gateway_slice = gateway_plan.get("gateway_slice") or {}
+        chain = self._prompt_scope_chain(gateway_slice, str(gateway_plan.get("scope") or "talk.initial"))
+        return any(isinstance(block, dict) and block.get("scope") in chain
+                   and block.get("source_id") == "ombre.date_recall" and block.get("enabled", True)
+                   and block.get("mode", "live_source") == "live_source"
+                   for block in gateway_slice.get("blocks") or [])
+
+    @staticmethod
+    async def _cancel_diary_read(task):
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     def _reconcile_memory_recall_injection(self, projection: dict, stable: str, dynamic: str,
                                           *, enabled: bool = True) -> None:

@@ -74,9 +74,42 @@ def l1_v2_event_matches_day(document, target):
     # Year/month-only evidence cannot locate an event on a particular day.
     if not target or event.get("precision") not in {"day", "minute", "second"}:
         return False
+    target = target.replace(hour=0, minute=0, second=0, microsecond=0)
     start = interval({"state": "known", "value": event.get("start")}, target.tzinfo)
     end = interval({"state": "known", "value": event.get("end")}, target.tzinfo) or start
     return bool(start and start[0] < target + timedelta(days=1) and end[1] > target)
+
+
+def l1_v2_time_weight(document, use_context):
+    """Provisional ranking for present intent; a dated event is not an expiry."""
+    profile = {"episode": (7, .6), "phase": (30, .4), "unknown": (30, .2)}
+    if use_context.get("purpose") != "current" or use_context.get("target_time"):
+        return 1.0
+    now = use_context.get("now")
+    event = document.get("event_time") or {}
+    if not now or document["stability"] not in profile or event.get("precision") not in {"day", "minute", "second"}:
+        return 1.0
+    bounds = interval({"state": "known", "value": event.get("end") or event.get("start")}, now.tzinfo)
+    if not bounds:
+        return 1.0
+    age_days = max(0.0, (now - bounds[0]).total_seconds() / 86400)
+    half_life, weight = profile[document["stability"]]
+    return 1.0 - weight + weight * 2 ** (-age_days / half_life)
+
+
+def l1_v2_delivery_text(original, document, use_context):
+    parts = [original]
+    for note in document.get("scope_notes") or []:
+        focus, rule = note["focus"], note["rule"]
+        if rule not in original:
+            parts.append(rule if focus in rule else f"关于{focus}，{rule}")
+    current_intent = (use_context.get("purpose") == "mixed"
+                      or use_context.get("purpose_reason") == "explicit_present_reference"
+                      or re.search(r"完成了吗|还有效|还作数|兑现了吗|还住在|是否仍然",
+                                   str(use_context.get("query") or "")))
+    if current_intent and document["stability"] != "stable":
+        parts.append("这段记忆记录的是当时的情况，现况或后续结果仍需新的依据。")
+    return "\n\n".join(dict.fromkeys(parts))
 
 
 async def snapshot_sources_current(service, entry, request):
@@ -349,13 +382,17 @@ def score_pool(service, request, query, pool, *, after_rerank=False):
         if request.get("local_only") or request.get("allow_semantic") is False:
             semantic = None
         if record.get("state") == "l1_v2":
+            from memory_l1_v2 import current_kind
+
+            time_weight = (l1_v2_time_weight(document, use_context)
+                           if settings["recall"].get("l1_v2_trial") else 1.0)
             calculation = {
                 "state": "computed",
                 "score": base,
-                "reason_codes": ["card_time_policy_pending"],
+                "reason_codes": ["l1_v2_trial_time_rank"] if time_weight < 1 else [],
                 "window_score": None,
                 "card_features": {
-                    "kind": document["kind"],
+                    "kind": current_kind(document["kind"]),
                     "stability": document["stability"],
                     "event_time": {key: value for key, value in (document.get("event_time") or {}).items()
                                    if key in {"start", "end", "precision"}} or None,
@@ -367,9 +404,12 @@ def score_pool(service, request, query, pool, *, after_rerank=False):
                     "semantic_score": semantic,
                     "rerank_score": item.get("rerank_score"),
                     "lexical": item.get("l1_local_match") or l1_v2_lexical_features(query, document),
+                    "time_weight": time_weight,
                 },
                 "inner_state_affinity": {"state": "unknown", "reason": "card_affect_evidence_unavailable"},
             }
+            if time_weight < 1:
+                calculation["ranking_score"] = base * time_weight
             item["_configured_score"] = calculation
             if not after_rerank:
                 item["_configured_score_before_rerank"] = calculation
@@ -672,8 +712,16 @@ async def verify_sources(service, request, query, items, *, refresh=False):
             if not bindings or set(bindings) != semantic_source_refs(document):
                 item["admission_reason"] = "l1_v2_source_bindings_invalid"
                 continue
+            if (check or {}).get("historical"):
+                item["admission_reason"] = "l1_v2_revision_not_current"
+                continue
             if (check or {}).get("sync_scope") or record.get("sync_scope"):
                 item["admission_reason"] = "l1_sync_required"
+                continue
+            relation_guards = (check or {}).get("relation_guards") or []
+            if use_context["purpose"] != "history" and any(
+                    not (guard.get("scope") or {}).get("historical_only") for guard in relation_guards):
+                item["admission_reason"] = "l1_v2_relation_requires_current_counterpart"
                 continue
             if not all(source_states.get(key) == "available" for key in bindings):
                 item["admission_reason"] = "l0_source_not_eligible"
@@ -1481,10 +1529,12 @@ async def _project_sections(service, request, query, buckets, sections):
                 if uses[bid]["state"] == "l1_v2":
                     from memory_readable_projection import fit_units
 
-                    text = fit_units([original], remaining, wrap=lambda narrative:
+                    qualified = l1_v2_delivery_text(original, records[bid]["document"],
+                                                    context(service, request, query))
+                    text = fit_units([qualified], remaining, wrap=lambda narrative:
                         service._resolve_gateway_fixed_prompt("ombre.memory_usage_card_prompt",
                             runtime_values={"header": "", "statements": "", "narrative": narrative}))
-                    if text.count(original) != 1:
+                    if not uses[bid]["narrative_allowed"] or not original or text.count(original) != 1:
                         text = ""
                     if text:
                         row["body_sha256"] = hashlib.sha256(original.encode()).hexdigest()
@@ -1555,7 +1605,7 @@ async def _project_sections(service, request, query, buckets, sections):
                         row["source"] = "none"
                         row.setdefault("render_reason", "usage_card_prompt_unavailable")
                 if uses[bid]["state"] == "l1_v2":
-                    main_text, support_spans = (original if text else ""), []
+                    main_text, support_spans = (qualified if text else ""), []
                 else:
                     text, main_text, support_spans = _relation_render_support(service, request, query,
                         bid, text, original, remaining, row)

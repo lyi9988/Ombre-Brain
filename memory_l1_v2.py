@@ -15,16 +15,18 @@ from memory_l1_contract import L1ContractError, canonical_json, canonical_l1_bod
 
 SCHEMA_VERSION = "memory-l1-v2"
 TEXT_PROJECTION_VERSION = "memory-l1-v2-text-v1"
-CATALOG_VERSION = "memory-l1-v2-catalog-20261113"
+CATALOG_VERSION = "memory-l1-v2-catalog-20261114"
 KINDS = {
-    "key_event": "值得回想的完整经历、转折或结果",
-    "preference": "有后续意义的喜好或习惯，持续程度另由 stability 表达",
-    "boundary": "相处边界、授权范围或明确拒绝，保留适用条件",
-    "signal": "双方赋予特殊含义的暗号、信号或默契",
-    "commitment": "已表达的承诺或约定，保留谁提出、谁接受和期限",
-    "project_state": "会影响后续工作的实质决定、进展、风险或结果",
-    "relationship_anchor": "有意义的相处、陪伴、亲密或关系理解变化",
-    "self_insight": "顾衍或当事人有归属的自我认识与变化",
+    "preference": "有后续意义的喜好或习惯，可阶段性或持久，持续程度由 stability 表达",
+    "boundary": "明确的行为限制、拒绝、允许或授权范围，保留适用条件；普通喜恶属于偏好",
+    "shared_language": "有双方明确约定或共同用法支持的隐语、特殊称呼或默契；保留关键原字词及有据异写",
+    "commitment": "单方明确承诺或双方确实达成的约定，保留谁承诺、是否接受、期限和履行状态",
+    "project_state": "有长期回想价值的项目决定、关键转折或教训；普通进度和工具结果留原记录",
+    "relationship_anchor": "有长期关系意义的相处、陪伴、和解或认识变化；可涉及第三方，分清亲历与转述",
+    "self_insight": "顾衍对自身动机、倾向、局限、价值或矛盾的新理解或修正，允许不确定",
+    "life_experience": "有长期回想价值的具体生活经历，如一次特别的旅行、搬家或家庭事件；不记流水账",
+    "knowledge_discovery": "顾衍实际探索所得且值得以后运用的外部知识、方法或理解；完整保留同一探索主线",
+    "personal_state": "有后续意义的个人现实处境、身心或生活状态，保留适用时间和依据；一次波动不推成长久状态",
 }
 STABILITIES = {
     "episode": "当次经历或当时状态，单次出现",
@@ -69,6 +71,16 @@ def is_v2(value):
     return isinstance(value, dict) and value.get("schema_version") == SCHEMA_VERSION
 
 
+def current_kind(kind):
+    """Interpret historical signal labels without rewriting stored revisions."""
+    return "shared_language" if kind == "signal" else kind
+
+
+def validate_adoptable_kind(kind):
+    if not isinstance(kind, str) or kind not in KINDS:
+        _error("classification_gap", "document.kind")
+
+
 def _error(code, path):
     raise L1ContractError(code, path)
 
@@ -85,7 +97,7 @@ def _string_array(values=None, *, minimum=0):
     return result
 
 
-def model_card_schema(source_refs, people_refs, catalog=None):
+def model_card_schema(source_refs, people_refs, catalog=None, *, allow_classification_gap=False):
     vocabulary = catalog or globals()["catalog"]()
     text = {"type": "string", "minLength": 1}
     refs = _string_array(source_refs, minimum=1)
@@ -104,10 +116,13 @@ def model_card_schema(source_refs, people_refs, catalog=None):
                  "start": text, "end": text,
                  "precision": {"type": "string", "enum": ["year", "month", "day", "minute", "second", "approximate"]},
                  "sources": refs}}
+    kind = {"type": "string", "enum": list(vocabulary["kinds"])}
+    if allow_classification_gap:
+        kind = {"type": ["string", "null"], "enum": [*kind["enum"], None]}
     return {"type": "object", "additionalProperties": False,
             "required": sorted(MODEL_REQUIRED), "properties": {
                 "title": text, "body": text,
-                "kind": {"type": "string", "enum": list(vocabulary["kinds"])},
+                "kind": kind,
                 "stability": {"type": "string", "enum": list(vocabulary["stabilities"])},
                 "keywords": _string_array(minimum=1),
                 "people": _string_array(people_refs), "sources": refs,
@@ -118,12 +133,21 @@ def model_card_schema(source_refs, people_refs, catalog=None):
                 "scope_notes": {"type": "array", "items": note}}}
 
 
-def build_model_response_format(source_refs, people_refs, catalog=None):
+def build_model_response_format(source_refs, people_refs, catalog=None, *, include_review=False):
+    card = model_card_schema(source_refs, people_refs, catalog, allow_classification_gap=True)
+    if include_review:
+        flags = ("sensitive", "transient", "generic")
+        card["properties"]["review"] = {"type": "object", "additionalProperties": False,
+            "required": ["confidence", *flags], "properties": {
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                **{flag: {"type": "boolean"} for flag in flags},
+            }}
+        card["required"].append("review")
     return {"type": "json_schema", "json_schema": {
         "name": "memory_l1_v2_cards", "strict": True,
         "schema": {"type": "object", "additionalProperties": False,
                    "required": ["cards"], "properties": {"cards": {
-                       "type": "array", "items": model_card_schema(source_refs, people_refs, catalog)}}}}}
+                       "type": "array", "items": card}}}}}
 
 
 def _date(value, path):
@@ -140,8 +164,8 @@ def _date(value, path):
         _error("invalid_event_time", path)
 
 
-def validate_model_card(card, *, source_refs, people_refs, catalog=None):
-    schema = model_card_schema(source_refs, people_refs, catalog)
+def validate_model_card(card, *, source_refs, people_refs, catalog=None, allow_classification_gap=False):
+    schema = model_card_schema(source_refs, people_refs, catalog, allow_classification_gap=allow_classification_gap)
     errors = sorted(Draft202012Validator(schema).iter_errors(card),
                     key=lambda error: tuple(str(part) for part in error.absolute_path))
     if errors:
@@ -186,13 +210,15 @@ def referenced_sources(card):
     return list(dict.fromkeys(refs))
 
 
-def prepare_card(card, *, people, bindings, generation, catalog=None, source_ref_map=None):
+def prepare_card(card, *, people, bindings, generation, catalog=None, source_ref_map=None,
+                 allow_classification_gap=False):
     vocabulary = deepcopy(catalog or globals()["catalog"]())
     people_by_ref = {item["ref"]: item for item in people}
     binding_by_id = {item["binding_id"]: item for item in bindings}
     mapping = source_ref_map or {ref: ref for ref in binding_by_id}
     value = validate_model_card(card, source_refs=list(mapping),
-                                people_refs=list(people_by_ref), catalog=vocabulary)
+                                people_refs=list(people_by_ref), catalog=vocabulary,
+                                allow_classification_gap=allow_classification_gap)
     all_refs = referenced_sources(value)
     selected_binding_ids = list(dict.fromkeys(mapping[ref] for ref in all_refs))
     if any(ref not in binding_by_id for ref in selected_binding_ids):
@@ -226,10 +252,10 @@ def prepare_card(card, *, people, bindings, generation, catalog=None, source_ref
     value["evidence_bindings"] = [deepcopy(binding_by_id[ref]) for ref in selected_binding_ids]
     value["generation"] = {**deepcopy(generation), "catalog_snapshot": vocabulary,
                            "catalog_revision": vocabulary["version"]}
-    return validate_document(value)
+    return validate_document(value, allow_classification_gap=allow_classification_gap)
 
 
-def validate_document(document):
+def validate_document(document, *, allow_classification_gap=False):
     canonical_json(document)
     required = (MODEL_REQUIRED - {"sources"}) | {
         "schema_version", "source_refs", "evidence_bindings", "generation"}
@@ -290,7 +316,8 @@ def validate_document(document):
     card = {key: deepcopy(document[key]) for key in (MODEL_REQUIRED | MODEL_OPTIONAL) - {"sources"} if key in document}
     card["people"] = person_ids
     card["sources"] = deepcopy(document["source_refs"])
-    validate_model_card(card, source_refs=binding_ids, people_refs=person_ids, catalog=vocabulary)
+    validate_model_card(card, source_refs=binding_ids, people_refs=person_ids, catalog=vocabulary,
+                        allow_classification_gap=allow_classification_gap)
     if set(referenced_sources(card)) != set(binding_ids):
         _error("unreferenced_source_binding", "document.evidence_bindings")
     return deepcopy(document)

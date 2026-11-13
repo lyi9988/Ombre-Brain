@@ -1,14 +1,20 @@
 """Local contract checks for the ordinary natural-card Recall path."""
 
 import asyncio
+import json
 from datetime import datetime, timezone
 
-from gateway import GatewayService
-from memory_commit_service import body_sha256
+import httpx
+import pytest
+
+from gateway import GatewayService, create_gateway_app
+from memory_system_config import configuration
+from memory_commit_service import BucketMemoryProjection, MemoryCommitService, body_sha256
 from memory_l1_contract import l1_content_sha256, make_text_anchor, semantic_sha256
-from memory_l1_v2 import SCHEMA_VERSION, TEXT_PROJECTION_VERSION, prepare_card
-from memory_delivery import compiled_candidates
+from memory_l1_v2 import SCHEMA_VERSION, TEXT_PROJECTION_VERSION, prepare_card, retrieval_text
+from memory_delivery import compiled_candidates, payload_texts, sha
 import memory_recall_runtime as memory_use
+from attachment_adoption_support import openai_response
 from test_memory_recall_gateway_r2 import (
     _base_config, _gateway_service, _install_source_http, _natural_candidate, _recall_input,
 )
@@ -19,7 +25,7 @@ from test_memory_local_first_settings import _base_config as _real_gateway_confi
 BODY = "2026年11月8日，我和主人约定先等她回复，再做下一步。那次没有执行。"
 
 
-def _commit_card(authority, bucket_id, *, body=BODY, dated=True):
+def _card_document(bucket_id, *, body=BODY, dated=True, scope_note=None):
     source_id = "synthetic:" + bucket_id
     binding = {
         "binding_id": "source_1", "source_namespace": "synthetic", "source_id": source_id,
@@ -34,10 +40,17 @@ def _commit_card(authority, bucket_id, *, body=BODY, dated=True):
     }
     if dated:
         card["event_time"] = {"start": "2026-11-08", "precision": "day", "sources": ["source_1"]}
+    if scope_note:
+        card["scope_notes"] = [{"focus": "桥面安排", "rule": scope_note, "sources": ["source_1"]}]
     document = prepare_card(card, people=[{"ref": "p1", "person_id": "owner", "name": "林柚",
                                          "kind": "human", "aliases": ["小柚"]}],
                             bindings=[binding], generation={"origin": "auto_l1"})
     document.pop("body")
+    return document, source_id
+
+
+def _commit_card(authority, bucket_id, *, body=BODY, dated=True):
+    document, source_id = _card_document(bucket_id, body=body, dated=dated)
     metadata = {
         "memory_l1": document,
         "memory_l1_semantic_sha256": semantic_sha256(document),
@@ -196,3 +209,190 @@ def test_v2_lexical_and_vector_hits_merge_in_the_real_candidate_builder(tmp_path
     assert chosen[0]["semantic_score"] == .91
     assert chosen[0]["computation"]["card_features"]["lexical"]["entity_match"] == 1
     assert calls.presentation_requests == []
+
+
+def test_l1_v2_http_talk_delivery_survives_restart_and_new_revision_blocks_the_old_target(tmp_path, monkeypatch):
+    from memory_authority import MemoryAuthorityStore
+
+    config = _real_gateway_config(tmp_path)
+    config["memory_authority"]["enabled"] = True
+    config["gateway"].update(upstream_base_url="https://provider.fixture/v1", upstream_default_model="public-model",
+                             core_memory_interval_rounds=0, favorite_memory_interval_rounds=0)
+    config["memory_system"]["recall"] = {"mode": "fast_hybrid"}
+    config["embedding"].update(enabled=True, api_key="fixture", base_url="https://embedding.fixture", model="fixture")
+    monkeypatch.setenv("OMBRE_GATEWAY_TOKEN", "gateway-v2-test")
+    monkeypatch.setenv("OMBRE_GATEWAY_UPSTREAM_API_KEY", "fixture")
+    authority = MemoryAuthorityStore(config)
+    service = GatewayService(config)
+    commit = MemoryCommitService(authority, BucketMemoryProjection(config, service.bucket_mgr))
+    note = "仅收到明确确认后再继续。"
+    revised = "2026年11月8日，我和主人约定先查蓝桦工程的桥面清单，再等她明确确认。那次没有执行。"
+    bucket_id = "bucket-v2-wire"
+    memory_id = "memory-v2-wire"
+    sent, source_requests, embedding_requests = [], [], []
+
+    def upstream(request):
+        assert request.url.host == "provider.fixture"
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json=openai_response(finish_reason="stop"))
+
+    async def sources(_service, _request, _stage, path, payload):
+        assert path == "/api/memory-authority/recall-sources"
+        source_requests.append(payload)
+        return {"items": [{**item, "state": "ok", "sources": {
+            bid: {"state": "available", "eligible_source": True} for bid in item["binding_ids"]}}
+            for item in payload["items"]]}
+
+    async def query_embeddings(texts, **_kwargs):
+        embedding_requests.extend(texts)
+        return [[1.0, 0.0] for _ in texts]
+
+    async def rerank(_query, items, **kwargs):
+        for item in items:
+            assert kwargs["documents_override"][item["bucket"]["id"]].startswith("桥面安排\n\n")
+            item["rerank_score"] = .95
+        return items
+
+    monkeypatch.setattr(memory_use, "read_batch", sources)
+    monkeypatch.setattr(service.embedding_engine, "query_embeddings", query_embeddings)
+    monkeypatch.setattr(service, "_rerank_scored_bucket_candidates", rerank)
+
+    async def adopt(body, expected):
+        document, source_id = _card_document(bucket_id, scope_note=note)
+        receipt = await commit.commit_memory(
+            memory_id=memory_id, bucket_id=bucket_id, expected_revision=expected, body=body,
+            metadata={"name": "桥面安排", "type": "dynamic", "memory_l1": document,
+                      "memory_l1_schema_version": SCHEMA_VERSION,
+                      "memory_l1_semantic_sha256": semantic_sha256(document),
+                      "memory_l1_content_sha256": l1_content_sha256(body, document)},
+            source_refs=[source_id], decision_source="owner_review" if not expected else "owner_revision",
+            idempotency_key=f"fixture-{expected}", actor="owner")
+        return document, receipt
+
+    def index(body, document, revision):
+        service.embedding_engine._store_embedding(bucket_id, [1.0, 0.0],
+            source_revision=revision, source_sha256=body_sha256(body), parent_memory_id=memory_id,
+            input_text=retrieval_text(body, document), text_projection_version=TEXT_PROJECTION_VERSION)
+
+    async def scenario():
+        await service.http_client.aclose()
+        service.http_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        app = create_gateway_app(config=config, service=service)
+        app.state.gateway_service = service
+        plan = {"scope": "talk.initial", "gateway_slice": {"blocks": [{
+            "source_id": "ombre.memory_recall", "block_id": "l1", "scope": "talk.initial",
+            "anchor": "current_user.before", "mode": "live_source", "role": "system",
+            "wrapper_text": "顾衍的记忆\n{{content}}",
+        }]}}
+        monkeypatch.setattr(service, "_prompt_plan_for_request", lambda *_args, **_kwargs: plan)
+        auth = {"Authorization": "Bearer gateway-v2-test"}
+        turn = {"conversation_id": "fixture-conversation", "user_source_event_id": "user-1",
+                "assistant_source_event_id": "assistant-1"}
+        async with service.http_client, httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://gateway.fixture") as client:
+            async def talk(scope):
+                return await client.post("/v1/chat/completions", headers={**auth,
+                    "X-Guyan-Conversation-Id": scope["conversation_id"],
+                    "X-Ombre-Canonical-Source-Event-Id": scope["user_source_event_id"],
+                    "X-Ombre-Canonical-Assistant-Source-Event-Id": scope["assistant_source_event_id"]},
+                    json={"model": "public-model", "messages": [{"role": "user", "content": "蓝桦工程的桥面安排是什么？"}]})
+
+            document, first = await adopt(BODY, 0)
+            assert first["revision"] == 1
+            index(BODY, document, 1)
+            assert (await talk(turn)).json()["choices"][0]["message"]["content"] == "完成"
+            first_wire = "\n".join(payload_texts(sent[-1]))
+            assert first_wire.count(BODY) == first_wire.count(note) == 1
+            assert "source_1" not in first_wire and "evidence_bindings" not in first_wire
+            assert len(embedding_requests) == 1
+            from memory_delivery import MemoryDeliveryStore
+            service.memory_delivery = MemoryDeliveryStore(service.memory_delivery.path)
+            path = "/internal/memory-delivery/lookup"
+            initial = (await client.post(path, json=turn, headers=auth)).json()
+            fragment = initial["context"]["fragments"][0]
+            assert len(initial["context"]["fragments"]) == 1
+            assert initial["fragment_states"] == [{"fragment_id": fragment["fragment_id"], "state": "available"}]
+            assert fragment["l1_revision"] == 1 and fragment["l2_revision"] is None
+            assert fragment["coverage"]["l1_body_sha256"] == sha(BODY)
+            assert fragment["text_sha256"] == sha(fragment["text"])
+            assert fragment["source_refs"][0]["anchors"] == document["evidence_bindings"][0]["anchors"]
+
+            _, correction = await adopt(revised, 1)
+            assert correction["revision"] == 2
+            original = (await client.post(path, json=turn, headers=auth)).json()
+            assert original["context"] == initial["context"]
+            assert original["fragment_states"][0]["state"] == "changed"
+            next_turn = {**turn, "user_source_event_id": "user-2", "assistant_source_event_id": "assistant-2"}
+            stale_hits = await service.embedding_engine.search_similar_queries(
+                ["桥面安排"], eligible_ids={bucket_id}, index_metadata=service.memory_authority_view.memory_index_metadata_map([bucket_id]))
+            assert stale_hits == [] and len(embedding_requests) == 1
+            stale = await talk(next_turn)
+            assert stale.status_code == 200
+            stale_wire = "\n".join(payload_texts(sent[-1]))
+            assert BODY not in stale_wire
+            assert len(embedding_requests) == 1, "old embedding is rejected before any embedding provider work"
+            index(revised, document, 2)
+            last_turn = {**turn, "user_source_event_id": "user-3", "assistant_source_event_id": "assistant-3"}
+            assert (await talk(last_turn)).status_code == 200
+            latest_wire = "\n".join(payload_texts(sent[-1]))
+            assert latest_wire.count(revised) == 1 and BODY not in latest_wire
+            assert len(embedding_requests) == 2
+            assert source_requests
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("trial", "query", "vector", "rerank", "selected"), [
+    (False, "另外还有什么？", .71, None, False),
+    (True, "另外还有什么？", .95, None, False),
+    (True, "蓝桦工程最近如何？", .62, None, True),
+    (True, "蓝桦工程最近如何？", .90, .59, False),
+    (True, "另外还有什么？", 0, .60, True),
+])
+def test_l1_v2_trial_admission_requires_independent_fallback_evidence(
+        tmp_path, monkeypatch, trial, query, vector, rerank, selected):
+    from memory_authority import MemoryAuthorityStore
+
+    config = _real_gateway_config(tmp_path)
+    config["memory_authority"]["enabled"] = True
+    authority = MemoryAuthorityStore(config)
+    card = _commit_card(authority, "bucket-v2")
+    options = _base_config(mode="fast_hybrid", local_threshold=None)
+    options["recall"].update(l1_v2_trial=trial, semantic_threshold=.72, rerank_threshold=.65)
+    service = GatewayService(config)
+    service.config["memory_system"] = options
+    item = _natural_candidate(card, score=.86, keyword_score=0)
+    item.update(semantic_score=vector, natural_semantic={"index_status": "verified"},
+                l1_local_match=memory_use.l1_v2_lexical_features(query,
+                    service.memory_authority_view.memory_l1_recall_map([card["id"]])[card["id"]]["document"]))
+    if rerank is not None:
+        item["rerank_score"] = rerank
+
+    async def candidates(*_args, **_kwargs):
+        return [item], []
+
+    async def no_planner(_query):
+        pytest.fail("Fast-hybrid must not call the Query Planner")
+
+    async def run():
+        request = _recall_input(query)
+        request["_use_context"]["now"] = datetime(2026, 11, 14, tzinfo=timezone.utc)
+        async with service.http_client:
+            return await service._finish_natural_selection(query, "v2-trial", [card],
+                                                           recall_input=request)
+
+    monkeypatch.setattr(service, "_dynamic_bucket_candidate_items", candidates)
+    monkeypatch.setattr(service, "_bucket_evidence_labels", lambda *_args: [])
+    monkeypatch.setattr(service, "query_planner_enabled", True)
+    monkeypatch.setattr(service, "_call_query_planner", no_planner)
+    _install_source_http(monkeypatch)
+    policy = configuration(service.config)
+    assert policy["validation"]["valid"] and policy["values"]["recall"]["l1_v2_trial"] == trial
+    result, _, debug = asyncio.run(run())
+    assert bool(result) is selected
+    calculation = debug["configured_computation"]["candidate_scores"][0]["computation"]
+    assert (calculation["card_features"]["time_weight"] < 1) is trial
+    historical = memory_use.l1_v2_time_weight(
+        service.memory_authority_view.memory_l1_recall_map([card["id"]])[card["id"]]["document"],
+        {"purpose": "history", "now": datetime(2026, 11, 14, tzinfo=timezone.utc)})
+    assert historical == 1

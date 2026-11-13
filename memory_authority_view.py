@@ -1,8 +1,9 @@
 """Read-only Gateway view of committed Memory authority facts."""
 from __future__ import annotations
 
-import os
+from contextlib import closing
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
@@ -28,6 +29,8 @@ class MemoryAuthorityRecallView:
         self._trusted_aliases: list[dict[str, Any]] = []
         self._auto_bucket_stamp: tuple[int, int, int, int] | None = None
         self._auto_bucket_ids: frozenset[str] = frozenset()
+        self._v2_head_file_stamp = None
+        self._v2_head_stamp: tuple = ()
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(f"file:{self.path.as_posix()}?mode=ro", uri=True, timeout=2.0)
@@ -47,6 +50,29 @@ class MemoryAuthorityRecallView:
 
     def available(self) -> bool:
         return bool(self.enabled and self.path.exists())
+
+    def l1_v2_head_stamp(self) -> tuple | None:
+        """Share a cheap check across chats without refreshing legacy buckets on other writes."""
+        if not self.enabled:
+            return ()
+        stamp = self._file_stamp()
+        if stamp is None:
+            return None
+        if self._v2_head_file_stamp == stamp:
+            return self._v2_head_stamp
+        try:
+            with closing(self._connect()) as conn:
+                heads = tuple(conn.execute(
+                    "SELECT m.memory_id,m.bucket_id,m.active_revision,m.state,m.recall_policy,r.body_sha256 "
+                    "FROM memories m JOIN memory_revisions r ON r.memory_id=m.memory_id AND r.revision=m.active_revision "
+                    "WHERE json_extract(r.metadata_json,'$.memory_l1.schema_version')=? ORDER BY m.memory_id",
+                    (L1_V2_SCHEMA_VERSION,),
+                ))
+        except sqlite3.Error:
+            return None
+        self._v2_head_file_stamp = stamp
+        self._v2_head_stamp = heads
+        return heads
 
     def auto_recallable_bucket_ids(self) -> frozenset[str]:
         """Only committed, active, auto-enabled Memory may enter chat recall.

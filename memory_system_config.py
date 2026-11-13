@@ -48,6 +48,7 @@ RECALL_DEFAULTS = {
     "window_formula_weight": 1.0, "rrf_constant": 60.0,
     "include_correction_background": True,
     "local_first_enabled": False,
+    "l1_v2_trial": False,
     "recent_context_mode": "auto", "recent_context_max_items": 6,
     "scoring_profiles": [],
     "signal_bindings": [], "affinity_mappings": [], "affinity_aggregation": "max",
@@ -428,7 +429,7 @@ def validate_values(values):
     if recall["formula_id"] is not None:
         _id(recall["formula_id"], "recall.formula_id")
     for name, value in recall.items():
-        if name in {"include_correction_background", "local_first_enabled"}:
+        if name in {"include_correction_background", "local_first_enabled", "l1_v2_trial"}:
             if type(value) is not bool:
                 _fail("boolean_required", "recall." + name)
             continue

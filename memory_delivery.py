@@ -92,6 +92,12 @@ def candidates(projection, records=None):
         refs = [{key: row.get(key) for key in
                  ('binding_id', 'source_namespace', 'source_id', 'source_revision')}
                 for row in document.get('evidence_bindings') or []]
+        card_coverage = {}
+        if record.get('state') == 'l1_v2' and trace.get('source') == 'l1_v2':
+            card_coverage = {'l1_schema_version': document['schema_version'],
+                'l1_body_sha256': record['body_sha256'], 'l1_semantic_sha256': record['semantic_sha256']}
+            for ref, binding in zip(refs, document['evidence_bindings']):
+                ref['anchors'] = copy.deepcopy(binding['anchors'])
         memory_id = trace.get('memory_id') or record.get('memory_id') or bid
         identities = sorted((row['source_namespace'], row['source_id']) for row in refs)
         group = digest(identities or [['memory', memory_id]])
@@ -105,7 +111,8 @@ def candidates(projection, records=None):
                 'unit_ids': trace.get('selected_unit_ids') or [],
                 'partial_presentation': bool(trace.get('partial_presentation')),
                 'legacy_projection_body_sha256': span.get('legacy_body_sha256') if not document else None,
-                'legacy_authority_revision': record.get('revision') if not document else None},
+                'legacy_authority_revision': record.get('revision') if not document else None,
+                **card_coverage},
             'legacy_body_sha256': None if document else (record.get('body_sha256') or span.get('legacy_body_sha256'))})
     return result
 
@@ -131,7 +138,7 @@ def compiled_candidates(projection, frozen):
             body = block.get('content') or ''
             offset = body.find(text)
             shown = text if offset >= 0 else ''
-            if not shown:
+            if not shown and not row['coverage'].get('l1_schema_version'):
                 # Match a surviving prefix at the end of a compiler-trimmed block.
                 start = body.find(text[:8])
                 while start >= 0:
