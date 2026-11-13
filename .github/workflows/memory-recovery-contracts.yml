@@ -1,0 +1,48 @@
+name: Memory recovery contracts
+
+on:
+  push:
+    branches: [main, 'release/**', 'codex/release-*', 'astra/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  memory-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt pytest pytest-asyncio
+      - name: Record revision and dependency versions
+        run: |
+          git rev-parse HEAD
+          python --version
+          python -m pip freeze
+      - name: Test durable recovery and legacy projection contracts
+        run: >-
+          python -m pytest -q
+          tests/test_memory_chat_segments.py
+          tests/test_memory_chat_event_flow.py
+          tests/test_memory_legacy_projection.py
+          tests/test_memory_legacy_backfill.py
+          tests/test_memory_comment_recovery.py
+          tests/test_memory_l2_p4.py::test_fact_edit_saved_as_l3_pending_sync_then_confirmed_after_l1_revision
+          tests/test_memory_l2_p4.py::test_ordinary_wording_does_not_confirm_pending_fact_proposal
+          --junitxml=memory-recovery-results.xml
+      - name: Preserve contract results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-recovery-${{ github.sha }}
+          path: memory-recovery-results.xml
+          if-no-files-found: warn

@@ -136,22 +136,46 @@ def test_l2_from_before_relation_tracking_reuses_the_saved_head(tmp_path, owner_
 
 
 def test_fact_edit_saved_as_l3_pending_sync_then_confirmed_after_l1_revision(tmp_path):
-    service, _, _ = setup(tmp_path)
-    run(service.run_once(1))
-    payload = owner_payload(service, kind='facts')
-    payload['document']['full_injection_text'] = '主人补充的事实稿。'
-    saved = run(service.save('m1', payload))
-    assert saved['sync_state'] == 'pending_l1'
-    assert saved['l2']['state'] == 'pending_sync'
-    assert saved['l2']['sync_proposals'][0]['state'] == 'pending'
-    edit = request_for(service.revisions, 'sync-l1')
-    edit['document']['narrative']['body'] += ' 主人补充的事实。'
-    run(service.revisions.save('m1', edit))
-    confirmed = owner_payload(service, 'owner-confirmed')
-    confirmed['confirm_sync_proposals'] = [saved['presentation_revision']]
-    final = run(service.save('m1', confirmed))
+    from test_memory_l3_sync import setup as sync_setup
+
+    f = sync_setup(tmp_path)
+    pending = f.sync.detail('m1')['proposals'][0]
+    assert pending['state'] == 'pending' and pending['receipt'] is None
+    assert f.l2.detail('m1')['l2']['state'] == 'pending_sync'
+    confirmed = owner_payload(f.l2, 'checkbox-before-sync')
+    confirmed['confirm_sync_proposals'] = [f.owner_revision]
+    with pytest.raises(L1OwnerError, match='l3_sync_action_required'):
+        run(f.l2.save('m1', confirmed))
+    with pytest.raises(L1OwnerError, match='l3_prepared_plan_required'):
+        run(f.sync.action('m1', f.owner_revision, 'apply',
+            {'expected_revision': pending['revision'], 'request_id': 'apply-without-plan'}))
+
+    queued = run(f.sync.action('m1', f.owner_revision, 'prepare',
+        {'expected_revision': pending['revision'], 'request_id': 'prepare-owner-sync'}))
+    assert queued['proposal']['state'] == 'pending'
+    assert f.authority.get_memory('m1')['active_revision'] == 2
+    # The real worker prepares, applies through the original L1 writer, and
+    # rebinds the exact owner prose only after the durable commit receipt.
+    completed = run(f.sync.run_once(1))['results'][0]
+    assert completed['state'] == 'synchronized', completed
+    receipt = completed['receipt']
+    assert receipt['phase'] == 'synchronized' and receipt['l1_revision'] == 3
+    assert receipt['l1_operation_id'] == f.authority.get_memory_revision('m1', 3)['operation_id']
+    assert receipt['l2_original_revision'] == f.owner_revision
+    assert receipt['l2_preserved_revision'] == f.owner_revision
+    document = run(f.revisions.detail('m1'))['l1']['document']
+    assert document['statements'][0]['content'] == '\u884c\u7a0b\u662f5\u53f7\u3002'
+    assert document['evidence_bindings'][-1]['source_namespace'] == 'snapshot.ombre.owner_l2_edit'
+    assert f.l2.detail('m1')['l2']['presentation']['document']['full_injection_text'] == f.owner_text
+
+    confirmed = owner_payload(f.l2, 'owner-confirmed-after-receipt')
+    confirmed['confirm_sync_proposals'] = [f.owner_revision]
+    final = run(f.l2.save('m1', confirmed))
     assert final['l2']['state'] == 'ready'
-    assert final['l2']['sync_proposals'][0]['state'] == 'owner_confirmed_after_l1_revision'
+    assert final['l2']['sync_proposals'][0]['state'] == 'synchronized'
+    assert f.sync.detail('m1')['proposals'][0]['receipt'] == receipt
+    assert run(f.sync.run_once(1))['results'] == []
+    assert len([call for call in f.calls if call[0] == 'memory_l3_sync']) == 1
 
 
 def test_resolve_uses_l2_but_not_after_dependency_change(tmp_path):
@@ -300,26 +324,41 @@ def test_missing_model_review_is_saved_for_review_and_owner_can_confirm(tmp_path
 
 
 def test_ordinary_wording_does_not_confirm_pending_fact_proposal(tmp_path):
-    service, _, _ = setup(tmp_path)
-    run(service.run_once(1))
-    facts = owner_payload(service, 'fact-change', 'facts')
-    facts['document']['full_injection_text'] += ' 主人修正了事实。'
-    first = run(service.save('m1', facts))
-    request = request_for(service.revisions, 'unrelated-l1')
-    request['document']['narrative']['title'] = '仅修改标题'
-    run(service.revisions.save('m1', request))
-    ordinary = owner_payload(service, 'ordinary-wording')
-    ordinary['document']['full_injection_text'] += ' 润色文字。'
-    result = run(service.save('m1', ordinary))
+    from test_memory_l3_sync import setup as sync_setup
+
+    f = sync_setup(tmp_path)
+    request = request_for(f.revisions, 'unrelated-l1')
+    request['document']['narrative']['title'] = 'Unrelated title edit'
+    run(f.revisions.save('m1', request))
+    ordinary = owner_payload(f.l2, 'ordinary-wording')
+    ordinary['document']['full_injection_text'] += ' Owner wording preserved.'
+    result = run(f.l2.save('m1', ordinary))
     assert result['l2']['sync_proposals'][0]['state'] == 'pending'
     assert result['sync_state'] == 'pending_l1'
-    explicit = owner_payload(service, 'explicit-confirm')
-    explicit['confirm_sync_proposals'] = [first['presentation_revision']]
-    result = run(service.save('m1', explicit))
-    assert result['l2']['state'] == 'ready'
-    proposal = result['l2']['sync_proposals'][0]
-    assert proposal['proposal']['synchronized_l1_revision'] == 3
-    assert proposal['proposal']['confirmed_presentation_revision'] == result['presentation_revision']
+    assert f.authority.get_memory('m1')['active_revision'] == 3
+    explicit = owner_payload(f.l2, 'checkbox-after-unrelated-edit')
+    explicit['confirm_sync_proposals'] = [f.owner_revision]
+    with pytest.raises(L1OwnerError, match='l3_sync_action_required'):
+        run(f.l2.save('m1', explicit))
+    assert f.sync.detail('m1')['proposals'][0]['receipt'] is None
+
+    pending = f.sync.detail('m1')['proposals'][0]
+    run(f.sync.action('m1', f.owner_revision, 'prepare',
+        {'expected_revision': pending['revision'], 'request_id': 'prepare-after-wording'}))
+    completed = run(f.sync.run_once(1))['results'][0]
+    assert completed['state'] == 'synchronized', completed
+    receipt = completed['receipt']
+    assert receipt['phase'] == 'synchronized' and receipt['l1_revision'] == 4
+    assert receipt['l1_operation_id'] == f.authority.get_memory_revision('m1', 4)['operation_id']
+    assert receipt['l2_original_revision'] == f.owner_revision
+    assert receipt['l2_preserved_revision'] == result['presentation_revision']
+    final = f.l2.detail('m1')['l2']
+    assert final['state'] == 'ready'
+    assert final['presentation']['document']['full_injection_text'] == ordinary['document']['full_injection_text']
+    document = run(f.revisions.detail('m1'))['l1']['document']
+    assert document['narrative']['title'] == 'Unrelated title edit'
+    assert document['statements'][0]['content'] == '\u884c\u7a0b\u662f5\u53f7\u3002'
+    assert len([call for call in f.calls if call[0] == 'memory_l3_sync']) == 1
 
 
 def test_full_text_edit_rebuilds_units_from_exact_owner_paragraphs(tmp_path):

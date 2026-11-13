@@ -166,9 +166,16 @@ def test_known_bad_segment_retries_only_on_explicit_request(tmp_path, finish, co
     engine.client.chat.completions.create = once_bad
     assert extract(engine, window)[1]['requires_manual_retry']
     assert extract(engine, window)[1]['requires_manual_retry'] and len(dispatched) == 1
-    candidates, progress = asyncio.run(engine._extract_daily_chat_memory_candidates(
+    # Reopen durable invalid_response state, rather than retrying only in memory.
+    resumed, service, _, new_calls, _ = fixture(tmp_path)
+    assert extract(resumed, window)[1]['requires_manual_retry'] and not new_calls
+    candidates, progress = asyncio.run(resumed._extract_daily_chat_memory_candidates(
         DAY, window, mode='review', max_candidates=10, audit={}, force=True))
-    assert len(dispatched) == 2 and candidates and progress['segment_progress']['cursor'] == 1
+    assert len(dispatched) == 1 and len(new_calls) == 1 and candidates
+    assert progress['segment_progress']['cursor'] == 1
+    state = ChatSegmentProgress(service.authority).get(progress['segment_progress']['task_id'])
+    assert state['progress']['phase'] == 'ready'
+    assert len(state['progress']['receipts']) == 1
 
 
 def test_response_saved_before_prepare_crash_reused(tmp_path, monkeypatch):

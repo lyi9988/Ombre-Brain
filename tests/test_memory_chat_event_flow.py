@@ -352,9 +352,36 @@ def test_known_invalid_response_force_retries_only_failed_step(tmp_path, stage):
     before = kinds(h)
     h.control['invalid'] = None
     assert not extract(h)[0] and kinds(h) == before
-    repaired, recovered = extract(h, force=True)
+    resumed = harness(tmp_path, texts, groups)
+    assert not extract(resumed)[0] and not resumed.calls
+    repaired, recovered = extract(resumed, force=True)
     assert len(repaired) == 1 and not recovered['partial'], recovered
-    assert kinds(h) == ([SELECTION, SELECTION, ASSEMBLY] if stage == SELECTION
-                        else [SELECTION, ASSEMBLY, ASSEMBLY])
-    assert len(h.service.authority.list_candidates(status='pending')) == 1
-    assert not h.service.authority.list_memories()
+    assert kinds(resumed) == ([SELECTION, ASSEMBLY] if stage == SELECTION else [ASSEMBLY])
+    assert kinds(h) == before
+    assert len(resumed.service.authority.list_candidates(status='pending')) == 1
+    assert not resumed.service.authority.list_memories()
+
+
+@pytest.mark.parametrize('after_commit', [False, True])
+def test_valid_assembly_response_survives_local_prepare_failure_and_restart(tmp_path, monkeypatch, after_commit):
+    texts = [('user', 'I moved the meeting to Saturday morning.')]
+    groups = [('meeting changed', [texts[0][1]])]
+    h = harness(tmp_path, texts, groups)
+    original = MemoryCandidatePreparation.prepare
+
+    def interrupted(self, *args, **kwargs):
+        if after_commit:
+            original(self, *args, **kwargs)
+        raise RuntimeError('synthetic local persistence interruption')
+
+    monkeypatch.setattr(MemoryCandidatePreparation, 'prepare', interrupted)
+    rows, failed = extract(h)
+    assert not rows and failed['partial']
+    assert kinds(h) == [SELECTION, ASSEMBLY]
+    monkeypatch.setattr(MemoryCandidatePreparation, 'prepare', original)
+    resumed = harness(tmp_path, texts, groups)
+    rows, recovered = extract(resumed)
+    assert len(rows) == 1 and not recovered['partial'], recovered
+    assert not resumed.calls
+    assert len(resumed.service.authority.list_candidates(status='pending')) == 1
+    assert not resumed.service.authority.list_memories()

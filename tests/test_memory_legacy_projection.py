@@ -72,6 +72,11 @@ def test_proven_imported_headerless_file_stages_and_adopts_without_resetting_act
     assert service.authority.get_memory('old-memory')['recall_policy'] == 'manual_only'
     assert service.authority.get_memory_revision('old-memory', 1) == old and snapshot.read_bytes() == old_bytes
     assert service.authority.get_memory_revision('old-memory', 2)['metadata']['activation_count'] == 7
+    replay = run(service.adopt(service.authority.get_candidate(staged['candidate_id']),
+                               request_id='owner-approve-import-again'))
+    assert replay['status'] == 'exists'
+    assert service.authority.get_memory('old-memory')['active_revision'] == 2
+    assert run(service.revisions.buckets.get('old-memory'))['metadata']['activation_count'] == 7
 
 
 @pytest.mark.parametrize('change', ['body', 'business_metadata', 'missing_snapshot', 'snapshot_metadata',
