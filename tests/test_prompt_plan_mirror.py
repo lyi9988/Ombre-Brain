@@ -52,6 +52,25 @@ def test_plan_revision_is_immutable_and_idempotent(store):
                        gateway_slice=_slice("override"))
 
 
+def test_memory_l1_v2_factory_and_owner_override_stay_in_background_scope(store):
+    from prompt_source_registry import source_detail
+
+    source_id = 'ombre.memory_l1_v2_generation_prompt'
+    scope = 'memory.l1_v2_generation'
+    detail = source_detail(source_id)
+    assert '当事人明确收回' in detail['factory_body']
+    payload = _slice('记忆试验的主人提示词')
+    payload['blocks'][0]['source_id'] = source_id
+    with pytest.raises(PromptPlanMirrorValidationError):
+        store.put_plan('preset:l1-test', 1, plan_sha256='d' * 64, gateway_slice=payload)
+    payload['blocks'][0]['scope'] = scope
+    store.put_plan('preset:l1-test', 1, plan_sha256='d' * 64, gateway_slice=payload)
+    store.put_binding(scope, preset_id='preset:l1-test', preset_revision=1,
+        plan_sha256='d' * 64, aiz_binding_revision=1)
+    text, _ = store.resolve_text(scope=scope, source_id=source_id, live_body=detail['factory_body'])
+    assert text == '记忆试验的主人提示词'
+
+
 def test_plan_rejects_non_gateway_source(store):
     payload = _slice()
     payload["blocks"][0]["source_id"] = "conversation.history"
