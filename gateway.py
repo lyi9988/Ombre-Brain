@@ -3603,6 +3603,8 @@ class GatewayService:
             )
             if memory_detail_debug and isinstance(injection_debug, dict):
                 injection_debug["memory_detail_recall_debug"] = memory_detail_debug
+                if memory_detail_debug.get("retried"):
+                    recalled_ids = injection_debug.get("injected_bucket_ids") or []
             trace_id = str(self._trace_from_payload(forward_payload).get("trace_id") or "")
             self.model_request_trace.update_metadata(
                 trace_id,
@@ -3805,6 +3807,8 @@ class GatewayService:
             )
             if memory_detail_debug and isinstance(injection_debug, dict):
                 injection_debug["memory_detail_recall_debug"] = memory_detail_debug
+                if memory_detail_debug.get("retried"):
+                    recalled_ids = injection_debug.get("injected_bucket_ids") or []
             trace_id = str(self._trace_from_payload(forward_payload).get("trace_id") or "")
             self.model_request_trace.update_metadata(
                 trace_id,
@@ -4771,6 +4775,14 @@ class GatewayService:
             )
             forward_payload["stream"] = payload.get("stream") is True
 
+        forward_payload.pop("_ombre_memory_detail_context", None)
+        recipe = prepared_payload.get("_ombre_memory_detail_context")
+        if (getattr(self, "memory_detail_recall_enabled", False) and not forward_payload.get("stream")
+                and isinstance(recipe, dict)):
+            recipe = deepcopy(recipe)
+            recipe["base_messages"] = deepcopy(forward_messages)
+            forward_payload["_ombre_memory_detail_context"] = recipe
+
         duration_ms = max(0, int((time.perf_counter() - started_at) * 1000))
         age_ms = max(
             0,
@@ -4879,6 +4891,10 @@ class GatewayService:
         autonomy_context: dict[str, Any] | None = None,
     ) -> tuple[dict, list[str] | None] | tuple[dict, list[str] | None, dict[str, Any]]:
         self._maybe_reload_runtime_overlay()
+        # Only this preparation may create the internal detail recipe. A client
+        # cannot supply one and bypass the normal source/Composer boundary.
+        payload = dict(payload)
+        payload.pop("_ombre_memory_detail_context", None)
         prepare_started_at = time.perf_counter()
         prepare_steps_ms: dict[str, int] = {}
 
@@ -5650,6 +5666,7 @@ class GatewayService:
         self._restore_cached_reasoning_content(session_id, forward_payload.get("messages"))
         operit_context_rewrite_debug = self._operit_context_rewrite_debug_base()
         messages_for_forward = forward_payload["messages"]
+        operit_context = []
         if self.operit_context_rewrite_enabled:
             (
                 messages_for_forward,
@@ -5667,11 +5684,12 @@ class GatewayService:
                 "Operit Activity Context",
                 operit_activity_context,
             )
+            operit_context = [
+                (operit_stable_context, 'system', 'gateway.after_first_system'),
+                (operit_activity_context, 'user', 'gateway.current_user_prefix'),
+            ]
             if composed_messages is not None:
-                for text, role, anchor in (
-                    (operit_stable_context, 'system', 'gateway.after_first_system'),
-                    (operit_activity_context, 'user', 'gateway.current_user_prefix'),
-                ):
+                for text, role, anchor in operit_context:
                     if str(text or '').strip():
                         composed_messages.append({'role':role, 'anchor':anchor, 'content':text})
         forward_payload["messages"] = self._inject_context_messages(
@@ -5702,6 +5720,26 @@ class GatewayService:
             retired_ids=(natural_input.get("projection_recovery") or {}).get("rejected_bucket_ids") or [])
         self._apply_prompt_cache_hints(forward_payload, session_id)
         forward_payload["stream"] = payload.get("stream") is True
+        if self.memory_detail_recall_enabled and not forward_payload["stream"]:
+            # Retain compilation inputs, not a second memory authority. Detail
+            # re-reads current buckets/L1/L0 and rebuilds the existing carriers.
+            forward_payload["_ombre_memory_detail_context"] = {
+                "base_messages": deepcopy(messages_for_forward),
+                "context_args": deepcopy(context_args),
+                "prompt_plan": deepcopy(prompt_plan),
+                "recent_material_blocks": deepcopy(recent_material_blocks),
+                "operit_context": deepcopy(operit_context),
+                "carrier_spans": deepcopy(carrier_spans),
+                "request": {key: deepcopy(natural_input[key]) for key in
+                    ("q_current", "q_context", "metadata", "_use_context", "_signal_snapshots",
+                     "_signal_sampled_at", "conversation_id", "source_event_id", "profile_id")
+                    if key in natural_input},
+                "query": recall_query,
+                "section_ids": {section: list(dict.fromkeys(span["bucket_id"]
+                    for span in natural_input.get("rendered_memory_spans") or []
+                    if span.get("section") == section and span.get("bucket_id")))
+                    for section in ("direct", "targeted", "diffused", "recent")},
+            }
         mark_step("finalize_forward_payload", stage_started_at)
 
         prepare_total_ms = max(0, int((time.perf_counter() - prepare_started_at) * 1000))
@@ -8501,19 +8539,16 @@ class GatewayService:
             debug["skip_reason"] = "no_allowed_ids"
             return finish(stripped_response)
 
-        detail_context, missing_ids = await self._build_memory_detail_recall_context(accepted_ids)
-        debug["missing_ids"] = missing_ids
-        if not detail_context.strip():
-            debug["skip_reason"] = "empty_detail_context"
+        if forward_payload.get("stream") is True:
+            debug["skip_reason"] = "stream_request_no_detail_retry"
             return finish(stripped_response)
-
-        retry_payload = deepcopy(forward_payload)
-        retry_payload["stream"] = False
-        retry_payload["messages"] = self._insert_memory_detail_context(
-            retry_payload.get("messages", []),
-            detail_context,
-        )
-        debug["detail_tokens"] = count_tokens_approx(detail_context)
+        retry_payload, retry_debug = await self._prepare_memory_detail_retry(
+            forward_payload, accepted_ids)
+        debug["missing_ids"] = retry_debug.get("missing_ids", [])
+        if retry_payload is None:
+            debug["skip_reason"] = retry_debug.get("skip_reason", "empty_detail_context")
+            return finish(stripped_response)
+        debug["detail_tokens"] = retry_debug.get("detail_tokens", 0)
         debug["retry_request_count"] = 1
         retry_started_at = time.perf_counter()
         retry_response = await self._forward_upstream(retry_payload)
@@ -8521,6 +8556,14 @@ class GatewayService:
         debug["retry_status_code"] = retry_response.status_code
         if 200 <= retry_response.status_code < 300:
             debug["retried"] = True
+            # Final-round bookkeeping and the receipt must describe this wire.
+            forward_payload.update(retry_payload)
+            forward_payload.pop("_ombre_memory_detail_context", None)
+            if isinstance(injection_debug, dict):
+                presence = {**(injection_debug.get("post_injection_presence") or {}),
+                            **(retry_debug.get("post_injection_presence") or {})}
+                injection_debug.update(retry_debug)
+                injection_debug["post_injection_presence"] = presence
             return finish(self._strip_memory_detail_marker_from_response(retry_response))
 
         if retry_response.extensions.get("guyan_context_capacity_blocked"):
@@ -9127,50 +9170,137 @@ class GatewayService:
             headers={"content-type": "application/json"},
         )
 
-    async def _build_memory_detail_recall_context(self, bucket_ids: list[str]) -> tuple[str, list[str]]:
-        all_buckets = await self._list_gateway_buckets(include_archive=False)
-        bucket_map = {
-            str(bucket.get("id") or ""): bucket
-            for bucket in all_buckets
-            if isinstance(bucket, dict)
-            and bucket.get("id")
-            and not self._is_self_anchor_recall_excluded_bucket(bucket)
-        }
-        requested = [bucket_id for bucket_id in bucket_ids if bucket_id]
-        if not requested:
-            return "", []
-        if len(requested) > self.memory_detail_recall_max_ids:
-            raise ValueError(
-                "memory_detail_recall_max_ids exceeded by direct detail request "
-                f"({len(requested)} > {self.memory_detail_recall_max_ids})"
-            )
-        if self.memory_detail_recall_budget <= 0:
-            return "", requested
-        per_bucket_budget = max(80, self.memory_detail_recall_budget // max(1, len(requested)))
-        blocks = [
-            "Additional private memory detail for this turn. Use quietly when relevant; do not mention lookup.",
-        ]
-        missing_ids = []
-        for bucket_id in requested:
-            bucket = bucket_map.get(bucket_id)
-            if not bucket:
-                missing_ids.append(bucket_id)
-                continue
-            meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-            title = str(meta.get("name") or bucket_id)
-            original = self._rendered_bucket_content(bucket)
-            date_part = " ".join(self._bucket_date_meta_parts(bucket))
-            header = f"[bucket_id:{bucket_id}] {date_part} {title}".strip()
-            block = f"{header}\nbucket_detail\n{original}".strip()
-            blocks.append(self._trim_text(block, per_bucket_budget))
-        return "\n\n".join(part for part in blocks if part.strip()), missing_ids
+    async def _prepare_memory_detail_retry(self, forward_payload, bucket_ids):
+        """Requalify requested detail, then use the original Composer contract.
 
-    def _insert_memory_detail_context(self, messages: Any, detail_context: str) -> list[dict]:
-        new_messages = deepcopy(messages) if isinstance(messages, list) else []
-        detail_message = {"role": "system", "content": detail_context}
-        insert_at = self._after_leading_system_index(new_messages)
-        new_messages.insert(insert_at, detail_message)
-        return new_messages
+        The first request's allow-list is only an ID boundary. It never proves
+        that a source/revision is still available or authorizes a whole bucket.
+        """
+        requested = list(dict.fromkeys(bid for bid in bucket_ids if bid))
+        if len(requested) > self.memory_detail_recall_max_ids:
+            raise ValueError("memory_detail_recall_max_ids exceeded by direct detail request")
+        recipe = forward_payload.get("_ombre_memory_detail_context")
+        if not isinstance(recipe, dict):
+            return None, {"skip_reason": "detail_preparation_unavailable", "missing_ids": requested}
+        plan = recipe.get("prompt_plan")
+        if (not getattr(self, "automatic_recall_enabled", True)
+                or not self._composer_live_recall_enabled(plan)):
+            return None, {"skip_reason": "composer_or_recall_disabled", "missing_ids": requested}
+        if not requested or self.memory_detail_recall_budget <= 0:
+            return None, {"skip_reason": "detail_budget_zero", "missing_ids": requested}
+
+        buckets = [b for b in await self._list_gateway_buckets(include_archive=False)
+                   if isinstance(b, dict) and b.get("id")
+                   and not self._is_self_anchor_recall_excluded_bucket(b)]
+        request = deepcopy(recipe.get("request") or {})
+        request["composer_recall_enabled"] = True
+        request["route"] = "ordinary"
+        query = str(recipe.get("query") or request.get("q_context") or "")
+        ids = deepcopy(recipe.get("section_ids") or {})
+        ids["targeted"] = requested + [bid for bid in ids.get("targeted", []) if bid not in requested]
+        budgets = {"direct": self.recalled_budget, "targeted": self.memory_detail_recall_budget,
+                   "diffused": self.related_memory_budget, "recent": self.recent_budget}
+        # The renderer consumes only current verified records. No stale first-
+        # round body, all-bucket fallback or whole-body detail formatter is used.
+        sections = await memory_use.project_sections(self, request, query, buckets, {
+            section: (" ".join(f"[bucket_id:{bid}]" for bid in ids.get(section, [])),
+                      ids.get(section, []), budget)
+            for section, budget in budgets.items()})
+        projection = self._build_memory_recall_projection(
+            recalled_memory=sections.get("direct", ""),
+            targeted_memory_detail=sections.get("targeted", ""),
+            related_memory=sections.get("diffused", ""), recalled_moments=[],
+            targeted_memory_detail_debug={"accepted_ids": requested},
+            memory_sentinel_debug={"route": "ordinary", "route_reason_codes": []},
+            natural_input=request)
+        from memory_delivery import candidates, sha
+        records = {b["id"]: {"memory_id": b["id"], "state": "legacy",
+                            "body_sha256": sha(str(b.get("content") or ""))} for b in buckets}
+        records.update(request.get("_semantic_records") or {})
+        previous = self._trace_from_payload(forward_payload).get("memory_delivery_manifest") or {}
+        # Other existing carriers keep their own identity and are counted only
+        # if the compiler and the actual second provider payload retain them.
+        retained = [row for row in previous.get("fragments") or []
+                    if (row.get("coverage") or {}).get("section") not in budgets]
+        args = deepcopy(recipe["context_args"])
+        carrier_fields = {"core": "core_memory", "portrait": "portrait_memory",
+            "favorite": "favorite_memory", "date": "date_recall",
+            "date_persona": "date_persona_trace", "dream": "dream_context"}
+        # A requested memory must not survive in an earlier, broader carrier
+        # after its newly qualified targeted section is disabled or narrowed.
+        for span in recipe.get("carrier_spans") or []:
+            key = carrier_fields.get(span.get("section"))
+            if key and span.get("bucket_id") in requested:
+                old, fragment = str(args.get(key) or ""), str(span.get("text") or "")
+                args[key] = old.replace(fragment, "").strip() if fragment and fragment in old else ""
+        retained = [row for row in retained if row.get("bucket_id") not in requested]
+        if retained:
+            from memory_delivery import final_fragments
+            evidence = final_fragments(retained, forward_payload)
+            states = await self._validate_memory_delivery({"fragments": evidence})
+            if len(states) != len(evidence) or any(row.get("state") != "available" for row in states):
+                return None, {"skip_reason": "retained_memory_changed_or_unavailable", "missing_ids": requested}
+        projection["delivery_candidates"] = retained + candidates(projection, records)
+        args.update(recalled_memory=sections.get("direct", ""),
+                    targeted_memory_detail=sections.get("targeted", ""),
+                    related_memory=sections.get("diffused", ""), recent_context=sections.get("recent", ""))
+        self._project_legacy_recall_status(plan, args, projection.get("recall_status") or {})
+        if plan is None or plan.get("fallback_legacy"):
+            stable, dynamic = self._build_injected_context_messages(
+                **args, memory_recall_projection=projection)
+            composer_debug, placements = {"status": "legacy_default"}, None
+        else:
+            stable, dynamic, composer_debug = self._build_composed_context_messages(
+                plan, **args, memory_recall_projection=projection)
+            placements = composer_debug.pop("_placement_messages", [])
+        for value, role, anchor in recipe.get("operit_context") or []:
+            if role == "system":
+                stable = self._append_named_context_section(stable, "Operit Stable Context", value)
+            else:
+                dynamic = self._append_named_context_section(dynamic, "Operit Activity Context", value)
+            if placements is not None and str(value or "").strip():
+                placements.append({"role": role, "anchor": anchor, "content": value})
+        retry = deepcopy(forward_payload)
+        retry.pop("_ombre_memory_detail_context", None)
+        retry["stream"] = False
+        retry["messages"] = self._inject_context_messages(
+            recipe["base_messages"], stable, dynamic, composed_messages=placements,
+            coverage=self._trace_from_payload(forward_payload).get("coverage"))
+        if recipe.get("recent_material_blocks"):
+            from prompt_placement import place_context_messages
+            retry["messages"] = place_context_messages(retry["messages"], recipe["recent_material_blocks"])
+        self._reconcile_memory_recall_injection(projection, stable, dynamic, enabled=True)
+        from memory_delivery import compiled_candidates, final_fragments
+        compiled = compiled_candidates(projection, projection["delivery_candidates"])
+        actual_fragments = final_fragments(compiled, retry)
+        actual = {row["bucket_id"] for row in actual_fragments
+                  if row["coverage"].get("section") == "targeted"}
+        actual_sections = {row["coverage"].get("section") for row in actual_fragments}
+        missing = [bid for bid in requested if bid not in actual]
+        if not any(bid in actual for bid in requested):
+            return None, {"skip_reason": "detail_not_eligible_or_not_compiled", "missing_ids": missing}
+        debug = {"memory_recall_projection": {key: value for key, value in projection.items()
+                                              if key not in {"body", "fact_body"}},
+                 "prompt_composer": composer_debug,
+                 "injected_bucket_ids": list(dict.fromkeys(row["bucket_id"] for row in actual_fragments)),
+                 "recent_context_injected": "recent" in actual_sections,
+                 "post_injection_presence": {
+                     "memory_recall": bool(actual_sections & set(budgets)),
+                     "core_memory": "core" in actual_sections},
+                 "missing_ids": missing, "detail_tokens": count_tokens_approx(sections.get("targeted", ""))}
+        trace = self._trace_from_payload(retry)
+        trace.pop("memory_delivery_manifest", None)
+        if previous.get("scope"):
+            # The first manifest already resolved a canonical-bridge fallback.
+            # Preserve that verified scope even when source headers were absent.
+            trace.update(previous["scope"])
+        retry["_ombre_trace_context"] = trace
+        self._prepare_memory_delivery(retry, debug)
+        if getattr(self, "memory_delivery", None) and not self._trace_from_payload(retry).get("memory_delivery_manifest"):
+            return None, {"skip_reason": "detail_delivery_scope_unavailable", "missing_ids": requested}
+        return retry, debug
+
+
 
     async def _update_persona_after_response(
         self,
@@ -28618,6 +28748,7 @@ class GatewayService:
         # Internal Aizizhu trace context is consumed by Gateway storage only;
         # it must never reach a provider and is not part of H1/H2 identity.
         upstream_payload.pop("_ombre_trace_context", None)
+        upstream_payload.pop("_ombre_memory_detail_context", None)
         upstream_payload["model"] = upstream_model
         return upstream_payload
 

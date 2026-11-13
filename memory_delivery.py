@@ -143,7 +143,7 @@ def compiled_candidates(projection, frozen):
             if shown:
                 value = copy.deepcopy(row)
                 value['text'], value['text_sha256'] = shown, sha(shown)
-                value['coverage']['wire_partial'] = shown != text
+                value['coverage']['wire_partial'] = bool(row['coverage'].get('wire_partial')) or shown != text
                 if shown != text:
                     value['coverage']['statement_ids'] = []
                     value['coverage']['unit_ids'] = []

@@ -926,8 +926,9 @@ def test_memory_detail_recall_debug_reports_trigger_and_retry_timing():
     service.memory_detail_recall_enabled = True
     service.memory_detail_recall_max_ids = 2
     service.memory_detail_recall_budget = 200
-    async def detail_context(_ids):
-        return "detail body", []
+    async def detail_context(payload, _ids):
+        return {**payload, "messages": [*payload["messages"],
+                {"role": "user", "content": "detail body"}]}, {"detail_tokens": 2}
 
     async def retry_response(_payload):
         return httpx.Response(
@@ -935,10 +936,7 @@ def test_memory_detail_recall_debug_reports_trigger_and_retry_timing():
             json={"choices": [{"message": {"role": "assistant", "content": "retried"}}]},
         )
 
-    service._build_memory_detail_recall_context = detail_context
-    service._insert_memory_detail_context = lambda messages, detail: [
-        *messages, {"role": "system", "content": detail}
-    ]
+    service._prepare_memory_detail_retry = detail_context
     service._forward_upstream = retry_response
 
     response, debug = asyncio.run(service._maybe_retry_with_memory_detail(
@@ -1064,27 +1062,15 @@ def test_diffusion_limit_is_independent_but_bounded_by_final_count():
     assert service._diffusion_inject_limit(SimpleNamespace(wants_body_chain=False)) == 0
 
 
-def test_direct_memory_detail_supports_more_than_three_and_rejects_over_limit():
+def test_memory_detail_request_rejects_over_configured_limit_before_source_reads():
     service = GatewayService.__new__(GatewayService)
     service.memory_detail_recall_max_ids = 4
-    service.memory_detail_recall_budget = 4_000
-    buckets = [
-        {"id": f"b{i}", "content": f"body {i}", "metadata": {"name": f"memory {i}"}}
-        for i in range(4)
-    ]
-    service._list_gateway_buckets = lambda **_kwargs: _async_result(buckets)
-    service._is_self_anchor_recall_excluded_bucket = lambda _bucket: False
-    service._rendered_bucket_content = lambda bucket: bucket["content"]
-    service._bucket_date_meta_parts = lambda _bucket: []
-
-    context, missing = asyncio.run(service._build_memory_detail_recall_context([f"b{i}" for i in range(4)]))
-    assert missing == []
-    assert all(f"[bucket_id:b{i}]" in context for i in range(4))
+    service._list_gateway_buckets = lambda **_kwargs: pytest.fail("over-limit request read sources")
     with pytest.raises(ValueError, match="memory_detail_recall_max_ids"):
-        asyncio.run(service._build_memory_detail_recall_context([f"b{i}" for i in range(5)]))
+        asyncio.run(service._prepare_memory_detail_retry({}, [f"b{i}" for i in range(5)]))
     service.memory_detail_recall_max_ids = 0
     with pytest.raises(ValueError, match="memory_detail_recall_max_ids"):
-        asyncio.run(service._build_memory_detail_recall_context(["b0"]))
+        asyncio.run(service._prepare_memory_detail_retry({}, ["b0"]))
 
 
 async def _async_result(value):

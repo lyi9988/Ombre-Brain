@@ -1,0 +1,49 @@
+name: Gateway memory delivery contracts
+
+on:
+  push:
+    branches: [main, "release/**", "codex/**", "astra/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  memory-delivery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install declared test dependencies
+        run: python -m pip install -r requirements.txt pytest pytest-asyncio
+      - name: Record revision and dependency versions
+        run: |
+          git rev-parse HEAD
+          python --version
+          python -m pip freeze
+      - name: Verify qualification, Composer and final wire receipts
+        run: >-
+          python -B -m pytest -q -p no:cacheprovider
+          tests/test_memory_detail_retry_contracts.py
+          tests/test_stage03_memory_delivery.py
+          tests/test_stage03_recall_composer_delivery.py
+          tests/test_gateway_request_capacity.py
+          tests/test_retrieval_runtime.py::test_memory_detail_recall_debug_reports_trigger_and_retry_timing
+          tests/test_retrieval_runtime.py::test_memory_detail_request_rejects_over_configured_limit_before_source_reads
+          --junitxml=gateway-memory-results.xml
+      - name: Preserve contract results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-memory-${{ github.sha }}
+          path: gateway-memory-results.xml
+          if-no-files-found: warn

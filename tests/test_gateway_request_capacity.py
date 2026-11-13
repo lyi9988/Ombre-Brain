@@ -249,9 +249,12 @@ def test_memory_detail_capacity_rejection_is_not_replaced_with_prior_success(tmp
     service.memory_detail_recall_enabled = True
     service.memory_detail_recall_max_ids = 1
     service._parse_memory_detail_request = lambda _text: (["bucket-1"], "prior answer")
-    async def detail(_ids):
-        return "DETAIL_BODY " * 1000, []
-    service._build_memory_detail_recall_context = detail
+    async def detail(payload, _ids):
+        # This test isolates the final capacity gate after authorized compilation.
+        retry = copy.deepcopy(payload)
+        retry["messages"].append({"role": "user", "content": "DETAIL_BODY " * 1000})
+        return retry, {"missing_ids": [], "detail_tokens": 10000}
+    service._prepare_memory_detail_retry = detail
     payload = {"model": "public-model", "max_tokens": 1000,
         "messages": [{"role": "user", "content": "complete question"}],
         "_ombre_trace_context": {"trace_id": "trace-1"}}
@@ -294,9 +297,12 @@ def test_memory_detail_block_revokes_only_exact_logical_prior_receipts(tmp_path)
     service.memory_detail_recall_enabled = True
     service.memory_detail_recall_max_ids = 1
     service._parse_memory_detail_request = lambda _text: (["bucket-1"], "prior answer")
-    async def detail(_ids):
-        return "DETAIL_BODY " * 1000, []
-    service._build_memory_detail_recall_context = detail
+    async def detail(payload, _ids):
+        # This test isolates the final capacity gate after authorized compilation.
+        retry = copy.deepcopy(payload)
+        retry["messages"].append({"role": "user", "content": "DETAIL_BODY " * 1000})
+        return retry, {"missing_ids": [], "detail_tokens": 10000}
+    service._prepare_memory_detail_retry = detail
     sends = []
     def provider(_request):
         call_id = "call-1" if not sends else "call-other"
