@@ -58,7 +58,10 @@ def test_memory_l1_v2_factory_and_owner_override_stay_in_background_scope(store)
     source_id = 'ombre.memory_l1_v2_generation_prompt'
     scope = 'memory.l1_v2_generation'
     detail = source_detail(source_id)
-    assert '当事人明确收回' in detail['factory_body']
+    assert '当事人确实收回决定' in detail['factory_body']
+    assert '同一件事只写一张' in detail['factory_body']
+    assert detail['factory_body'].count('{l1_material_rules}') == 1
+    assert '浏览记忆：' not in detail['factory_body']
     payload = _slice('记忆试验的主人提示词')
     payload['blocks'][0]['source_id'] = source_id
     with pytest.raises(PromptPlanMirrorValidationError):

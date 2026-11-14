@@ -15,18 +15,20 @@ from memory_l1_contract import L1ContractError, canonical_json, canonical_l1_bod
 
 SCHEMA_VERSION = "memory-l1-v2"
 TEXT_PROJECTION_VERSION = "memory-l1-v2-text-v1"
-CATALOG_VERSION = "memory-l1-v2-catalog-20261114"
+CATALOG_VERSION = "memory-l1-v2-catalog-20261114-r2"
 KINDS = {
     "preference": "有后续意义的喜好或习惯，可阶段性或持久，持续程度由 stability 表达",
     "boundary": "明确的行为限制、拒绝、允许或授权范围，保留适用条件；普通喜恶属于偏好",
     "shared_language": "有双方明确约定或共同用法支持的隐语、特殊称呼或默契；保留关键原字词及有据异写",
     "commitment": "单方明确承诺或双方确实达成的约定，保留谁承诺、是否接受、期限和履行状态",
     "project_state": "有长期回想价值的项目决定、关键转折或教训；普通进度和工具结果留原记录",
-    "relationship_anchor": "有长期关系意义的相处、陪伴、和解或认识变化；可涉及第三方，分清亲历与转述",
+    "relationship_anchor": "有长期关系意义的相处、陪伴、和解或认识变化；按完整经历选类，可涉及第三方，分清亲历与转述",
     "self_insight": "顾衍对自身动机、倾向、局限、价值或矛盾的新理解或修正，允许不确定",
     "life_experience": "有长期回想价值的具体生活经历，如一次特别的旅行、搬家或家庭事件；不记流水账",
     "knowledge_discovery": "顾衍实际探索所得且值得以后运用的外部知识、方法或理解；完整保留同一探索主线",
     "personal_state": "有后续意义的个人现实处境、身心或生活状态，保留适用时间和依据；一次波动不推成长久状态",
+    "person_relationship": "主线是确认有后续用途的人物身份、角色或关系事实，例如经谁认识某人。普通提及、同名和猜测留在原材料里；若主线是一次相处或和解，整件事归 relationship_anchor。",
+    "expressed_need": "主线是当事人明确向对方提出、以后仍需理解的诉求，例如希望少隔几天才联系。保留对方实际回应。一般喜好归 preference，现实处境归 personal_state，明确承诺或达成的约定归 commitment。",
 }
 STABILITIES = {
     "episode": "当次经历或当时状态，单次出现",
@@ -56,8 +58,8 @@ TOPICS = {
     "projects_creation": {"name": "项目与创作", "aliases": ["创作", "设计", "产品", "工程"],
         "include": "其他项目、作品与创作过程", "exclude": "纯调试输出或源码全文"},
 }
-MODEL_REQUIRED = {"title", "body", "kind", "stability", "keywords", "people", "sources"}
-MODEL_OPTIONAL = {"primary_topic", "secondary_topic", "event_time", "people_links", "scope_notes"}
+MODEL_REQUIRED = {"title", "body", "kind", "stability", "keywords", "people", "sources", "primary_topic", "event_time"}
+MODEL_OPTIONAL = {"secondary_topic", "people_links", "scope_notes"}
 DOCUMENT_FIELDS = (MODEL_REQUIRED - {"sources"}) | MODEL_OPTIONAL | {
     "schema_version", "source_refs", "evidence_bindings", "generation"}
 
@@ -111,7 +113,8 @@ def model_card_schema(source_refs, people_refs, catalog=None, *, allow_classific
                 "detail": text, "sources": refs}}
     if people_refs:
         link["properties"]["via"] = {"type": "string", "enum": list(people_refs)}
-    event = {"type": "object", "additionalProperties": False,
+    event = {"type": ["object", "null"], "additionalProperties": False,
+             "description": "有依据时填事件实际发生时间及支持来源。提起旧事的时间、计划日期和消息写入时间不等于事件发生时间。发生时间确实无法确定时填 null。",
              "required": ["start", "precision", "sources"], "properties": {
                  "start": text, "end": text,
                  "precision": {"type": "string", "enum": ["year", "month", "day", "minute", "second", "approximate"]},
@@ -134,7 +137,7 @@ def model_card_schema(source_refs, people_refs, catalog=None, *, allow_classific
 
 
 def build_model_response_format(source_refs, people_refs, catalog=None, *, include_review=False):
-    card = model_card_schema(source_refs, people_refs, catalog, allow_classification_gap=True)
+    card = model_card_schema(source_refs, people_refs, catalog, allow_classification_gap=False)
     if include_review:
         flags = ("sensitive", "transient", "generic")
         card["properties"]["review"] = {"type": "object", "additionalProperties": False,
@@ -164,8 +167,13 @@ def _date(value, path):
         _error("invalid_event_time", path)
 
 
-def validate_model_card(card, *, source_refs, people_refs, catalog=None, allow_classification_gap=False):
+def validate_model_card(card, *, source_refs, people_refs, catalog=None, allow_classification_gap=False,
+                        require_primary_topic=True, require_event_time=True):
     schema = model_card_schema(source_refs, people_refs, catalog, allow_classification_gap=allow_classification_gap)
+    if not require_primary_topic:
+        schema["required"].remove("primary_topic")
+    if not require_event_time:
+        schema["required"].remove("event_time")
     errors = sorted(Draft202012Validator(schema).iter_errors(card),
                     key=lambda error: tuple(str(part) for part in error.absolute_path))
     if errors:
@@ -216,9 +224,12 @@ def prepare_card(card, *, people, bindings, generation, catalog=None, source_ref
     people_by_ref = {item["ref"]: item for item in people}
     binding_by_id = {item["binding_id"]: item for item in bindings}
     mapping = source_ref_map or {ref: ref for ref in binding_by_id}
+    # The provider response schema enforces current generation requirements.
+    # Assembly also resumes drafts saved before the topic and time fields became required.
     value = validate_model_card(card, source_refs=list(mapping),
                                 people_refs=list(people_by_ref), catalog=vocabulary,
-                                allow_classification_gap=allow_classification_gap)
+                                allow_classification_gap=allow_classification_gap, require_primary_topic=False,
+                                require_event_time=False)
     all_refs = referenced_sources(value)
     selected_binding_ids = list(dict.fromkeys(mapping[ref] for ref in all_refs))
     if any(ref not in binding_by_id for ref in selected_binding_ids):
@@ -257,7 +268,7 @@ def prepare_card(card, *, people, bindings, generation, catalog=None, source_ref
 
 def validate_document(document, *, allow_classification_gap=False):
     canonical_json(document)
-    required = (MODEL_REQUIRED - {"sources"}) | {
+    required = (MODEL_REQUIRED - {"sources", "primary_topic", "event_time"}) | {
         "schema_version", "source_refs", "evidence_bindings", "generation"}
     if not isinstance(document, dict) or set(document) - DOCUMENT_FIELDS or required - set(document):
         _error("invalid_v2_document_shape", "document")
@@ -317,7 +328,8 @@ def validate_document(document, *, allow_classification_gap=False):
     card["people"] = person_ids
     card["sources"] = deepcopy(document["source_refs"])
     validate_model_card(card, source_refs=binding_ids, people_refs=person_ids, catalog=vocabulary,
-                        allow_classification_gap=allow_classification_gap)
+                        allow_classification_gap=allow_classification_gap, require_primary_topic=False,
+                        require_event_time=False)
     if set(referenced_sources(card)) != set(binding_ids):
         _error("unreferenced_source_binding", "document.evidence_bindings")
     return deepcopy(document)
