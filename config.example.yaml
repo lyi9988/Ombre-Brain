@@ -689,6 +689,7 @@ reflection:
   daily_chat_memory_max_per_day: 10 # compatibility name: internal candidate batch size; the same job continues until the date is complete
   daily_chat_memory_min_confidence: 0.68 # auto-write threshold
   daily_chat_memory_review_max_per_day: 10 # internal Review batch size, not a daily candidate cap; all valid drafts are retained
+  owner_summary_l1_enabled: false  # owner summaries reach chat context via the Composer summary block; leave false so they never become L1 memory cards
   daily_chat_memory_review_min_confidence: 0.55 # review stays recall-friendly; owner filters. Strict confidence is auto-only (daily_chat_memory_min_confidence)
   daily_chat_memory_summary_enabled: true       # first compress chat windows (locate windows only), then extract candidates from original turns
   daily_chat_memory_summary_window_turns: 14    # overlapping context window so boundaries do not split causality

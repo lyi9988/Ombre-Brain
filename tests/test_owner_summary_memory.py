@@ -26,6 +26,9 @@ def setup(tmp_path, monkeypatch, *, mode='review', count=1, body=None, draft=Non
     config = reflection_config(tmp_path / 'engine', mode=mode)
     config['gateway'] = {'canonical_continuation': {'enabled':True, 'base_url':'http://aiz.test', 'conversation_id':'other-fixed-conversation'}}
     config['reflection']['daily_chat_memory_window_max_input_chars'] = 256
+    # Owner summaries no longer produce L1 cards by default; these tests cover the
+    # retained generation path, so they opt in explicitly.
+    config['reflection']['owner_summary_l1_enabled'] = True
     engine = ReflectionEngine(config)
     engine.memory_authority_store = env['authority']
     engine._memory_l1_revisions = lambda manager=None: env['revisions']

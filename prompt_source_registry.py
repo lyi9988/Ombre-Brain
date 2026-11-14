@@ -102,7 +102,7 @@ FIXED_PROMPT_SOURCES = {
               "memory_chat_event_prompts:EVENT_ASSEMBLY_PROMPT", render="identity",
               revision="factory-chat-event-assembly-v5"),
         _spec("ombre.memory_l1_v2_generation_prompt", "memory.l1_v2_generation",
-              "memory_l1_v2_prompts:L1_V2_GENERATION_PROMPT", revision="factory-memory-l1-v2-20261114-r2"),
+              "memory_l1_v2_prompts:L1_V2_GENERATION_PROMPT", revision="factory-memory-l1-v2-20261114-r4"),
         _spec("ombre.memory_l1_v2_revision_prompt", "memory.reflection",
               "memory_l1_v2_prompts:L1_V2_REVISION_PROMPT", revision="factory-memory-l1-v2-revision-v1"),
         _spec("ombre.memory_l2_generation_prompt", "memory.reflection",

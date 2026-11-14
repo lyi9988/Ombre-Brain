@@ -1,6 +1,7 @@
 """Normal Reflection ingestion and native v2 requests with a scripted provider."""
 import asyncio
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import json
 from types import SimpleNamespace
 
@@ -20,7 +21,7 @@ from test_memory_authority_r1 import reflection_config
 DAY = '2026-11-12'
 
 
-def _engine(path, reply, *, mode='review'):
+def _engine(path, reply, *, mode='review', compress=lambda _payload: []):
     config = reflection_config(path, mode=mode)
     config['reflection'].update(daily_chat_memory_extraction_mode='whole_window_v2',
                                 daily_chat_memory_turn_limit=1, daily_chat_memory_window_turns=2)
@@ -31,10 +32,13 @@ def _engine(path, reply, *, mode='review'):
 
     async def create(**request):
         payload = json.loads(request['messages'][-1]['content'])
-        calls.append((request, payload))
-        data = reply(payload)
+        if request['response_format']['type'] == 'json_object' and 'input_kind' not in payload:
+            result = {'events': compress(payload)}
+        else:
+            calls.append((request, payload))
+            result = {'cards': reply(payload)}
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
-            content=json.dumps({'cards': data}, ensure_ascii=False)), finish_reason='stop')],
+            content=json.dumps(result, ensure_ascii=False)), finish_reason='stop')],
             usage={'prompt_tokens': 100, 'completion_tokens': 200, 'total_tokens': 300})
 
     client = SimpleNamespace(base_url='https://fixture.invalid/v1',
@@ -49,9 +53,9 @@ def _engine(path, reply, *, mode='review'):
     return engine, calls
 
 
-def _events(engine, texts):
+def _events(engine, texts, *, start=None):
     store = RawEventStore(engine.config)
-    start = datetime.fromisoformat(DAY).replace(tzinfo=timezone.utc)
+    start = start or datetime.fromisoformat(DAY).replace(tzinfo=timezone.utc)
     records = [{'source_event_id': f'event-{index}', 'role': role, 'text': text,
         'created_at': (start + timedelta(seconds=index)).isoformat(),
         'session_id': 'main', 'conversation_id': 'main', 'metadata': {'profile_id': 'profile', 'round_id': index // 2}}
@@ -69,7 +73,8 @@ def _run(engine, store, *, force=False):
 def _card(sources):
     return {'title': '雨夜的约定', 'body': '2026年11月12日，我记得那晚我们一起等雨停，约好第二天再走。',
             'kind': 'commitment', 'stability': 'episode', 'keywords': ['雨夜', '等雨停'],
-            'people': [], 'sources': sources}
+            'people': [], 'sources': sources, 'primary_topic': 'daily_life',
+            'event_time': {'start': DAY, 'precision': 'day', 'sources': [sources[-1]]}}
 
 
 def test_daily_window_delivers_every_original_then_queues_cards(tmp_path):
@@ -79,13 +84,20 @@ def test_daily_window_delivers_every_original_then_queues_cards(tmp_path):
     store = _events(engine, texts)
     result = _run(engine, store)
     assert result['status'] == 'pending', result
-    assert result['cursor_updated'] and result['model_call_count'] == 1
+    assert result['cursor_updated'] and result['model_call_count'] == 2
     assert len(calls) == 1 and [row[3] for row in calls[0][1]['messages']] == [text for _, text in texts]
     request, payload = calls[0]
     assert payload['window']['turns'] == 46
     assert request['max_tokens'] == 32000 and request['extra_body']['thinking']['type'] == 'enabled'
     assert 'statements' not in json.dumps(request['response_format'])
-    assert result['candidates'][0]['l1_document']['generation']['prompt_source_id'] == PROMPT_ID
+    system = request['messages'][0]['content']
+    assert '一事一卡，不写整天日报' in system and 'primary_topic' in system
+    assert system.count('自动记忆：') == 1
+    assert not any(label in system for label in (
+        '主动记忆：', '浏览记忆：', '行动记忆：', '附件记忆：', '手动摘要：', '续接：', '{l1_material_rules}'))
+    generation = result['candidates'][0]['l1_document']['generation']
+    assert generation['prompt_source_id'] == PROMPT_ID
+    assert generation['prompt_revision'] == 'prompt_sha256:' + sha256(system.encode()).hexdigest()
     assert engine.memory_authority_store.get_memory(result['candidates'][0]['id']) is None
     assert _run(engine, store)['status'] == 'skipped' and len(calls) == 1
     diagnostic = MemoryV2Diagnostics(engine.memory_authority_store).list(result['run_id'])
@@ -94,30 +106,95 @@ def test_daily_window_delivers_every_original_then_queues_cards(tmp_path):
     assert '在旧小窗限制之外' not in json.dumps(diagnostic, ensure_ascii=False)
 
 
-def test_unclassified_experience_reaches_review_without_becoming_a_memory(tmp_path):
-    from memory_l1_schema import join_document
+def test_compression_refs_are_checked_and_persisted_before_writing_cards(tmp_path):
+    event = {'summary': '我们原本约好在雨中等车，后来等来了迟到的车。', 'source_refs': ['m1']}
+    received = []
+
+    def compress(payload):
+        received.append(payload)
+        if len(received) == 1:
+            raise TimeoutError('fixture compression outcome unknown')
+        if len(received) == 2:
+            return [{**event, 'source_refs': ['m99']}]
+        return [event]
 
     def reply(payload):
+        assert payload['window_summaries'] == [event]
+        assert payload['messages'] == received[-1]['messages']
+        if len(calls) == 1:
+            raise TimeoutError('fixture card outcome unknown')
+        return [_card(['m1'])]
+
+    engine, calls = _engine(tmp_path, reply, compress=compress)
+    store = _events(engine, [('user', '那次真的等到了迟到的车。')])
+    first = _run(engine, store)
+    assert first['status'] == 'partial' and not first['cursor_updated'] and not calls
+    assert _run(engine, store)['reason'] == 'model_outcome_unknown_requires_retry_decision'
+    assert len(received) == 1
+    invalid = _run(engine, store, force=True)
+    assert invalid['reason'] == 'native_l1_schema_mismatch' and not calls
+    assert len(received) == 2
+    retry = _run(engine, store, force=True)
+    assert retry['status'] == 'partial' and not retry['cursor_updated']
+    assert len(received) == 3 and len(calls) == 1
+    assert set(received[-1]) == {'messages'}
+    assert _run(engine, store)['reason'] == 'model_outcome_unknown_requires_retry_decision'
+    completed = _run(engine, store, force=True)
+    assert completed['status'] == 'pending' and completed['cursor_updated']
+    assert completed['model_call_count'] == 1 and len(received) == 3 and len(calls) == 2
+
+
+@pytest.mark.parametrize('owner_text', ['起点\n{l1_material_rules}\n落点', '早先保存的主人原稿', ''])
+def test_owner_l1_block_inserts_source_rules_in_place_and_respects_off(tmp_path, owner_text):
+    engine, calls = _engine(tmp_path, lambda _payload: [])
+    scope = 'memory.l1_v2_generation'
+    store = _events(engine, [('user', '我想明天再看雨。')])
+    engine.prompt_plan_mirror.put_plan('preset:l1-v2', 1, plan_sha256='b' * 64,
+        gateway_slice={'blocks': [{
+            'block_id': 'owner:l1', 'source_id': PROMPT_ID, 'scope': scope,
+            'stage': 'ombre_post_injection', 'mode': 'owner_override' if owner_text else 'off',
+            'role': 'system', 'lane': 'instruction', 'anchor': 'instructions.end',
+            'order': 10, 'priority': 10, 'enabled': True, 'owner_body': owner_text,
+            'wrapper_text': '外层开始\n{{content}}\n外层结束',
+        }]})
+    engine.prompt_plan_mirror.put_binding(scope, preset_id='preset:l1-v2', preset_revision=1,
+        plan_sha256='b' * 64, aiz_binding_revision=1, identity_id='main')
+    result = _run(engine, store)
+    if not owner_text:
+        assert result['reason'] == 'prompt_disabled' and not calls
+        return
+    assert result['status'] == 'zero_candidates'
+    system = calls[0][0]['messages'][0]['content']
+    assert system.count('自动记忆：') == 1
+    assert '{l1_material_rules}' not in system and '主动记忆：' not in system
+    if '起点' in owner_text:
+        assert system.index('外层开始') < system.index('起点') < system.index('自动记忆：')
+        assert system.index('自动记忆：') < system.index('落点') < system.index('外层结束')
+    else:
+        assert system.startswith('外层开始\n' + owner_text + '\n外层结束\n\n自动记忆：')
+
+
+@pytest.mark.parametrize('invalid_field', ['kind', 'primary_topic', 'event_time'])
+def test_model_requires_a_classification_primary_topic_and_event_time(tmp_path, invalid_field):
+    def reply(payload):
         card = _card([payload['messages'][0][0]])
-        return [{**card, 'kind': None}, {**card, 'title': '真实生活经历', 'kind': 'life_experience'}]
+        if invalid_field == 'kind':
+            card['kind'] = None
+        else:
+            del card[invalid_field]
+        return [card]
 
     engine, calls = _engine(tmp_path, reply)
     store = _events(engine, [('user', '雨很大，我们留在屋里直到天亮。')])
     result = _run(engine, store)
-    assert result['status'] == 'pending' and len(calls) == 1
-    cards = {item['l1_document']['kind']: item for item in result['candidates']}
-    assert cards[None]['classification_gap'] and not cards['life_experience']['classification_gap']
-    candidate_id = cards[None]['id']
-    row = engine.memory_authority_store.get_candidate(candidate_id)
-    assert row['policy']['reason_codes'] == ['classification_gap']
-    assert asyncio.run(engine._memory_l1_adopt_candidate(row, None, owner=True,
-        request_id='try-unclassified'))['status'] == 'classification_gap'
-    assert engine.memory_authority_store.get_candidate(candidate_id)['status'] == 'pending'
-    assert engine.memory_authority_store.get_memory(candidate_id) is None
-    proposal = row['proposal']
-    document = join_document(proposal['proposed_body'], proposal['metadata']['memory_l1'],
-                             allow_classification_gap=True)
-    assert document['source_refs'] and document['kind'] is None
+    assert result['status'] == 'partial' and result['reason'] == 'native_l1_schema_mismatch'
+    assert len(calls) == 1
+    schema = calls[0][0]['response_format']['json_schema']['schema']['properties']['cards']['items']
+    assert 'primary_topic' in schema['required']
+    assert 'event_time' in schema['required']
+    assert 'secondary_topic' not in schema['required']
+    assert set(schema['properties']['kind']['enum']) >= {'person_relationship', 'expressed_need'}
+    assert None not in schema['properties']['kind']['enum']
 
 
 def test_v2_uses_saved_auto_policy_and_retains_sensitive_drafts(tmp_path):
@@ -166,6 +243,8 @@ def test_overlong_message_is_read_in_continuous_ranges_and_empty_cards_advance(t
                 covered.append((left, right))
     assert covered[0][0] == 0 and covered[-1][1] == len(text)
     assert ''.join(text[left:right] for left, right in covered) == text
+    assert '续接：' not in calls[0][0]['messages'][0]['content']
+    assert all('续接：' in request['messages'][0]['content'] for request, _ in calls[1:])
 
 
 def test_card_from_one_segment_binds_only_that_observed_range(tmp_path):
@@ -184,27 +263,120 @@ def test_card_from_one_segment_binds_only_that_observed_range(tmp_path):
 
 
 def test_adjacent_day_context_records_matching_prior_card_revision(tmp_path):
+    from bucket_manager import BucketManager
+
     engine, calls = _engine(tmp_path, lambda payload: [_card(list(dict.fromkeys(
         row[0] for row in payload['messages'])))])
-    store = _events(engine, [('user', '那晚我提议等雨停。'), ('assistant', '好，我陪你等。')])
+    store = _events(engine, [('assistant', '23:30 前的聊天不补读。'),
+                            ('user', '那晚我提议等雨停。'), ('assistant', '好，我陪你等。')],
+                    start=datetime.fromisoformat(DAY + 'T15:29:59+00:00'))
     first = _run(engine, store)
     assert first['status'] == 'pending'
+    prior_id = first['candidates'][0]['id']
+    row = engine.memory_authority_store.get_candidate(prior_id)
+    adopted = asyncio.run(engine._memory_l1_adopt_candidate(row, BucketManager(engine.config), owner=True,
+        request_id='adopt-prior-day'))
+    assert adopted['status'] == 'created'
     tomorrow = '2026-11-13'
     store.ingest([{'source_event_id': 'next-day', 'role': 'user', 'text': '后来雨停了，我们一起走了。',
-        'created_at': tomorrow + 'T00:00:00Z', 'session_id': 'main', 'conversation_id': 'main',
+        'created_at': DAY + 'T16:00:00Z', 'session_id': 'main', 'conversation_id': 'main',
         'metadata': {'profile_id': 'profile', 'round_id': 1}}], source='gateway')
     second = asyncio.run(engine.run_daily_chat_memory(None, raw_event_store=store,
         persona_engine=SimpleNamespace(profile_id='profile'), key=tomorrow, chat_windows_only=True))
     assert second['status'] == 'pending' and len(calls) == 2, second
-    assert [row[3] for row in calls[1][1]['messages']] == [
+    request, payload = calls[1]
+    assert [row[3] for row in payload['messages']] == [
         '那晚我提议等雨停。', '好，我陪你等。', '后来雨停了，我们一起走了。']
-    prior = calls[1][1]['continuation']['draft_cards'][0]
-    assert prior['body'] == first['candidates'][0]['l1_document']['body']
-    assert set(prior['sources']) == {'m1', 'm2'}
+    assert [row[2] for row in payload['messages']] == [
+        DAY + 'T23:30:00+08:00', DAY + 'T23:30:01+08:00', tomorrow + 'T00:00:00+08:00']
+    assert payload['cross_day_sources'] == ['m1', 'm2']
+    assert payload['core_sources'] == ['m3']
+    assert '这是跨天的聊天，可能能帮助理解，按需取用' in request['messages'][0]['content']
+    assert payload['continuation']['draft_cards'] == [{
+        'body': first['candidates'][0]['l1_document']['body'], 'title': '雨夜的约定',
+        'kind': 'commitment', 'sources': []}]
     row = engine.memory_authority_store.get_candidate(second['candidates'][0]['id'])
     link = row['proposal']['metadata']['l1_v2_continuation'][0]
     assert link['previous_candidate_id'] == first['candidates'][0]['id']
-    assert link['previous_candidate_revision'] == 1
+    assert link['previous_candidate_revision'] == engine.memory_authority_store.get_candidate(prior_id)['revision']
+
+
+@pytest.mark.parametrize('use_raw_events', [True, False])
+def test_cross_day_material_alone_cannot_create_a_card(tmp_path, use_raw_events):
+    from gateway_state import GatewayStateStore
+
+    engine, calls = _engine(tmp_path, lambda payload: [_card(payload['cross_day_sources'])])
+    midnight = datetime.fromisoformat(DAY + 'T00:00:00+08:00')
+    if use_raw_events:
+        store = _events(engine, [('user', '昨天的原话。'), ('assistant', '今天的新话。')],
+                        start=midnight - timedelta(seconds=1))
+        source = {'raw_event_store': store}
+    else:
+        store = GatewayStateStore(str(tmp_path / 'gateway.sqlite3'))
+        for index, (stamp, body) in enumerate((
+                (midnight - timedelta(minutes=31), '不会补读的原话。'),
+                (midnight - timedelta(minutes=30), '昨天的原话。'),
+                (midnight, '今天的新话。')), 1):
+            store.record_conversation_turn(profile_id='profile', session_id='main', round_id=index,
+                                           created_at=stamp, user_text=body)
+        source = {'conversation_turn_store': store}
+    result = asyncio.run(engine.run_daily_chat_memory(None, **source,
+        persona_engine=SimpleNamespace(profile_id='profile'), key=DAY, chat_windows_only=True))
+    assert result['reason'] == 'l1_v2_card_without_core_source' and not result['cursor_updated'], result
+    _, payload = calls[0]
+    assert [row[3] for row in payload['messages']] == ['昨天的原话。', '今天的新话。']
+    assert payload['cross_day_sources'] == ['m1'] and payload['core_sources'] == ['m2']
+
+
+def test_previous_day_context_contains_all_adopted_bodies_without_shared_sources(tmp_path):
+    from bucket_manager import BucketManager
+
+    def reply(payload):
+        if len(calls) > 1:
+            return []
+        original = _card(['m1'])
+        return [original, {**original, 'title': '经朋友认识林工', 'body': '那天经朋友介绍认识了林工。', 'event_time': None,
+                           'kind': 'person_relationship', 'primary_topic': 'people_relationships'},
+                {**original, 'title': '待审记忆', 'body': '待审正文不应出现在下一日。',
+                 'event_time': None, 'kind': 'expressed_need'}]
+
+    engine, calls = _engine(tmp_path, reply)
+    store = _events(engine, [('user', '边界原话之外的早先一句。'),
+                             ('assistant', '天气转凉，我把窗户关上了。')])
+    first = _run(engine, store)
+    assert first['status'] == 'pending'
+    buckets = BucketManager(engine.config)
+    authority = engine.memory_authority_store
+    for candidate in first['candidates'][:2]:
+        row = authority.get_candidate(candidate['id'])
+        result = asyncio.run(engine._memory_l1_adopt_candidate(row, buckets, owner=True,
+            request_id='adopt-' + candidate['id']))
+        assert result['status'] == 'created'
+
+    memory_id = first['candidates'][0]['id']
+    service = engine._memory_l1_revisions(buckets)
+    document = asyncio.run(service.detail(memory_id))['l1']['document']
+    document['body'] = '主人修订后的当前正文。'
+    document['event_time'] = None
+    asyncio.run(service.save(memory_id, {'expected_revision': 1, 'request_id': 'edit-prior', 'document': document}))
+
+    # Yesterday's originals are outside the half-hour window.
+    tomorrow = '2026-11-13'
+    store.ingest([{'source_event_id': 'today', 'role': 'user', 'text': '又聊起同样的日常。',
+        'created_at': tomorrow + 'T01:00:00Z', 'session_id': 'main', 'conversation_id': 'main',
+        'metadata': {'profile_id': 'profile'}}], source='gateway')
+    second = asyncio.run(engine.run_daily_chat_memory(buckets, raw_event_store=store,
+        persona_engine=SimpleNamespace(profile_id='profile'), key=tomorrow, chat_windows_only=True))
+    assert second['status'] == 'zero_candidates' and len(calls) == 2, second
+    request, payload = calls[-1]
+    drafts = payload['continuation']['draft_cards']
+    assert sorted(card['body'] for card in drafts) == sorted([document['body'], '那天经朋友介绍认识了林工。'])
+    assert all(card['sources'] == [] for card in drafts)
+    assert [entry[3] for entry in payload['messages']] == ['又聊起同样的日常。']
+    assert 'cross_day_sources' not in payload
+    assert '这是跨天的聊天，可能能帮助理解，按需取用' not in request['messages'][0]['content']
+    assert '待审正文不应出现在下一日。' not in request['messages'][-1]['content']
+    assert '昨天已入库卡片的正文' in request['messages'][0]['content']
 
 
 def test_unknown_dispatch_cannot_retry_from_scheduler(tmp_path):
@@ -236,6 +408,8 @@ def test_daily_force_rescans_changed_source_while_original_dispatch_is_unknown(t
         original_create = engine.client.chat.completions.create
 
         async def create(**request):
+            if request['response_format']['type'] == 'json_object':
+                return await original_create(**request)
             if not late_return:
                 original_calls.append(request)
                 raise TimeoutError('fixture provider outcome unknown')
@@ -429,6 +603,9 @@ def test_chat_draft_can_prepare_without_nearby_chat_sources(tmp_path):
     result = asyncio.run(prepare_chat_tasks(engine, None))
     assert result['results'][0]['memory_status'] == 'pending', result
     assert calls[0][1]['messages'][0][3] == envelope['arguments']['narrative']['body']
+    system = calls[0][0]['messages'][0]['content']
+    assert '主动记忆：以我提交的 agent_draft 为主' in system
+    assert not any(label in system for label in ('自动记忆：', '浏览记忆：', '行动记忆：', '手动摘要：'))
     row = engine.memory_authority_store.get_candidate(queued['task_id'])
     assert row['proposal']['metadata']['memory_l1']['evidence_bindings'][0]['source_namespace'] == (
         'snapshot.ombre.agent_memory_draft')

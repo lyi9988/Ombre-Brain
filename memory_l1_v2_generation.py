@@ -6,25 +6,32 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 import hashlib
 import json
+from pathlib import Path
 from time import monotonic
+
+import frontmatter
 
 from memory_candidate_preparation import MemoryCandidatePreparation
 from memory_chat_segments import ChatSegmentProgress
-from memory_l1_api import create_completion, validate_response
+from memory_l1_api import array, create_completion, obj, validate_response
 from memory_commit_service import body_sha256
 from memory_l1_contract import canonical_json, make_text_anchor, semantic_sha256
 from memory_l1_ingestion import bind_sources
 from memory_l1_service import L1OwnerError
+from memory_l1_v2_prompts import L1_V2_CONTINUATION_RULE, L1_V2_MATERIAL_PLACEHOLDER, L1_V2_SOURCE_RULES
 from memory_model_io import model_error_details, response_usage
 
 PROTOCOL = 'whole_window_v2'
 PROMPT_ID = 'ombre.memory_l1_v2_generation_prompt'
 INPUT_TOKENS = 32000
 TOTAL_TOKENS = 64000
+COMPRESSION_OUTPUT_TOKENS = 8000
 CONTEXT_TOKENS = 2000
 CONTINUATION_TOKENS = 4000
+CROSS_DAY_MINUTES = 30
 
 _WINDOW_PREFIX = 'daily_chat_l1_v2_window:'
+_PROMPTS = Path(__file__).with_name('resources') / 'l1_v2'
 
 
 def enabled(config):
@@ -69,7 +76,7 @@ def _diagnostic(engine, task_id, stage, data):
 
 
 def _route(engine, origin):
-    stage = {'browse_l1': 'chat_l1', 'attachment_l1': 'auto_l1', 'owner_summary': 'auto_l1'}.get(origin, origin)
+    stage = {'browse_l1': 'chat_l1', 'attachment_l1': 'auto_l1'}.get(origin, origin)
     route = engine._memory_task_route(stage)
     if not route['configured']:
         raise L1OwnerError(route['unavailable_reason'], field_path='generation')
@@ -77,6 +84,19 @@ def _route(engine, origin):
     # current provider, model, effort and timeout settings.
     return {**route, 'max_tokens': TOTAL_TOKENS - INPUT_TOKENS,
             'thinking_mode': 'enabled', 'reasoning_effort': route.get('reasoning_effort') or 'low'}
+
+
+def _generation_prompt(engine, origin):
+    if origin != 'auto_l1':
+        return engine._memory_l1_prompt(PROMPT_ID)
+    # Supply the Auto L1 factory body without changing the shared Composer
+    # source. The same resolver applies overrides, snapshots and wrappers.
+    body, _ = engine.prompt_plan_mirror.resolve_text(
+        scope='memory.l1_v2_generation', source_id=PROMPT_ID,
+        live_body=(_PROMPTS / 'J-owner-1114g.txt').read_text(encoding='utf-8'),
+        identity_id=str((engine.config.get('persona') or {}).get('canonical_session_id') or 'jiajia-main'),
+        conversation_id='')
+    return body, {'prompt_revision': 'prompt_sha256:' + _digest(body)}
 
 
 def _schema_rejected(exc):
@@ -130,24 +150,31 @@ class Generation:
         from memory_l1_v2 import catalog
 
         self.engine, self.origin, self.task_id = engine, origin, task_id
+        if origin not in L1_V2_SOURCE_RULES:
+            raise L1OwnerError('l1_v2_unknown_source_kind', field_path='input_kind')
+        self.source_rule = L1_V2_SOURCE_RULES[origin]
         self.route = _route(engine, origin)
-        self.prompt, prompt_context = engine._memory_l1_prompt(PROMPT_ID)
+        self.prompt, prompt_context = _generation_prompt(engine, origin)
         if not self.prompt.strip():
             raise L1OwnerError('prompt_disabled', field_path='generation')
+        self.compress_window = origin == 'auto_l1'
+        # Leave space for the first pass output in the original-source request.
+        self.planning_input_limit = INPUT_TOKENS - (COMPRESSION_OUTPUT_TOKENS if self.compress_window else 0)
         self.sources = sources
         self.snapshots, self.bindings = bind_sources(sources, config=engine.config)
         self.people, self.speakers, narrator, direct = _people(engine, self.snapshots, sources)
         self.catalog = catalog()
         self.include_review = include_review
-        self.previous_day_drafts = (context or {}).get('previous_day_drafts') or []
-        context = {key: value for key, value in (context or {}).items() if key != 'previous_day_drafts'}
-        self.summary_body = ((context or {}).get('owner_selected_summary') or {}).get('body')
-        if self.summary_body is not None:
-            context = {**context, 'owner_selected_summary': {key: value for key, value in
-                       context['owner_selected_summary'].items() if key != 'body'}}
+        context = dict(context or {})
+        self.cross_day_sources = set(context.pop('cross_day_sources', ()))
+        previous = context.get('previous_day_drafts', [])
+        # Frozen windows from the earlier protocol carry source-bound draft objects.
+        self.previous_day_drafts = previous if previous and isinstance(previous[0], dict) else []
+        if self.previous_day_drafts:
+            context.pop('previous_day_drafts')
         self.common = {'input_kind': origin, 'narrator': narrator, 'catalogs': self.catalog,
                        'people': [{key: item[key] for key in ('ref', 'name', 'kind')} for item in self.people],
-                       **(context or {})}
+                       **context}
         if direct:
             self.common['direct_conversation'] = direct
         self.generation = {'origin': origin, 'task_id': task_id, 'model': self.route['model'],
@@ -158,54 +185,114 @@ class Generation:
         self.views = [(index, anchor['start'], anchor['end'])
                       for index, binding in enumerate(self.bindings) for anchor in binding['anchors']]
 
-    def request(self, views, *, core=None, continuation=None):
-        from memory_l1_v2 import build_model_response_format
+    def _system_prompt(self, *, continuing):
+        rules = self.source_rule
+        if continuing:
+            rules += '\n' + L1_V2_CONTINUATION_RULE
+        slot = L1_V2_MATERIAL_PLACEHOLDER
+        template = self.prompt.replace('{' + slot + '}', slot)
+        before, found, after = template.partition(slot)
+        if found:
+            return before + rules + after.replace(slot, '')
+        # Preserve owner-authored blocks created before the slot existed.
+        return self.prompt + '\n\n' + rules
 
-        source_refs = list(dict.fromkeys(f'm{index + 1}' for index, _, _ in views))
+    def _source_material(self, views):
         messages = []
+        observed = {}
         ranges = {}
         for index, left, right in views:
             snapshot = self.snapshots[index]
             ref = f'm{index + 1}'
             messages.append([ref, self.speakers[index], _local_time(snapshot.get('recorded_at'), self.engine.tz),
                              snapshot['text'][left:right]])
+            observed.setdefault(ref, []).append([left, right])
             if (left, right) != (0, len(snapshot['text'])):
                 ranges.setdefault(ref, []).append([left, right])
+        return messages, observed, ranges
+
+    def request(self, views, *, core=None, continuation=None):
+        from memory_l1_v2 import build_model_response_format
+
+        messages, observed, ranges = self._source_material(views)
+        source_refs = list(observed)
         envelope = {**self.common, 'messages': messages}
-        if self.summary_body is not None:
-            summary = envelope['owner_selected_summary']
-            envelope['owner_selected_summary'] = {**summary, **self._summary_view(views)}
+        if self.compress_window:
+            envelope['window_summaries'] = []
         if ranges:
             envelope['source_ranges'] = ranges
         if core is not None:
             envelope['core_sources'] = list(dict.fromkeys(f'm{index + 1}' for index, _, _ in core))
         if continuation:
             envelope['continuation'] = continuation
-        wire = [{'role': 'system', 'content': self.prompt}, {'role': 'user', 'content': canonical_json(envelope)}]
+        continuing = bool(continuation and (continuation.get('part_after_first') or continuation.get('draft_cards')))
+        system = self._system_prompt(continuing=continuing)
+        cross_day = [ref for ref in source_refs if ref in self.cross_day_sources]
+        if cross_day:
+            envelope['cross_day_sources'] = cross_day
+            system += '\n\ncross_day_sources：这是跨天的聊天，可能能帮助理解，按需取用。'
+        wire = [{'role': 'system', 'content': system},
+                {'role': 'user', 'content': canonical_json(envelope)}]
         native = build_model_response_format(source_refs, [person['ref'] for person in self.people],
             self.catalog, include_review=self.include_review)
+        return self._request_with_budget(wire, native, source_refs, observed)
+
+    def _request_with_budget(self, wire, native, refs, observed):
         serialized = canonical_json({'messages': wire, 'response_format': native})
         # Keep room for the exact same schema in the user envelope if the
         # provider explicitly rejects native JSON Schema before processing.
         estimate = max(_tokens(serialized), _tokens(canonical_json({
             'messages': self._json_object_wire(wire, native), 'response_format': {'type': 'json_object'}})))
-        observed = {}
-        for index, left, right in views:
-            observed.setdefault(f'm{index + 1}', []).append([left, right])
-        return wire, native, source_refs, estimate, observed
+        return wire, native, refs, estimate, observed
 
-    def _summary_view(self, views):
-        if views == self.views or not views:
-            return {'body': self.summary_body}
-        # The summary provides focus; only the actual source messages can
-        # support the memory. Long summaries follow their original order.
-        length = len(self.summary_body)
-        first, left, _ = views[0]
-        last, _, right = views[-1]
-        start = int(length * (first + left / len(self.snapshots[first]['text'])) / len(self.snapshots))
-        end = int(length * (last + right / len(self.snapshots[last]['text'])) / len(self.snapshots))
-        return {'body': self.summary_body[start:end], 'observed_range': {'start': start, 'end': end},
-                'total_characters': length}
+    def add_window_summaries(self, request, events):
+        wire, native, refs, _, observed = request
+        payload = json.loads(wire[1]['content'])
+        payload['window_summaries'] = events
+        wire = [wire[0], {'role': 'user', 'content': canonical_json(payload)}]
+        return self._request_with_budget(wire, native, refs, observed)
+
+    def compression_request(self, request, current):
+        payload = json.loads(request[0][1]['content'])
+        cross_day = payload.get('cross_day_sources', [])
+        original, observed, _ = self._source_material(current)
+        messages = [message for message in payload['messages'] if message[0] in cross_day] + original
+        material = {'messages': messages}
+        if cross_day:
+            material['cross_day_sources'] = cross_day
+        wire = [{'role': 'system', 'content': (_PROMPTS / 'compress3-1114.txt').read_text(encoding='utf-8')},
+                {'role': 'user', 'content': canonical_json(material)}]
+        refs = {'type': 'string', 'enum': list(dict.fromkeys(message[0] for message in messages))}
+        event = obj({'summary': {'type': 'string', 'minLength': 1, 'pattern': r'\S'},
+                     'source_refs': {**array(refs), 'minItems': 1}}, ('summary', 'source_refs'))
+        schema = obj({'events': array(event)}, ('events',))
+        estimated = _tokens(canonical_json({'messages': wire, 'response_format': {'type': 'json_object'}}))
+        if estimated > INPUT_TOKENS:
+            raise L1OwnerError('l1_v2_compression_input_exceeds_budget', field_path='generation')
+        return wire, schema, set(observed), estimated
+
+    async def compress(self, request, *, part):
+        wire, schema, core_refs, estimated = request
+        route = {**self.route, 'max_tokens': COMPRESSION_OUTPUT_TOKENS,
+                 'thinking_mode': 'disabled', 'reasoning_effort': ''}
+        started = monotonic()
+        meta = {'origin': self.origin, 'part': part, 'model': route['model'], 'source_count': len(core_refs),
+                'prompt_sha256': _digest(wire[0]['content']), 'user_sha256': _digest(wire[1]['content']),
+                'input_tokens_estimate': estimated, 'max_output_tokens': route['max_tokens']}
+        _diagnostic(self.engine, self.task_id, 'window_compression_dispatch', meta)
+        try:
+            response = await create_completion(route['client'], model=route['model'], messages=wire, route=route,
+                temperature=self.engine.temperature, response_format={'type': 'json_object'}, validation_schema=schema)
+            _diagnostic(self.engine, self.task_id, 'window_compression_return', {
+                **meta, 'usage': response_usage(response), 'finish_reason': self.engine._completion_finish_reason(response),
+                'duration_ms': int((monotonic() - started) * 1000)})
+            validate_response(response)
+            events = json.loads(self.engine._completion_content(response))['events']
+            return [event for event in events if core_refs.intersection(event['source_refs'])]
+        except Exception as exc:
+            _diagnostic(self.engine, self.task_id, 'window_compression_issue', {
+                **meta, 'issue': model_error_details(exc), 'duration_ms': int((monotonic() - started) * 1000)})
+            raise
 
     @staticmethod
     def _json_object_wire(wire, native):
@@ -263,7 +350,9 @@ class Generation:
     def prepare(self, draft):
         from memory_l1_v2 import prepare_card
 
-        card = {key: value for key, value in draft.items() if key not in {'_observed', 'review'}}
+        card = {key: value for key, value in draft.items() if key not in {'_observed', '_prompt_revision', 'review'}}
+        generation = {**self.generation, 'prompt_revision': draft.get('_prompt_revision',
+            self.generation['prompt_revision'])}
         source_ref_map, bindings = {}, []
         for ref, ranges in draft['_observed'].items():
             index = int(ref[1:]) - 1
@@ -272,7 +361,7 @@ class Generation:
             bindings.append({**binding, 'anchors': [make_text_anchor(snapshot['text'], target_namespace='l0',
                 target_id=binding['source_id'], target_revision=binding['source_revision'],
                 text_view_id=snapshot['text_view_id'], start=left, end=right) for left, right in _ranges(ranges)]})
-        return prepare_card(card, people=self.people, bindings=bindings, generation=self.generation,
+        return prepare_card(card, people=self.people, bindings=bindings, generation=generation,
                              catalog=self.catalog, source_ref_map=source_ref_map, allow_classification_gap=True)
 
     async def verify(self, document):
@@ -290,7 +379,10 @@ def _continuation(drafts, refs):
     selected = []
     for index in range(len(drafts) - 1, -1, -1):
         card = drafts[index]
-        if not refs.intersection(card['sources']):
+        # Cards already adopted on a previous day carry no refs in this request.
+        # They stay in the continuation so the model can see what has been
+        # recorded and skip the routine that repeats every day.
+        if card.get('sources') and not refs.intersection(card['sources']):
             continue
         # Cross-segment context is an in-flight draft, not a historical L1.
         item = {key: card[key] for key in ('title', 'body', 'kind', 'sources')}
@@ -309,7 +401,7 @@ def _ranges(values):
     return output
 
 
-def _fold(drafts, cards, core_refs, context_refs, observed):
+def _fold(drafts, cards, core_refs, context_refs, observed, *, prompt_revision):
     from memory_l1_v2 import referenced_sources
 
     for card in cards:
@@ -321,7 +413,7 @@ def _fold(drafts, cards, core_refs, context_refs, observed):
                  and context_refs.intersection(prior['sources']).intersection(card['sources'])
                  and (prior['title'] == card['title'] or set(prior['keywords']).intersection(card['keywords']))]
         refs = referenced_sources(card)
-        value = {**card, '_observed': {ref: observed[ref] for ref in refs}}
+        value = {**card, '_observed': {ref: observed[ref] for ref in refs}, '_prompt_revision': prompt_revision}
         if len(peers) == 1:
             prior = drafts[peers[0]]
             if prior.get('review') and value.get('review'):
@@ -365,8 +457,8 @@ def _tail(job, prior_views):
 def _next_part(job, core, offset, earlier, drafts):
     context = _tail(job, earlier)
     context_refs = {f'm{index + 1}' for index, _, _ in context}
-    # Earlier-day drafts use the current request's source numbers, and only
-    # travel when the corresponding boundary evidence actually fits.
+    # In-flight drafts need visible source references. Adopted cards from the
+    # previous day are context and have no references in this request.
     continuation = _continuation([*job.previous_day_drafts, *drafts], context_refs)
 
     def request(views):
@@ -379,7 +471,7 @@ def _next_part(job, core, offset, earlier, drafts):
     while start <= end:
         middle = (start + end) // 2
         value = request(core[offset:middle])
-        if value[3] <= INPUT_TOKENS:
+        if value[3] <= job.planning_input_limit:
             best = (middle, 0, value)
             start = middle + 1
         else:
@@ -397,7 +489,7 @@ def _next_part(job, core, offset, earlier, drafts):
         middle = (start + end) // 2
         views = [(index, left, middle)]
         value = request(views)
-        if value[3] <= INPUT_TOKENS:
+        if value[3] <= job.planning_input_limit:
             best = (middle, value)
             start = middle + 1
         else:
@@ -423,7 +515,7 @@ def _proposal(document, *, candidate_id, source_type, mode, metadata=None, owner
         source_refs.insert(0, 'tool_operation:' + operation)
     return MemoryProposal.from_mapping({'proposal_id': candidate_id, 'source_type': source_type,
         'proposed_body': body, 'source_status': 'verified', 'requested_mode': mode,
-        'owner_explicit': owner_explicit, 'memory_type': kind or 'classification_gap',
+        'owner_explicit': owner_explicit, 'memory_type': kind,
         'confidence': (review or {}).get('confidence', 0.0),
         'sensitive': (review or {}).get('sensitive', False),
         'transient': (review or {}).get('transient', False),
@@ -475,6 +567,12 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                                  dispatch=dispatch, guard=before_progress_save)
             revision, state = updated['revision'], updated['progress']
 
+        def record_model_failure(exc):
+            error = model_error_details(exc)
+            if error.get('http_status') in (400, 401, 403, 404, 413, 422, 429) or isinstance(
+                    exc, (L1OwnerError, ValueError)):
+                save({**state, 'phase': 'failed', 'issue': error})
+
         base = [view for view in job.views if view[0] < core_start]
         original_core = [view for view in job.views if view[0] >= core_start]
         if state['phase'] != 'generated':
@@ -488,11 +586,11 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                     index, start, end = core[offset]
                     earlier.append((index, start, state['split']))
                     core[offset] = (index, state['split'], end)
-                if offset == 0 and not state['split'] and not base:
+                if offset == 0 and not state['split'] and not base and not job.previous_day_drafts:
                     whole = job.request(core)
                 else:
                     whole = None
-                if whole and whole[3] <= INPUT_TOKENS:
+                if whole and whole[3] <= job.planning_input_limit:
                     stop, split, wire, sent, context_refs = len(core), 0, whole, core, set()
                 else:
                     stop, split, wire, sent, context_refs = _next_part(job, core, offset, earlier, state['drafts'])
@@ -501,19 +599,36 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                 # explicit retry authorizes. Never re-dispatch from the scheduler.
                 if state['phase'] == 'dispatched':
                     save({**state, 'phase': 'ready'})
-                save({**state, 'phase': 'dispatched'}, dispatch=True)
+                if job.compress_window:
+                    compression = job.compression_request(wire, sent)
+                    compressed_input = _digest(canonical_json(compression[0]))
+                    cached = state.get('compression') or {}
+                    if cached.get('input_sha256') != compressed_input:
+                        save({**state, 'phase': 'dispatched', 'dispatch_step': 'window_compression'}, dispatch=True)
+                        calls += 1
+                        try:
+                            events = await job.compress(compression, part=part)
+                        except Exception as exc:
+                            record_model_failure(exc)
+                            raise
+                        cached = {'input_sha256': compressed_input, 'events': events}
+                        save({**state, 'phase': 'ready', 'dispatch_step': None, 'compression': cached})
+                    if getattr(engine, '_daily_chat_memory_cancel_requested', False):
+                        raise L1OwnerError('cancelled_or_disabled', field_path='generation')
+                    wire = job.add_window_summaries(wire, cached['events'])
+                    if wire[3] > INPUT_TOKENS:
+                        raise L1OwnerError('l1_v2_input_exceeds_budget', field_path='generation')
+                save({**state, 'phase': 'dispatched', 'dispatch_step': 'cards'}, dispatch=True)
                 calls += 1
                 try:
                     cards, _usage = await job.call(wire, part=part)
                     drafts = list(state['drafts'])
-                    _fold(drafts, cards, {f'm{index + 1}' for index, _, _ in sent}, context_refs, wire[4])
+                    _fold(drafts, cards, {f'm{index + 1}' for index, _, _ in sent}, context_refs, wire[4],
+                          prompt_revision='prompt_sha256:' + _digest(wire[0][0]['content']))
                 except Exception as exc:
                     # A known provider rejection/validation failure can be
                     # surfaced precisely. A timeout may already have run.
-                    error = model_error_details(exc)
-                    if error.get('http_status') in (400, 401, 403, 404, 413, 422, 429) or isinstance(
-                            exc, (L1OwnerError, ValueError)):
-                        save({**state, 'phase': 'failed', 'issue': error})
+                    record_model_failure(exc)
                     raise
                 phase = 'generated' if stop >= len(core) else 'ready'
                 save({'phase': phase, 'offset': stop, 'split': split, 'parts': part, 'drafts': drafts})
@@ -595,19 +710,44 @@ def _previous_day_cards(engine, day, profile_id):
                 or audit.get('prompt_version') != PROTOCOL or not audit.get('run_id')):
             continue
         receipt = queue.get('l1-v2:' + (audit.get('generation_task_id') or audit['run_id']))
-        if not receipt or receipt.get('stale'):
+        if not receipt:
             continue
         for row in queue.rows(receipt):
             candidate_id = row['candidate_id']
-            if candidate_id in results or row['status'] not in ('pending', 'accepted', 'commit_failed', 'committed'):
+            if candidate_id in results or row['status'] != 'committed':
                 continue
-            if row['status'] == 'committed':
-                active = authority.get_memory(candidate_id)
-                if (not active or active['active_revision'] != 1 or active['state'] != 'active' or active['recall_policy'] == 'disabled'
-                        or active['body_sha256'] != body_sha256(row['proposal']['proposed_body'])):
-                    continue
-            results[candidate_id] = row
+            if row['proposal']['source_type'] != 'daily_chat':
+                continue
+            active = authority.get_memory(candidate_id)
+            if active and active['state'] == 'active' and active['recall_policy'] == 'enabled':
+                results[candidate_id] = _with_prior_memory(engine, row, active['active_revision'])
     return list(reversed(results.values()))
+
+
+def _with_prior_memory(engine, row, revision):
+    memory_id = row['candidate_id']
+    record = engine.memory_authority_store.get_memory_revision(memory_id, revision)
+    if not record:
+        raise L1OwnerError('l1_v2_continuation_source_unavailable', status=409, field_path='sources')
+    body = row['proposal']['proposed_body']
+    if body_sha256(body) != record['body_sha256']:
+        projection = engine._memory_authority_service(None).projection
+        snapshot = Path(record['snapshot_path']).resolve()
+        if (snapshot != projection.snapshot_path(memory_id, revision).resolve()
+                or not snapshot.is_relative_to(projection.revisions_dir) or not snapshot.is_file()):
+            raise L1OwnerError('l1_v2_continuation_source_unavailable', status=409, field_path='sources')
+        body = frontmatter.loads(snapshot.read_text(encoding='utf-8')).content
+        if body_sha256(body) != record['body_sha256']:
+            raise L1OwnerError('revision_body_mismatch', status=503, field_path='sources')
+    return {**row, 'memory_revision': revision, 'memory_body': body,
+            'memory_semantic': record['metadata']['memory_l1']}
+
+
+def _prior_card_version(row):
+    version = [row['candidate_id'], row['revision']]
+    if 'memory_revision' in row:
+        version.append(row['memory_revision'])
+    return version
 
 
 def _binding_origin(binding):
@@ -615,6 +755,20 @@ def _binding_origin(binding):
 
 
 def _previous_day_drafts(rows, boundary_bindings):
+    if rows and 'memory_revision' in rows[0]:
+        from memory_l1_v2 import current_kind
+        drafts = []
+        for row in rows:
+            semantic = row.get('memory_semantic') or {}
+            drafts.append({'title': semantic.get('title') or '',
+                           'body': row['memory_body'],
+                           'kind': current_kind(semantic.get('kind')) or '',
+                           # Yesterday's adopted cards are reference material, not
+                           # sources of today's request, so they carry no refs.
+                           'sources': []})
+        return drafts, [_prior_card_version(row) for row in rows]
+
+    # Keep the input of an already frozen, source-bound window reproducible.
     available = {_binding_origin(binding): f'm{index}' for index, binding in enumerate(boundary_bindings, 1)}
     drafts, versions = [], []
     for row in reversed(rows):
@@ -637,7 +791,7 @@ def _record_day_continuation(proposal, previous_cards):
     present = {_binding_origin(binding): binding['binding_id'] for binding in document['evidence_bindings']}
     links = []
     for row in previous_cards:
-        prior = row['proposal']['metadata'].get('memory_l1') or {}
+        prior = row.get('memory_semantic') or row['proposal']['metadata'].get('memory_l1') or {}
         if (prior.get('kind') != document['kind'] or (prior.get('title') != document['title']
                 and not set(prior.get('keywords', [])).intersection(document['keywords']))):
             continue
@@ -655,6 +809,11 @@ def _usable_prior_draft(authority, row):
     if (not latest or latest['status'] in ('deferred', 'rejected')
             or latest['proposal_sha256'] != row['proposal_sha256']):
         return False
+    if 'memory_revision' in row:
+        active = authority.get_memory(row['candidate_id'])
+        return bool(latest['status'] == 'committed' and active and active['state'] == 'active'
+                    and active['recall_policy'] == 'enabled' and active['active_revision'] == row['memory_revision']
+                    and active['body_sha256'] == body_sha256(row['memory_body']))
     if latest['status'] == 'committed':
         active = authority.get_memory(row['candidate_id'])
         return bool(active and active['active_revision'] == 1 and active['state'] == 'active' and active['recall_policy'] != 'disabled'
@@ -663,18 +822,18 @@ def _usable_prior_draft(authority, row):
 
 
 def _daily_sources(engine, *, start, end, profile_id, raw_event_store, conversation_turn_store,
-                   raw_cursor, turn_cursor, source_kind=None, through=None):
+                   raw_cursor, turn_cursor, source_kind=None, through=None, cross_day_minutes=CROSS_DAY_MINUTES):
     from memory_source_provenance import daily_sources
 
     session = str((engine.config.get('persona') or {}).get('canonical_session_id') or 'jiajia-main')
+    # Older frozen windows must replay with the range that produced their fingerprint.
+    lookback = timedelta(days=1) if cross_day_minutes is None else timedelta(minutes=cross_day_minutes)
+    context_start = start - lookback
     if ((source_kind == 'raw_events' and raw_event_store is None)
             or (source_kind == 'conversation_turns' and conversation_turn_store is None)):
         raise L1OwnerError('l1_v2_daily_source_store_unavailable', status=503, field_path='sources')
     if source_kind != 'conversation_turns' and raw_event_store is not None:
-        # Use the same exact main-chat archive scope as the whole-window trial.
-        # Include the preceding date for bounded boundary context and read the
-        # full current interval before applying any model segmentation.
-        events = raw_event_store.list_events_between(start_at=start - timedelta(days=1), end_at=end,
+        events = raw_event_store.list_events_between(start_at=context_start, end_at=end,
             limit=0, chronological=True, profile_id=profile_id, source='gateway', session_id=session,
             conversation_id=session)
         events = [event for event in events if event.get('role') in ('user', 'assistant')
@@ -709,7 +868,7 @@ def _daily_sources(engine, *, start, end, profile_id, raw_event_store, conversat
     if conversation_turn_store is None:
         return [], [], 'conversation_turns', turn_cursor, 0
     rows = conversation_turn_store.list_conversation_turns_between(profile_id=profile_id,
-        start_at=start - timedelta(days=1), end_at=end, limit=0, chronological=True)
+        start_at=context_start, end_at=end, limit=0, chronological=True)
     rows = [row for row in rows if row.get('session_id') == session
             and (through is None or int(row['id']) <= through)]
     before, current = [], []
@@ -724,8 +883,10 @@ def _daily_sources(engine, *, start, end, profile_id, raw_event_store, conversat
     return context, core, 'conversation_turns', max((int(row['id']) for row in current), default=turn_cursor), len(current)
 
 
-def _daily_window(engine, *, start, end, read_sources, source_kind=None, through=None, previous_cards=()):
-    context, core, turn_source, watermark, turns = read_sources(end=end, source_kind=source_kind, through=through)
+def _daily_window(engine, *, start, end, read_sources, source_kind=None, through=None, previous_cards=(),
+                  cross_day_minutes=CROSS_DAY_MINUTES):
+    context, core, turn_source, watermark, turns = read_sources(end=end, source_kind=source_kind, through=through,
+                                                                cross_day_minutes=cross_day_minutes)
     tail = []
     count_tokens = 0
     for source in reversed(context):
@@ -735,12 +896,17 @@ def _daily_window(engine, *, start, end, read_sources, source_kind=None, through
             break
     tail.reverse()
     envelope = {'window': {'from': start.isoformat(), 'to_exclusive': end.isoformat(), 'turns': turns}}
+    if cross_day_minutes is not None:
+        cross_day = [f'm{index}' for index, source in enumerate(tail, 1)
+                     if (stamp := _local_time(source.get('recorded_at'), engine.tz)) and datetime.fromisoformat(stamp) < start]
+        if cross_day:
+            envelope['cross_day_sources'] = cross_day
     sources = [*tail, *core]
     if sources:
         _, bindings = bind_sources(sources, config=engine.config)
     else:
         bindings = []
-    if previous_cards and tail:
+    if previous_cards:
         drafts, versions = _previous_day_drafts(previous_cards, bindings[:len(tail)])
         if drafts:
             envelope['previous_day_drafts'] = drafts
@@ -752,6 +918,8 @@ def _daily_window(engine, *, start, end, read_sources, source_kind=None, through
     window = {'turn_source': turn_source, 'observed_watermark': watermark, 'end': end.isoformat(), 'turns': turns,
               'source_fingerprint': fingerprint, 'manifest_sha256': semantic_sha256({'sources': source_manifest}),
               'core_count': len(core), 'boundary_count': len(tail)}
+    if cross_day_minutes is not None:
+        window['cross_day_minutes'] = cross_day_minutes
     if 'previous_day_drafts' in envelope:
         window['previous_card_versions'] = versions
     return window, sources, envelope
@@ -785,10 +953,11 @@ async def run_daily(engine, bucket_mgr, *, key, start, end, profile_id, mode, fo
              'processed_until_seq': raw_cursor, 'processed_until_turn_id': turn_cursor,
              'created_at': datetime.now(timezone.utc).isoformat(), 'window_count': 0, 'model_call_count': 0}
 
-    def read_sources(*, end, source_kind=None, through=None):
+    def read_sources(*, end, source_kind, through, cross_day_minutes):
         return _daily_sources(engine, start=start, end=end, profile_id=profile_id,
             raw_event_store=raw_event_store, conversation_turn_store=conversation_turn_store,
-            raw_cursor=raw_cursor, turn_cursor=turn_cursor, source_kind=source_kind, through=through)
+            raw_cursor=raw_cursor, turn_cursor=turn_cursor, source_kind=source_kind, through=through,
+            cross_day_minutes=cross_day_minutes)
 
     try:
         window = authority.get_meta(window_key)
@@ -808,15 +977,17 @@ async def run_daily(engine, bucket_mgr, *, key, start, end, profile_id, mode, fo
                 window = _save_daily_window(authority, window_key, {**observed,
                     'watermark': observed['observed_watermark'], 'task_id': run_id})
         frozen_end = datetime.fromisoformat(window['end'])
-        previous_cards = [authority.get_candidate_revision(candidate_id, revision)
-                          for candidate_id, revision in window.get('previous_card_versions', [])]
-        if any(row is None for row in previous_cards):
-            raise L1OwnerError('l1_v2_continuation_source_unavailable', status=409, field_path='sources')
+        previous_cards = []
+        for candidate_id, candidate_revision, *memory_revision in window.get('previous_card_versions', []):
+            row = authority.get_candidate_revision(candidate_id, candidate_revision)
+            if row is None:
+                raise L1OwnerError('l1_v2_continuation_source_unavailable', status=409, field_path='sources')
+            previous_cards.append(_with_prior_memory(engine, row, memory_revision[0]) if memory_revision else row)
 
         def reread_window():
             return _daily_window(engine, start=start, end=frozen_end, read_sources=read_sources,
                                  source_kind=window['turn_source'], through=window['watermark'],
-                                 previous_cards=previous_cards)
+                                 previous_cards=previous_cards, cross_day_minutes=window.get('cross_day_minutes'))
 
         def matches_window(observed):
             return observed == {name: window.get(name) for name in observed}
@@ -832,7 +1003,10 @@ async def run_daily(engine, bucket_mgr, *, key, start, end, profile_id, mode, fo
             # An explicit rescan of a changed prefix gets a new source identity.
             # Preserve the old draft/revision as audit and stop replaying it.
             old_task = window['task_id']
-            previous_cards = [row for row in previous_cards if _usable_prior_draft(authority, row)]
+            if previous_cards and 'memory_revision' in previous_cards[0]:
+                previous_cards = _previous_day_cards(engine, key, profile_id)
+            else:
+                previous_cards = [row for row in previous_cards if _usable_prior_draft(authority, row)]
             observed, sources, envelope = reread_window()
             replacement = {**observed, 'watermark': window['watermark'],
                 'task_id': run_id + ':' + semantic_sha256({'previous': old_task, 'window': observed})[:24],
@@ -840,7 +1014,7 @@ async def run_daily(engine, bucket_mgr, *, key, start, end, profile_id, mode, fo
             window = _save_daily_window(authority, window_key, replacement, previous=window)
             selected_versions = {tuple(pair) for pair in window.get('previous_card_versions', [])}
             previous_cards = [row for row in previous_cards
-                              if (row['candidate_id'], row['revision']) in selected_versions]
+                              if tuple(_prior_card_version(row)) in selected_versions]
         turn_source, watermark, count = window['turn_source'], window['watermark'], window['turns']
         task_id = window['task_id']
         audit['generation_task_id'] = task_id

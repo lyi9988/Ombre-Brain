@@ -246,13 +246,21 @@ def test_v2_requires_keywords_and_preserves_unknown_people(tmp_path):
     _, _, _, _, document, _ = setup_v2(tmp_path)
     card = {key: value for key, value in document.items() if key in {
         "title", "body", "kind", "stability", "keywords", "primary_topic"}}
-    card.update(people=["p1"], sources=["m1"], people_links=[
+    card.update(people=["p1"], sources=["m1"], event_time=None, people_links=[
         {"label": "林工", "how": "mentioned", "sources": ["m1"]}])
     validated = validate_model_card(card, source_refs=["m1"], people_refs=["p1"])
     assert validated["people"] == ["p1"]
     card["keywords"] = []
     with pytest.raises(L1ContractError, match="minItems"):
         validate_model_card(card, source_refs=["m1"], people_refs=["p1"])
+
+
+def test_existing_v2_memory_without_primary_topic_remains_readable(tmp_path):
+    from memory_l1_v2 import validate_document
+
+    _, _, _, _, document, _ = setup_v2(tmp_path)
+    del document['primary_topic']
+    assert validate_document(document) == document
 
 
 def test_agent_draft_is_own_source_and_revision_change_invalidates(tmp_path):

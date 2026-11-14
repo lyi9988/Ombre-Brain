@@ -372,6 +372,12 @@ async def prepare_owner_summary_tasks(engine, bucket_mgr, *, max_jobs=None):
     allowance = options['chat_memory_jobs_per_run'] if max_jobs is None else min(options['chat_memory_jobs_per_run'], max_jobs)
     if not engine.memory_authority_enabled or not engine.memory_authority_store or allowance <= 0:
         return {'status': 'disabled', 'results': []}
+    # Owner summaries are kept in Aiz's own summary store and reach the chat
+    # context through the Composer summary block. They are not L1 memories.
+    # Submission, task records and the read API stay intact; this worker only
+    # refrains from claiming L1 work and calling the model.
+    if not (engine.config.get('reflection') or {}).get('owner_summary_l1_enabled', False):
+        return {'status': 'not_applicable', 'reason': 'owner_summary_not_l1', 'results': []}
     if getattr(engine, '_owner_summary_preparation_running', False): return {'status': 'locked', 'results': []}
     limit = max(1, int(engine.daily_chat_memory_max_per_day or 1))
     prompt, context = engine._memory_l1_prompt('ombre.daily_chat_memory_prompt', runtime_values={'max_candidates': limit})
