@@ -5,7 +5,9 @@ from hashlib import sha256
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from openai import BadRequestError
 
 from chat_memory_tool import ChatMemoryTool
 from memory_candidate_preparation import MemoryCandidatePreparation
@@ -85,6 +87,7 @@ def test_daily_window_delivers_every_original_then_queues_cards(tmp_path):
     result = _run(engine, store)
     assert result['status'] == 'pending', result
     assert result['cursor_updated'] and result['model_call_count'] == 2
+    assert result['candidates'][0]['date'] == DAY
     assert len(calls) == 1 and [row[3] for row in calls[0][1]['messages']] == [text for _, text in texts]
     request, payload = calls[0]
     assert payload['window']['turns'] == 46
@@ -142,6 +145,73 @@ def test_compression_refs_are_checked_and_persisted_before_writing_cards(tmp_pat
     completed = _run(engine, store, force=True)
     assert completed['status'] == 'pending' and completed['cursor_updated']
     assert completed['model_call_count'] == 1 and len(received) == 3 and len(calls) == 2
+
+
+def _bad_request(message='Invalid request', *, param=None):
+    response = httpx.Response(400, request=httpx.Request('POST', 'https://fixture.invalid/v1/chat/completions'))
+    return BadRequestError(message, response=response, body={'error': {'message': message, 'param': param}})
+
+
+@pytest.mark.parametrize('step', ['compression', 'cards'])
+@pytest.mark.parametrize('recovers', [True, False])
+def test_auto_l1_retries_only_failed_400_step_at_most_twice(tmp_path, step, recovers):
+    compression_inputs = []
+    event = {'summary': '那晚一起等雨停。', 'source_refs': ['m1']}
+
+    def should_reject(attempt):
+        return attempt < 3 or not recovers
+
+    def compress(payload):
+        compression_inputs.append(payload)
+        if step == 'compression' and should_reject(len(compression_inputs)):
+            raise _bad_request()
+        return [event]
+
+    def reply(payload):
+        assert payload['window_summaries'] == [event]
+        if step == 'cards' and should_reject(len(calls)):
+            raise _bad_request()
+        return [_card(['m1'])]
+
+    engine, calls = _engine(tmp_path, reply, compress=compress)
+    store = _events(engine, [('user', '我们那晚是在一起等雨停。')])
+
+    result = _run(engine, store)
+
+    assert len(compression_inputs) == (3 if step == 'compression' else 1)
+    assert all(value == compression_inputs[0] for value in compression_inputs)
+    assert len(calls) == (3 if step == 'cards' else int(recovers))
+    if calls:
+        assert all(wire == calls[0][0] for wire, _ in calls)
+    if recovers:
+        assert result['status'] == 'pending' and result['model_call_count'] == 4
+        assert result['cursor_updated'] and len(result['candidates']) == 1
+    else:
+        assert result['issue']['http_status'] == 400 and not result['cursor_updated']
+        _run(engine, store)
+        assert len(compression_inputs) + len(calls) == (3 if step == 'compression' else 4)
+    diagnostics = MemoryV2Diagnostics(engine.memory_authority_store).list(result['generation_task_id'])
+    retry_stage = 'window_compression_retry' if step == 'compression' else 'model_retry'
+    assert sorted(row['data']['attempt'] for row in diagnostics if row['stage'] == retry_stage) == [1, 2]
+
+
+def test_auto_l1_schema_fallback_uses_the_same_retry_budget(tmp_path):
+    def reply(payload):
+        if len(calls) == 1:
+            raise _bad_request('json_schema is not supported', param='response_format')
+        if len(calls) == 2:
+            raise _bad_request()
+        return [_card(['m1'])]
+
+    engine, calls = _engine(tmp_path, reply)
+    store = _events(engine, [('user', '我们那晚是在一起等雨停。')])
+
+    result = _run(engine, store)
+
+    assert result['status'] == 'pending' and result['model_call_count'] == 4
+    assert [wire['response_format']['type'] for wire, _ in calls] == ['json_schema', 'json_object', 'json_object']
+    assert calls[1] == calls[2]
+    assert calls[1][1]['output_schema'] == calls[0][0]['response_format']['json_schema']['schema']
 
 
 @pytest.mark.parametrize('owner_text', ['起点\n{l1_material_rules}\n落点', '早先保存的主人原稿', ''])
@@ -326,6 +396,29 @@ def test_cross_day_material_alone_cannot_create_a_card(tmp_path, use_raw_events)
     _, payload = calls[0]
     assert [row[3] for row in payload['messages']] == ['昨天的原话。', '今天的新话。']
     assert payload['cross_day_sources'] == ['m1'] and payload['core_sources'] == ['m2']
+
+
+def test_auto_review_keeps_supported_card_beside_context_only_and_invalid_dates(tmp_path):
+    def reply(payload):
+        dated = _card(payload['core_sources'])
+        missing_date_in_body = {**dated, 'body': '那晚我记得我们一起等雨停。'}
+        invalid_date = {**dated, 'event_time': {**dated['event_time'], 'start': '2026-11-99'}}
+        return [_card(payload['cross_day_sources']), missing_date_in_body, invalid_date, dated]
+
+    engine, calls = _engine(tmp_path, reply)
+    midnight = datetime.fromisoformat(DAY + 'T00:00:00+08:00')
+    store = _events(engine, [('user', '昨天的原话。'), ('assistant', '今天的新话。')],
+                    start=midnight - timedelta(seconds=1))
+
+    result = _run(engine, store)
+
+    assert result['status'] == 'pending' and result['cursor_updated'], result
+    assert len(calls) == 1 and len(result['candidates']) == 1
+    diagnostic = MemoryV2Diagnostics(engine.memory_authority_store).list(result['generation_task_id'])
+    rejected = {row['data']['code']: row['data']['rejected_count'] for row in diagnostic
+                if row['stage'] == 'card_source_rejected'}
+    assert rejected == {'l1_v2_card_without_core_source': 1, 'event_date_missing_from_body': 1,
+                        'invalid_event_time': 1}
 
 
 def test_previous_day_context_contains_all_adopted_bodies_without_shared_sources(tmp_path):

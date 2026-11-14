@@ -843,6 +843,7 @@ class ReflectionEngine(MemoryL1Runtime):
                                                        allow_classification_gap=True)
             from memory_l1_v2 import KINDS, is_v2
             if is_v2(metadata['memory_l1']):
+                candidate['date'] = candidate.get('date') or metadata.get('date', '')
                 candidate['classification_gap'] = metadata['memory_l1']['kind'] not in KINDS
                 candidate['confidence_source'] = metadata.get('confidence_source')
                 candidate['l1_v2_kinds'] = list(KINDS)

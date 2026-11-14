@@ -1,6 +1,7 @@
 """Prepare L1 v2 cards from full, authenticated source views."""
 from __future__ import annotations
 
+import asyncio
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -29,8 +30,11 @@ COMPRESSION_OUTPUT_TOKENS = 8000
 CONTEXT_TOKENS = 2000
 CONTINUATION_TOKENS = 4000
 CROSS_DAY_MINUTES = 30
+AUTO_L1_BAD_REQUEST_RETRIES = 2
 
 _WINDOW_PREFIX = 'daily_chat_l1_v2_window:'
+_EVENT_TIME_ERRORS = {'event_date_missing_from_body', 'invalid_event_time',
+                      'reversed_event_range', 'inconsistent_event_timezone'}
 _PROMPTS = Path(__file__).with_name('resources') / 'l1_v2'
 
 
@@ -150,6 +154,7 @@ class Generation:
         from memory_l1_v2 import catalog
 
         self.engine, self.origin, self.task_id = engine, origin, task_id
+        self.model_calls = 0
         if origin not in L1_V2_SOURCE_RULES:
             raise L1OwnerError('l1_v2_unknown_source_kind', field_path='input_kind')
         self.source_rule = L1_V2_SOURCE_RULES[origin]
@@ -279,10 +284,9 @@ class Generation:
         meta = {'origin': self.origin, 'part': part, 'model': route['model'], 'source_count': len(core_refs),
                 'prompt_sha256': _digest(wire[0]['content']), 'user_sha256': _digest(wire[1]['content']),
                 'input_tokens_estimate': estimated, 'max_output_tokens': route['max_tokens']}
-        _diagnostic(self.engine, self.task_id, 'window_compression_dispatch', meta)
         try:
-            response = await create_completion(route['client'], model=route['model'], messages=wire, route=route,
-                temperature=self.engine.temperature, response_format={'type': 'json_object'}, validation_schema=schema)
+            response = await self._complete(wire, route=route, response_format={'type': 'json_object'},
+                validation_schema=schema, stage='window_compression', meta=meta)
             _diagnostic(self.engine, self.task_id, 'window_compression_return', {
                 **meta, 'usage': response_usage(response), 'finish_reason': self.engine._completion_finish_reason(response),
                 'duration_ms': int((monotonic() - started) * 1000)})
@@ -299,6 +303,37 @@ class Generation:
         payload = json.loads(wire[1]['content'])
         payload['output_schema'] = native['json_schema']['schema']
         return [wire[0], {'role': 'user', 'content': canonical_json(payload)}]
+
+    async def _complete(self, wire, *, route, response_format, stage, meta, validation_schema=None):
+        auto = self.origin == 'auto_l1'
+        retries = AUTO_L1_BAD_REQUEST_RETRIES if auto else int(response_format['type'] == 'json_schema')
+        for attempt in range(1, retries + 2):
+            if auto and getattr(self.engine, '_daily_chat_memory_cancel_requested', False):
+                raise L1OwnerError('cancelled_or_disabled', field_path='generation')
+            meta['attempt'] = attempt
+            _diagnostic(self.engine, self.task_id, stage + '_dispatch', meta)
+            self.model_calls += 1
+            try:
+                return await create_completion(route['client'], model=route['model'], messages=wire, route=route,
+                    temperature=self.engine.temperature, response_format=response_format,
+                    validation_schema=validation_schema)
+            except Exception as exc:
+                if attempt > retries:
+                    raise
+                issue = model_error_details(exc)
+                if response_format['type'] == 'json_schema' and _schema_rejected(exc):
+                    _diagnostic(self.engine, self.task_id, 'native_schema_rejected', {**meta, 'issue': issue})
+                    validation_schema = response_format['json_schema']['schema']
+                    wire = self._json_object_wire(wire, response_format)
+                    response_format = {'type': 'json_object'}
+                    meta.update(protocol='json_object', user_sha256=_digest(wire[1]['content']),
+                        user_chars=len(wire[1]['content']), input_tokens_estimate=_tokens(canonical_json({
+                            'messages': wire, 'response_format': response_format})))
+                elif auto and issue.get('http_status') == 400:
+                    _diagnostic(self.engine, self.task_id, stage + '_retry', {**meta, 'issue': issue})
+                    await asyncio.sleep(0.5 * attempt)
+                else:
+                    raise
 
     async def call(self, request, *, part):
         wire, native, refs, estimated, _ = request
@@ -317,25 +352,8 @@ class Generation:
                 'thinking_mode': self.route['thinking_mode'], 'source_count': len(refs),
                 'visible_message_count': len(payload['messages']), 'partial_source_ranges': payload.get('source_ranges', {}),
                 'first_source_ref': refs[0] if refs else None, 'last_source_ref': refs[-1] if refs else None}
-        _diagnostic(self.engine, self.task_id, 'model_dispatch', meta)
         try:
-            try:
-                response = await create_completion(self.route['client'], model=self.route['model'],
-                    messages=wire, route=self.route, temperature=self.engine.temperature, response_format=native)
-            except Exception as exc:
-                if not _schema_rejected(exc):
-                    raise
-                _diagnostic(self.engine, self.task_id, 'native_schema_rejected', {
-                    **meta, 'issue': model_error_details(exc)})
-                fallback = self._json_object_wire(wire, native)
-                response_format = {'type': 'json_object'}
-                meta = {**meta, 'protocol': 'json_object', 'user_sha256': _digest(fallback[1]['content']),
-                        'user_chars': len(fallback[1]['content']), 'input_tokens_estimate': _tokens(canonical_json({
-                            'messages': fallback, 'response_format': response_format}))}
-                _diagnostic(self.engine, self.task_id, 'model_dispatch', meta)
-                response = await create_completion(self.route['client'], model=self.route['model'],
-                    messages=fallback, route=self.route, temperature=self.engine.temperature,
-                    response_format=response_format, validation_schema=native['json_schema']['schema'])
+            response = await self._complete(wire, route=self.route, response_format=native, stage='model', meta=meta)
             usage = response_usage(response)
             finish = self.engine._completion_finish_reason(response)
             _diagnostic(self.engine, self.task_id, 'model_return', {
@@ -399,6 +417,38 @@ def _ranges(values):
         else:
             output.append([start, end])
     return output
+
+
+def _eligible_daily_cards(job, cards, core_refs, source_refs, *, part, prior_drafts):
+    from memory_l1_contract import L1ContractError
+    from memory_l1_v2 import validate_model_card
+
+    accepted, errors = [], {}
+    field_paths = {}
+    people_refs = [person['ref'] for person in job.people]
+    for card in cards:
+        if not core_refs.intersection(card['sources']):
+            code = 'l1_v2_card_without_core_source'
+        else:
+            try:
+                validate_model_card({key: value for key, value in card.items() if key != 'review'},
+                    source_refs=source_refs, people_refs=people_refs, catalog=job.catalog)
+            except L1ContractError as exc:
+                if exc.code not in _EVENT_TIME_ERRORS:
+                    raise
+                code = exc.code
+                field_paths[code] = exc.path
+            else:
+                accepted.append(card)
+                continue
+        errors[code] = errors.get(code, 0) + 1
+    for code, count in errors.items():
+        _diagnostic(job.engine, job.task_id, 'card_source_rejected', {
+            'origin': job.origin, 'part': part, 'code': code, 'rejected_count': count})
+    if errors and not accepted and not prior_drafts:
+        code = next(iter(errors))
+        raise L1OwnerError(code, field_path=field_paths.get(code, 'cards.sources'))
+    return accepted
 
 
 def _fold(drafts, cards, core_refs, context_refs, observed, *, prompt_revision):
@@ -605,7 +655,6 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                     cached = state.get('compression') or {}
                     if cached.get('input_sha256') != compressed_input:
                         save({**state, 'phase': 'dispatched', 'dispatch_step': 'window_compression'}, dispatch=True)
-                        calls += 1
                         try:
                             events = await job.compress(compression, part=part)
                         except Exception as exc:
@@ -619,12 +668,14 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                     if wire[3] > INPUT_TOKENS:
                         raise L1OwnerError('l1_v2_input_exceeds_budget', field_path='generation')
                 save({**state, 'phase': 'dispatched', 'dispatch_step': 'cards'}, dispatch=True)
-                calls += 1
                 try:
                     cards, _usage = await job.call(wire, part=part)
                     drafts = list(state['drafts'])
-                    _fold(drafts, cards, {f'm{index + 1}' for index, _, _ in sent}, context_refs, wire[4],
-                          prompt_revision='prompt_sha256:' + _digest(wire[0][0]['content']))
+                    core_refs = {f'm{index + 1}' for index, _, _ in sent}
+                    if origin == 'auto_l1':
+                        cards = _eligible_daily_cards(job, cards, core_refs, wire[2], part=part, prior_drafts=drafts)
+                    prompt_revision = 'prompt_sha256:' + _digest(wire[0][0]['content'])
+                    _fold(drafts, cards, core_refs, context_refs, wire[4], prompt_revision=prompt_revision)
                 except Exception as exc:
                     # A known provider rejection/validation failure can be
                     # surfaced precisely. A timeout may already have run.
@@ -632,6 +683,7 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                     raise
                 phase = 'generated' if stop >= len(core) else 'ready'
                 save({'phase': phase, 'offset': stop, 'split': split, 'parts': part, 'drafts': drafts})
+        calls = job.model_calls
         cards = state['drafts']
         if (not allow_empty and not cards) or (candidate_id is not None and len(cards) != 1):
             save({**state, 'phase': 'failed', 'offset': 0, 'split': 0, 'parts': 0, 'drafts': [],
