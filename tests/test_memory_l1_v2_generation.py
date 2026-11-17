@@ -16,6 +16,7 @@ from memory_chat_preparation import prepare_chat_tasks
 from memory_l1_service import L1OwnerError
 from memory_l1_v2_diagnostics import MemoryV2Diagnostics
 from memory_l1_v2_generation import Generation, INPUT_TOKENS, PROMPT_ID
+from memory_model_io import MemoryModelIO
 from raw_events import RawEventStore
 from reflection_engine import ReflectionEngine
 from test_memory_authority_r1 import reflection_config
@@ -758,6 +759,61 @@ def test_chat_draft_can_prepare_without_nearby_chat_sources(tmp_path, has_title)
         document['generation']['submitted_at'])
     assert document['evidence_bindings'][0]['source_namespace'] == 'snapshot.ombre.agent_memory_draft'
     assert (document.get('event_time') or {}).get('start') == (DAY if has_title else None)
+    capture = MemoryModelIO(engine.memory_authority_store).list(queued['task_id'])
+    record, = capture['items']
+    assert capture['capture_state'] == 'recorded'
+    assert record['status'] == 'succeeded' and record['task_id'] == queued['task_id']
+    assert record['draft_revision'] == task['draft_revision'] and record['attempt'] == task['attempts']
+    assert record['native_request'] == request
+    assert json.loads(record['raw_output']) == {'cards': [metadata]}
+    assert record['generation']['prompt_source_id'] == CHAT_PROMPT_ID
+    assert record['source_revisions'] == document['evidence_bindings']
+
+
+@pytest.mark.parametrize('retry_schema', [True, False])
+def test_chat_v2_model_io_captures_each_request_and_preserves_rejected_output(tmp_path, retry_schema):
+    metadata = {'kind': 'life_experience', 'stability': 'episode', 'keywords': ['雨夜等车'],
+                'people': [], 'sources': [], 'primary_topic': 'daily_life', 'event_time': None}
+    engine, _ = _engine(tmp_path, lambda _payload: [metadata])
+    envelope = {'operation_id': 'op-' + '1' * 32,
+                'arguments': {'narrative': {'title': '雨夜', 'body': '我在雨夜等车。'}},
+                'context': {'conversation_id': 'canonical-main', 'request_id': 'r1',
+                            'turn_id': 'e1', 'sources': []}}
+    queued = asyncio.run(ChatMemoryTool(engine, None).submit(envelope))
+    recorder = MemoryModelIO(engine.memory_authority_store)
+    create = engine.client.chat.completions.create
+    requests = []
+    invalid_output = '  {"cards": "invalid"}\n'
+
+    async def respond(**request):
+        requests.append(request)
+        record = recorder.list(queued['task_id'])['items'][0]
+        assert record['status'] == 'running'
+        assert record['native_request'] == request
+        if not retry_schema:
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=invalid_output), finish_reason='stop')])
+        if len(requests) == 1:
+            raise _bad_request('response_format is not supported', param='response_format')
+        return await create(**request)
+
+    engine.client.chat.completions.create = respond
+    result = asyncio.run(prepare_chat_tasks(engine, None))
+    records = recorder.list(queued['task_id'])['items']
+    assert [record['native_request'] for record in reversed(records)] == requests
+    if retry_schema:
+        final, first = records
+        assert first['error']['http_status'] == 400 and first['raw_output'] is None
+        assert final['status'] == 'succeeded'
+        assert first['generation']['request_attempt'] == 1 and final['generation']['request_attempt'] == 2
+        assert [wire['response_format']['type'] for wire in requests] == ['json_schema', 'json_object']
+        assert result['results'][0]['memory_status'] == 'pending'
+    else:
+        rejected, = records
+        assert rejected['status'] == 'failed'
+        assert rejected['error']['failure_phase'] == 'response_processing'
+        assert rejected['raw_output'] == invalid_output and rejected['finish_reason'] == 'stop'
+        assert result['results'][0]['status'] == 'failed'
 
 
 def test_chat_v2_accepts_a_staged_window_over_the_legacy_message_cap(tmp_path, monkeypatch):

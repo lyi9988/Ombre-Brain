@@ -20,7 +20,7 @@ from memory_l1_contract import canonical_json, make_text_anchor, semantic_sha256
 from memory_l1_ingestion import bind_sources
 from memory_l1_service import L1OwnerError
 from memory_l1_v2_prompts import L1_V2_CONTINUATION_RULE, L1_V2_MATERIAL_PLACEHOLDER, L1_V2_SOURCE_RULES
-from memory_model_io import model_error_details, response_usage
+from memory_model_io import MemoryModelIO, completion_parameters, model_error_details, response_usage
 from memory_l1_v2_chat import CHAT_PROMPT_ID, build_chat_response_format
 
 PROTOCOL = 'whole_window_v2'
@@ -341,7 +341,7 @@ class Generation:
                 'prompt_sha256': _digest(wire[0]['content']), 'user_sha256': _digest(wire[1]['content']),
                 'input_tokens_estimate': estimated, 'max_output_tokens': route['max_tokens']}
         try:
-            response = await self._complete(wire, route=route, response_format={'type': 'json_object'},
+            response, _ = await self._complete(wire, route=route, response_format={'type': 'json_object'},
                 validation_schema=schema, stage='window_compression', meta=meta)
             _diagnostic(self.engine, self.task_id, 'window_compression_return', {
                 **meta, 'usage': response_usage(response), 'finish_reason': self.engine._completion_finish_reason(response),
@@ -361,7 +361,8 @@ class Generation:
         wire[self.material_position] = {'role': 'user', 'content': canonical_json(payload)}
         return wire
 
-    async def _complete(self, wire, *, route, response_format, stage, meta, validation_schema=None):
+    async def _complete(self, wire, *, route, response_format, stage, meta, validation_schema=None,
+                        recorder=None, chat_model_io=None):
         auto = self.origin == 'auto_l1'
         retries = AUTO_L1_BAD_REQUEST_RETRIES if auto else int(response_format['type'] == 'json_schema')
         for attempt in range(1, retries + 2):
@@ -369,13 +370,25 @@ class Generation:
                 raise L1OwnerError('cancelled_or_disabled', field_path='generation')
             meta['attempt'] = attempt
             _diagnostic(self.engine, self.task_id, stage + '_dispatch', meta)
+            io_id, capture = None, None
+            if recorder is not None:
+                io_id = recorder.start(
+                    **chat_model_io, stage='chat_l1', messages=wire,
+                    parameters=completion_parameters(route, self.engine.temperature),
+                    generation={**self.generation, 'request_attempt': attempt},
+                )
+                capture = lambda request: recorder.requested(
+                    io_id, request, timeout_seconds=route.get('timeout_seconds', 180))
             self.model_calls += 1
             try:
-                return await create_completion(route['client'], model=route['model'], messages=wire, route=route,
+                response = await create_completion(route['client'], model=route['model'], messages=wire, route=route,
                     temperature=self.engine.temperature, response_format=response_format,
-                    validation_schema=validation_schema)
-            except Exception as exc:
-                if attempt > retries:
+                    validation_schema=validation_schema, capture=capture)
+                return response, io_id
+            except (Exception, asyncio.CancelledError) as exc:
+                if io_id:
+                    recorder.finish(io_id, error=exc)
+                if isinstance(exc, asyncio.CancelledError) or attempt > retries:
                     raise
                 issue = model_error_details(exc)
                 if response_format['type'] == 'json_schema' and _schema_rejected(exc):
@@ -393,7 +406,7 @@ class Generation:
                 else:
                     raise
 
-    async def call(self, request, *, part):
+    async def call(self, request, *, part, chat_model_io=None):
         wire, native, refs, estimated, _ = request
         if estimated > INPUT_TOKENS:
             raise L1OwnerError('l1_v2_input_exceeds_budget', field_path='generation')
@@ -412,19 +425,32 @@ class Generation:
                 'thinking_mode': self.route['thinking_mode'], 'source_count': len(refs),
                 'visible_message_count': len(payload['messages']), 'partial_source_ranges': payload.get('source_ranges', {}),
                 'first_source_ref': refs[0] if refs else None, 'last_source_ref': refs[-1] if refs else None}
+        recorder, io_id = None, None
+        if chat_model_io is not None:
+            recorder = MemoryModelIO(self.engine.memory_authority_store)
+            chat_model_io = {**chat_model_io,
+                             'source_revisions': [self.bindings[int(ref[1:]) - 1] for ref in refs]}
         try:
-            response = await self._complete(wire, route=self.route, response_format=native, stage='model', meta=meta)
+            response, io_id = await self._complete(wire, route=self.route, response_format=native,
+                stage='model', meta=meta, recorder=recorder, chat_model_io=chat_model_io)
             usage = response_usage(response)
             finish = self.engine._completion_finish_reason(response)
+            raw_output = self.engine._completion_content(response)
+            if io_id:
+                recorder.returned(io_id, response=response, raw_output=raw_output, finish_reason=finish)
             _diagnostic(self.engine, self.task_id, 'model_return', {
                 **meta, 'usage': usage, 'finish_reason': finish, 'duration_ms': int((monotonic() - started) * 1000)})
             validate_response(response)
-            cards = json.loads(self.engine._completion_content(response))['cards']
+            cards = json.loads(raw_output)['cards']
             if self.origin == 'chat_l1':
                 self._attach_chat_draft(cards[0])
                 cards[0]['_prompt_source_id'] = CHAT_PROMPT_ID
+            if io_id:
+                recorder.finish(io_id)
             return cards, usage
         except Exception as exc:
+            if io_id:
+                recorder.finish(io_id, error=exc)
             _diagnostic(self.engine, self.task_id, 'model_issue', {
                 **meta, 'issue': model_error_details(exc), 'duration_ms': int((monotonic() - started) * 1000)})
             raise
@@ -678,7 +704,7 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                    candidate_id=None, policy=None, owner_explicit=False, metadata=None,
                    required_source_ref=None, required_any_source_refs=None, before_prepare=None,
                    prepare_policy=None, expected_source_fingerprint=None, before_progress_save=None,
-                   active_reading=False):
+                   active_reading=False, chat_model_io=None):
     """Durably prepare once, resume per range, and drain through the normal policy."""
     authority = engine.memory_authority_store
     queue = MemoryCandidatePreparation(authority)
@@ -774,7 +800,7 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                         raise L1OwnerError('l1_v2_input_exceeds_budget', field_path='generation')
                 save({**state, 'phase': 'dispatched', 'dispatch_step': 'cards'}, dispatch=True)
                 try:
-                    cards, _usage = await job.call(wire, part=part)
+                    cards, _usage = await job.call(wire, part=part, chat_model_io=chat_model_io)
                     drafts = [] if origin == 'chat_l1' else list(state['drafts'])
                     core_refs = {f'm{index + 1}' for index, _, _ in sent}
                     if origin == 'auto_l1':

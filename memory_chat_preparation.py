@@ -472,6 +472,8 @@ async def _prepare_v2_chat(engine, bucket_mgr, tasks, claimed, sources, *, force
         context={'agent_draft': {'source_ref': 'm1', 'title': draft.get('title') or '',
                                  'draft_revision': draft_revision}},
         candidate_id=memory_id, force=force, allow_empty=False, required_source_ref='m1',
+        chat_model_io={'memory_id': memory_id, 'task_id': memory_id, 'attempt': claimed['attempts'],
+                       'attempt_id': claimed['claim_token'], 'draft_revision': draft_revision},
         before_prepare=tasks.guard_claim(claimed), metadata={'tool_operation_id': claimed['operation_id'],
             'chat_submission': {'operation_id': claimed['operation_id'], 'task_id': memory_id,
                                 'draft_revision': draft_revision}})
