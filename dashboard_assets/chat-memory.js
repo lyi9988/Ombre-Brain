@@ -31,7 +31,15 @@
   }
 
   function modelIoStageLabel(stage) {
-    var labels = { chat_l1: '完整第一遍记忆 L1', presentation_l2: '第二遍可读注入记忆 L2' };
+    var labels = {
+      chat_l1: '主动聊天记忆 L1',
+      auto_l1: '自动记忆 L1',
+      window_compression: '自动记忆窗口摘要',
+      browse_l1: '浏览记忆 L1',
+      action_l1: '行动与主动阅读记忆 L1',
+      presentation_l2: '第二遍可读注入记忆 L2',
+      memory_l3_sync: '记忆修订 L3'
+    };
     return labels[stage] || String(stage || '未提供阶段');
   }
 
@@ -151,14 +159,15 @@
     details.setAttribute('data-model-io-stage', stage);
     var summary = document.createElement('summary');
     var attempt = record.attempt;
-    var numericAttempt = stage === 'chat_l1' && attempt != null && /^\d+$/.test(String(attempt));
+    var numericAttempt = attempt != null && /^\d+$/.test(String(attempt));
     var attemptText = attempt == null ? '尝试标识未留存'
       : (numericAttempt ? '第 ' + modelIoText(attempt) + ' 次尝试' : '本轮调用');
     var stateText = record.status == null ? '状态未留存' : modelIoText(record.status);
     var finishText = record.finish_reason == null || record.finish_reason === ''
       ? 'finish_reason 未留存' : 'finish_reason ' + modelIoText(record.finish_reason);
     var started = record.started_at || record.ended_at || '';
-    summary.textContent = modelIoStageLabel(stage) + ' · ' + attemptText + ' · ' + stateText +
+    var partText = record.part == null ? '' : ' · 第 ' + modelIoText(record.part) + ' 段';
+    summary.textContent = modelIoStageLabel(stage) + partText + ' · ' + attemptText + ' · ' + stateText +
       ' · ' + finishText + (started ? ' · ' + modelIoText(started) : '') +
       ' · ' + modelIoTokenSummary(record.usage);
     details.appendChild(summary);
@@ -1835,6 +1844,10 @@
     }
     var modelIoIds = Array.isArray(task.candidate_ids)
       ? Array.from(new Set(task.candidate_ids.map(modelIoMemoryId).filter(Boolean))) : [];
+    if (!modelIoIds.length && (task.phase === 'failed' || task.phase === 'generating')) {
+      var taskIoId = modelIoMemoryId(task.task_id);
+      if (taskIoId) modelIoIds.push(taskIoId);
+    }
     var actions = document.createElement('div'); actions.className = 'chat-memory-card-actions';
     if (task.phase === 'failed' || task.phase === 'generating') {
       var retry = document.createElement('button'); retry.type = 'button'; retry.textContent = task.phase === 'failed' ? '重试整理' : '中断后恢复整理';

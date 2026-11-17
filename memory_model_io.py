@@ -6,7 +6,7 @@ are retained. This is call evidence, never another memory or source authority.
 from __future__ import annotations
 
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import re
@@ -14,13 +14,22 @@ import uuid
 
 from memory_l1_contract import canonical_json
 from memory_l1_service import L1OwnerError
+from memory_l1_v2_diagnostics import DEFAULT_MAX_BYTES, RETENTION_DAYS
 
 PREFIX = 'memory_model_io:'
-STAGES = ('chat_l1', 'auto_l1', 'presentation_l2', 'memory_l3_sync')
+V2_PREFIX = 'memory_model_io_v2:'
+STAGES = ('chat_l1', 'auto_l1', 'window_compression', 'browse_l1', 'action_l1',
+          'presentation_l2', 'memory_l3_sync')
+REQUEST_FIELDS = {'model', 'input', 'messages', 'max_output_tokens', 'max_tokens',
+                  'temperature', 'reasoning', 'text', 'response_format', 'reasoning_effort', 'extra_body'}
 
 
 def _stamp():
     return datetime.now(timezone.utc).isoformat(timespec='microseconds')
+
+
+def _v2_cutoff():
+    return (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat(timespec='microseconds')
 
 
 def completion_parameters(route, temperature):
@@ -94,15 +103,15 @@ class MemoryModelIO:
         self.authority = authority
 
     @staticmethod
-    def _prefix(memory_id):
-        return PREFIX + hashlib.sha256(memory_id.encode('utf-8')).hexdigest() + ':'
+    def _prefix(memory_id, *, v2=False):
+        return (V2_PREFIX if v2 else PREFIX) + hashlib.sha256(memory_id.encode('utf-8')).hexdigest() + ':'
 
     def start(self, memory_id, *, stage, task_id, attempt, messages, parameters,
-              generation=None, draft_revision=None, source_revisions=None, attempt_id=None):
+              generation=None, draft_revision=None, source_revisions=None, attempt_id=None, part=None):
         if stage not in STAGES:
             raise ValueError('unsupported model IO stage')
         started = _stamp()
-        io_id = self._prefix(memory_id) + started + ':' + uuid.uuid4().hex
+        io_id = self._prefix(memory_id, v2=part is not None) + started + ':' + uuid.uuid4().hex
         # This whitelist accepts SDK options only, not route/client/headers/key.
         allowed = {'model', 'max_tokens', 'max_completion_tokens', 'temperature',
                    'reasoning_effort', 'thinking', 'effort'}
@@ -117,8 +126,30 @@ class MemoryModelIO:
                'completion_parameters': safe, 'started_at': started, 'ended_at': None,
                'status': 'running', 'usage': {}, 'finish_reason': None, 'raw_output': None,
                'validation': {'status': 'pending'}}
+        if part is not None:
+            row['part'] = part
         self.authority.set_meta(io_id, row)
         return io_id
+
+    @staticmethod
+    def _rotate_v2(db):
+        lower, upper = V2_PREFIX, V2_PREFIX + '\uffff'
+        time_start = len(V2_PREFIX) + 66  # SQLite offsets are one-based.
+        db.execute('DELETE FROM authority_meta WHERE key>=? AND key<? AND substr(key,?)<?',
+                   (lower, upper, time_start, _v2_cutoff()))
+        rows = db.execute(
+            "SELECT key,length(CAST(value AS BLOB)),json_extract(value,'$.status') "
+            "FROM authority_meta WHERE key>=? AND key<? ORDER BY substr(key,?)",
+            (lower, upper, time_start)).fetchall()
+        total = sum(row[1] for row in rows)
+        expired = []
+        for key, size, status in rows:
+            if total <= DEFAULT_MAX_BYTES:
+                break
+            if status in ('succeeded', 'failed'):
+                expired.append((key,))
+                total -= size
+        db.executemany('DELETE FROM authority_meta WHERE key=?', expired)
 
     def _update(self, io_id, **changes):
         db = self.authority._connect()
@@ -130,6 +161,8 @@ class MemoryModelIO:
             row = json.loads(found['value'])
             row.update(copy.deepcopy(changes))
             db.execute('UPDATE authority_meta SET value=? WHERE key=?', (canonical_json(row), io_id))
+            if io_id.startswith(V2_PREFIX) and changes.get('status') in ('succeeded', 'failed'):
+                self._rotate_v2(db)
             db.commit()
         except Exception:
             db.rollback()
@@ -140,10 +173,8 @@ class MemoryModelIO:
     def returned(self, io_id, *, response, raw_output, finish_reason):
         wire = getattr(response, 'native_request', None)
         actual = {}
-        if isinstance(wire, dict):
-            allowed = {'model', 'input', 'messages', 'max_output_tokens', 'max_tokens',
-                       'temperature', 'reasoning', 'text', 'response_format', 'reasoning_effort', 'extra_body'}
-            request = {k: copy.deepcopy(v) for k, v in wire.items() if k in allowed}
+        if isinstance(wire, dict) and not io_id.startswith(V2_PREFIX):
+            request = {k: copy.deepcopy(v) for k, v in wire.items() if k in REQUEST_FIELDS}
             actual = {'native_request': request,
                       'messages': request.get('input', request.get('messages', [])),
                       'completion_parameters': {k: v for k, v in request.items() if k not in ('input', 'messages')}}
@@ -152,13 +183,16 @@ class MemoryModelIO:
 
     def requested(self, io_id, request, *, timeout_seconds):
         """Capture the real native wire before dispatch, including on timeout."""
-        allowed = {'model', 'input', 'messages', 'max_output_tokens', 'max_tokens',
-                   'temperature', 'reasoning', 'text', 'response_format', 'reasoning_effort', 'extra_body'}
-        wire = {key: copy.deepcopy(value) for key, value in request.items() if key in allowed}
+        wire = {key: copy.deepcopy(value) for key, value in request.items() if key in REQUEST_FIELDS}
+        transport = {'timeout_seconds': timeout_seconds, 'max_retries': 0}
+        if io_id.startswith(V2_PREFIX):
+            # The owner API derives messages and options from this one exact copy.
+            self._update(io_id, native_request=wire, transport=transport)
+            return
         self._update(io_id, native_request=wire,
             messages=wire.get('input', wire.get('messages', [])),
             completion_parameters={key: value for key, value in wire.items() if key not in ('input', 'messages')},
-            transport={'timeout_seconds': timeout_seconds, 'max_retries': 0})
+            transport=transport)
 
     def finish(self, io_id, *, error=None):
         row = self.authority.get_meta(io_id)
@@ -174,21 +208,51 @@ class MemoryModelIO:
         self._update(io_id, **changes)
         return failure
 
+    def _generation_task(self, memory_id):
+        from memory_l1_v2 import is_v2
+
+        candidate = self.authority.get_candidate(memory_id)
+        if candidate:
+            metadata = candidate['proposal'].get('metadata') or {}
+        else:
+            memory = self.authority.get_memory(memory_id)
+            if not memory or not memory['active_revision']:
+                return None
+            revision = self.authority.get_memory_revision(memory_id, memory['active_revision'])
+            metadata = (revision or {}).get('metadata') or {}
+        document = metadata.get('memory_l1')
+        return (document.get('generation') or {}).get('task_id') if is_v2(document) else None
+
     def list(self, memory_id, limit=20, offset=0):
         if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0:
             raise L1OwnerError('invalid_model_io_page', field_path='query')
-        prefix = self._prefix(memory_id)
+        direct = self._prefix(memory_id)
+        cutoff = _v2_cutoff()
+        scopes = [(direct, direct + '\uffff', len(direct) + 1)]
+        task_id = self._generation_task(memory_id)
+        for identity in dict.fromkeys((memory_id, task_id)):
+            if isinstance(identity, str) and identity:
+                prefix = self._prefix(identity, v2=True)
+                scopes.append((prefix + cutoff, prefix + '\uffff', len(prefix) + 1))
+        condition = 'key>=? AND key<?'
+        query = ' UNION ALL '.join(
+            f'SELECT value, substr(key, ?) AS started FROM authority_meta WHERE {condition}' for _ in scopes)
+        arguments = [value for lower, upper, offset_start in scopes for value in (offset_start, lower, upper)]
         db = self.authority._connect()
         try:
-            # Primary-key range avoids scanning other memories or metadata families.
-            rows = db.execute('SELECT value FROM authority_meta WHERE key>=? AND key<? '
-                              'ORDER BY key DESC LIMIT ? OFFSET ?',
-                              (prefix, prefix + '\uffff', limit + 1, offset)).fetchall()
-            exists = bool(rows) or bool(db.execute('SELECT 1 FROM authority_meta WHERE key>=? AND key<? LIMIT 1',
-                                                   (prefix, prefix + '\uffff')).fetchone())
+            rows = db.execute(query + ' ORDER BY started DESC LIMIT ? OFFSET ?',
+                              (*arguments, limit + 1, offset)).fetchall()
+            exists = bool(rows) or any(db.execute(
+                f'SELECT 1 FROM authority_meta WHERE {condition} LIMIT 1', (lower, upper)).fetchone()
+                for lower, upper, _ in scopes)
         finally:
             db.close()
         items = [json.loads(row['value']) for row in rows[:limit]]
+        for item in items:
+            wire = item.get('native_request')
+            if item['io_id'].startswith(V2_PREFIX) and wire:
+                item['messages'] = wire.get('input', wire.get('messages', []))
+                item['completion_parameters'] = {k: v for k, v in wire.items() if k not in ('input', 'messages')}
         more = len(rows) > limit
         return {'status': 'ok', 'memory_id': memory_id, 'items': items, 'limit': limit,
                 'offset': offset, 'has_more': more, 'next_offset': offset + len(items) if more else None,

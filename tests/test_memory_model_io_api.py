@@ -12,6 +12,7 @@ from starlette.routing import Route
 from memory_authority import MemoryAuthorityStore
 from memory_l1_contract import L1ContractError
 from memory_l1_service import L1OwnerError
+import memory_model_io
 from memory_model_io import MemoryModelIO
 
 
@@ -80,3 +81,31 @@ def test_model_io_route_empty_legacy_and_pagination_validation(tmp_path):
     assert result.json()['items'] == []
     for query in ('limit=201', 'limit=0', 'offset=-1', 'limit=x', 'limit=2&limit=3', 'secret=1'):
         assert get(app, url + '?' + query).status_code == 400
+
+
+def test_model_io_v2_expiry_and_order_preserve_legacy_records(tmp_path, monkeypatch):
+    authority = MemoryAuthorityStore({'state_dir': str(tmp_path)})
+    recorder = MemoryModelIO(authority)
+    monkeypatch.setattr(memory_model_io, '_v2_cutoff', lambda: '2026-11-11T00:00:00.000000+00:00')
+    stamps = ('2026-11-10T23:59:59.000000+00:00', '2026-11-17T10:00:00.000000+00:00',
+              '2026-11-17T11:00:00.000000+00:00', '2026-11-17T12:00:00.000000+00:00')
+    times = iter(stamps)
+    monkeypatch.setattr(memory_model_io, '_stamp', lambda: next(times))
+    params = {'stage': 'action_l1', 'task_id': 'task', 'attempt': 1, 'messages': [], 'parameters': {'model': 'x'}}
+    expired = recorder.start('task', part=1, **params)
+    older = recorder.start('task', **{**params, 'stage': 'presentation_l2'})
+    newer = recorder.start('task', part=1, **params)
+    recorder.requested(newer, {'model': 'x', 'input': [{'role': 'user', 'content': 'reading input'}],
+                               'text': {'format': {'type': 'json_object'}}, 'api_key': 'secret'}, timeout_seconds=5)
+    recorder.finish(newer, error=TimeoutError('private provider details'))
+    assert authority.get_meta(expired) is None and authority.get_meta(older) is not None
+    app = app_for(authority)
+    uri = '/api/memory-authority/memories/task/model-io'
+    first = get(app, uri + '?limit=1').json()
+    assert first['next_offset'] == 1 and len(first['items']) == 1
+    record = first['items'][0]
+    assert record['io_id'] == newer and record['status'] == 'failed'
+    assert record['messages'] == record['native_request']['input']
+    assert 'api_key' not in record['native_request']
+    assert record['raw_output'] is None and record['error']['code'] == 'TimeoutError'
+    assert get(app, uri + '?limit=1&offset=1').json()['items'][0]['io_id'] == older

@@ -16,6 +16,7 @@ from memory_chat_preparation import prepare_chat_tasks
 from memory_l1_service import L1OwnerError
 from memory_l1_v2_diagnostics import MemoryV2Diagnostics
 from memory_l1_v2_generation import Generation, INPUT_TOKENS, PROMPT_ID
+from memory_model_io import MemoryModelIO
 from raw_events import RawEventStore
 from reflection_engine import ReflectionEngine
 from test_memory_authority_r1 import reflection_config
@@ -108,6 +109,13 @@ def test_daily_window_delivers_every_original_then_queues_cards(tmp_path):
     generation = result['candidates'][0]['l1_document']['generation']
     assert generation['prompt_source_id'] == PROMPT_ID
     assert generation['prompt_revision'] == 'prompt_sha256:' + sha256(system.encode()).hexdigest()
+    recorder = MemoryModelIO(engine.memory_authority_store)
+    saved = recorder.list(result['candidates'][0]['id'])['items']
+    assert saved == recorder.list(generation['task_id'])['items']
+    assert [row['stage'] for row in saved] == ['auto_l1', 'window_compression']
+    assert saved[0]['native_request'] == request
+    assert saved[0]['messages'] == request['messages']
+    assert json.loads(saved[1]['raw_output']) == {'events': []}
     assert engine.memory_authority_store.get_memory(result['candidates'][0]['id']) is None
     assert _run(engine, store)['status'] == 'skipped' and len(calls) == 1
     diagnostic = MemoryV2Diagnostics(engine.memory_authority_store).list(result['run_id'])
@@ -219,6 +227,10 @@ def test_auto_l1_schema_fallback_uses_the_same_retry_budget(tmp_path):
     assert [wire['response_format']['type'] for wire, _ in calls] == ['json_schema', 'json_object', 'json_object']
     assert calls[1] == calls[2]
     assert calls[1][1]['output_schema'] == calls[0][0]['response_format']['json_schema']['schema']
+    records = MemoryModelIO(engine.memory_authority_store).list(result['candidates'][0]['id'])['items']
+    assert [row['status'] for row in records] == ['succeeded', 'failed', 'failed', 'succeeded']
+    assert [row['native_request'] for row in reversed(records[:3])] == [wire for wire, _ in calls]
+    assert all(row['error']['http_status'] == 400 and row['raw_output'] is None for row in records[1:3])
 
 
 @pytest.mark.parametrize('owner_text', ['起点\n{l1_material_rules}\n落点', '早先保存的主人原稿', ''])
@@ -272,6 +284,11 @@ def test_model_requires_a_classification_primary_topic_and_event_time(tmp_path, 
     assert 'secondary_topic' not in schema['required']
     assert set(schema['properties']['kind']['enum']) >= {'person_relationship', 'expressed_need'}
     assert None not in schema['properties']['kind']['enum']
+    record = MemoryModelIO(engine.memory_authority_store).list(result['generation_task_id'])['items'][0]
+    assert record['status'] == 'failed' and record['finish_reason'] == 'stop'
+    assert record['error']['failure_phase'] == 'response_processing'
+    assert record['error']['code'] == 'native_l1_schema_mismatch'
+    assert record['raw_output'] and record['native_request'] == calls[0][0]
 
 
 def test_v2_uses_saved_auto_policy_and_retains_sensitive_drafts(tmp_path):
@@ -490,6 +507,10 @@ def test_unknown_dispatch_cannot_retry_from_scheduler(tmp_path):
     second = _run(engine, store)
     assert second['reason'] == 'model_outcome_unknown_requires_retry_decision'
     assert len(calls) == 1
+    record = MemoryModelIO(engine.memory_authority_store).list(first['generation_task_id'])['items'][0]
+    assert record['native_request'] == calls[0][0]
+    assert record['status'] == 'failed' and record['raw_output'] is None
+    assert record['error']['failure_phase'] == 'request'
 
 
 def test_v2_will_not_use_legacy_generator_without_authority(tmp_path):
@@ -758,6 +779,11 @@ def test_chat_draft_can_prepare_without_nearby_chat_sources(tmp_path, has_title)
         document['generation']['submitted_at'])
     assert document['evidence_bindings'][0]['source_namespace'] == 'snapshot.ombre.agent_memory_draft'
     assert (document.get('event_time') or {}).get('start') == (DAY if has_title else None)
+    record = MemoryModelIO(engine.memory_authority_store).list(queued['task_id'])['items'][0]
+    assert record['stage'] == 'chat_l1' and record['task_id'] == queued['task_id'] + ':1'
+    assert record['draft_revision'] == 1 and record['part'] == 1
+    assert record['native_request'] == request and record['validation'] == {'status': 'passed'}
+    assert json.loads(record['raw_output']) == {'cards': [metadata]}
 
 
 def test_chat_v2_accepts_a_staged_window_over_the_legacy_message_cap(tmp_path, monkeypatch):

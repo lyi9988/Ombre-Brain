@@ -387,6 +387,7 @@ def active_reading(tmp_path, monkeypatch):
 def test_active_reading_prepares_and_adopts_one_card_with_the_original_draft_and_exact_sources(active_reading, unsolicited_body):
     from memory_l1_v2_generation import ACTIVE_PROMPT_ID
     from memory_l1_v2_prompts import L1_V2_ACTIVE_PROMPT
+    from memory_model_io import MemoryModelIO
 
     f = active_reading
     assert f.post(authorized=False)[0] == 401
@@ -440,6 +441,14 @@ def test_active_reading_prepares_and_adopts_one_card_with_the_original_draft_and
     revision = f.engine.memory_authority_store.get_memory_revision(candidate_id, 1)
     assert revision['metadata']['memory_l1']['evidence_bindings'] == metadata['evidence_bindings']
     assert run(f.buckets.get(candidate_id))['content'].strip() == body
+    recorder = MemoryModelIO(f.engine.memory_authority_store)
+    saved = recorder.list(candidate_id)['items']
+    assert saved == recorder.list(f.task_id)['items']
+    record, = saved
+    assert record['stage'] == 'action_l1' and record['native_request'] == request
+    assert record['generation']['prompt_source_id'] == ACTIVE_PROMPT_ID
+    returned = json.loads(record['raw_output'])['cards'][0]
+    assert ('body' in returned) is unsolicited_body
 
 
 def test_active_reading_replay_keeps_original_task_and_candidate(active_reading):

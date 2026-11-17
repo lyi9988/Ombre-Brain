@@ -20,7 +20,7 @@ from memory_l1_contract import canonical_json, make_text_anchor, semantic_sha256
 from memory_l1_ingestion import bind_sources
 from memory_l1_service import L1OwnerError
 from memory_l1_v2_prompts import L1_V2_CONTINUATION_RULE, L1_V2_MATERIAL_PLACEHOLDER, L1_V2_SOURCE_RULES
-from memory_model_io import model_error_details, response_usage
+from memory_model_io import MemoryModelIO, completion_parameters, model_error_details, response_usage
 from memory_l1_v2_chat import CHAT_PROMPT_ID, build_chat_response_format
 
 PROTOCOL = 'whole_window_v2'
@@ -155,13 +155,15 @@ def _people(engine, snapshots, sources):
 
 class Generation:
     def __init__(self, engine, *, origin, task_id, sources, context=None, include_review=False,
-                 active_reading=False):
+                 active_reading=False, candidate_id=None):
         from memory_l1_v2 import catalog
 
         self.engine, self.origin, self.task_id = engine, origin, task_id
         self.model_calls = 0
         if origin not in L1_V2_SOURCE_RULES:
             raise L1OwnerError('l1_v2_unknown_source_kind', field_path='input_kind')
+        self.model_io = MemoryModelIO(engine.memory_authority_store)
+        self.model_io_id = candidate_id or task_id
         self.source_rule = L1_V2_SOURCE_RULES[origin]
         self.route = _route(engine, origin)
         self.active_reading = active_reading
@@ -340,19 +342,24 @@ class Generation:
         meta = {'origin': self.origin, 'part': part, 'model': route['model'], 'source_count': len(core_refs),
                 'prompt_sha256': _digest(wire[0]['content']), 'user_sha256': _digest(wire[1]['content']),
                 'input_tokens_estimate': estimated, 'max_output_tokens': route['max_tokens']}
+        io_id = None
         try:
-            response = await self._complete(wire, route=route, response_format={'type': 'json_object'},
+            response, io_id = await self._complete(wire, route=route, response_format={'type': 'json_object'},
                 validation_schema=schema, stage='window_compression', meta=meta)
             _diagnostic(self.engine, self.task_id, 'window_compression_return', {
                 **meta, 'usage': response_usage(response), 'finish_reason': self.engine._completion_finish_reason(response),
                 'duration_ms': int((monotonic() - started) * 1000)})
             validate_response(response)
             events = json.loads(self.engine._completion_content(response))['events']
-            return [event for event in events if core_refs.intersection(event['source_refs'])]
+            events = [event for event in events if core_refs.intersection(event['source_refs'])]
         except Exception as exc:
+            if io_id:
+                self.model_io.finish(io_id, error=exc)
             _diagnostic(self.engine, self.task_id, 'window_compression_issue', {
                 **meta, 'issue': model_error_details(exc), 'duration_ms': int((monotonic() - started) * 1000)})
             raise
+        self.model_io.finish(io_id)
+        return events
 
     def _json_object_wire(self, wire, native):
         wire = list(wire)
@@ -364,17 +371,39 @@ class Generation:
     async def _complete(self, wire, *, route, response_format, stage, meta, validation_schema=None):
         auto = self.origin == 'auto_l1'
         retries = AUTO_L1_BAD_REQUEST_RETRIES if auto else int(response_format['type'] == 'json_schema')
+        io_stage = self.origin if stage == 'model' else stage
+        draft_revision = (self.common.get('agent_draft') or {}).get('draft_revision')
+        material_index = 1 if stage == 'window_compression' else self.material_position
+        refs = dict.fromkeys(row[0] for row in json.loads(wire[material_index]['content'])['messages'])
+        source_revisions = []
+        for ref in refs:
+            binding = self.bindings[int(ref[1:]) - 1]
+            source_revisions.append({key: binding[key] for key in
+                                     ('binding_id', 'source_namespace', 'source_id', 'source_revision')})
+        parameters = completion_parameters(route, self.engine.temperature)
+        generation = {**self.generation, 'prompt_revision': 'prompt_sha256:' + meta['prompt_sha256']}
         for attempt in range(1, retries + 2):
             if auto and getattr(self.engine, '_daily_chat_memory_cancel_requested', False):
                 raise L1OwnerError('cancelled_or_disabled', field_path='generation')
             meta['attempt'] = attempt
             _diagnostic(self.engine, self.task_id, stage + '_dispatch', meta)
+            io_id = self.model_io.start(self.model_io_id, stage=io_stage, task_id=self.task_id, attempt=attempt,
+                messages=[], parameters=parameters, generation=generation, draft_revision=draft_revision,
+                source_revisions=source_revisions, part=meta['part'])
+
+            def capture(request):
+                self.model_io.requested(io_id, request, timeout_seconds=route.get('timeout_seconds', 180))
+
             self.model_calls += 1
             try:
-                return await create_completion(route['client'], model=route['model'], messages=wire, route=route,
-                    temperature=self.engine.temperature, response_format=response_format,
+                response = await create_completion(route['client'], model=route['model'], messages=wire, route=route,
+                    temperature=self.engine.temperature, response_format=response_format, capture=capture,
                     validation_schema=validation_schema)
+            except asyncio.CancelledError:
+                self.model_io.finish(io_id, error=L1OwnerError('worker_interrupted'))
+                raise
             except Exception as exc:
+                self.model_io.finish(io_id, error=exc)
                 if attempt > retries:
                     raise
                 issue = model_error_details(exc)
@@ -392,6 +421,11 @@ class Generation:
                     await asyncio.sleep(0.5 * attempt)
                 else:
                     raise
+            else:
+                self.model_io.returned(io_id, response=response,
+                    raw_output=self.engine._completion_content(response),
+                    finish_reason=self.engine._completion_finish_reason(response))
+                return response, io_id
 
     async def call(self, request, *, part):
         wire, native, refs, estimated, _ = request
@@ -412,8 +446,9 @@ class Generation:
                 'thinking_mode': self.route['thinking_mode'], 'source_count': len(refs),
                 'visible_message_count': len(payload['messages']), 'partial_source_ranges': payload.get('source_ranges', {}),
                 'first_source_ref': refs[0] if refs else None, 'last_source_ref': refs[-1] if refs else None}
+        io_id = None
         try:
-            response = await self._complete(wire, route=self.route, response_format=native, stage='model', meta=meta)
+            response, io_id = await self._complete(wire, route=self.route, response_format=native, stage='model', meta=meta)
             usage = response_usage(response)
             finish = self.engine._completion_finish_reason(response)
             _diagnostic(self.engine, self.task_id, 'model_return', {
@@ -423,11 +458,14 @@ class Generation:
             if self.origin == 'chat_l1':
                 self._attach_chat_draft(cards[0])
                 cards[0]['_prompt_source_id'] = CHAT_PROMPT_ID
-            return cards, usage
         except Exception as exc:
+            if io_id:
+                self.model_io.finish(io_id, error=exc)
             _diagnostic(self.engine, self.task_id, 'model_issue', {
                 **meta, 'issue': model_error_details(exc), 'duration_ms': int((monotonic() - started) * 1000)})
             raise
+        self.model_io.finish(io_id)
+        return cards, usage
 
     def prepare_reading_response(self, card):
         from memory_l1_v2 import prepare_active_reading_card
@@ -694,7 +732,7 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
             raise L1OwnerError('memory_source_disabled', status=409, field_path='mode')
         job = Generation(engine, origin=origin, task_id=task_id, sources=sources, context=context,
                          include_review=effective_mode == 'auto' and not owner_explicit,
-                         active_reading=active_reading)
+                         active_reading=active_reading, candidate_id=candidate_id)
         fingerprint = semantic_sha256({'sources': job.bindings, 'context': context, 'core_start': core_start})
         if expected_source_fingerprint is not None and fingerprint != expected_source_fingerprint:
             raise L1OwnerError('l1_v2_source_changed', status=409, field_path='sources')
