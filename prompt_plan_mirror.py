@@ -49,6 +49,7 @@ _GATEWAY_SOURCES = frozenset(
 _L1_V2_PROMPT_SCOPES = {
     'ombre.memory_l1_v2_generation_prompt': 'memory.l1_v2_generation',
     'ombre.memory_l1_v2_revision_prompt': 'memory.reflection',
+    'ombre.memory_l1_v2_chat_prompt': 'memory.chat_prepare',
 }
 
 

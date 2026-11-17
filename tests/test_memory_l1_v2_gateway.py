@@ -26,7 +26,7 @@ BODY = "2026年11月8日，我和主人约定先等她回复，再做下一步�
 
 
 def _card_document(bucket_id, *, body=BODY, dated=True, event_day="2026-11-08", scope_note=None,
-                   title="桥面安排", keyword="蓝桦工程"):
+                   title="桥面安排", keyword="蓝桦工程", origin="auto_l1"):
     source_id = "synthetic:" + bucket_id
     binding = {
         "binding_id": "source_1", "source_namespace": "synthetic", "source_id": source_id,
@@ -45,13 +45,13 @@ def _card_document(bucket_id, *, body=BODY, dated=True, event_day="2026-11-08", 
         card["scope_notes"] = [{"focus": "桥面安排", "rule": scope_note, "sources": ["source_1"]}]
     document = prepare_card(card, people=[{"ref": "p1", "person_id": "owner", "name": "林柚",
                                          "kind": "human", "aliases": ["小柚"]}],
-                            bindings=[binding], generation={"origin": "auto_l1"})
+                            bindings=[binding], generation={"origin": origin})
     document.pop("body")
     return document, source_id
 
 
-def _commit_card(authority, bucket_id, *, body=BODY, dated=True):
-    document, source_id = _card_document(bucket_id, body=body, dated=dated)
+def _commit_card(authority, bucket_id, *, body=BODY, dated=True, origin="auto_l1"):
+    document, source_id = _card_document(bucket_id, body=body, dated=dated, origin=origin)
     metadata = {
         "memory_l1": document,
         "memory_l1_semantic_sha256": semantic_sha256(document),
@@ -68,6 +68,29 @@ def _commit_card(authority, bucket_id, *, body=BODY, dated=True):
     return {"id": bucket_id, "content": body,
             "metadata": {"name": "桥面安排", "type": "dynamic", "created": "2026-11-13T09:00:00",
                          "memory_l1_schema_version": SCHEMA_VERSION}}
+
+
+def test_active_chat_preserves_the_draft_when_recalled_by_event_date(tmp_path, monkeypatch):
+    with monkeypatch.context() as setup:
+        authority, service, view, _, plan = _fixture(tmp_path, setup)
+    body = "我和你约好，蓝桦工程先等你回复再推进，当时还没有执行。"
+    card = _commit_card(authority, "bucket-active-chat", body=body, origin="chat_l1")
+    bucket_id = card["id"]
+    query = "2026年11月8日蓝桦工程的安排是什么？"
+    request = _recall_input(query)
+    inputs = {"direct": (f"[bucket_id:{bucket_id}]", [bucket_id], 500)}
+    calls = _install_source_http(monkeypatch)
+
+    sections = asyncio.run(memory_use.project_sections(service, request, query, [card], inputs))
+
+    assert sections["direct"] == body
+    assert len(calls) == 1
+    record = view.memory_l1_recall_map([bucket_id])[bucket_id]
+    assert record["state"] == "l1_v2"
+    assert record["document"]["event_time"]["start"] == "2026-11-08"
+    projection = _projection(service, request, sections)
+    messages, *_ = _compose(service, plan, projection, sections, date="", recent="")
+    assert sum(row["content"].count(body) for row in messages) == 1
 
 
 def test_v2_normal_projection_validates_sources_and_compiles_the_full_body_once(tmp_path, monkeypatch):

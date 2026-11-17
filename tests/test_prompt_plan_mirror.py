@@ -74,6 +74,25 @@ def test_memory_l1_v2_factory_and_owner_override_stay_in_background_scope(store)
     assert text == '记忆试验的主人提示词'
 
 
+def test_active_chat_metadata_prompt_keeps_its_background_scope_and_override(store):
+    from memory_l1_v2_chat import CHAT_L1_PROMPT, CHAT_PROMPT_ID
+    from prompt_source_registry import source_detail
+
+    detail = source_detail(CHAT_PROMPT_ID)
+    assert detail["factory_body"] == CHAT_L1_PROMPT
+    payload = _slice("主动记忆的主人提示词")
+    payload["blocks"][0]["source_id"] = CHAT_PROMPT_ID
+    with pytest.raises(PromptPlanMirrorValidationError):
+        store.put_plan("preset:chat-metadata", 1, plan_sha256="e" * 64, gateway_slice=payload)
+    payload["blocks"][0]["scope"] = "memory.chat_prepare"
+    store.put_plan("preset:chat-metadata", 1, plan_sha256="e" * 64, gateway_slice=payload)
+    store.put_binding("memory.chat_prepare", preset_id="preset:chat-metadata", preset_revision=1,
+                      plan_sha256="e" * 64, aiz_binding_revision=1)
+    text, _ = store.resolve_text(scope="memory.chat_prepare", source_id=CHAT_PROMPT_ID,
+                                 live_body=detail["factory_body"])
+    assert text == "主动记忆的主人提示词"
+
+
 def test_plan_rejects_non_gateway_source(store):
     payload = _slice()
     payload["blocks"][0]["source_id"] = "conversation.history"

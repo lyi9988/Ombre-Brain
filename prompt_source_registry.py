@@ -94,6 +94,8 @@ FIXED_PROMPT_SOURCES = {
               "memory_l1_prompts:DIARY_L1_PROMPT", render="domain_identity", revision="factory-diary-semantic-v6-native-l1"),
         _spec("ombre.chat_memory_prepare_prompt", "memory.chat_prepare",
               "memory_l1_prompts:CHAT_PREPARATION_PROMPT", render="domain_identity", revision="factory-chat-semantic-v11-configured-names"),
+        _spec("ombre.memory_l1_v2_chat_prompt", "memory.chat_prepare",
+              "memory_l1_v2_chat:CHAT_L1_PROMPT", revision="factory-memory-l1-v2-chat-20261117"),
         _spec("ombre.daily_chat_memory_prompt", "memory.daily_chat_review",
               "memory_l1_prompts:DAILY_L1_PROMPT",
               render="domain_identity", required=("{max_candidates}",), revision="factory-memory-semantic-v16-valued-kinds"),
