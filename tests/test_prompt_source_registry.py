@@ -32,6 +32,7 @@ EXPECTED_FIXED_SOURCE_IDS = {
     "ombre.daily_chat_event_selection_prompt",
     "ombre.daily_chat_event_assembly_prompt",
     "ombre.memory_l1_v2_generation_prompt",
+    "ombre.memory_l1_v2_chat_prompt",
     "ombre.memory_l1_v2_active_prompt",
     "ombre.memory_l1_v2_revision_prompt",
     "ombre.memory_l3_sync_prompt",
@@ -94,7 +95,8 @@ def test_active_l1_prompt_is_registered_with_the_shared_background_factory():
     assert spec.source_revision == "factory-memory-l1-v2-active-20261116-r2"
     assert detail["source_revision"] == spec.source_revision
     assert detail["factory_body"] == body
-    assert "body 原样返回顾衍的原稿" in body
+    assert "正文由程序沿用顾衍的原稿" in body
+    assert "无需返回 body" in body
     assert "阅读只依据实际已读范围" in body
     assert "顶层只有 cards，且恰好一张卡" in body
 
@@ -169,7 +171,8 @@ def test_fixed_detail_has_factory_and_live_body_only():
         }
         assert detail["body_kind"] == "fixed_prompt"
         retired = source_id in {'ombre.memory_detail_request_prompt', 'ombre.memory_reading_policy_prompt',
-                                'ombre.date_boundary_prompt'}
+                                'ombre.date_boundary_prompt', 'ombre.handoff_hint_prompt',
+                                'ombre.handoff_date_hint_prompt'}
         assert bool(detail["factory_body"]) is not retired
         assert bool(detail["live_body"]) is not retired
         assert detail["source_revision"]

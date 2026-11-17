@@ -136,7 +136,7 @@ def model_card_schema(source_refs, people_refs, catalog=None, *, allow_classific
                 "scope_notes": {"type": "array", "items": note}}}
 
 
-def build_model_response_format(source_refs, people_refs, catalog=None, *, include_review=False):
+def build_model_response_format(source_refs, people_refs, catalog=None, *, include_review=False, one_card=False):
     card = model_card_schema(source_refs, people_refs, catalog, allow_classification_gap=False)
     if include_review:
         flags = ("sensitive", "transient", "generic")
@@ -146,11 +146,13 @@ def build_model_response_format(source_refs, people_refs, catalog=None, *, inclu
                 **{flag: {"type": "boolean"} for flag in flags},
             }}
         card["required"].append("review")
+    cards = {"type": "array", "items": card}
+    if one_card:
+        cards.update(minItems=1, maxItems=1)
     return {"type": "json_schema", "json_schema": {
         "name": "memory_l1_v2_cards", "strict": True,
         "schema": {"type": "object", "additionalProperties": False,
-                   "required": ["cards"], "properties": {"cards": {
-                       "type": "array", "items": card}}}}}
+                   "required": ["cards"], "properties": {"cards": cards}}}}
 
 
 def _date(value, path):
@@ -165,6 +167,56 @@ def _date(value, path):
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         _error("invalid_event_time", path)
+
+
+def _day_in_body(body, stamp):
+    date_text = f"{stamp.year}年{stamp.month}月{stamp.day}日"
+    compact = re.sub(r"\s+", "", body)
+    return date_text in compact or stamp.strftime("%Y-%m-%d") in compact
+
+
+def _validate_reading_time(value, precision, occurred_at, path):
+    stamp = _date(value, path)
+    calendar_chars = {"year": 4, "month": 7, "day": 10}
+    if precision in calendar_chars or (precision == "approximate" and stamp.tzinfo is None):
+        length = calendar_chars.get(precision, len(value))
+        matches = value == occurred_at.date().isoformat()[:length]
+    else:
+        # A zoned instant must match the executor's timestamp at the claimed
+        # precision. Clock time cannot be inferred from a day-only reference.
+        minute = precision == "minute"
+        has_second = re.search(r"T\d{2}:\d{2}:\d{2}", value)
+        if precision == "approximate":
+            minute = not has_second
+        if minute:
+            matches = stamp.replace(second=0, microsecond=0) == occurred_at.replace(second=0, microsecond=0)
+        else:
+            matches = bool(has_second and stamp.replace(microsecond=0) == occurred_at.replace(microsecond=0))
+    if not matches:
+        _error("l1_v2_reading_time_unsupported", path)
+    return stamp
+
+
+def prepare_active_reading_card(card, *, original_body, receipt_ref, occurred_at, article_time):
+    """Preserve the submitted wording and add a date only after checking its basis."""
+    card = {**card, "body": original_body, "sources": list(dict.fromkeys([*card['sources'], receipt_ref]))}
+    event = card['event_time']
+    if event is None:
+        return card
+    occurred = datetime.fromisoformat(occurred_at) if occurred_at else None
+    article = datetime.fromisoformat(article_time) if article_time else None
+    article_support = (occurred and article and article.date() == occurred.date() and "m2" in event['sources']
+                       and event["precision"] in {"year", "month", "day", "approximate"}
+                       and "T" not in event["start"] and "T" not in event.get("end", ""))
+    if not occurred or (receipt_ref not in event['sources'] and not article_support):
+        _error("l1_v2_reading_time_unsupported", "card.event_time.sources")
+    start = _validate_reading_time(event["start"], event["precision"], occurred, "card.event_time.start")
+    if event.get("end"):
+        _validate_reading_time(event["end"], event["precision"], occurred, "card.event_time.end")
+    card["event_time"] = {**event, "sources": list(dict.fromkeys([*event['sources'], receipt_ref]))}
+    if event["precision"] in {"day", "minute", "second"} and not _day_in_body(original_body, start):
+        card["body"] = f"{start.year}年{start.month}月{start.day}日\n\n{original_body}"
+    return card
 
 
 def validate_model_card(card, *, source_refs, people_refs, catalog=None, allow_classification_gap=False,
@@ -200,11 +252,8 @@ def validate_model_card(card, *, source_refs, people_refs, catalog=None, allow_c
                     _error("reversed_event_range", "card.event_time.end")
             except TypeError:
                 _error("inconsistent_event_timezone", "card.event_time")
-        if require_date_in_body and event["precision"] in {"day", "minute", "second"}:
-            date_text = f"{start.year}年{start.month}月{start.day}日"
-            compact = re.sub(r"\s+", "", value["body"])
-            if date_text not in compact and start.strftime("%Y-%m-%d") not in compact:
-                _error("event_date_missing_from_body", "card.body")
+        if require_date_in_body and event["precision"] in {"day", "minute", "second"} and not _day_in_body(value["body"], start):
+            _error("event_date_missing_from_body", "card.body")
     return value
 
 

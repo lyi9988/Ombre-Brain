@@ -52,6 +52,12 @@ _L1_V2_PROMPT_SCOPES = {
     'ombre.memory_l1_v2_revision_prompt': 'memory.reflection',
     'ombre.memory_l1_v2_chat_prompt': 'memory.chat_prepare',
 }
+_BACKGROUND_ANCHOR_ORDER = {
+    "instructions.start": 10, "gateway.after_first_system": 15,
+    "instructions.end": 20, "history.start": 30, "history.depth": 40,
+    "current_user.before": 50, "gateway.current_user_prefix": 60,
+    "current_user.prefix": 60, "current_user.after": 110,
+}
 
 
 class PromptPlanMirrorError(RuntimeError):
@@ -95,6 +101,54 @@ def _hash_value(value: Any, field: str) -> str:
     if not _SHA_RE.fullmatch(result):
         raise PromptPlanMirrorValidationError(f"{field} must be sha256")
     return result
+
+
+def prompt_condition_matches(condition: dict, facts: dict[str, Any]) -> bool:
+    rules = condition.get("rules") if isinstance(condition, dict) else []
+    if not rules:
+        return True
+    values = []
+    for rule in rules:
+        actual = facts.get(str(rule.get("source") or ""))
+        expected = rule.get("value")
+        op = str(rule.get("op") or "equals")
+        if op == "equals":
+            hit = actual == expected
+        elif op == "not_equals":
+            hit = actual != expected
+        elif op == "contains":
+            hit = str(expected) in str(actual or "")
+        elif op == "present":
+            hit = actual not in (None, "", [], {})
+        elif op == "absent":
+            hit = actual in (None, "", [], {})
+        elif op in {"greater_than", "less_than"}:
+            try:
+                hit = (float(actual) > float(expected) if op == "greater_than"
+                       else float(actual) < float(expected))
+            except (TypeError, ValueError):
+                hit = False
+        else:
+            hit = False
+        values.append(hit)
+    return any(values) if condition.get("match") == "any" else all(values)
+
+
+def _fixed_text(block, live_body):
+    mode = block["mode"]
+    if mode == "off" or not block.get("enabled", True):
+        return ""
+    body = live_body if mode == "live_source" else str(
+        block.get("owner_body") if mode == "owner_override"
+        else block.get("frozen_body") if mode == "frozen_snapshot" else "")
+    wrapper = str(block.get("wrapper_text") or "")
+    if wrapper and body:
+        body = (wrapper.replace("{{content}}", body)
+                if "{{content}}" in wrapper else f"{wrapper}\n{body}")
+    budget = block.get("token_budget")
+    if budget not in (None, "", "all"):
+        body = body[:max(0, int(budget)) * 4]
+    return body
 
 
 def normalize_gateway_slice(value: Any) -> dict:
@@ -557,30 +611,17 @@ class PromptPlanMirrorStore:
                 ),
             }
 
-    def resolve_text(self, *, scope: str, source_id: str, live_body: str,
-                     identity_id: str = "jiajia-main",
-                     conversation_id: str = "") -> tuple[str, dict]:
-        """Resolve one standalone Gateway prompt from the derived mirror.
-
-        No binding is the exact legacy path.  The mirror never becomes an
-        editing authority; it only projects an immutable Aizizhu-owned plan.
-        """
-        scope = _identifier(scope, "scope")
-        source_id = _identifier(source_id, "source_id")
+    def _scope_slice(self, scope, source_id, identity_id, conversation_id):
         internal_spec = INTERNAL_FIXED_PROMPT_SOURCES.get(source_id)
         if source_id not in _GATEWAY_SOURCES and internal_spec is None:
             raise PromptPlanMirrorValidationError("source_id is not a Gateway source")
         if internal_spec is not None and scope != internal_spec.scope:
             raise PromptPlanMirrorValidationError("internal source scope mismatch")
-        live_body = str(live_body or "")
-        binding = self.get_binding(
-            scope, identity_id=identity_id,
-            conversation_id=conversation_id)
+        if source_id in _L1_V2_PROMPT_SCOPES and scope != _L1_V2_PROMPT_SCOPES[source_id]:
+            raise PromptPlanMirrorValidationError("memory L1 prompt scope mismatch")
+        binding = self.get_binding(scope, identity_id=identity_id, conversation_id=conversation_id)
         if binding.get("status") == "legacy_default":
-            return live_body, {
-                "status": "legacy_default", "binding": binding,
-                "payload_unchanged": True, "source_id": source_id,
-            }
+            return binding, []
         if binding.get("status") != "mirrored":
             raise PromptPlanMirrorConflict("background binding mirror is degraded")
         plan = self.get_plan(
@@ -588,11 +629,22 @@ class PromptPlanMirrorStore:
             include_slice=True)
         if plan["plan_sha256"] != binding["plan_sha256"]:
             raise PromptPlanMirrorConflict("background plan SHA is stale")
-        blocks = [
-            item for item in plan["gateway_slice"].get("blocks") or []
-            if item.get("scope") == scope
-            and item.get("source_id") == source_id
-        ]
+        return binding, [item for item in plan["gateway_slice"]["blocks"] if item["scope"] == scope]
+
+    def resolve_text(self, *, scope: str, source_id: str, live_body: str,
+                     identity_id: str = "jiajia-main",
+                     conversation_id: str = "") -> tuple[str, dict]:
+        """Resolve one standalone Gateway prompt from the derived mirror."""
+        scope = _identifier(scope, "scope")
+        source_id = _identifier(source_id, "source_id")
+        live_body = str(live_body or "")
+        binding, scoped = self._scope_slice(scope, source_id, identity_id, conversation_id)
+        if binding.get("status") == "legacy_default":
+            return live_body, {
+                "status": "legacy_default", "binding": binding,
+                "payload_unchanged": True, "source_id": source_id,
+            }
+        blocks = [item for item in scoped if item["source_id"] == source_id]
         if not blocks:
             return live_body, {
                 "status": "source_unmanaged", "binding": binding,
@@ -609,17 +661,7 @@ class PromptPlanMirrorStore:
                 selected.append({"block_id": block.get("block_id"),
                                  "mode": "off", "sha256": None})
                 continue
-            body = live_body if mode == "live_source" else str(
-                block.get("owner_body") if mode == "owner_override"
-                else block.get("frozen_body") if mode == "frozen_snapshot"
-                else "")
-            wrapper = str(block.get("wrapper_text") or "")
-            if wrapper and body:
-                body = (wrapper.replace("{{content}}", body)
-                        if "{{content}}" in wrapper else f"{wrapper}\n{body}")
-            budget = block.get("token_budget")
-            if budget not in (None, "", "all"):
-                body = body[:max(0, int(budget)) * 4]
+            body = _fixed_text(block, live_body)
             if body:
                 rendered.append(body)
             selected.append({
@@ -636,9 +678,33 @@ class PromptPlanMirrorStore:
                 resolved.encode("utf-8")).hexdigest(),
         }
 
+    def compile_background_messages(self, *, scope, source_id, live_body, identity_id):
+        """Place a fixed prompt and scoped custom blocks around the protocol input."""
+        _, scoped = self._scope_slice(scope, source_id, identity_id, "")
+        blocks = [block for block in scoped if block["source_id"] in {source_id, "custom.gateway_block"}]
+        if not any(block["source_id"] == source_id for block in blocks):
+            blocks.append({"block_id": f"legacy:{scope}:{source_id}", "source_id": source_id,
+                           "anchor": "instructions.end", "role": "system", "mode": "live_source",
+                           "order": 100, "priority": 100})
+        blocks.sort(key=lambda block: (_BACKGROUND_ANCHOR_ORDER.get(block["anchor"], 70),
+            -block.get("history_depth", 0) if block["anchor"] == "history.depth" else 0,
+            block["order"], block["priority"], block["block_id"]))
+        facts = {"gateway.scope": scope, f"source.{source_id}.present": bool(live_body.strip())}
+        before, after, source_enabled = [], [], False
+        for block in blocks:
+            if not prompt_condition_matches(block.get("condition") or {}, facts):
+                continue
+            is_source = block["source_id"] == source_id
+            body = _fixed_text(block, live_body if is_source else "")
+            if body.strip():
+                messages = after if block["anchor"] == "current_user.after" else before
+                messages.append({"role": block["role"], "content": body})
+                source_enabled = source_enabled or is_source
+        return before, after, source_enabled
+
 
 __all__ = [
     "PromptPlanMirrorConflict", "PromptPlanMirrorError",
     "PromptPlanMirrorNotFound", "PromptPlanMirrorStore",
-    "PromptPlanMirrorValidationError", "normalize_gateway_slice",
+    "PromptPlanMirrorValidationError", "normalize_gateway_slice", "prompt_condition_matches",
 ]
