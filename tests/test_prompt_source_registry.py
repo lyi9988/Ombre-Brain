@@ -29,6 +29,12 @@ EXPECTED_FIXED_SOURCE_IDS = {
     "ombre.diary_memory_prompt",
     "ombre.chat_memory_prepare_prompt",
     "ombre.daily_chat_memory_prompt",
+    "ombre.daily_chat_event_selection_prompt",
+    "ombre.daily_chat_event_assembly_prompt",
+    "ombre.memory_l1_v2_generation_prompt",
+    "ombre.memory_l1_v2_active_prompt",
+    "ombre.memory_l1_v2_revision_prompt",
+    "ombre.memory_l3_sync_prompt",
     "ombre.memory_l2_generation_prompt",
     "ombre.daily_chat_summary_prompt",
     "ombre.daily_activity_summary_prompt",
@@ -76,6 +82,21 @@ def test_l2_generation_prompt_is_registered_and_has_gateway_fallback_factory():
     assert "review" in body and "required" in body and "reasons" in body
     assert "仅放审阅元数据" in body
     assert "不能把理由写进正文" in body
+
+
+def test_active_l1_prompt_is_registered_with_the_shared_background_factory():
+    source_id = "ombre.memory_l1_v2_active_prompt"
+    spec = FIXED_PROMPT_SOURCES[source_id]
+    detail = source_detail(source_id, {})
+    body = factory_body(source_id)
+
+    assert spec.scope == "memory.l1_v2_active"
+    assert spec.source_revision == "factory-memory-l1-v2-active-20261116-r2"
+    assert detail["source_revision"] == spec.source_revision
+    assert detail["factory_body"] == body
+    assert "body 原样返回顾衍的原稿" in body
+    assert "阅读只依据实际已读范围" in body
+    assert "顶层只有 cards，且恰好一张卡" in body
 
 
 def test_internal_recall_preparation_sources_are_scoped_and_provenanced():

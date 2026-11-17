@@ -93,6 +93,69 @@ def test_active_chat_metadata_prompt_keeps_its_background_scope_and_override(sto
     assert text == "主动记忆的主人提示词"
 
 
+@pytest.mark.parametrize("wrong_scope", [
+    "talk.initial",
+    "memory.l1_v2_generation",
+])
+def test_active_l1_prompt_rejects_other_scopes(store, wrong_scope):
+    source_id = "ombre.memory_l1_v2_active_prompt"
+    payload = _slice("主动记忆的主人提示")
+    payload["blocks"][0]["source_id"] = source_id
+    payload["blocks"][0]["scope"] = wrong_scope
+
+    with pytest.raises(PromptPlanMirrorValidationError):
+        store.put_plan("preset:active-l1-wrong-scope", 1,
+                       plan_sha256="e" * 64, gateway_slice=payload)
+
+
+def test_active_l1_prompt_uses_own_scope_and_preserves_existing_generation_binding(store):
+    from prompt_source_registry import factory_body, resolve_fixed_prompt
+
+    active_id = "ombre.memory_l1_v2_active_prompt"
+    active_scope = "memory.l1_v2_active"
+    generation_id = "ombre.memory_l1_v2_generation_prompt"
+    generation_scope = "memory.l1_v2_generation"
+    active_factory = factory_body(active_id)
+    legacy_text, legacy_meta = resolve_fixed_prompt(store, active_id)
+    assert legacy_text == active_factory
+    assert legacy_meta["status"] == "legacy_default"
+    active = _slice("主人主动记忆提示")["blocks"][0]
+    active.update(block_id="block:active-l1", source_id=active_id,
+                  scope=active_scope)
+    generation = _slice("原有自动 L1 提示")["blocks"][0]
+    generation.update(block_id="block:generation-l1", source_id=generation_id,
+                       scope=generation_scope)
+    plan_sha = "f" * 64
+    store.put_plan("preset:l1-both-scopes", 1, plan_sha256=plan_sha,
+                   gateway_slice={"blocks": [active, generation]})
+    store.put_binding(active_scope, preset_id="preset:l1-both-scopes",
+                      preset_revision=1, plan_sha256=plan_sha,
+                      aiz_binding_revision=1)
+    store.put_binding(generation_scope, preset_id="preset:l1-both-scopes",
+                      preset_revision=1, plan_sha256=plan_sha,
+                      aiz_binding_revision=1)
+
+    active_text, active_meta = resolve_fixed_prompt(store, active_id)
+    generation_text, generation_meta = resolve_fixed_prompt(store, generation_id)
+    assert active_text == "主人主动记忆提示"
+    assert active_meta["status"] == "applied"
+    assert generation_text == "原有自动 L1 提示"
+    assert generation_meta["status"] == "applied"
+
+    off = _slice()["blocks"][0]
+    off.update(block_id="block:active-l1-off", source_id=active_id,
+               scope=active_scope, mode="off")
+    off_plan_sha = "a" * 64
+    store.put_plan("preset:active-l1-off", 1, plan_sha256=off_plan_sha,
+                   gateway_slice={"blocks": [off]})
+    store.put_binding(active_scope, preset_id="preset:active-l1-off",
+                      preset_revision=1, plan_sha256=off_plan_sha,
+                      aiz_binding_revision=2)
+    off_text, off_meta = resolve_fixed_prompt(store, active_id)
+    assert off_text == ""
+    assert off_meta["status"] == "applied"
+
+
 def test_plan_rejects_non_gateway_source(store):
     payload = _slice()
     payload["blocks"][0]["source_id"] = "conversation.history"
