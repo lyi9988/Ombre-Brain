@@ -780,10 +780,61 @@ def test_chat_draft_can_prepare_without_nearby_chat_sources(tmp_path, has_title)
     assert document['evidence_bindings'][0]['source_namespace'] == 'snapshot.ombre.agent_memory_draft'
     assert (document.get('event_time') or {}).get('start') == (DAY if has_title else None)
     record = MemoryModelIO(engine.memory_authority_store).list(queued['task_id'])['items'][0]
-    assert record['stage'] == 'chat_l1' and record['task_id'] == queued['task_id'] + ':1'
+    assert record['stage'] == 'chat_l1' and record['task_id'] == queued['task_id']
+    assert record['generation']['task_id'] == queued['task_id'] + ':1'
+    assert record['task_attempt'] == task['attempts'] == 1
     assert record['draft_revision'] == 1 and record['part'] == 1
     assert record['native_request'] == request and record['validation'] == {'status': 'passed'}
     assert json.loads(record['raw_output']) == {'cards': [metadata]}
+
+
+def test_chat_v2_model_io_groups_fallback_calls_with_the_original_preparation(tmp_path):
+    from memory_chat_preparation import ChatMemoryPreparation
+
+    metadata = {'kind': 'life_experience', 'stability': 'episode', 'keywords': ['雨夜等车'],
+                'people': [], 'sources': [], 'primary_topic': 'daily_life', 'event_time': None}
+    engine, _ = _engine(tmp_path, lambda _payload: [metadata])
+    queued = asyncio.run(ChatMemoryTool(engine, None).submit({
+        'operation_id': 'op-' + '1' * 32,
+        'arguments': {'narrative': {'title': '雨夜', 'body': '我在雨夜等车。'}},
+        'context': {'conversation_id': 'canonical-main', 'request_id': 'r1', 'turn_id': 'e1', 'sources': []},
+    }))
+    task_id = queued['task_id']
+    recorder = MemoryModelIO(engine.memory_authority_store)
+    provider = engine.client.chat.completions.create
+    requests = []
+    invalid_output = '  {"cards": "invalid"}\n'
+
+    async def respond(**request):
+        requests.append(request)
+        record = recorder.list(task_id)['items'][0]
+        assert record['status'] == 'running' and record['native_request'] == request
+        if len(requests) == 1:
+            raise _bad_request('response_format is not supported', param='response_format')
+        if len(requests) == 2:
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=invalid_output), finish_reason='stop')])
+        return await provider(**request)
+
+    engine.client.chat.completions.create = respond
+    first = asyncio.run(prepare_chat_tasks(engine, None))
+    assert first['results'][0]['status'] == 'failed'
+    tasks = ChatMemoryPreparation(engine.memory_authority_store)
+    failed_task = tasks.get(task_id)
+    tasks.update(task_id, expected_revision=failed_task['revision'],
+                 transform=lambda row: {**row, 'phase': 'queued', 'lease_until': 0,
+                                        'claim_token': None, 'issue': None, 'manual_generation_retry': True})
+    second = asyncio.run(prepare_chat_tasks(engine, None))
+    assert second['results'][0]['memory_status'] == 'pending'
+    last, invalid, schema = recorder.list(task_id)['items']
+    assert [row['native_request'] for row in (schema, invalid, last)] == requests
+    assert (schema['task_attempt'], schema['attempt']) == (1, 1)
+    assert (invalid['task_attempt'], invalid['attempt']) == (1, 2)
+    assert (last['task_attempt'], last['attempt']) == (2, 1)
+    assert schema['attempt_id'] == invalid['attempt_id'] != last['attempt_id']
+    assert schema['error']['http_status'] == 400 and schema['raw_output'] is None
+    assert invalid['error']['failure_phase'] == 'response_processing'
+    assert invalid['raw_output'] == invalid_output and invalid['finish_reason'] == 'stop'
 
 
 def test_chat_v2_accepts_a_staged_window_over_the_legacy_message_cap(tmp_path, monkeypatch):

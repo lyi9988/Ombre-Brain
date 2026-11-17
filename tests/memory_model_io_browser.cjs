@@ -58,6 +58,7 @@ function makeL1() {
             stage: 'chat_l1',
             task_id: memoryId,
             attempt: 1,
+            task_attempt: 2,
             attempt_id: 'claim-lease-1',
             draft_revision: 3,
             source_revisions: { canonical: 'rev-17' },
@@ -139,7 +140,7 @@ function makeL1() {
       'large input and output remain collapsed until the attempt is opened');
     const l1Record = viewer.locator('[data-model-io-stage-section="chat_l1"] .chat-memory-model-io-record');
     const l2Record = viewer.locator('[data-model-io-stage-section="presentation_l2"] .chat-memory-model-io-record');
-    assert.match(await l1Record.locator('summary').first().textContent(), /第 1 次尝试.*finish_reason length.*prompt 12.*completion 9/);
+    assert.match(await l1Record.locator('summary').first().textContent(), /第 2 次整理，模型第 1 次调用.*finish_reason length.*prompt 12.*completion 9/);
     assert.match(await l2Record.locator('summary').first().textContent(), /本轮调用/);
     assert.doesNotMatch(await l2Record.locator('summary').first().textContent(), /第 lease-token-2 次尝试/);
     await l1Record.locator('summary').first().click();

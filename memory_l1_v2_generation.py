@@ -155,7 +155,7 @@ def _people(engine, snapshots, sources):
 
 class Generation:
     def __init__(self, engine, *, origin, task_id, sources, context=None, include_review=False,
-                 active_reading=False, candidate_id=None):
+                 active_reading=False, candidate_id=None, chat_model_io=None):
         from memory_l1_v2 import catalog
 
         self.engine, self.origin, self.task_id = engine, origin, task_id
@@ -164,6 +164,7 @@ class Generation:
             raise L1OwnerError('l1_v2_unknown_source_kind', field_path='input_kind')
         self.model_io = MemoryModelIO(engine.memory_authority_store)
         self.model_io_id = candidate_id or task_id
+        self.chat_model_io = chat_model_io or {}
         self.source_rule = L1_V2_SOURCE_RULES[origin]
         self.route = _route(engine, origin)
         self.active_reading = active_reading
@@ -387,9 +388,10 @@ class Generation:
                 raise L1OwnerError('cancelled_or_disabled', field_path='generation')
             meta['attempt'] = attempt
             _diagnostic(self.engine, self.task_id, stage + '_dispatch', meta)
-            io_id = self.model_io.start(self.model_io_id, stage=io_stage, task_id=self.task_id, attempt=attempt,
+            io_id = self.model_io.start(self.model_io_id, stage=io_stage,
+                task_id=self.model_io_id if self.chat_model_io else self.task_id, attempt=attempt,
                 messages=[], parameters=parameters, generation=generation, draft_revision=draft_revision,
-                source_revisions=source_revisions, part=meta['part'])
+                source_revisions=source_revisions, part=meta['part'], **self.chat_model_io)
 
             def capture(request):
                 self.model_io.requested(io_id, request, timeout_seconds=route.get('timeout_seconds', 180))
@@ -716,7 +718,7 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                    candidate_id=None, policy=None, owner_explicit=False, metadata=None,
                    required_source_ref=None, required_any_source_refs=None, before_prepare=None,
                    prepare_policy=None, expected_source_fingerprint=None, before_progress_save=None,
-                   active_reading=False):
+                   active_reading=False, chat_model_io=None):
     """Durably prepare once, resume per range, and drain through the normal policy."""
     authority = engine.memory_authority_store
     queue = MemoryCandidatePreparation(authority)
@@ -732,7 +734,7 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
             raise L1OwnerError('memory_source_disabled', status=409, field_path='mode')
         job = Generation(engine, origin=origin, task_id=task_id, sources=sources, context=context,
                          include_review=effective_mode == 'auto' and not owner_explicit,
-                         active_reading=active_reading, candidate_id=candidate_id)
+                         active_reading=active_reading, candidate_id=candidate_id, chat_model_io=chat_model_io)
         fingerprint = semantic_sha256({'sources': job.bindings, 'context': context, 'core_start': core_start})
         if expected_source_fingerprint is not None and fingerprint != expected_source_fingerprint:
             raise L1OwnerError('l1_v2_source_changed', status=409, field_path='sources')

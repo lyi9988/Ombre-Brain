@@ -162,6 +162,10 @@
     var numericAttempt = attempt != null && /^\d+$/.test(String(attempt));
     var attemptText = attempt == null ? '尝试标识未留存'
       : (numericAttempt ? '第 ' + modelIoText(attempt) + ' 次尝试' : '本轮调用');
+    if (record.task_attempt != null) {
+      attemptText = '第 ' + modelIoText(record.task_attempt) + ' 次整理，' +
+        '模型第 ' + modelIoText(attempt) + ' 次调用';
+    }
     var stateText = record.status == null ? '状态未留存' : modelIoText(record.status);
     var finishText = record.finish_reason == null || record.finish_reason === ''
       ? 'finish_reason 未留存' : 'finish_reason ' + modelIoText(record.finish_reason);

@@ -107,7 +107,8 @@ class MemoryModelIO:
         return (V2_PREFIX if v2 else PREFIX) + hashlib.sha256(memory_id.encode('utf-8')).hexdigest() + ':'
 
     def start(self, memory_id, *, stage, task_id, attempt, messages, parameters,
-              generation=None, draft_revision=None, source_revisions=None, attempt_id=None, part=None):
+              generation=None, draft_revision=None, source_revisions=None, attempt_id=None, part=None,
+              task_attempt=None):
         if stage not in STAGES:
             raise ValueError('unsupported model IO stage')
         started = _stamp()
@@ -128,6 +129,8 @@ class MemoryModelIO:
                'validation': {'status': 'pending'}}
         if part is not None:
             row['part'] = part
+        if task_attempt is not None:
+            row['task_attempt'] = task_attempt
         self.authority.set_meta(io_id, row)
         return io_id
 
