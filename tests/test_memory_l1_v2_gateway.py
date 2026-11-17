@@ -2,13 +2,15 @@
 
 import asyncio
 import json
+import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from gateway import GatewayService, create_gateway_app
-from memory_system_config import configuration
+from memory_system_config import REQUEST_CONFIGURATION, configuration
 from memory_commit_service import BucketMemoryProjection, MemoryCommitService, body_sha256
 from memory_l1_contract import l1_content_sha256, make_text_anchor, semantic_sha256
 from memory_l1_v2 import SCHEMA_VERSION, TEXT_PROJECTION_VERSION, prepare_card, retrieval_text
@@ -23,6 +25,216 @@ from test_memory_local_first_settings import _base_config as _real_gateway_confi
 
 
 BODY = "2026年11月8日，我和主人约定先等她回复，再做下一步。那次没有执行。"
+
+
+@pytest.fixture
+def final_source_case(tmp_path, monkeypatch):
+    with monkeypatch.context() as setup:
+        authority, service, _, _, _ = _fixture(tmp_path, setup)
+    card = _commit_card(authority, "final-source-chat", body="这一次已经完成。", origin="chat_l1")
+    query = "那次安排后来完成了吗？"
+    request = _recall_input(query)
+    inputs = {section: (f"[bucket_id:{card['id']}]", [card["id"]], 500)
+              for section in ("direct", "diffused", "recent")}
+    state = SimpleNamespace(calls=[], response="available", delay=0.0, started=None, cancelled=False)
+    original_client = httpx.AsyncClient
+
+    async def handle(http_request):
+        assert http_request.url.path == "/api/memory-authority/recall-sources"
+        payload = json.loads(http_request.content)
+        state.calls.append(payload)
+        if state.response == "block":
+            state.started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                state.cancelled = True
+        if state.delay:
+            await asyncio.sleep(state.delay)
+        if state.response == "http_error":
+            return httpx.Response(503, json={"error": {"code": "recall_sources_unavailable"}})
+        return httpx.Response(200, json={"items": [
+            {"memory_id": item["memory_id"], "revision": item["revision"], "state": "ok", "sources": {
+                key: {"state": state.response, "eligible_source": state.response == "available"}
+                for key in item["binding_ids"]}} for item in payload["items"]]})
+
+    transport = httpx.MockTransport(handle)
+
+    def client(*args, **kwargs):
+        return original_client(*args, **{**kwargs, "transport": transport})
+
+    monkeypatch.setattr(memory_use.httpx, "AsyncClient", client)
+    monkeypatch.setenv("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://brain.synthetic.invalid")
+    monkeypatch.setenv("OMBRE_MEMORY_WRITE_TOKEN", "synthetic-source-check-token")
+    frozen = {"service": id(service), "values": memory_use.values(service)}
+    token = REQUEST_CONFIGURATION.set(frozen)
+    try:
+        yield SimpleNamespace(service=service, request=request, query=query, card=card, inputs=inputs, http=state)
+    finally:
+        REQUEST_CONFIGURATION.reset(token)
+
+
+@pytest.mark.parametrize(("main_remaining", "owner_timeout"), [(-5.0, 15.0), (-5.0, 1.0), (0.01, 15.0)])
+def test_final_source_budget_observes_a_fresh_chat_source_and_restores_the_deadline(
+        final_source_case, monkeypatch, main_remaining, owner_timeout):
+    case = final_source_case
+
+    async def run():
+        case.service.recall_timeout_seconds = owner_timeout
+        memory_use.prepare(case.service, case.request, case.query, [case.card])
+        case.request["_deadline"] = time.monotonic() + 5
+        assert await memory_use.verify_sources(case.service, case.request, case.query, [{"bucket": case.card}])
+        case.http.delay = 0.005
+        original = time.monotonic() + main_remaining
+        case.request["_deadline"] = original
+        resolve_presentations = memory_use.resolve_presentations
+
+        async def resolve(service, candidates, *, request):
+            assert request["_deadline"] == original
+            return await resolve_presentations(service, candidates, request=request)
+
+        monkeypatch.setattr(memory_use, "resolve_presentations", resolve)
+        sections = await memory_use.project_sections(case.service, case.request, case.query, [case.card], case.inputs)
+        assert sections["direct"].count(case.card["content"]) == 1
+        assert case.request["_deadline"] == original
+        assert len(case.http.calls) == 2 and case.http.calls[0] == case.http.calls[1]
+        stats = case.request["recall_io"]["final_source_recheck"]
+        assert stats["passes"] == stats["calls"] == 1
+        assert 0 < stats["extra_budget_ms"] <= min(2000, owner_timeout * 1000)
+        assert 0 <= stats["extra_duration_ms"] <= stats["duration_ms"]
+        if main_remaining < 0:
+            assert stats["extra_budget_ms"] == round(min(2.0, owner_timeout) * 1000)
+            assert stats["extra_duration_ms"] == stats["duration_ms"]
+            assert stats["duration_ms"] >= 4
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("response", "reason"), [
+    ("withdrawn", "l0_source_not_eligible"), ("http_error", "l0_source_verification_unavailable"),
+])
+def test_final_source_budget_keeps_withdrawal_and_http_failure_excluded(final_source_case, response, reason):
+    case = final_source_case
+
+    async def run():
+        memory_use.prepare(case.service, case.request, case.query, [case.card])
+        assert await memory_use.verify_sources(case.service, case.request, case.query, [{"bucket": case.card}])
+        case.http.response = response
+        original = time.monotonic() - 5
+        case.request["_deadline"] = original
+        sections = await memory_use.project_sections(case.service, case.request, case.query, [case.card], case.inputs)
+        assert not any(sections.values())
+        assert case.request["_deadline"] == original
+        assert len(case.http.calls) == 2
+        assert case.request["presentation_trace"][0]["fallback_reason"] == reason
+        assert case.request["usage_by_bucket"][case.card["id"]]["state"] == "excluded"
+
+    asyncio.run(run())
+
+
+def test_final_source_budget_leaves_the_normal_single_batch_unchanged(final_source_case):
+    case = final_source_case
+
+    async def run():
+        original = time.monotonic() + 10
+        case.request["_deadline"] = original
+        sections = await memory_use.project_sections(case.service, case.request, case.query, [case.card], case.inputs)
+        assert sections["direct"].count(case.card["content"]) == 1
+        assert len(case.http.calls) == 1
+        assert case.request["_deadline"] == original
+        stats = case.request["recall_io"]["final_source_recheck"]
+        assert stats["passes"] == stats["calls"] == 1
+        assert stats["extra_budget_ms"] == stats["extra_duration_ms"] == 0
+        assert "_final_source_deadline" not in REQUEST_CONFIGURATION.get()["source_validation"]
+
+    asyncio.run(run())
+
+
+def test_final_source_budget_reuses_one_absolute_deadline_across_passes(final_source_case, monkeypatch):
+    case = final_source_case
+    observed_deadlines = []
+    read_batch = memory_use.read_batch
+
+    async def read(service, request, stage, path, payload):
+        observed_deadlines.append(request["_deadline"])
+        return await read_batch(service, request, stage, path, payload)
+
+    monkeypatch.setattr(memory_use, "read_batch", read)
+
+    async def run():
+        original = time.monotonic() - 5
+        case.request["_deadline"] = original
+        first = await memory_use.project_sections(case.service, case.request, case.query, [case.card], case.inputs)
+        second_request = {**case.request}
+        second = await memory_use.project_sections(case.service, second_request, case.query, [case.card], case.inputs)
+        assert first["direct"].count(case.card["content"]) == second["direct"].count(case.card["content"]) == 1
+        assert observed_deadlines[0] == observed_deadlines[1]
+        assert case.request["_deadline"] == second_request["_deadline"] == original
+        stats = case.request["recall_io"]["final_source_recheck"]
+        assert stats["extra_budget_ms"] == 2000
+        assert stats["passes"] == stats["calls"] == len(case.http.calls) == 2
+
+    asyncio.run(run())
+
+
+def test_final_source_budget_cannot_renew_an_expired_grace_period(final_source_case):
+    case = final_source_case
+
+    async def run():
+        case.service.recall_timeout_seconds = 1.0
+        original = time.monotonic() - 5
+        case.request["_deadline"] = original
+        first = await memory_use.project_sections(case.service, case.request, case.query, [case.card], case.inputs)
+        assert first["direct"].count(case.card["content"]) == 1
+        await asyncio.sleep(1.02)
+        second = await memory_use.project_sections(case.service, case.request, case.query, [case.card], case.inputs)
+        assert not any(second.values())
+        assert len(case.http.calls) == 1 and case.request["_deadline"] == original
+        stats = case.request["recall_io"]["final_source_recheck"]
+        assert stats["extra_budget_ms"] == 1000 and stats["passes"] == 2 and stats["calls"] == 1
+        assert "final_source_deadline" in case.request["incomplete_reasons"]
+
+    asyncio.run(run())
+
+
+def test_final_source_budget_propagates_external_cancel_and_cleans_up_the_http_read(final_source_case):
+    case = final_source_case
+
+    async def run():
+        original = time.monotonic() - 5
+        case.request["_deadline"] = original
+        case.http.response, case.http.started = "block", asyncio.Event()
+        task = asyncio.create_task(memory_use.project_sections(
+            case.service, case.request, case.query, [case.card], case.inputs))
+        await asyncio.wait_for(case.http.started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert case.http.cancelled
+        assert case.request["_deadline"] == original
+        assert len(case.http.calls) == 1
+        assert case.request["recall_io"]["final_source_recheck"]["calls"] == 1
+
+    asyncio.run(run())
+
+
+def test_final_source_budget_timeout_keeps_the_source_excluded_and_restores_the_main_deadline(final_source_case):
+    case = final_source_case
+
+    async def run():
+        case.service.recall_timeout_seconds = 0.025
+        original = time.monotonic() - 5
+        case.request["_deadline"] = original
+        case.http.response, case.http.started = "block", asyncio.Event()
+        sections = await memory_use.project_sections(case.service, case.request, case.query, [case.card], case.inputs)
+        assert not any(sections.values()) and case.http.cancelled
+        assert case.request["_deadline"] == original
+        assert "final_source_deadline" in case.request["incomplete_reasons"]
+        stats = case.request["recall_io"]["final_source_recheck"]
+        assert stats["extra_budget_ms"] == 25 and stats["calls"] == 1
+        assert case.request["recall_io"]["sources"]["timeouts"] == 1
+
+    asyncio.run(run())
 
 
 def _card_document(bucket_id, *, body=BODY, dated=True, event_day="2026-11-08", scope_note=None,

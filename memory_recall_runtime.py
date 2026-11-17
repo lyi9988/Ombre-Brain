@@ -1403,11 +1403,30 @@ async def _project_sections(service, request, query, buckets, sections):
         "final_source_recheck", {"passes": 0, "calls": 0, "duration_ms": 0})
     final_check["passes"] += 1
     source_calls_before = request["recall_io"].get("sources", {}).get("calls", 0)
-    final_check_started = time.perf_counter()
+    final_check_started = time.monotonic()
+    original_deadline = deadline(service, request)
+    original_remaining = max(0.0, original_deadline - final_check_started)
+    recheck_budget = min(2.0, max(0.0, getattr(service, "recall_timeout_seconds", 15.0)))
+    final_check.setdefault("extra_budget_ms", 0)
+    if original_remaining < recheck_budget:
+        frozen = REQUEST_CONFIGURATION.get()
+        validation = (frozen.setdefault("source_validation", {})
+                      if frozen and frozen.get("service") == id(service) else request)
+        if "_final_source_deadline" not in validation:
+            validation["_final_source_deadline"] = final_check_started + recheck_budget
+            final_check["extra_budget_ms"] += round((recheck_budget - original_remaining) * 1000)
+        # Only this fresh source observation may finish after the main recall
+        # deadline. Every later pass shares the same absolute grace deadline.
+        request["_deadline"] = max(original_deadline, validation["_final_source_deadline"])
     try:
         permitted = await verify_sources(service, request, query, candidates, refresh=True)
     finally:
-        final_check["duration_ms"] += max(0, int((time.perf_counter() - final_check_started) * 1000))
+        request["_deadline"] = original_deadline
+        final_check_ended = time.monotonic()
+        duration_ms = max(0, int((final_check_ended - final_check_started) * 1000))
+        final_check["duration_ms"] += duration_ms
+        final_check["extra_duration_ms"] = final_check.get("extra_duration_ms", 0) + max(
+            0, int((final_check_ended - max(final_check_started, original_deadline)) * 1000))
         final_check["calls"] += max(0, request["recall_io"].get("sources", {}).get("calls", 0) - source_calls_before)
     allowed = {str(item["bucket"]["id"]) for item in permitted}
     uses = request.get("usage_by_bucket", {})
