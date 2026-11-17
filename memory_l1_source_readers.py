@@ -141,7 +141,19 @@ class AizBrowseSourceReader(CanonicalMemorySourceReader):
 
     async def capture(self, content_item_id, version='current'):
         from memory_l1_contract import canonical_json
-        source_id = canonical_json({'content_item_id': content_item_id, 'view': self.view})
+        return await self._fetch(canonical_json({'content_item_id': content_item_id, 'view': self.view}), version)
+
+    async def capture_reading(self, reading, version='current'):
+        from memory_browse_source import validate_reading_view
+        from memory_l1_contract import canonical_json
+        if self.view != 'article':
+            return {'state': 'unavailable', 'reason': 'unsupported_browse_reading_view'}
+        value = await self._fetch(canonical_json({**reading, 'view': self.view}), version)
+        if value.get('state') == 'available' and value.get('eligible_source') is True:
+            return validate_reading_view(value, reading)
+        return value
+
+    async def _fetch(self, source_id, version):
         options = self.options
         token = os.environ.get('OMBRE_CANONICAL_BRIDGE_TOKEN', '')
         if not options.get('enabled') or not token or not options.get('base_url'):
@@ -163,7 +175,12 @@ class AizBrowseSourceReader(CanonicalMemorySourceReader):
         version = self.upstream_version(binding) if hasattr(self, 'upstream_version') else None
         if not version:
             return {'state': 'unavailable', 'reason': 'browse_upstream_revision_unknown'}
-        value = await self.capture(json.loads(binding['source_id'])['content_item_id'], version)
+        locator = json.loads(binding['source_id'])
+        if 'material_id' in locator:
+            reading = {key: locator[key] for key in ('material_id', 'source_revision', 'read_ranges')}
+            value = await self.capture_reading(reading, version)
+        else:
+            value = await self.capture(locator['content_item_id'], version)
         if value.get('state') != 'available' or value.get('eligible_source') is not True:
             return value
         return snapshot(model_source(value, self.config))

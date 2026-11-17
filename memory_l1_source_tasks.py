@@ -11,7 +11,8 @@ import json
 import re
 
 from memory_authority import IdempotencyConflict
-from memory_l1_contract import canonical_json
+from memory_browse_source import valid_read_ranges
+from memory_l1_contract import canonical_json, semantic_sha256
 from memory_l1_service import L1OwnerError
 
 PREFIX = 'memory_l1_source_task:'
@@ -84,8 +85,9 @@ class MemoryL1SourceTasks:
                 raise L1OwnerError('invalid_source_identity', field_path='source_task.' + key)
         source = {'action_id': payload['action_id'], 'artifact_id': payload['artifact_id']}
         intent = payload.get('memory_intent')
+        reading = None
         if intent is not None:
-            if (not isinstance(intent, dict) or set(intent) != {
+            if (not isinstance(intent, dict) or set(intent) - {'reading'} != {
                     'decision', 'draft', 'activity_id', 'activity_revision', 'sources'}
                     or intent['decision'] != 'remember' or not isinstance(intent['draft'], str)
                     or not intent['draft'].strip() or not isinstance(intent['activity_id'], str)
@@ -95,10 +97,24 @@ class MemoryL1SourceTasks:
                            or any(not isinstance(value, str) or not _ID.fullmatch(value) for value in item.values())
                            for item in intent['sources'])):
                 raise L1OwnerError('invalid_action_memory_intent', field_path='source_task.memory_intent')
-        digest = hashlib.sha256(canonical_json({**source, **({'memory_intent': intent} if intent else {})}).encode()).hexdigest()
-        task_identity = ({'activity_id': intent['activity_id'], 'activity_revision': str(intent['activity_revision'])}
-                         if intent else source)
-        task_id = 'action_source_' + hashlib.sha256(canonical_json(task_identity).encode()).hexdigest()[:40]
+            if 'reading' in intent:
+                reading = intent['reading']
+                if (not isinstance(reading, dict) or set(reading) != {'material_id', 'source_revision', 'read_ranges'}
+                        or any(not isinstance(reading[key], str) or not _ID.fullmatch(reading[key])
+                               for key in ('material_id', 'source_revision'))
+                        or not valid_read_ranges(reading['read_ranges'])):
+                    raise L1OwnerError('invalid_action_reading', field_path='source_task.memory_intent.reading')
+        digest = semantic_sha256({**source, **({'memory_intent': intent} if intent else {})})
+        if reading:
+            identity_hash = semantic_sha256({key: reading[key] for key in ('material_id', 'source_revision')})
+            if payload['request_id'] != 'action-memory-intent:' + identity_hash:
+                raise L1OwnerError('action_reading_request_id_mismatch', field_path='source_task.request_id')
+        elif intent:
+            identity_hash = semantic_sha256({'activity_id': intent['activity_id'],
+                                            'activity_revision': str(intent['activity_revision'])})
+        else:
+            identity_hash = semantic_sha256(source)
+        task_id = 'action_source_' + identity_hash[:40]
         key = PREFIX + task_id
         request_key = PREFIX + 'request:' + hashlib.sha256(payload['request_id'].encode()).hexdigest()
         db = self.authority._connect()

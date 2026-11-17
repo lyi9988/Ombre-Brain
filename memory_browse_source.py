@@ -9,6 +9,36 @@ from memory_l1_contract import make_text_anchor
 from memory_l1_service import L1OwnerError
 
 
+def valid_read_ranges(ranges, *, text_length=None):
+    return bool(isinstance(ranges, list) and ranges and all(
+        isinstance(pair, list) and len(pair) == 2
+        and all(type(offset) is int for offset in pair)
+        and 0 <= pair[0] < pair[1] and (text_length is None or pair[1] <= text_length)
+        for pair in ranges))
+
+
+def validate_reading_view(value, reading):
+    """Check the bridge's projected view and its original reading footprint."""
+    if (value.get('material_id') != reading['material_id']
+            or value.get('content_revision') != reading['source_revision']):
+        return {'state': 'changed', 'reason': 'reading_content_revision_changed'}
+    coverage, text, projected = value.get('coverage'), value.get('text'), value.get('read_ranges')
+    absolute = coverage.get('read_ranges') if isinstance(coverage, dict) else None
+    if (not valid_read_ranges(absolute) or absolute != reading['read_ranges']
+            or not isinstance(text, str) or not text.strip()
+            or not valid_read_ranges(projected, text_length=len(text))
+            or len(projected) != len(absolute)):
+        return {'state': 'changed', 'reason': 'reading_footprint_changed'}
+    end = 0
+    for (left, right), (original_left, original_right) in zip(projected, absolute, strict=True):
+        if left < end or right - left != original_right - original_left or text[end:left].strip():
+            return {'state': 'changed', 'reason': 'reading_footprint_changed'}
+        end = right
+    if end != len(text):
+        return {'state': 'changed', 'reason': 'reading_footprint_changed'}
+    return value
+
+
 def snapshot(source):
     value = copy.deepcopy(source['browse_snapshot'])
     if (value.get('state') != 'available' or value.get('eligible_source') is not True

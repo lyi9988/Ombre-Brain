@@ -65,6 +65,7 @@ from prompt_plan_mirror import (
     PromptPlanMirrorNotFound,
     PromptPlanMirrorStore,
     PromptPlanMirrorValidationError,
+    prompt_condition_matches,
 )
 from model_route_mirror import (
     ModelRouteMirrorConflict,
@@ -23265,37 +23266,7 @@ class GatewayService:
             current = parent
         return chain
 
-    @staticmethod
-    def _prompt_condition_matches(condition: dict, facts: dict[str, Any]) -> bool:
-        rules = condition.get("rules") if isinstance(condition, dict) else []
-        if not rules:
-            return True
-        values = []
-        for rule in rules:
-            actual = facts.get(str(rule.get("source") or ""))
-            expected = rule.get("value")
-            op = str(rule.get("op") or "equals")
-            if op == "equals":
-                hit = actual == expected
-            elif op == "not_equals":
-                hit = actual != expected
-            elif op == "contains":
-                hit = str(expected) in str(actual or "")
-            elif op == "present":
-                hit = actual not in (None, "", [], {})
-            elif op == "absent":
-                hit = actual in (None, "", [], {})
-            elif op in {"greater_than", "less_than"}:
-                try:
-                    hit = (float(actual) > float(expected) if op == "greater_than"
-                           else float(actual) < float(expected))
-                except (TypeError, ValueError):
-                    hit = False
-            else:
-                hit = False
-            values.append(hit)
-        return (any(values) if condition.get("match") == "any"
-                else all(values))
+    _prompt_condition_matches = staticmethod(prompt_condition_matches)
 
     def _build_composed_context_messages(
         self, gateway_plan: dict[str, Any], *,

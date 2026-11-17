@@ -44,6 +44,7 @@ class MemoryL1RevisionService:
                                    "scenes.*.scene_id", "scenes.*.scene_revision_id", "scenes.*.generation", "relations.*.relation_id", "relations.*.origin"],
                  "limits": {"request_bytes": 524288, "request_id_characters": 128},
                  "l1_v2": {"schema_version": V2_SCHEMA_VERSION, "generation_enabled": generation_enabled,
+                           "active_reading_memory": True,
                            "catalog": vocabulary, "catalog_revision": vocabulary['version'],
                            "source_modes": dict(source_modes or {})}}
 

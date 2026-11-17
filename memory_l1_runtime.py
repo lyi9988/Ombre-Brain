@@ -95,6 +95,21 @@ def namespace_local_ids(document, prefix, known_ids=(), catalog=None):
     return doc, {**ids, **{old: ids.get(local, local) for old, local in first_map.items()}}
 
 
+def _matches_reading_receipt(source, reading):
+    from memory_browse_source import valid_read_ranges
+
+    if (source.get('action_status') != 'completed' or source.get('completion_kind') != 'executor'
+            or source.get('tool_id') != 'browse.fetch_page_text'):
+        return False
+    try:
+        result = json.loads(source['text'])
+    except ValueError:
+        return False
+    observed = result.get('reading') if isinstance(result, dict) and result.get('ok') is True else None
+    return (isinstance(observed, dict) and valid_read_ranges(observed.get('read_ranges'))
+            and all(observed.get(key) == value for key, value in reading.items()))
+
+
 async def _prepare_v2_action(engine, bucket_mgr, tasks, claimed, reader, mode, *, force):
     from memory_l1_v2_generation import generate
     from memory_l1_v2_sources import draft_source
@@ -104,24 +119,47 @@ async def _prepare_v2_action(engine, bucket_mgr, tasks, claimed, reader, mode, *
     if not intent:
         tasks.transition(task_id, 'generating', 'prepared', generation_status='l0_only')
         return {'task_id': task_id, 'status': 'retained_source_only', 'candidate_ids': []}
-    raw_sources, receipts = [draft_source(claimed, engine.config, kind='action')], []
+    reading = intent.get('reading')
+    raw_sources = [draft_source(claimed, engine.config, kind='action')]
+    receipt_sources, receipts = [], []
+    reading_receipt = None
     for item in intent['sources']:
         action_id, artifact_id = item['action_id'], item['artifact_id']
         source = await reader.capture(action_id, artifact_id)
         if (source.get('state') != 'available' or source.get('eligible_source') is not True
                 or not isinstance(source.get('text'), str) or not source['text'].strip()):
             raise L1OwnerError('action_source_not_available', status=409, field_path='sources')
-        raw_sources.append({'namespace': 'action_receipt', 'system': 'aizizhu',
+        receipt_sources.append({'namespace': 'action_receipt', 'system': 'aizizhu',
             'conversation_id': reader.options.get('conversation_id', 'conv-jiajia-main'),
             'profile_id': engine.memory_semantic_profile_id, 'event_id': action_id,
             'version_id': artifact_id, 'role': 'tool', 'text': source['text'],
             'recorded_at': source.get('recorded_at')})
-        receipts.append({'source_ref': f'm{len(raw_sources)}', 'coverage': source.get('coverage')})
+        receipt_ref = f'm{len(receipt_sources) + (2 if reading else 1)}'
+        receipts.append({'source_ref': receipt_ref, 'coverage': source.get('coverage')})
+        if reading and (action_id, artifact_id) == (claimed['action_id'], claimed['artifact_id']):
+            if not _matches_reading_receipt(source, reading):
+                raise L1OwnerError('reading_action_receipt_mismatch', status=409, field_path='sources')
+            reading_receipt = {'source_ref': receipt_ref, 'occurred_at': source.get('recorded_at')}
+
+    context = {'agent_draft': {'source_ref': 'm1', 'activity_id': intent['activity_id'],
+        'activity_revision': intent['activity_revision']}, 'action_receipts': receipts}
+    required_result_refs = {item['source_ref'] for item in receipts}
+    if reading:
+        from memory_browse_source import model_source
+        from memory_l1_source_readers import AizBrowseSourceReader
+
+        value = await AizBrowseSourceReader(engine.config, 'article').capture_reading(reading)
+        if value.get('state') != 'available' or value.get('eligible_source') is not True:
+            raise L1OwnerError(value.get('reason') or 'reading_article_not_available', status=409, field_path='sources')
+        raw_sources.append(model_source(value, engine.config))
+        context['read_coverage'] = [{'source_ref': 'm2', 'coverage': value['coverage'],
+            'title': value.get('title'), 'author': value.get('author'), 'limitations': value.get('limitations', [])}]
+        context['reading_event'] = reading_receipt
+        required_result_refs = {'m2'}
+    raw_sources.extend(receipt_sources)
     result = await generate(engine, bucket_mgr, origin='action_l1', task_id=task_id, source_type='action_receipt',
-        mode=mode, sources=raw_sources, context={'agent_draft': {'source_ref': 'm1',
-            'activity_id': intent['activity_id'], 'activity_revision': intent['activity_revision']},
-            'action_receipts': receipts}, force=force, metadata={'source_task_id': task_id},
-        required_source_ref='m1', required_any_source_refs={item['source_ref'] for item in receipts})
+        mode=mode, sources=raw_sources, context=context, force=force, metadata={'source_task_id': task_id},
+        required_source_ref='m1', required_any_source_refs=required_result_refs, active_reading=bool(reading))
     states = {row['candidate_id']: row['status'] for row in result['rows']}
     issues = result['adoption_issues']
     phase = 'failed' if issues else 'prepared'

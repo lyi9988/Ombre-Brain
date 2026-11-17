@@ -105,6 +105,8 @@ FIXED_PROMPT_SOURCES = {
               revision="factory-chat-event-assembly-v5"),
         _spec("ombre.memory_l1_v2_generation_prompt", "memory.l1_v2_generation",
               "memory_l1_v2_prompts:L1_V2_GENERATION_PROMPT", revision="factory-memory-l1-v2-20261114-r4"),
+        _spec("ombre.memory_l1_v2_active_prompt", "memory.l1_v2_active",
+              "memory_l1_v2_prompts:L1_V2_ACTIVE_PROMPT", revision="factory-memory-l1-v2-active-20261116-r2"),
         _spec("ombre.memory_l1_v2_revision_prompt", "memory.reflection",
               "memory_l1_v2_prompts:L1_V2_REVISION_PROMPT", revision="factory-memory-l1-v2-revision-v1"),
         _spec("ombre.memory_l2_generation_prompt", "memory.reflection",

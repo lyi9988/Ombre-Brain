@@ -25,6 +25,7 @@ from memory_l1_v2_chat import CHAT_PROMPT_ID, build_chat_response_format
 
 PROTOCOL = 'whole_window_v2'
 PROMPT_ID = 'ombre.memory_l1_v2_generation_prompt'
+ACTIVE_PROMPT_ID = 'ombre.memory_l1_v2_active_prompt'
 INPUT_TOKENS = 32000
 TOTAL_TOKENS = 64000
 COMPRESSION_OUTPUT_TOKENS = 8000
@@ -153,7 +154,8 @@ def _people(engine, snapshots, sources):
 
 
 class Generation:
-    def __init__(self, engine, *, origin, task_id, sources, context=None, include_review=False):
+    def __init__(self, engine, *, origin, task_id, sources, context=None, include_review=False,
+                 active_reading=False):
         from memory_l1_v2 import catalog
 
         self.engine, self.origin, self.task_id = engine, origin, task_id
@@ -162,8 +164,23 @@ class Generation:
             raise L1OwnerError('l1_v2_unknown_source_kind', field_path='input_kind')
         self.source_rule = L1_V2_SOURCE_RULES[origin]
         self.route = _route(engine, origin)
-        self.prompt, prompt_context = _generation_prompt(engine, origin)
-        if not self.prompt.strip():
+        self.active_reading = active_reading
+        self.material_position = 1
+        prompt_source_id = ACTIVE_PROMPT_ID if active_reading else PROMPT_ID
+        if active_reading:
+            from prompt_source_registry import fixed_prompt_source
+
+            source = fixed_prompt_source(prompt_source_id)
+            identity_id = str((engine.config.get('persona') or {}).get('canonical_session_id') or 'jiajia-main')
+            self.prompt_before, self.prompt_after, source_enabled = engine.prompt_plan_mirror.compile_background_messages(
+                scope=source.scope, source_id=prompt_source_id, live_body=source.factory_body(), identity_id=identity_id)
+            self.material_position = len(self.prompt_before)
+            prompt_revision = 'prompt_sha256:' + _digest(self._wire_prompt([*self.prompt_before, {}, *self.prompt_after]))
+        else:
+            self.prompt, prompt_context = _generation_prompt(engine, origin)
+            source_enabled = bool(self.prompt.strip())
+            prompt_revision = prompt_context['prompt_revision']
+        if not source_enabled:
             raise L1OwnerError('prompt_disabled', field_path='generation')
         self.compress_window = origin == 'auto_l1'
         # Leave space for the first pass output in the original-source request.
@@ -174,6 +191,9 @@ class Generation:
         self.catalog = catalog()
         self.include_review = include_review
         context = dict(context or {})
+        if active_reading:
+            event = context['reading_event']
+            context['reading_event'] = {**event, 'occurred_at': _local_time(event['occurred_at'], engine.tz)}
         self.cross_day_sources = set(context.pop('cross_day_sources', ()))
         previous = context.get('previous_day_drafts', [])
         # Frozen windows from the earlier protocol carry source-bound draft objects.
@@ -186,7 +206,7 @@ class Generation:
         if direct:
             self.common['direct_conversation'] = direct
         self.generation = {'origin': origin, 'task_id': task_id, 'model': self.route['model'],
-                           'prompt_source_id': PROMPT_ID, 'prompt_revision': prompt_context['prompt_revision'],
+                           'prompt_source_id': prompt_source_id, 'prompt_revision': prompt_revision,
                            'route_revision': 'route_sha256:' + semantic_sha256({
                                k: v for k, v in self.route.items() if k != 'client'}),
                            'catalog_revision': self.catalog['version']}
@@ -218,6 +238,11 @@ class Generation:
             return before + rules + after.replace(slot, '')
         # Preserve owner-authored blocks created before the slot existed.
         return self.prompt + '\n\n' + rules
+
+    def _wire_prompt(self, wire):
+        if not self.active_reading:
+            return wire[0]['content']
+        return canonical_json([*wire[:self.material_position], None, *wire[self.material_position + 1:]])
 
     def _source_material(self, views):
         messages = []
@@ -254,16 +279,23 @@ class Generation:
             envelope['core_sources'] = list(dict.fromkeys(f'm{index + 1}' for index, _, _ in core))
         if continuation:
             envelope['continuation'] = continuation
-        continuing = bool(continuation and (continuation.get('part_after_first') or continuation.get('draft_cards')))
-        system = self._system_prompt(continuing=continuing)
         cross_day = [ref for ref in source_refs if ref in self.cross_day_sources]
         if cross_day:
             envelope['cross_day_sources'] = cross_day
-            system += '\n\ncross_day_sources：这是跨天的聊天，可能能帮助理解，按需取用。'
-        wire = [{'role': 'system', 'content': system},
-                {'role': 'user', 'content': canonical_json(envelope)}]
+        material = {'role': 'user', 'content': canonical_json(envelope)}
+        if self.active_reading:
+            wire = [*self.prompt_before, material, *self.prompt_after]
+        else:
+            continuing = bool(continuation and (continuation.get('part_after_first') or continuation.get('draft_cards')))
+            system = self._system_prompt(continuing=continuing)
+            if cross_day:
+                system += '\n\ncross_day_sources：这是跨天的聊天，可能能帮助理解，按需取用。'
+            wire = [{'role': 'system', 'content': system}, material]
         native = build_model_response_format(source_refs, [person['ref'] for person in self.people],
-            self.catalog, include_review=self.include_review)
+            self.catalog, include_review=self.include_review, one_card=self.active_reading)
+        if self.active_reading:
+            cards = native['json_schema']['schema']['properties']['cards']
+            cards['items']['required'].remove('body')
         return self._request_with_budget(wire, native, source_refs, observed)
 
     def _request_with_budget(self, wire, native, refs, observed):
@@ -322,11 +354,12 @@ class Generation:
                 **meta, 'issue': model_error_details(exc), 'duration_ms': int((monotonic() - started) * 1000)})
             raise
 
-    @staticmethod
-    def _json_object_wire(wire, native):
-        payload = json.loads(wire[1]['content'])
+    def _json_object_wire(self, wire, native):
+        wire = list(wire)
+        payload = json.loads(wire[self.material_position]['content'])
         payload['output_schema'] = native['json_schema']['schema']
-        return [wire[0], {'role': 'user', 'content': canonical_json(payload)}]
+        wire[self.material_position] = {'role': 'user', 'content': canonical_json(payload)}
+        return wire
 
     async def _complete(self, wire, *, route, response_format, stage, meta, validation_schema=None):
         auto = self.origin == 'auto_l1'
@@ -350,8 +383,9 @@ class Generation:
                     validation_schema = response_format['json_schema']['schema']
                     wire = self._json_object_wire(wire, response_format)
                     response_format = {'type': 'json_object'}
-                    meta.update(protocol='json_object', user_sha256=_digest(wire[1]['content']),
-                        user_chars=len(wire[1]['content']), input_tokens_estimate=_tokens(canonical_json({
+                    material = wire[self.material_position]['content']
+                    meta.update(protocol='json_object', user_sha256=_digest(material),
+                        user_chars=len(material), input_tokens_estimate=_tokens(canonical_json({
                             'messages': wire, 'response_format': response_format})))
                 elif auto and issue.get('http_status') == 400:
                     _diagnostic(self.engine, self.task_id, stage + '_retry', {**meta, 'issue': issue})
@@ -365,11 +399,13 @@ class Generation:
             raise L1OwnerError('l1_v2_input_exceeds_budget', field_path='generation')
         started = monotonic()
         schema = canonical_json(native)
-        payload = json.loads(wire[1]['content'])
+        prompt = self._wire_prompt(wire)
+        material = wire[self.material_position]['content']
+        payload = json.loads(material)
         meta = {'origin': self.origin, 'part': part, 'model': self.route['model'], 'protocol': 'json_schema',
-                'prompt_sha256': _digest(wire[0]['content']), 'user_sha256': _digest(wire[1]['content']),
-                'schema_sha256': _digest(schema), 'system_chars': len(wire[0]['content']),
-                'user_chars': len(wire[1]['content']), 'schema_chars': len(schema),
+                'prompt_sha256': _digest(prompt), 'user_sha256': _digest(material),
+                'schema_sha256': _digest(schema), 'system_chars': len(prompt),
+                'user_chars': len(material), 'schema_chars': len(schema),
                 'input_tokens_estimate': _tokens(canonical_json({'messages': wire, 'response_format': native})),
                 'input_tokenizer': 'o200k_base',
                 'max_output_tokens': self.route['max_tokens'], 'total_token_budget': TOTAL_TOKENS,
@@ -392,6 +428,14 @@ class Generation:
             _diagnostic(self.engine, self.task_id, 'model_issue', {
                 **meta, 'issue': model_error_details(exc), 'duration_ms': int((monotonic() - started) * 1000)})
             raise
+
+    def prepare_reading_response(self, card):
+        from memory_l1_v2 import prepare_active_reading_card
+
+        event = self.common['reading_event']
+        return prepare_active_reading_card(card, original_body=self.snapshots[0]['text'],
+            receipt_ref=event['source_ref'], occurred_at=event['occurred_at'],
+            article_time=_local_time(self.snapshots[1].get('recorded_at'), self.engine.tz))
 
     def prepare(self, draft):
         from memory_l1_v2 import prepare_card
@@ -633,7 +677,8 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                    context=None, core_start=0, force=False, allow_empty=True,
                    candidate_id=None, policy=None, owner_explicit=False, metadata=None,
                    required_source_ref=None, required_any_source_refs=None, before_prepare=None,
-                   prepare_policy=None, expected_source_fingerprint=None, before_progress_save=None):
+                   prepare_policy=None, expected_source_fingerprint=None, before_progress_save=None,
+                   active_reading=False):
     """Durably prepare once, resume per range, and drain through the normal policy."""
     authority = engine.memory_authority_store
     queue = MemoryCandidatePreparation(authority)
@@ -648,7 +693,8 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
         if effective_mode == 'off':
             raise L1OwnerError('memory_source_disabled', status=409, field_path='mode')
         job = Generation(engine, origin=origin, task_id=task_id, sources=sources, context=context,
-                         include_review=effective_mode == 'auto' and not owner_explicit)
+                         include_review=effective_mode == 'auto' and not owner_explicit,
+                         active_reading=active_reading)
         fingerprint = semantic_sha256({'sources': job.bindings, 'context': context, 'core_start': core_start})
         if expected_source_fingerprint is not None and fingerprint != expected_source_fingerprint:
             raise L1OwnerError('l1_v2_source_changed', status=409, field_path='sources')
@@ -699,6 +745,9 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                 elif whole and whole[3] <= job.planning_input_limit:
                     stop, split, wire, sent, context_refs = len(core), 0, whole, core, set()
                 else:
+                    if active_reading:
+                        # A one-card response must see the complete original draft and its sources together.
+                        raise L1OwnerError('l1_v2_input_exceeds_budget', field_path='generation')
                     stop, split, wire, sent, context_refs = _next_part(job, core, offset, earlier, state['drafts'])
                 part = state['parts'] + 1
                 # Clear only the original uncertain dispatch that the owner's
@@ -730,7 +779,9 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                     core_refs = {f'm{index + 1}' for index, _, _ in sent}
                     if origin == 'auto_l1':
                         cards = _eligible_daily_cards(job, cards, core_refs, wire[2], part=part, prior_drafts=drafts)
-                    prompt_revision = 'prompt_sha256:' + _digest(wire[0][0]['content'])
+                    elif active_reading:
+                        cards = [job.prepare_reading_response(card) for card in cards]
+                    prompt_revision = 'prompt_sha256:' + _digest(job._wire_prompt(wire[0]))
                     _fold(drafts, cards, core_refs, context_refs, wire[4], prompt_revision=prompt_revision)
                 except Exception as exc:
                     # A known provider rejection/validation failure can be
@@ -741,7 +792,7 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                 save({'phase': phase, 'offset': stop, 'split': split, 'parts': part, 'drafts': drafts})
         calls = job.model_calls
         cards = state['drafts']
-        if (not allow_empty and not cards) or (candidate_id is not None and len(cards) != 1):
+        if (not allow_empty and not cards) or ((candidate_id is not None or active_reading) and len(cards) != 1):
             save({**state, 'phase': 'failed', 'offset': 0, 'split': 0, 'parts': 0, 'drafts': [],
                   'issue': {'code': 'l1_v2_expected_one_card'}})
             raise L1OwnerError('l1_v2_expected_one_card', field_path='cards')
