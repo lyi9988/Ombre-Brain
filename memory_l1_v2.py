@@ -168,7 +168,7 @@ def _date(value, path):
 
 
 def validate_model_card(card, *, source_refs, people_refs, catalog=None, allow_classification_gap=False,
-                        require_primary_topic=True, require_event_time=True):
+                         require_primary_topic=True, require_event_time=True, require_date_in_body=True):
     schema = model_card_schema(source_refs, people_refs, catalog, allow_classification_gap=allow_classification_gap)
     if not require_primary_topic:
         schema["required"].remove("primary_topic")
@@ -200,7 +200,7 @@ def validate_model_card(card, *, source_refs, people_refs, catalog=None, allow_c
                     _error("reversed_event_range", "card.event_time.end")
             except TypeError:
                 _error("inconsistent_event_timezone", "card.event_time")
-        if event["precision"] in {"day", "minute", "second"}:
+        if require_date_in_body and event["precision"] in {"day", "minute", "second"}:
             date_text = f"{start.year}年{start.month}月{start.day}日"
             compact = re.sub(r"\s+", "", value["body"])
             if date_text not in compact and start.strftime("%Y-%m-%d") not in compact:
@@ -229,7 +229,7 @@ def prepare_card(card, *, people, bindings, generation, catalog=None, source_ref
     value = validate_model_card(card, source_refs=list(mapping),
                                 people_refs=list(people_by_ref), catalog=vocabulary,
                                 allow_classification_gap=allow_classification_gap, require_primary_topic=False,
-                                require_event_time=False)
+                                require_event_time=False, require_date_in_body=generation.get("origin") != "chat_l1")
     all_refs = referenced_sources(value)
     selected_binding_ids = list(dict.fromkeys(mapping[ref] for ref in all_refs))
     if any(ref not in binding_by_id for ref in selected_binding_ids):
@@ -329,7 +329,7 @@ def validate_document(document, *, allow_classification_gap=False):
     card["sources"] = deepcopy(document["source_refs"])
     validate_model_card(card, source_refs=binding_ids, people_refs=person_ids, catalog=vocabulary,
                         allow_classification_gap=allow_classification_gap, require_primary_topic=False,
-                        require_event_time=False)
+                         require_event_time=False, require_date_in_body=generation["origin"] != "chat_l1")
     if set(referenced_sources(card)) != set(binding_ids):
         _error("unreferenced_source_binding", "document.evidence_bindings")
     return deepcopy(document)

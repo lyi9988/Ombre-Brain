@@ -19,6 +19,7 @@ from memory_l1_v2_generation import Generation, INPUT_TOKENS, PROMPT_ID
 from raw_events import RawEventStore
 from reflection_engine import ReflectionEngine
 from test_memory_authority_r1 import reflection_config
+from memory_l1_v2_chat import CHAT_L1_PROMPT, CHAT_PROMPT_ID
 
 
 DAY = '2026-11-12'
@@ -721,18 +722,73 @@ def test_explicit_retry_keeps_unfinished_nonzero_window(tmp_path, monkeypatch):
     assert len(calls) == 2 and len(engine.memory_authority_store.list_candidates(status='pending')) == 2
 
 
-def test_chat_draft_can_prepare_without_nearby_chat_sources(tmp_path):
-    engine, calls = _engine(tmp_path, lambda payload: [_card([payload['agent_draft']['source_ref']])])
-    envelope = {'operation_id': 'op-' + '1' * 32, 'arguments': {'narrative': {
-        'title': '雨夜', 'body': '我记得有一次自己在雨夜等车，想起她说可以晚点再走。'}},
+@pytest.mark.parametrize('has_title', [True, False])
+def test_chat_draft_can_prepare_without_nearby_chat_sources(tmp_path, has_title):
+    from memory_chat_preparation import ChatMemoryPreparation
+
+    body = '二〇二六年十一月十二日，我在雨夜等车。\n\n我记得我那时有点舍不得走。'
+    event_time = {'start': DAY, 'precision': 'day', 'sources': ['m1']} if has_title else None
+    metadata = {'kind': 'life_experience', 'stability': 'episode', 'keywords': ['雨夜等车'],
+                'people': [], 'sources': [], 'primary_topic': 'daily_life', 'event_time': event_time}
+    if not has_title:
+        metadata['title'] = '等车的雨夜'
+    engine, calls = _engine(tmp_path, lambda _payload: [metadata])
+    narrative = {'title': '我的原题', 'body': body} if has_title else {'body': body}
+    envelope = {'operation_id': 'op-' + '1' * 32, 'arguments': {'narrative': narrative},
         'context': {'conversation_id': 'canonical-main', 'request_id': 'r1', 'turn_id': 'e1', 'sources': []}}
     queued = asyncio.run(ChatMemoryTool(engine, None).submit(envelope))
     result = asyncio.run(prepare_chat_tasks(engine, None))
     assert result['results'][0]['memory_status'] == 'pending', result
-    assert calls[0][1]['messages'][0][3] == envelope['arguments']['narrative']['body']
-    system = calls[0][0]['messages'][0]['content']
-    assert '主动记忆：以我提交的 agent_draft 为主' in system
-    assert not any(label in system for label in ('自动记忆：', '浏览记忆：', '行动记忆：', '手动摘要：'))
+    [(request, payload)] = calls
+    assert payload['messages'][0][3] == body
+    assert request['messages'][0]['content'] == CHAT_L1_PROMPT
+    schema = request['response_format']['json_schema']['schema']['properties']['cards']
+    assert schema['minItems'] == schema['maxItems'] == 1
+    assert 'body' not in schema['items']['properties']
+    assert ('title' in schema['items']['required']) is not has_title
     row = engine.memory_authority_store.get_candidate(queued['task_id'])
-    assert row['proposal']['metadata']['memory_l1']['evidence_bindings'][0]['source_namespace'] == (
-        'snapshot.ombre.agent_memory_draft')
+    proposal = row['proposal']
+    document = proposal['metadata']['memory_l1']
+    assert proposal['proposed_body'] == body
+    assert document['title'] == (narrative.get('title') or metadata['title'])
+    assert document['generation']['prompt_source_id'] == CHAT_PROMPT_ID
+    task = ChatMemoryPreparation(engine.memory_authority_store).get(queued['task_id'])
+    assert document['generation']['submitted_at'] == task['created_at']
+    assert datetime.fromisoformat(payload['agent_draft']['submitted_at']) == datetime.fromisoformat(
+        document['generation']['submitted_at'])
+    assert document['evidence_bindings'][0]['source_namespace'] == 'snapshot.ombre.agent_memory_draft'
+    assert (document.get('event_time') or {}).get('start') == (DAY if has_title else None)
+
+
+def test_chat_v2_accepts_a_staged_window_over_the_legacy_message_cap(tmp_path, monkeypatch):
+    from memory_chat_preparation import ChatMemoryPreparation
+    from memory_l1_service import L1OwnerError
+
+    def respond(payload):
+        return [{'title': '这次聊天', 'kind': 'life_experience', 'stability': 'episode',
+                 'keywords': ['分批聊天'], 'people': [], 'sources': [payload['messages'][-1][0]],
+                 'primary_topic': 'daily_life', 'event_time': None}]
+
+    engine, calls = _engine(tmp_path, respond)
+
+    async def locate(_binding, *, verify_only=False):
+        return {'eligible_source': True}
+
+    monkeypatch.setattr(engine, '_memory_l1_sources',
+        lambda: SimpleNamespace(retain_copy=lambda _snapshot: None, locate=locate))
+    tasks = ChatMemoryPreparation(engine.memory_authority_store)
+    sources = [{'event_id': f'e{index}', 'version_id': f'v{index}', 'role': 'user',
+                'text': '同一轮里的原话', 'created_at': '2026-11-12T01:00:00+08:00'}
+               for index in range(62)]
+    envelope = {'operation_id': 'op-' + '2' * 32, 'arguments': {'narrative': {'body': '我的回忆'}},
+                'context': {'conversation_id': 'canonical-main', 'request_id': 'r2',
+                            'turn_id': sources[-1]['event_id'], 'sources': sources}}
+    with pytest.raises(L1OwnerError, match='source_missing'):
+        tasks.enqueue(envelope)
+    tasks.enqueue(envelope, generation_protocol='whole_window_v2')
+    assert len(tasks.list(private=True)[0]['envelope']['context']['sources']) == len(sources)
+    result = asyncio.run(prepare_chat_tasks(engine, None))
+    assert result['results'][0]['memory_status'] == 'pending', result
+    [(_, payload)] = calls
+    assert len(payload['messages']) == len(sources) + 1
+    assert payload['messages'][-1][3] == sources[-1]['text']

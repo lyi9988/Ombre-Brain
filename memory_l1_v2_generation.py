@@ -21,6 +21,7 @@ from memory_l1_ingestion import bind_sources
 from memory_l1_service import L1OwnerError
 from memory_l1_v2_prompts import L1_V2_CONTINUATION_RULE, L1_V2_MATERIAL_PLACEHOLDER, L1_V2_SOURCE_RULES
 from memory_model_io import model_error_details, response_usage
+from memory_l1_v2_chat import CHAT_PROMPT_ID, build_chat_response_format
 
 PROTOCOL = 'whole_window_v2'
 PROMPT_ID = 'ombre.memory_l1_v2_generation_prompt'
@@ -91,6 +92,8 @@ def _route(engine, origin):
 
 
 def _generation_prompt(engine, origin):
+    if origin == 'chat_l1':
+        return engine._memory_l1_prompt(CHAT_PROMPT_ID)
     if origin != 'auto_l1':
         return engine._memory_l1_prompt(PROMPT_ID)
     # Supply the Auto L1 factory body without changing the shared Composer
@@ -187,8 +190,22 @@ class Generation:
                            'route_revision': 'route_sha256:' + semantic_sha256({
                                k: v for k, v in self.route.items() if k != 'client'}),
                            'catalog_revision': self.catalog['version']}
+        if origin == 'chat_l1':
+            submitted_at = self.snapshots[0].get('recorded_at')
+            local_submission_time = _local_time(submitted_at, engine.tz)
+            if local_submission_time is None:
+                raise L1OwnerError('chat_submission_time_missing', field_path='generation.submitted_at')
+            self.generation.update(prompt_source_id=CHAT_PROMPT_ID, submitted_at=submitted_at)
+            self.common['agent_draft'] = {**self.common['agent_draft'], 'submitted_at': local_submission_time}
         self.views = [(index, anchor['start'], anchor['end'])
                       for index, binding in enumerate(self.bindings) for anchor in binding['anchors']]
+
+    def _attach_chat_draft(self, card):
+        card['body'] = self.snapshots[0]['text']
+        title = self.common['agent_draft']['title']
+        if title.strip():
+            card['title'] = title
+        card['sources'] = list(dict.fromkeys(['m1', *card['sources']]))
 
     def _system_prompt(self, *, continuing):
         rules = self.source_rule
@@ -226,6 +243,13 @@ class Generation:
             envelope['window_summaries'] = []
         if ranges:
             envelope['source_ranges'] = ranges
+        if self.origin == 'chat_l1':
+            native = build_chat_response_format(source_refs, [person['ref'] for person in self.people],
+                self.catalog, has_title=bool(self.common['agent_draft']['title'].strip()),
+                include_review=self.include_review)
+            wire = [{'role': 'system', 'content': self.prompt},
+                    {'role': 'user', 'content': canonical_json(envelope)}]
+            return self._request_with_budget(wire, native, source_refs, observed)
         if core is not None:
             envelope['core_sources'] = list(dict.fromkeys(f'm{index + 1}' for index, _, _ in core))
         if continuation:
@@ -359,7 +383,11 @@ class Generation:
             _diagnostic(self.engine, self.task_id, 'model_return', {
                 **meta, 'usage': usage, 'finish_reason': finish, 'duration_ms': int((monotonic() - started) * 1000)})
             validate_response(response)
-            return json.loads(self.engine._completion_content(response))['cards'], usage
+            cards = json.loads(self.engine._completion_content(response))['cards']
+            if self.origin == 'chat_l1':
+                self._attach_chat_draft(cards[0])
+                cards[0]['_prompt_source_id'] = CHAT_PROMPT_ID
+            return cards, usage
         except Exception as exc:
             _diagnostic(self.engine, self.task_id, 'model_issue', {
                 **meta, 'issue': model_error_details(exc), 'duration_ms': int((monotonic() - started) * 1000)})
@@ -368,9 +396,13 @@ class Generation:
     def prepare(self, draft):
         from memory_l1_v2 import prepare_card
 
-        card = {key: value for key, value in draft.items() if key not in {'_observed', '_prompt_revision', 'review'}}
+        card = {key: value for key, value in draft.items()
+                if key not in {'_observed', '_prompt_revision', '_prompt_source_id', 'review'}}
         generation = {**self.generation, 'prompt_revision': draft.get('_prompt_revision',
             self.generation['prompt_revision'])}
+        if self.origin == 'chat_l1':
+            self._attach_chat_draft(card)
+            generation['prompt_source_id'] = draft.get('_prompt_source_id', PROMPT_ID)
         source_ref_map, bindings = {}, []
         for ref, ranges in draft['_observed'].items():
             index = int(ref[1:]) - 1
@@ -551,6 +583,26 @@ def _next_part(job, core, offset, earlier, drafts):
         offset, end, wire, [(index, left, end)], context_refs)
 
 
+def _chat_request(job, views):
+    request = job.request(views)
+    if request[3] <= job.planning_input_limit:
+        return request, views
+    draft = [view for view in views if view[0] == 0]
+    nearby = views[len(draft):]
+    low, high = 1, len(nearby)
+    while low < high:
+        middle = (low + high) // 2
+        if job.request([*draft, *nearby[middle:]])[3] <= job.planning_input_limit:
+            high = middle
+        else:
+            low = middle + 1
+    views = [*draft, *nearby[low:]]
+    request = job.request(views)
+    if request[3] > job.planning_input_limit:
+        raise L1OwnerError('l1_v2_input_exceeds_budget', field_path='generation')
+    return request, views
+
+
 def _proposal(document, *, candidate_id, source_type, mode, metadata=None, owner_explicit=False,
               review=None):
     from memory_authority import MemoryProposal
@@ -640,7 +692,11 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                     whole = job.request(core)
                 else:
                     whole = None
-                if whole and whole[3] <= job.planning_input_limit:
+                if origin == 'chat_l1':
+                    wire, sent = (whole, core) if whole and whole[3] <= job.planning_input_limit else _chat_request(
+                        job, original_core)
+                    stop, split, context_refs = len(original_core), 0, set()
+                elif whole and whole[3] <= job.planning_input_limit:
                     stop, split, wire, sent, context_refs = len(core), 0, whole, core, set()
                 else:
                     stop, split, wire, sent, context_refs = _next_part(job, core, offset, earlier, state['drafts'])
@@ -670,7 +726,7 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                 save({**state, 'phase': 'dispatched', 'dispatch_step': 'cards'}, dispatch=True)
                 try:
                     cards, _usage = await job.call(wire, part=part)
-                    drafts = list(state['drafts'])
+                    drafts = [] if origin == 'chat_l1' else list(state['drafts'])
                     core_refs = {f'm{index + 1}' for index, _, _ in sent}
                     if origin == 'auto_l1':
                         cards = _eligible_daily_cards(job, cards, core_refs, wire[2], part=part, prior_drafts=drafts)

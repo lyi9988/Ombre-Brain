@@ -39,7 +39,9 @@ def validate_submission(envelope, *, generation_protocol=None):
         raise L1OwnerError('invalid_source_identity', field_path='context')
     sources = context['sources']
     v2 = generation_protocol == 'whole_window_v2'
-    if not isinstance(sources, list) or not (0 if v2 else 1) <= len(sources) <= 16:
+    # One staged round can contain up to 32 user messages and one active reply.
+    max_sources = 16 * (32 + 1) if v2 else 16
+    if not isinstance(sources, list) or not (0 if v2 else 1) <= len(sources) <= max_sources:
         raise L1OwnerError('source_missing', field_path='context.sources')
     seen = set()
     for source in sources:
