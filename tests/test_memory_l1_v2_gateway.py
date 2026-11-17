@@ -25,7 +25,8 @@ from test_memory_local_first_settings import _base_config as _real_gateway_confi
 BODY = "2026年11月8日，我和主人约定先等她回复，再做下一步。那次没有执行。"
 
 
-def _card_document(bucket_id, *, body=BODY, dated=True, scope_note=None):
+def _card_document(bucket_id, *, body=BODY, dated=True, event_day="2026-11-08", scope_note=None,
+                   title="桥面安排", keyword="蓝桦工程"):
     source_id = "synthetic:" + bucket_id
     binding = {
         "binding_id": "source_1", "source_namespace": "synthetic", "source_id": source_id,
@@ -34,12 +35,12 @@ def _card_document(bucket_id, *, body=BODY, dated=True, scope_note=None):
                                     target_revision=1, text_view_id="original", start=0, end=len(body))],
     }
     card = {
-        "title": "桥面安排", "body": body, "kind": "commitment", "stability": "phase",
-        "keywords": ["蓝桦工程"], "people": ["p1"], "sources": ["source_1"],
+        "title": title, "body": body, "kind": "commitment", "stability": "phase",
+        "keywords": [keyword], "people": ["p1"], "sources": ["source_1"],
         "primary_topic": "projects_creation",
     }
     if dated:
-        card["event_time"] = {"start": "2026-11-08", "precision": "day", "sources": ["source_1"]}
+        card["event_time"] = {"start": event_day, "precision": "day", "sources": ["source_1"]}
     if scope_note:
         card["scope_notes"] = [{"focus": "桥面安排", "rule": scope_note, "sources": ["source_1"]}]
     document = prepare_card(card, people=[{"ref": "p1", "person_id": "owner", "name": "林柚",
@@ -209,6 +210,106 @@ def test_v2_lexical_and_vector_hits_merge_in_the_real_candidate_builder(tmp_path
     assert chosen[0]["semantic_score"] == .91
     assert chosen[0]["computation"]["card_features"]["lexical"]["entity_match"] == 1
     assert calls.presentation_requests == []
+
+
+DATE_QUERY = "回到2026年10月11日的招聘会，我最后投了几份简历？"
+
+
+@pytest.mark.parametrize(("query", "expected"), [
+    (DATE_QUERY, True),
+    ("2026年10月11日招聘会结果怎么样？我投了几份简历？", True),
+    ("10月11日的面试有结果吗", True),
+    ("10月11日聊过什么？", True),
+    ("2027年1月10日的招聘会要带简历吗？", False),
+    ("10月11日出生的人是什么星座？", False),
+    ("10月11日的招聘会已经结束了。", False),
+    ("今天的状态怎么样？", False),
+    ("刚才的回答里写过10月11日吗？", False),
+    ("你现在怎么看招聘会经历？", False),
+    ("今天的招聘会最后投了几份简历？", True),
+    ("今天的招聘会需要带几份简历？", False),
+])
+def test_date_route_accepts_plain_event_questions_without_treating_all_dates_as_recall(monkeypatch, query, expected):
+    monkeypatch.setattr("gateway.reference_now", lambda _tz: datetime(2026, 11, 15, tzinfo=timezone.utc))
+    service = GatewayService.__new__(GatewayService)
+    service.gateway_tz = timezone.utc
+    assert service._query_requests_date_recall(query) is expected
+
+
+def test_plain_dated_event_filters_other_days_before_rerank_and_delivery(tmp_path, monkeypatch):
+    from memory_authority import MemoryAuthorityStore
+
+    monkeypatch.setenv("OMBRE_GATEWAY_TOKEN", "gateway-v2-date-test")
+    monkeypatch.setenv("OMBRE_GATEWAY_UPSTREAM_API_KEY", "fixture")
+    config = _real_gateway_config(tmp_path)
+    config["memory_authority"]["enabled"] = True
+    config["memory_system"]["recall"] = {"mode": "fast_hybrid"}
+    config["gateway"].update(upstream_base_url="https://provider.fixture/v1", upstream_default_model="public-model",
+                             core_memory_interval_rounds=0, favorite_memory_interval_rounds=0)
+    authority = MemoryAuthorityStore(config)
+    service = GatewayService(config)
+    commit = MemoryCommitService(authority, BucketMemoryProjection(config, service.bucket_mgr))
+    previous = "2026年10月10日，我提醒你明天去招聘会前把简历带上。"
+    target = "2026年10月11日，你从招聘会回来，一份简历也没投出去。"
+    ranks, sent = [], []
+
+    async def sources(_service, _request, _stage, path, payload):
+        assert path == "/api/memory-authority/recall-sources"
+        return {"items": [{**item, "state": "ok", "sources": {
+            bid: {"state": "available", "eligible_source": True} for bid in item["binding_ids"]}}
+            for item in payload["items"]]}
+
+    async def rerank(_query, items, **kwargs):
+        ranks.append(list(kwargs["documents_override"].values()))
+        for item in items:
+            item["rerank_score"] = .95
+        return items
+
+    def upstream(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json=openai_response(finish_reason="stop"))
+
+    monkeypatch.setattr(memory_use, "read_batch", sources)
+    monkeypatch.setattr(service, "_rerank_scored_bucket_candidates", rerank)
+    monkeypatch.setattr(service, "_prompt_plan_for_request", lambda *_args, **_kwargs: {
+        "scope": "talk.initial", "gateway_slice": {"blocks": [{
+            "source_id": "ombre.memory_recall", "block_id": "l1", "scope": "talk.initial",
+            "anchor": "current_user.before", "mode": "live_source", "role": "system",
+            "wrapper_text": "顾衍的记忆\n{{content}}",
+        }]},
+    })
+
+    async def adopt(bucket_id, text, day):
+        title = "招聘会"
+        doc, source = _card_document(bucket_id, body=text, event_day=day, title=title, keyword=title)
+        await commit.commit_memory(memory_id=bucket_id, bucket_id=bucket_id, expected_revision=0,
+            body=text, metadata={"name": title, "type": "dynamic", "memory_l1": doc,
+                "memory_l1_schema_version": SCHEMA_VERSION,
+                "memory_l1_semantic_sha256": semantic_sha256(doc),
+                "memory_l1_content_sha256": l1_content_sha256(text, doc)},
+            source_refs=[source], decision_source="owner_review", idempotency_key=bucket_id, actor="owner")
+
+    async def scenario():
+        await adopt("fixture-wrong-day", previous, "2026-10-10")
+        await adopt("fixture-right-day", target, "2026-10-11")
+        await service.http_client.aclose()
+        service.http_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        app = create_gateway_app(config=config, service=service)
+        app.state.gateway_service = service
+        async with service.http_client, httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://gateway.fixture") as client:
+            response = await client.post("/v1/chat/completions", headers={
+                "Authorization": "Bearer gateway-v2-date-test",
+                "X-Guyan-Conversation-Id": "date-fixture",
+                "X-Ombre-Canonical-Source-Event-Id": "date-user",
+                "X-Ombre-Canonical-Assistant-Source-Event-Id": "date-assistant"},
+                json={"model": "public-model", "messages": [{"role": "user", "content": DATE_QUERY}]})
+        assert response.status_code == 200
+        assert ranks == [["招聘会\n\n" + target]]
+        wire = "\n".join(payload_texts(sent[-1]))
+        assert wire.count(target) == 1 and previous not in wire
+
+    asyncio.run(scenario())
 
 
 def test_l1_v2_http_talk_delivery_survives_restart_and_new_revision_blocks_the_old_target(tmp_path, monkeypatch):

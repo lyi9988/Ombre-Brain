@@ -10,10 +10,12 @@ import json
 import os
 from datetime import date, datetime, time, timezone
 
+from memory_l1_v2 import SCHEMA_VERSION as L1_V2_SCHEMA_VERSION
 from utils import LOCAL_TZ
 
 
-CLAIM_KINDS = {"explicit_preference", "revisable_impression", "historical"}
+EXPLICIT_USER_CLAIMS = {"explicit_fact", "explicit_preference"}
+CLAIM_KINDS = EXPLICIT_USER_CLAIMS | {"revisable_impression", "historical"}
 SEMANTIC_METADATA = ("id", "source", "speaker", "role", "created", "active",
                      "deprecated", "type", "tags", "profile_kind", "retracted",
                      "withdrawn", "superseded_by", "corrected_by", "event_id",
@@ -31,13 +33,19 @@ def portrait_state_path(config: dict) -> str:
     return os.path.join(state_dir, "portrait_state.json")
 
 
+def _claim_text(claim: dict) -> str:
+    if claim.get("kind") in EXPLICIT_USER_CLAIMS and claim.get("display_reviewed") is not True:
+        return ""
+    return str(claim.get("text") or "").strip()
+
+
 def chat_evidence_ids(state: dict) -> list[str]:
     user = (state.get("portrait") or {}).get("user") or {}
     if user.get("chat_claims_revision") != user.get("stable_revision"):
         return []
     return list(dict.fromkeys(
         str(ref.get("bucket_id") or "") for claim in user.get("chat_claims") or []
-        if isinstance(claim, dict) and claim.get("kind") in CLAIM_KINDS - {"historical"}
+        if isinstance(claim, dict) and claim.get("kind") in CLAIM_KINDS - {"historical"} and _claim_text(claim)
         for ref in claim.get("evidence") or [] if isinstance(ref, dict) and ref.get("bucket_id")))
 
 
@@ -64,11 +72,16 @@ def bind_source_authority(bucket: dict | None, authority: dict | None,
         return None
     if not isinstance(semantic, dict):
         return None
-    if semantic.get("l1_sync_required") or semantic.get("state") not in {"legacy", "l1"}:
+    state = semantic.get("state")
+    document = semantic.get("document")
+    if state == "l1_v2" and isinstance(document, dict) and document.get("schema_version") == L1_V2_SCHEMA_VERSION:
+        # Keep the key already written by Brain, which labels v2 documents as l1.
+        state = "l1"
+    if semantic.get("l1_sync_required") or state not in {"legacy", "l1"}:
         return None
     token = hashlib.sha256(json.dumps(
         {"authority_dependency": authority.get("dependency_token"),
-         "state": semantic.get("state"), "document": semantic.get("document")},
+         "state": state, "document": document},
         ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
     origins = set()
     meta = bucket.get("metadata") or {}
@@ -78,7 +91,7 @@ def bind_source_authority(bucket: dict | None, authority: dict | None,
     for ref in meta.get("source_refs") or []:
         if isinstance(ref, str) and ref:
             origins.add("origin:" + ref)
-    document = semantic.get("document") or {}
+    document = document or {}
     for binding in document.get("evidence_bindings") or []:
         if binding.get("source_id"):
             origins.add("origin:" + str(binding["source_id"]))
@@ -140,11 +153,11 @@ def render_claims(claims: list[dict], *, include_history: bool = False) -> str:
     lines = []
     for claim in claims:
         kind = claim.get("kind")
-        text = str(claim.get("text") or "").strip()
+        text = _claim_text(claim)
         if not text:
             continue
-        if kind == "explicit_preference":
-            lines.append("她明确表达过：" + text)
+        if kind in EXPLICIT_USER_CLAIMS:
+            lines.append(text)
         elif kind == "revisable_impression":
             lines.append("我目前觉得，" + text)
         elif kind == "owner_authored":
@@ -167,7 +180,7 @@ def build_user_portrait_projection(state: dict, source_lookup, *, enabled: bool 
         return {**result, "status": "unreviewed"}
     active = []
     for claim in user.get("chat_claims") or []:
-        if not isinstance(claim, dict) or claim.get("kind") == "historical":
+        if not isinstance(claim, dict) or claim.get("kind") == "historical" or not _claim_text(claim):
             continue
         if claim.get("kind") == "owner_authored" and user.get("stable_source") in {"manual", "rollback"}:
             active.append(claim)

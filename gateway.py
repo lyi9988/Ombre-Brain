@@ -4949,7 +4949,8 @@ class GatewayService:
             snapshot_entry = self._prepare_snapshot_get(snapshot_key)
             replay_started_at = time.perf_counter()
             if (snapshot_entry is not None
-                    and await self._portrait_snapshot_current(snapshot_entry, portrait_plan)
+                    and await self._portrait_snapshot_current(
+                        snapshot_entry, portrait_plan, recall_request=recall_budget_request)
                     and await memory_use.snapshot_sources_current(self, snapshot_entry, recall_budget_request)):
                 replay = self._prepare_snapshot_replay(
                     snapshot_entry,
@@ -5014,32 +5015,10 @@ class GatewayService:
         from recall_preflight import clock_preflight
         preflight = clock_preflight(natural_input, messages, clock_metadata(messages))
         pure_clock = preflight["skip_dynamic_recall"]
-        has_handoff_context = self._messages_contain_handoff_context(messages)
-        is_session_start = self.state_store.get_last_success_at(session_id) is None
         just_now_context_requested = (
             self.just_now_context_enabled
             and self._query_requests_just_now_context(current_user_query)
         )
-        is_handoff_trigger_query = self._query_is_handoff_trigger(current_user_query)
-        handoff_just_now_requested = (
-            just_now_context_requested
-            and self._query_has_handoff_transition_marker(current_user_query)
-        )
-        is_session_start_handoff_query = (
-            is_session_start
-            and not has_handoff_context
-            and not handoff_just_now_requested
-            and self._query_prefers_session_start_handoff(current_user_query)
-        )
-        if is_handoff_trigger_query:
-            handoff_skip_reason = "handoff_trigger"
-        elif handoff_just_now_requested:
-            handoff_skip_reason = "handoff_trigger_with_just_now"
-        elif is_session_start_handoff_query:
-            handoff_skip_reason = "session_start_handoff"
-        else:
-            handoff_skip_reason = ""
-        needs_handoff_first = bool(handoff_skip_reason)
         diary_questions = []
         if (not pure_clock and self.date_recall_enabled and autonomy_context is None
                 and getattr(self, "date_recall_budget", 0) > 0 and self._composer_live_date_enabled(prompt_plan)):
@@ -5093,7 +5072,6 @@ class GatewayService:
         targeted_memory_detail = ""
         targeted_memory_detail_debug: dict[str, Any] = self._targeted_memory_detail_debug_base()
         memory_detail_recall_instruction = ""
-        handoff_tool_hint = ""
         dream_context = ""
         dream_context_status: dict[str, Any] = {"status": "skipped", "reason": "not_current_user_turn"}
         active_reminders = ""
@@ -5123,7 +5101,6 @@ class GatewayService:
                 recall_query,
                 session_id,
                 all_buckets,
-                needs_handoff_first=needs_handoff_first,
                 just_now_context_requested=just_now_context_requested,
                 date_recall_requested=date_recall_requested,
                 targeted_detail_skip=skip_for_targeted_detail,
@@ -5174,23 +5151,7 @@ class GatewayService:
             recall_plan_skip_reason = str(
                 (query_planner_debug.get("recall_query_plan") or {}).get("skip_reason") or ""
             )
-            if needs_handoff_first:
-                query_planner_debug["skip_reason"] = handoff_skip_reason
-                if is_session_start_handoff_query and not is_handoff_trigger_query:
-                    handoff_tool_hint = self._resolve_gateway_fixed_prompt(
-                        "ombre.handoff_date_hint_prompt"
-                    )
-                else:
-                    handoff_tool_hint = self._resolve_gateway_fixed_prompt(
-                        "ombre.handoff_hint_prompt"
-                    )
-                if handoff_just_now_requested:
-                    stage_started_at = time.perf_counter()
-                    just_now_context, just_now_context_debug = self._build_just_now_chat_context(
-                        current_user_query,
-                    )
-                    mark_step("just_now_context", stage_started_at)
-            elif just_now_context_requested:
+            if just_now_context_requested:
                 query_planner_debug["skip_reason"] = "just_now_context"
                 stage_started_at = time.perf_counter()
                 just_now_context, just_now_context_debug = self._build_just_now_chat_context(
@@ -5258,7 +5219,7 @@ class GatewayService:
                 channel="gateway",
             )
             mark_step("active_reminders", stage_started_at)
-            if not needs_handoff_first and not just_now_context_requested and not date_recall_requested and self._should_inject_interval(
+            if not just_now_context_requested and not date_recall_requested and self._should_inject_interval(
                 session_id,
                 self.core_memory_interval_rounds,
             ):
@@ -5371,12 +5332,8 @@ class GatewayService:
             )
             mark_step("format_recalled_memory", stage_started_at)
             date_persona_trace_requested = self._query_requests_date_persona_trace(current_user_query)
-            if needs_handoff_first or just_now_context_requested:
-                date_persona_trace_debug["skip_reason"] = (
-                    "just_now_context"
-                    if just_now_context_requested and not needs_handoff_first
-                    else handoff_skip_reason
-                )
+            if just_now_context_requested:
+                date_persona_trace_debug["skip_reason"] = "just_now_context"
             elif not date_persona_trace_requested:
                 date_persona_trace_debug["skip_reason"] = (
                     "no_date_hint"
@@ -5487,7 +5444,6 @@ class GatewayService:
                 session_id,
                 current_user_query,
                 has_reliable_dynamic_context=reliable_dynamic_context,
-                has_handoff_context=has_handoff_context or needs_handoff_first,
             ):
                 explicit_recent_query = self._query_requests_recent_context(current_user_query)
                 stage_started_at = time.perf_counter()
@@ -5508,9 +5464,6 @@ class GatewayService:
             if pure_clock:
                 dream_context = ""
                 dream_context_status = {"status": "skipped", "reason": "pure_current_clock"}
-            elif has_handoff_context or needs_handoff_first:
-                dream_context = ""
-                dream_context_status = {"status": "skipped", "reason": "handoff_context"}
             else:
                 dream_context, dream_context_status = await self._build_dream_context_block(
                     current_user_query,
@@ -5634,7 +5587,8 @@ class GatewayService:
         recall_status = memory_recall_projection.get("recall_status", {})
         recall_status["automatic_recall_enabled"] = getattr(self, "automatic_recall_enabled", True)
         stage_started_at = time.perf_counter()
-        portrait_memory, portrait_memory_debug, portrait_guard = await self._chat_portrait_input(portrait_plan)
+        portrait_memory, portrait_memory_debug, portrait_guard = await self._chat_portrait_input(
+            portrait_plan, recall_request=natural_input)
         mark_step("portrait_memory", stage_started_at)
         dated_chat = date_recall
         private_diary = ""
@@ -5666,7 +5620,6 @@ class GatewayService:
             "dream_context": dream_context,
             "active_reminders": active_reminders,
             "memory_detail_recall_instruction": memory_detail_recall_instruction,
-            "handoff_tool_hint": handoff_tool_hint,
             "context_mode": context_mode,
         }
         # Existing owner presets predate the unified Memory source. Project
@@ -5841,7 +5794,6 @@ class GatewayService:
             "message_count": len(messages),
             "bucket_count": len(all_buckets),
             "is_new_user_turn": is_new_user_turn,
-            "needs_handoff_first": needs_handoff_first,
             "just_now_context_requested": just_now_context_requested,
             "date_recall_requested": date_recall_requested,
             "date_persona_trace_requested": date_persona_trace_requested,
@@ -12176,51 +12128,6 @@ class GatewayService:
             return ""
         return hashlib.sha256(f"{h1}|{h2}".encode("utf-8")).hexdigest()[:40]
 
-    def _messages_contain_handoff_context(self, messages: list[dict[str, Any]]) -> bool:
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            text = self._coerce_message_text(message.get("content"))
-            if "=== Handoff Context ===" in text:
-                return True
-            if "Handoff Context" in text and "Use this compact private block" in text:
-                return True
-        return False
-
-    @staticmethod
-    def _query_is_handoff_trigger(query_text: str) -> bool:
-        compact = re.sub(r"[\s!！?？。.,，、:：;；~～…_\-]+", "", str(query_text or "").strip().lower())
-        return compact in {
-            "新窗口",
-            "开新窗",
-            "换窗",
-            "醒来",
-            "醒过来",
-            "新窗口醒来",
-            "新窗醒来",
-            "handoff",
-            "newwindow",
-            "sessionstart",
-        }
-
-    @staticmethod
-    def _query_has_handoff_transition_marker(query_text: str) -> bool:
-        compact = re.sub(r"[\s!！?？。.,，、:：;；~～…_\-]+", "", str(query_text or "").strip().lower())
-        if not compact:
-            return False
-        if GatewayService._query_is_handoff_trigger(query_text):
-            return True
-        return any(marker in compact for marker in ("换窗", "开新窗"))
-
-    def _query_prefers_session_start_handoff(self, query_text: str) -> bool:
-        text = str(query_text or "").strip()
-        if not text:
-            return False
-        if not self._query_date_hint(text):
-            return False
-        continuity_markers = query_intent_terms("handoff.session_start_continuity_markers")
-        return any(marker in text for marker in continuity_markers)
-
     def _coerce_message_text(self, content: Any) -> str:
         if isinstance(content, str):
             return content
@@ -12685,7 +12592,7 @@ class GatewayService:
         )
         return await self._summarize_buckets(core_buckets, self.core_budget)
 
-    async def _chat_portrait_input(self, plan: dict | None):
+    async def _chat_portrait_input(self, plan: dict | None, *, recall_request=None):
         debug = self._portrait_memory_debug_base()
         if not plan or plan.get("fallback_legacy") or plan.get("scope") not in {"talk.initial", "talk.continuation"}:
             return "", debug, None
@@ -12703,6 +12610,24 @@ class GatewayService:
         if not enabled:
             return "", {**debug, "skip_reason": "portrait_disabled"}, modes
         projection = await asyncio.to_thread(self.user_portrait.read)
+        checks = projection.get("v2_source_checks")
+        if checks:
+            request = recall_request if recall_request is not None else {}
+            try:
+                result = await memory_use.read_batch(self, request, "portrait_sources",
+                    "/api/memory-authority/recall-sources", {"items": checks})
+                verified = {
+                    (row["memory_id"], row["revision"]): {
+                        key for key, source in row["sources"].items() if source.get("eligible_source") is True
+                    }
+                    for row in result["items"] if row.get("state") == "ok" and not row.get("historical")
+                    and not row.get("l1_sync_required") and not row.get("sync_scope")
+                    and not any(not (guard.get("scope") or {}).get("historical_only")
+                                for guard in row.get("relation_guards") or [])
+                }
+                projection = await asyncio.to_thread(self.user_portrait.read, verified_v2=verified)
+            except (asyncio.TimeoutError, httpx.HTTPError, KeyError, TypeError, ValueError, AttributeError):
+                debug["source_check"] = "unavailable"
         text = projection["text"]
         revision = projection["revision"]
         status = projection["status"]
@@ -12713,8 +12638,8 @@ class GatewayService:
         guard = (modes, revision, status, hashlib.sha256(text.encode("utf-8")).hexdigest())
         return text, debug, guard
 
-    async def _portrait_snapshot_current(self, entry: dict, plan: dict | None) -> bool:
-        _, _, current = await self._chat_portrait_input(plan)
+    async def _portrait_snapshot_current(self, entry: dict, plan: dict | None, *, recall_request=None) -> bool:
+        _, _, current = await self._chat_portrait_input(plan, recall_request=recall_request)
         return (entry.get("memory_guard") or {}).get("user_portrait") == current
 
     @staticmethod
@@ -12795,14 +12720,11 @@ class GatewayService:
         query_text: str,
         *,
         has_reliable_dynamic_context: bool = False,
-        has_handoff_context: bool = False,
     ) -> bool:
         if self.recent_budget <= 0 or self.head_recent_hours <= 0:
             return False
         if self._query_requests_recent_context(query_text):
             return True
-        if has_handoff_context:
-            return False
         if self._auto_recall_low_signal_query(query_text):
             return False
         if self._auto_query_too_vague(query_text):
@@ -13160,7 +13082,8 @@ class GatewayService:
 
     def _query_requests_date_recall(self, query: str) -> bool:
         text = str(query or "").strip()
-        if not text or not self._query_date_recall_hint(text):
+        hint = self._query_date_recall_hint(text)
+        if not hint:
             return False
         if self._query_prefers_identity_name_over_date_recall(text):
             return False
@@ -13175,14 +13098,18 @@ class GatewayService:
             return False
         if any(marker in text for marker in DATE_RECALL_CHAT_MARKERS):
             return True
-        return self._query_has_explicit_date_topic(text)
+        if self._date_recall_protected_topic_terms(text):
+            return True
 
-    def _query_has_explicit_date_topic(self, query: str) -> bool:
-        text = str(query or "").strip()
-        hint = self._query_date_recall_hint(text)
-        if not hint:
+        _, _, after_date = text.partition(hint["label"])
+        if not re.search(r"[?？]|[吗么]\s*$|多少|几|哪|什么|怎么|是否|有没有", after_date):
             return False
-        return bool(self._date_recall_protected_topic_terms(text))
+        past_event = re.search(r"当时|后来|最后|(?:过|了)(?:多少|几|哪|什么)", after_date)
+        today = reference_now(self.gateway_tz).date().isoformat()
+        # Present-day plans still use the ordinary route.
+        if hint["date"] > today or (hint["date"] == today and not past_event):
+            return False
+        return bool(past_event or re.match(r"\s*(?:的\s*\w|那[天场次件回个轮])", after_date))
 
     def _query_requires_role_safe_date_transcript(self, query: str) -> bool:
         compact = self._compact_lookup_key(query)
@@ -19184,7 +19111,6 @@ class GatewayService:
         session_id: str,
         all_buckets: list[dict],
         *,
-        needs_handoff_first: bool = False,
         just_now_context_requested: bool = False,
         date_recall_requested: bool = False,
         targeted_detail_skip: bool = False,
@@ -19236,7 +19162,6 @@ class GatewayService:
         hard_bypass = self._memory_sentinel_hard_bypass_reason(
             query,
             all_buckets,
-            needs_handoff_first=needs_handoff_first,
             just_now_context_requested=just_now_context_requested,
             date_recall_requested=date_recall_requested,
             targeted_detail_skip=targeted_detail_skip,
@@ -19298,7 +19223,6 @@ class GatewayService:
         query: str,
         all_buckets: list[dict],
         *,
-        needs_handoff_first: bool = False,
         just_now_context_requested: bool = False,
         date_recall_requested: bool = False,
         targeted_detail_skip: bool = False,
@@ -19306,8 +19230,6 @@ class GatewayService:
         text = str(query or "").strip()
         if not text:
             return "empty_query"
-        if needs_handoff_first:
-            return "handoff"
         if just_now_context_requested:
             return "just_now"
         if date_recall_requested:
@@ -25386,7 +25308,6 @@ class GatewayService:
                 targeted_memory_detail,
                 related_memory,
                 memory_detail_recall_instruction,
-                handoff_tool_hint,
                 dream_context,
                 active_reminders,
                 context_mode,
@@ -25457,7 +25378,6 @@ class GatewayService:
             add_section("Diffused Memory", related_memory)
             add_section("Recent Context", recent_context)
             add_section("Date Persona Trace", date_persona_trace)
-            add_section("New Window Handoff Hint", handoff_tool_hint)
             if persona_block.strip():
                 dynamic_sections.extend(["", persona_block])
             add_section("Relationship Weather", relationship_weather)
@@ -25826,7 +25746,7 @@ class GatewayService:
         relationship_weather: str, favorite_memory: str,
         related_memory: str, targeted_memory_detail: str,
         dream_context: str, active_reminders: str,
-        memory_detail_recall_instruction: str, handoff_tool_hint: str,
+        memory_detail_recall_instruction: str, handoff_tool_hint: str = "",
         context_mode: str, date_persona_trace: str, date_recall: str,
         memory_recall_projection: dict[str, Any] | None = None,
     ) -> tuple[str, str, dict[str, Any]]:
@@ -25893,12 +25813,6 @@ class GatewayService:
                     "ombre.memory_detail_request_prompt",
                     runtime_values={"max_ids": memory_detail_max_ids}
                 ) if memory_detail_recall_instruction.strip() else ""),
-            "ombre.handoff_hint_prompt": (
-                None, handoff_tool_hint if not handoff_tool_hint.startswith(
-                    "First turn of a new session") else ""),
-            "ombre.handoff_date_hint_prompt": (
-                None, handoff_tool_hint if handoff_tool_hint.startswith(
-                    "First turn of a new session") else ""),
             "ombre.active_reminder_prompt": (
                 None, self._resolve_gateway_fixed_prompt(
                     "ombre.active_reminder_prompt",
@@ -25933,7 +25847,6 @@ class GatewayService:
             "ombre.recent_context": (None, recent_context),
             "ombre.date_persona_trace": (
                 "Date Persona Trace", date_persona_trace),
-            "ombre.handoff_hint": ("New Window Handoff Hint", handoff_tool_hint),
             "ombre.persona_state": (None, persona_block),
             "ombre.relationship_weather": (
                 "Relationship Weather", relationship_weather),
@@ -25990,8 +25903,13 @@ class GatewayService:
                 continue
             source_id = str(block.get("source_id") or "")
             title, live_body = sources.get(source_id, (None, ""))
-            if source_id == "ombre.relationship_weather":
-                continue  # Includes an old frozen/override copy of the retired source.
+            if source_id in {
+                "ombre.relationship_weather",
+                "ombre.handoff_hint",
+                "ombre.handoff_hint_prompt",
+                "ombre.handoff_date_hint_prompt",
+            }:
+                continue  # Also skips previously saved overrides and frozen blocks.
             mode = str(block.get("mode") or "live_source")
             spec = fixed_prompt_source(source_id)
             runtime_values = {}

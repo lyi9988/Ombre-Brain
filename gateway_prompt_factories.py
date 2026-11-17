@@ -39,17 +39,9 @@ GATEWAY_DYNAMIC_PREFACE_PROMPT = (
 MEMORY_READING_POLICY_PROMPT = ""
 DATE_BOUNDARY_PROMPT = ""
 MEMORY_DETAIL_REQUEST_PROMPT = ""
-HANDOFF_HINT_PROMPT = (
-    "New-window signal: call the memory tool as breath(is_session_start=True) "
-    "or breath(mode=\"handoff\") before replying. Do not call breath(query=\"新窗口\") "
-    "for this literal signal, and do not write/hold it unless the user explicitly asks."
-)
-HANDOFF_DATE_HINT_PROMPT = (
-    "First turn of a new session with a date-continuity question: call the memory tool "
-    "as breath(is_session_start=True) or breath(mode=\"handoff\") before answering. "
-    "Use this to restore identity and life context first; if concrete details are still "
-    "needed afterwards, then call breath(query=...) for the date/event."
-)
+# Keep these source IDs readable in older Composer presets.
+HANDOFF_HINT_PROMPT = ""
+HANDOFF_DATE_HINT_PROMPT = ""
 ACTIVE_REMINDER_PROMPT = "照顾备忘：只在合适时轻轻带一句，不要机械复述。\n{{content}}"
 DREAM_WRAPPER_PROMPT = (
     "Private dream residue for this turn. Let it quietly color tone or imagery only if it fits. "

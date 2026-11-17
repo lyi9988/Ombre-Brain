@@ -9,7 +9,7 @@ import yaml
 
 from user_portrait_chat import (
     bind_source_authority, build_user_portrait_projection, chat_evidence_ids,
-    portrait_state_path,
+    portrait_state_path, source_binding_matches,
 )
 
 
@@ -56,14 +56,47 @@ class GatewayUserPortrait:
         bucket = {"id": bucket_id, "metadata": item.metadata, "content": item.content}
         return bind_source_authority(bucket, authority, semantic)
 
-    def read(self):
+    def read(self, *, verified_v2=None):
         try:
             state = self._read_user()
             ids = chat_evidence_ids(state)
             authorities = self.authority.memory_index_metadata_map(ids) if ids else {}
             semantics = self.authority.memory_l1_recall_map(ids) if ids else {}
-            return build_user_portrait_projection(
-                state, lambda ref: self._source(ref, authorities, semantics))
+            sources = {}
+            checks = {}
+
+            def source_lookup(ref):
+                bucket_id = ref.get("bucket_id")
+                cache_key = (bucket_id, ref.get("relative_path"))
+                if cache_key not in sources:
+                    sources[cache_key] = self._source(ref, authorities, semantics)
+                source = sources[cache_key]
+                semantic = semantics.get(bucket_id) or {}
+                if not source or semantic.get("state") != "l1_v2":
+                    return source
+                if not source_binding_matches(ref, source):
+                    return None
+                authority = source["_portrait_authority"]
+                key = (authority["memory_id"], authority["memory_revision"])
+                bindings = {binding["binding_id"] for binding in semantic["document"]["evidence_bindings"]}
+                wanted = {ref["binding_id"]} if ref.get("binding_id") else bindings
+                if not wanted or not wanted <= bindings:
+                    return None
+                if verified_v2 is None:
+                    checks.setdefault(key, set()).update(wanted)
+                    return source
+                return source if wanted <= verified_v2.get(key, set()) else None
+
+            projection = build_user_portrait_projection(state, source_lookup)
+            if checks:
+                # Only the verified pass can expose v2 claims to the caller.
+                verified_v2 = {}
+                projection = build_user_portrait_projection(state, source_lookup)
+                projection["v2_source_checks"] = [
+                    {"memory_id": memory_id, "revision": revision, "binding_ids": sorted(bindings)}
+                    for (memory_id, revision), bindings in checks.items()
+                ]
+            return projection
         except (OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error, yaml.YAMLError):
             # Chat can continue. An earlier text must never stand in for a
             # missing state file, withdrawn source or unavailable authority.
