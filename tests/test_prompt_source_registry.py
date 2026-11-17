@@ -31,6 +31,7 @@ EXPECTED_FIXED_SOURCE_IDS = {
     "ombre.daily_chat_event_selection_prompt",
     "ombre.daily_chat_event_assembly_prompt",
     "ombre.memory_l1_v2_generation_prompt",
+    "ombre.memory_l1_v2_chat_prompt",
     "ombre.memory_l1_v2_active_prompt",
     "ombre.memory_l1_v2_revision_prompt",
     "ombre.memory_l2_generation_prompt",
