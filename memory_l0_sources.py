@@ -10,6 +10,7 @@ from memory_l1_contract import L1ContractError, canonical_json, make_text_anchor
 
 DIARY_NAMESPACE = "snapshot.ombre.diary_mcp"
 DIARY_VIEW = "diary_mcp.content.exact-v1"
+CANONICAL_EVENT_NAMESPACE = "snapshot.aiz.canonical_event"
 
 
 def initialize(conn):
@@ -116,7 +117,7 @@ class MemoryL0Sources:
                    "author_ref": None, "speaker_ref": None, "anchors": [anchor]}
         return {"source": snapshot, "binding": binding}
 
-    async def locate(self, binding, *, start=None, end=None, verify_only=False):
+    async def _read_live(self, binding):
         adapter = self.adapters.get(binding["source_namespace"])
         failure_kind, http_status = None, None
         try:
@@ -131,6 +132,19 @@ class MemoryL0Sources:
             if failure_kind == 'http_status' and type(status) is int and 100 <= status <= 599:
                 http_status = status
             current = {"state": "unavailable", "reason": "source_read_failed"}
+        return current, failure_kind, http_status
+
+    async def locate(self, binding, *, start=None, end=None, verify_only=False, canonical_reads=None):
+        if canonical_reads is not None and binding["source_namespace"] == CANONICAL_EVENT_NAMESPACE:
+            # The canonical adapter reads the source version. Binding offsets
+            # and checksums are verified independently below for each caller.
+            key = canonical_json({name: value for name, value in binding.items()
+                                  if name not in {"binding_id", "anchors"}})
+            if key not in canonical_reads:
+                canonical_reads[key] = asyncio.create_task(self._read_live(binding))
+            current, failure_kind, http_status = await asyncio.shield(canonical_reads[key])
+        else:
+            current, failure_kind, http_status = await self._read_live(binding)
         eligible = (current.get("state") == "available" and current.get("source_namespace") == binding["source_namespace"]
                     and current.get("source_id") == binding["source_id"]
                     and type(current.get("source_revision")) is type(binding["source_revision"])

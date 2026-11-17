@@ -13,8 +13,9 @@ from chat_memory_tool import ChatMemoryTool
 from memory_candidate_preparation import MemoryCandidatePreparation
 from memory_chat_segments import ChatSegmentProgress
 from memory_chat_preparation import prepare_chat_tasks
+from memory_l1_service import L1OwnerError
 from memory_l1_v2_diagnostics import MemoryV2Diagnostics
-from memory_l1_v2_generation import INPUT_TOKENS, PROMPT_ID
+from memory_l1_v2_generation import Generation, INPUT_TOKENS, PROMPT_ID
 from raw_events import RawEventStore
 from reflection_engine import ReflectionEngine
 from test_memory_authority_r1 import reflection_config
@@ -77,6 +78,11 @@ def _card(sources):
             'kind': 'commitment', 'stability': 'episode', 'keywords': ['雨夜', '等雨停'],
             'people': [], 'sources': sources, 'primary_topic': 'daily_life',
             'event_time': {'start': DAY, 'precision': 'day', 'sources': [sources[-1]]}}
+
+
+def test_attachment_is_not_an_l1_v2_generation_origin():
+    with pytest.raises(L1OwnerError, match='l1_v2_unknown_source_kind'):
+        Generation(None, origin='attachment_l1', task_id='retired', sources=[])
 
 
 def test_daily_window_delivers_every_original_then_queues_cards(tmp_path):
@@ -485,6 +491,20 @@ def test_unknown_dispatch_cannot_retry_from_scheduler(tmp_path):
     assert len(calls) == 1
 
 
+def test_v2_will_not_use_legacy_generator_without_authority(tmp_path):
+    engine, calls = _engine(tmp_path, lambda _: pytest.fail('model should not be called'))
+    engine.memory_authority_store = None
+
+    class UnreadableTurns:
+        def list_conversation_turns_between(self, **_kwargs):
+            pytest.fail('legacy source reader should not be called')
+
+    result = asyncio.run(engine.run_daily_chat_memory(None, conversation_turn_store=UnreadableTurns(),
+                                                    key=DAY, chat_windows_only=True))
+    assert result['status'] == 'failed' and result['reason'] == 'memory_authority_unavailable'
+    assert not result['cursor_updated'] and not calls
+
+
 @pytest.mark.parametrize('late_return', [False, True])
 def test_daily_force_rescans_changed_source_while_original_dispatch_is_unknown(tmp_path, late_return):
     def reply(payload):
@@ -590,8 +610,22 @@ def test_daily_resume_uses_prepared_watermark_then_reads_new_messages(tmp_path, 
     assert len(before) == (0 if first_empty else 1)
     _append_event(store, '雨停后，我又说可以一起走。')
 
-    resumed = _run(engine, store)
+    # DAY is older than yesterday, so selection of its genuine V2 partial
+    # checkpoint must come from the scheduler rather than the default date.
+    engine.enabled = engine.auto_enabled = True
+    engine.diary_memory_extract_enabled = False
+    scheduled_at = datetime.fromisoformat(DAY).replace(tzinfo=engine.tz) + timedelta(days=2, hours=10)
+    monkeypatch.setattr(engine, '_local_now', lambda now=None: now or scheduled_at)
+    legacy_date = (scheduled_at.date() - timedelta(days=3)).isoformat()
+    legacy = {'date': legacy_date, 'profile_id': 'profile', 'status': 'partial',
+              'source_start_seq': 0, 'error_category': 'source_batch_exhausted'}
+    engine._store_daily_chat_memory_run_audit(legacy)
+    resumed, = asyncio.run(engine.run_due(None, persona_engine=SimpleNamespace(profile_id='profile'),
+                                        raw_event_store=store))
+    assert resumed['date'] == DAY
     assert resumed['status'] == 'pending', resumed
+    assert [row['date'] for row in resumed['unresolved_dates']] == [legacy_date]
+    assert [row for row in engine._load_daily_chat_memory_run_audit() if row['date'] == legacy_date] == [legacy]
     assert watermarks == [1, 1, 2] and len(calls) == 2
     second = calls[1][1]
     assert [row[3] for row in second['messages']] == ['原来我们说好等雨停。', '雨停后，我又说可以一起走。']

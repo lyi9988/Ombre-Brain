@@ -2328,6 +2328,15 @@
     outline: none;
     border-color: var(--border-strong);
   }
+  .portrait-wording-label {
+    display: block;
+    margin-bottom: 8px;
+  }
+  .portrait-wording-label input {
+    display: block;
+    width: 100%;
+    margin-top: 4px;
+  }
   .portrait-stable-actions {
     display: flex;
     flex-wrap: wrap;
@@ -4252,6 +4261,11 @@ let allBuckets = [];
 let renderedBuckets = [];
 let portraitState = null;
 let portraitEditorScope = '';
+const PORTRAIT_CANDIDATE_PAGE_SIZE = 8;
+const portraitCandidateVisible = {
+  stable_candidates: PORTRAIT_CANDIDATE_PAGE_SIZE,
+  profile_fact_candidates: PORTRAIT_CANDIDATE_PAGE_SIZE
+};
 let profileFacts = [];
 let profileFactProposals = [];
 let anchorProposals = [];
@@ -5325,6 +5339,8 @@ async function loadPortraitState() {
   var content = document.getElementById('portrait-state-content');
   var summary = document.getElementById('portrait-state-summary');
   if (!content || !summary) return;
+  var maintenance = document.getElementById('portrait-maintenance-candidates');
+  var maintenanceOpen = maintenance && maintenance.open;
   content.innerHTML = '<div class="loading">加载 Portrait State…</div>';
   summary.textContent = '读取中…';
   try {
@@ -5334,6 +5350,7 @@ async function loadPortraitState() {
     if (!res.ok) throw new Error(data.error || '加载失败');
     portraitState = data;
     renderPortraitState(data);
+    if (maintenanceOpen) document.getElementById('portrait-maintenance-candidates').open = true;
     if (portraitEditorScope) renderPortraitEditorPanel(portraitEditorScope);
   } catch (e) {
     summary.textContent = '读取失败';
@@ -5352,6 +5369,11 @@ async function runPortraitMaintain() {
     if (!res) return;
     var data = await res.json().catch(function() { return {}; });
     if (!res.ok) throw new Error(data.error || '生成失败');
+    if (data.status === 'failed' && data.daily_failure) {
+      setPortraitMaintainMessage('日维护失败，保留上一版。' + portraitDailyFailureLabel(data.daily_failure.reason), 'error');
+      await loadPortraitState();
+      return;
+    }
     var materials = data.materials || {};
     var rejected = Array.isArray(data.rejected) ? data.rejected.length : Number(data.rejected_count || 0);
     var parts = [
@@ -5394,19 +5416,30 @@ async function resetPortraitState() {
   }
 }
 
+function portraitDailyFailureLabel(reason) {
+  switch (reason) {
+    case 'model_unavailable': return '未配置画像模型';
+    case 'model_response_invalid_json': return '模型输出无法解析';
+    default: return '模型请求失败';
+  }
+}
+
 function renderPortraitState(data) {
   var content = document.getElementById('portrait-state-content');
   var summary = document.getElementById('portrait-state-summary');
   if (!content || !summary) return;
   var state = data || {};
   var portrait = state.portrait || {};
+  var failure = state.daily_failure || {};
   summary.innerHTML = '<div class="portrait-state-meta">' +
     '<span class="profile-chip">auto maintained</span>' +
     portraitStatusChip('engine', state.enabled !== false) +
     portraitStatusChip('auto', state.auto_enabled !== false) +
     portraitStatusChip('auto initial', state.auto_initial_enabled === true) +
     portraitStatusChip('daily', state.daily_enabled !== false) +
-    '<span class="profile-chip">last run ' + esc(state.last_run_date || '—') + '</span>' +
+    '<span class="profile-chip">日维护日期 ' + esc(state.last_run_date || '—') + '</span>' +
+    (failure.reason ? '<span class="profile-chip">日维护失败，保留上一版 · ' + esc(failure.date || '') +
+      ' · ' + esc(portraitDailyFailureLabel(failure.reason)) + '</span>' : '') +
     '<span class="profile-chip">updated ' + esc(state.updated_at || '—') + '</span>' +
     '<span class="profile-chip">state ' + esc(state.state_path || '—') + '</span>' +
   '</div>';
@@ -5417,16 +5450,48 @@ function renderPortraitState(data) {
       renderPortraitScope('user', portrait.user || {}) +
       renderPortraitScope('relationship', portrait.relationship || {}) +
     '</div>' +
-    '<details class="portrait-maintenance">' +
+    '<details id="portrait-maintenance-candidates" class="portrait-maintenance">' +
       '<summary>生成记录与候选</summary>' +
       '<div class="portrait-maintenance-body">' +
+        renderPortraitL1Review(state.l1_v2_review) +
         renderPortraitTimeline(state.recent_timeline, state.recent_activities) +
         '<div class="portrait-candidate-grid">' +
-          renderPortraitCandidates('Stable Candidates', state.stable_candidates) +
-          renderPortraitCandidates('Profile Fact Candidates', state.profile_fact_candidates) +
+          renderPortraitCandidates('stable_candidates', 'Stable Candidates', state.stable_candidates) +
+          renderPortraitCandidates('profile_fact_candidates', 'Profile Fact Candidates', state.profile_fact_candidates,
+            Number((portrait.user || {}).stable_revision || 0)) +
         '</div>' +
       '</div>' +
     '</details>';
+}
+
+function renderPortraitL1Review(review) {
+  review = review || {};
+  var labels = {
+    unavailable: '送检暂不可用',
+    no_cards: '没有待检卡',
+    no_changes: '本轮无新增',
+    checked: '检查完成',
+    partial: '部分处理',
+    failed: '检查失败'
+  };
+  var counts = review.counts || {};
+  var reasons = review.reasons || {};
+  var checkedAt = review.checked_at && new Date(review.checked_at).toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai', hour12: false
+  });
+  var details = Object.keys(reasons).map(function(reason) {
+    return esc(reason) + ' × ' + esc(reasons[reason]);
+  }).join('，');
+  return '<section class="portrait-candidates">' +
+    '<h3>新版 L1 送检</h3>' +
+    '<div class="portrait-row">' +
+      '<div>' + esc(labels[review.status] || '尚未检查') +
+      (checkedAt ? ' · ' + esc(checkedAt) : '') + '</div>' +
+      (review.checked_at ? '<div class="portrait-row-meta">检查 ' + esc(counts.attempted || 0) +
+        ' 张 · 生成候选 ' + esc(counts.candidates || 0) + ' 条</div>' : '') +
+      (details ? '<div class="portrait-row-meta">' + details + '</div>' : '') +
+    '</div>' +
+  '</section>';
 }
 
 function bucketTimeValue(bucket) {
@@ -5739,15 +5804,55 @@ function renderPortraitRows(rows, emptyText) {
   return rows.map(renderPortraitRow).join('');
 }
 
-function renderPortraitCandidates(title, candidates) {
-  var area = title.indexOf('Stable') === 0 ? 'stable_candidates' : 'profile_fact_candidates';
-  var rows = portraitRows(candidates).map(function(row, index) {
-    return withPortraitDelete(row, { area: area, index: index, text: row && row.text || '' });
-  }).slice(-8).reverse();
+function portraitCandidateRows(area, candidates, offset, end, stableRevision) {
+  return candidates.slice(candidates.length - end, candidates.length - offset).reverse().map(function(row, i) {
+    row = row || {};
+    var candidateId = area === 'profile_fact_candidates' && row.origin === 'l1_v2' &&
+      row.status === 'candidate' && row.candidate_id;
+    var candidate = withPortraitDelete(row, candidateId
+      ? { area: area, candidate_id: candidateId }
+      : { area: area, index: candidates.length - offset - i - 1, text: row.text || '' });
+    if (candidateId && row.scope === 'user' && Number.isSafeInteger(stableRevision)) {
+      candidate._approve = { id: candidateId, revision: stableRevision };
+    }
+    return candidate;
+  });
+}
+
+function portraitCandidateCountLabel(shown, total) {
+  return '已显示 ' + shown + ' / ' + total + ' 条';
+}
+
+function renderPortraitCandidates(area, title, candidates, stableRevision) {
+  candidates = portraitRows(candidates);
+  var total = candidates.length;
+  var shown = Math.min(total, portraitCandidateVisible[area]);
   return '<section class="portrait-candidates">' +
     '<h3>' + esc(title) + '</h3>' +
-    renderPortraitRows(rows, '没有候选。') +
+    '<div id="portrait-' + area + '-rows">' +
+      renderPortraitRows(portraitCandidateRows(area, candidates, 0, shown, stableRevision), '没有候选。') +
+    '</div>' +
+    (total > PORTRAIT_CANDIDATE_PAGE_SIZE ? '<div class="portrait-row-meta">' +
+      '<span class="profile-chip" aria-live="polite">' + portraitCandidateCountLabel(shown, total) + '</span>' +
+      '<button type="button" data-candidate-area="' + area + '" onclick="showMorePortraitCandidates(this)"' +
+      (shown >= total ? ' hidden' : '') + '>显示更多</button>' +
+    '</div>' : '') +
   '</section>';
+}
+
+function showMorePortraitCandidates(button) {
+  var area = button.dataset.candidateArea;
+  var list = document.getElementById('portrait-' + area + '-rows');
+  if (!list || !portraitState || !Number.isSafeInteger(portraitCandidateVisible[area])) return;
+  var revision = Number((((portraitState.portrait || {}).user || {}).stable_revision) || 0);
+  var candidates = portraitRows(portraitState[area]);
+  var shown = portraitCandidateVisible[area];
+  var end = Math.min(shown + PORTRAIT_CANDIDATE_PAGE_SIZE, candidates.length);
+  if (end <= shown) return;
+  list.insertAdjacentHTML('beforeend', renderPortraitRows(portraitCandidateRows(area, candidates, shown, end, revision)));
+  portraitCandidateVisible[area] = end;
+  button.previousElementSibling.textContent = portraitCandidateCountLabel(end, candidates.length);
+  button.hidden = end >= candidates.length;
 }
 
 function withPortraitDelete(row, spec) {
@@ -5787,13 +5892,66 @@ function renderPortraitRow(item) {
   var deleteButton = deleteSpec
     ? '<button type="button" class="danger" onclick="deletePortraitStateItem(\'' + deleteSpec + '\')">删除</button>'
     : '';
+  var approveButton = item._approve
+    ? '<button type="button" data-candidate-id="' + escAttr(item._approve.id) +
+      '" data-revision="' + escAttr(String(item._approve.revision)) +
+      '" onclick="approvePortraitFact(this)">采用到主人画像</button>'
+    : '';
+  var buttons = approveButton + deleteButton;
+  var content = item._approve
+    ? '<label class="portrait-wording-label">给顾衍看的句子' +
+      '<input type="text" data-portrait-wording value="' + escAttr(item.display_text || '') + '"></label>' +
+      '<div class="portrait-row-text">来源原话 · ' + esc(text) + '</div>'
+    : '<div class="portrait-row-text">' + esc(text) + '</div>';
   return '<div class="portrait-row">' +
-    '<div class="portrait-row-text">' + esc(text) + '</div>' +
+    content +
     (meta.length ? '<div class="portrait-row-meta">' + meta.map(function(part) {
       return '<span class="profile-chip">' + esc(part) + '</span>';
-    }).join('') + deleteButton + '</div>' : (deleteButton ? '<div class="portrait-row-meta">' + deleteButton + '</div>' : '')) +
+    }).join('') + buttons + '</div>' : (buttons ? '<div class="portrait-row-meta">' + buttons + '</div>' : '')) +
     renderPortraitEvidence(item.evidence) +
   '</div>';
+}
+
+async function approvePortraitFact(button) {
+  var wording = button.closest('.portrait-row').querySelector('[data-portrait-wording]').value.trim();
+  if (!wording) {
+    setPortraitMaintainMessage('请先填写给顾衍看的句子。', 'error');
+    return;
+  }
+  button.disabled = true;
+  try {
+    var res = await authFetch(BASE + '/api/portrait-state/stable', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        scope: 'user',
+        candidate_id: button.dataset.candidateId,
+        expected_revision: Number(button.dataset.revision),
+        display_text: wording
+      })
+    });
+    if (!res) return;
+    var data = await res.json().catch(function() { return {}; });
+    if (res.status === 409) {
+      setPortraitMaintainMessage('画像或来源已更新。请刷新后核对候选。', 'error');
+      return;
+    }
+    if (!res.ok) {
+      if (data.reason === 'portrait_wording_required') {
+        setPortraitMaintainMessage('请把原话写成一句自然资料。', 'error');
+        return;
+      }
+      throw new Error(data.error || data.reason || '采用失败');
+    }
+    await loadPortraitState();
+    var details = document.getElementById('portrait-maintenance-candidates');
+    if (details) details.open = true;
+    setPortraitMaintainMessage('已采用到主人画像。', 'ok');
+  } catch (e) {
+    setPortraitMaintainMessage('采用失败，' + e.message, 'error');
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function deletePortraitStateItem(specJson) {

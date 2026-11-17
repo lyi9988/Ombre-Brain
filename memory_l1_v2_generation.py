@@ -80,7 +80,7 @@ def _diagnostic(engine, task_id, stage, data):
 
 
 def _route(engine, origin):
-    stage = {'browse_l1': 'chat_l1', 'attachment_l1': 'auto_l1'}.get(origin, origin)
+    stage = 'chat_l1' if origin == 'browse_l1' else origin
     route = engine._memory_task_route(stage)
     if not route['configured']:
         raise L1OwnerError(route['unavailable_reason'], field_path='generation')
@@ -745,11 +745,12 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
             'model_calls': calls, 'adoption_issues': adoption_issues}
 
 
-def _active_legacy(engine, day, profile_id):
-    for row in reversed(engine._load_daily_chat_memory_run_audit()):
-        if row.get('date') == day and row.get('profile_id', profile_id) == profile_id:
-            return (row.get('prompt_version') != PROTOCOL and row.get('status') in ('partial', 'needs_review'))
-    return False
+def paused_legacy_checkpoint(audit, profile_id):
+    if (audit.get('prompt_version') == PROTOCOL
+            or audit.get('status') not in ('partial', 'needs_review', 'failed', 'degraded_empty_outputs')):
+        return None
+    return {'status': 'needs_review', 'reason': 'legacy_daily_chat_memory_requires_legacy_mode',
+            'date': audit['date'], 'profile_id': profile_id, 'cursor_updated': False}
 
 
 def _previous_day_cards(engine, day, profile_id):
@@ -994,8 +995,11 @@ def _save_daily_window(authority, key, window, *, previous=None):
 
 async def run_daily(engine, bucket_mgr, *, key, start, end, profile_id, mode, force,
                     raw_event_store, conversation_turn_store, raw_cursor, turn_cursor):
-    if _active_legacy(engine, key, profile_id):
-        return None
+    for row in reversed(engine._load_daily_chat_memory_run_audit()):
+        if row.get('date') == key and row.get('profile_id', profile_id) == profile_id:
+            if paused := paused_legacy_checkpoint(row, profile_id):
+                return {**paused, 'mode': mode}
+            break
     run_id = _daily_run_id(profile_id, key, raw_cursor, turn_cursor)
     window_key = _WINDOW_PREFIX + run_id
     authority = engine.memory_authority_store

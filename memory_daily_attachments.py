@@ -1,4 +1,4 @@
-"""Daily attachment sources from completed canonical turns, never upload lists.
+"""Resolve adopted attachment evidence from completed canonical turns.
 
 Author identity remains unknown. An adopted source depends on both the exact
 attachment and the effective successful assistant event that adopted it.
@@ -7,7 +7,7 @@ import copy
 import json
 import os
 import httpx
-from memory_attachment_source import canonical, digest, normalize, snapshot
+from memory_attachment_source import canonical, digest, snapshot
 
 NAMESPACE = 'snapshot.aiz.adopted_attachment_text'
 REF_KEYS = {'source_id','source_revision','body_sha256','request_id','turn_id',
@@ -99,58 +99,3 @@ class AdoptedAttachmentReader:
             return {'state':'unavailable','reason':'adoption_locator_mismatch'}
         source=await self.capture(locator['adoption'])
         return adopted_snapshot(source) if source.get('namespace')=='attachment_text' else source
-
-
-async def collect_daily_attachments(day, *, timezone, config, profile_id):
-    """Read a bounded day snapshot, respecting the bridge pagination watermark.
-
-    Errors retain successfully verified sources but make coverage explicitly
-    partial. No raw cursor or source body is changed by this reader.
-    """
-    reader=AdoptedAttachmentReader(config)
-    if reader.profile_id!=profile_id:
-        return [], [{'code':'adoption_profile_mismatch'}]
-    options=reader.options; token=os.environ.get('OMBRE_CANONICAL_BRIDGE_TOKEN','')
-    if not options.get('enabled') or not token or not options.get('base_url'):
-        return [], [{'code':'adoption_reader_unconfigured'}]
-    found={}; issues=[]; after=0; cutoff=None; seen=set()
-    try:
-        async with httpx.AsyncClient(timeout=15,trust_env=False,follow_redirects=False) as client:
-            while True:
-                params={'adoption_day':day,'timezone':timezone,'after_seq':after,'limit':100}
-                if cutoff is not None:params['snapshot_completed_before_ms']=cutoff
-                response=await client.get(str(options['base_url']).rstrip('/')+'/bridge/v1/events',params=params,
-                    headers={'Authorization':'Bearer '+token,'X-Guyan-Device-ID':str(options.get('device_id') or 'ombre-gateway-operit')})
-                response.raise_for_status(); page=response.json()
-                watermark=page.get('snapshot_completed_before_ms')
-                if type(watermark) is not int or (cutoff is not None and watermark!=cutoff):
-                    raise ValueError('adoption_page_snapshot_changed')
-                cutoff=watermark
-                items=page.get('items')
-                if not isinstance(items,list):raise ValueError('adoption_page_invalid')
-                for event in items:
-                    identity=(event.get('id'),(event.get('version_state') or {}).get('version_id'))
-                    if identity in seen:continue
-                    seen.add(identity)
-                    if event.get('conversation_id')!=reader.conversation_id or event.get('role')!='assistant':
-                        issues.append({'code':'adoption_event_scope_mismatch'});continue
-                    for pending in event.get('attachment_adoption_pending') or []:
-                        issues.append({'code':'adoption_receipt_pending','event_id':identity[0],
-                            'event_version':identity[1],'pending':pending})
-                    for ref in event.get('attachment_adoption_refs') or []:
-                        try:
-                            dep={'event_id':identity[0],'version_id':identity[1],'ref':ref}
-                            source=await reader.capture(dep)
-                            if source.get('namespace')!='attachment_text':
-                                issues.append({'code':source.get('reason','adoption_unavailable'),'event_id':identity[0]});continue
-                            found[source['source_key']]=source
-                        except (ValueError,TypeError,KeyError,httpx.HTTPError):
-                            issues.append({'code':'adoption_source_unavailable','event_id':identity[0]})
-                if page.get('has_more') is False:break
-                next_after=page.get('next_after_seq')
-                if page.get('has_more') is not True or type(next_after) is not int or next_after<=after:
-                    raise ValueError('adoption_pagination_invalid')
-                after=next_after
-    except (ValueError,TypeError,KeyError,httpx.HTTPError):
-        issues.append({'code':'adoption_listing_incomplete'})
-    return list(found.values()),issues

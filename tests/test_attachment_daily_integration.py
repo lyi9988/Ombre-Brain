@@ -1,4 +1,4 @@
-"""Actual local Aiz/Gateway -> ReflectionEngine -> Authority/Bucket/L2 chain.
+"""Local verification of attachment generation retirement and evidence compatibility.
 
 Only completion responses are synthetic. No provider calls, production state,
 or replacement extraction/commit methods are used. Requires the local candidate
@@ -6,7 +6,6 @@ worktrees and the documented staging archive fixture.
 """
 from datetime import datetime, timezone
 import asyncio
-import copy
 import importlib.util
 import json
 from pathlib import Path
@@ -33,7 +32,11 @@ assert Path(local_gateway.__file__).parent == GATEWAY
 
 from bucket_manager import BucketManager
 from gateway_state import GatewayStateStore
+from memory_authority import MemoryProposal
 from memory_candidate_preparation import MemoryCandidatePreparation
+from memory_daily_attachments import AdoptedAttachmentReader
+from memory_l1_schema import split_document
+from memory_l1_semantic_wire import assemble_document
 from memory_l1_service import L1OwnerError
 from memory_l2_service import MemoryL2Service
 from raw_events import RawEventStore
@@ -58,11 +61,13 @@ async def fixture(code=False):
         value.scope.canonical_user_event_id = value.event['id']
         value.client = AttachmentAdoptionClient(str(value.server.make_url('/v1')), 'test-only', value.scope)
         value.raw_block = block
-    value.assistant = value.commit(await value.completed_meta())
+    metadata = await value.completed_meta()
+    value.attachment_ref = metadata['attachment_adoption_refs'][0]
+    value.assistant = value.commit(metadata)
     return value
 
 
-def engine_for(path, upstream, mode, *, fail_first=False):
+def engine_for(path, upstream, mode):
     config = {
         'state_dir': str(path / 'state'), 'buckets_dir': str(path / 'buckets'),
         'identity': {'ai_name': 'Fixture AI', 'user_name': 'Fixture Owner'},
@@ -81,43 +86,19 @@ def engine_for(path, upstream, mode, *, fail_first=False):
 
     async def completion(client, **kwargs):
         stage = kwargs['task_stage']
+        calls.append(stage)
+        assert stage == 'presentation_l2', stage
         payload = json.loads(kwargs['messages'][-1]['content'])
-        calls.append({'stage': stage, 'payload': copy.deepcopy(payload)})
-        if fail_first and len(calls) == 1:
-            raise RuntimeError('synthetic completion interruption')
-        if stage == 'auto_l1':
-            source_id = payload['l1_contract']['semantic_contract']['source_ids'][0]
-            result = {'candidates': [{'kind': 'key_event', 'confidence': 0.95,
-                'source_refs': [source_id], 'reason': 'External author claim, not owner testimony.',
-                'document': {'format': 'semantic-v1', 'entry': {'form': 'reference'},
-                    'narrative': {'title': 'External reading', 'body': 'I read an external author describing a preference for mystery stories; the author is unknown.'},
-                    'entities': [{'name': 'Unknown document author', 'entity_type': 'third_party'}],
-                    'statements': [{'content': 'The external author describes a preference for mystery stories.',
-                        'subject_ref': 'e1', 'classification': {'kind': 'preference', 'stability': None,
-                            'modality': 'assertion', 'basis': 'reported'},
-                        'time': None, 'conditions': None, 'evidence_refs': [source_id]}],
-                    'retrieval': {'keywords': ['external reading', 'mystery stories']}}}]}
-            from memory_l1_api import prepare_request
-            _, schema = prepare_request(kwargs['messages'], stage=stage)
-        elif stage == 'presentation_l2':
-            sid = payload['l1_document']['statements'][0]['statement_id']
-            result = {'full_injection_text': 'I read an external document whose unknown author described liking mystery stories.',
-                'coherent_sections': [{'section_id': 'reading', 'text': 'The unknown author described liking mystery stories.', 'statement_refs': [sid]}],
-                'optional_use_variants': [], 'review': {'required': False, 'reasons': []}}
-            schema = None
-        else:
-            raise AssertionError('Unexpected completion stage: ' + stage)
-        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(result)), finish_reason='stop')])
-        if schema is not None:
-            response.native_schema = schema
-            response.native_status = 'completed'
-        return response
+        sid = payload['l1_document']['statements'][0]['statement_id']
+        result = {'full_injection_text': 'I read an external document whose unknown author described liking mystery stories.',
+            'coherent_sections': [{'section_id': 'reading', 'text': 'The unknown author described liking mystery stories.', 'statement_refs': [sid]}],
+            'optional_use_variants': [], 'review': {'required': False, 'reasons': []}}
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(result)), finish_reason='stop')])
     engine._daily_chat_memory_create_completion = completion
     manager = BucketManager(config)
     turns = GatewayStateStore(str(path / 'turns.sqlite'))
     raw = RawEventStore(config)
-    # Persist a pre-existing chat cursor; the authority daily path must still
-    # consume completed attachments when the actual raw DB contains no new row.
+    # The attachment was read and adopted upstream, while chat has no new row.
     engine._update_daily_chat_memory_raw_cursor('default', 7, '2026-10-19')
     return engine, manager, turns, raw, calls
 
@@ -127,30 +108,68 @@ async def daily(engine, manager, turns, raw):
         raw_event_store=raw, key='2026-10-19', now=datetime(2026, 10, 19, 3, tzinfo=timezone.utc))
     assert result['reason'] == 'no_new_raw_events'
     assert engine._daily_chat_memory_last_raw_event_id('default') == 7
-    return result['attachment_memory_preparation']
+    assert 'attachment_memory_preparation' not in result
+
+
+async def seed_pending_attachment(engine, upstream):
+    event_id = upstream.assistant['id']
+    version = upstream.store.version_state_for_event('c', event_id)['version_id']
+    source = await AdoptedAttachmentReader(engine.config).capture({
+        'event_id': event_id, 'version_id': version, 'ref': upstream.attachment_ref,
+    })
+    assert source['namespace'] == 'attachment_text'
+    ident = 'attachment_l1_existing_candidate'
+    key = 'attachment_l1:existing_receipt'
+    model_document = {
+        'format': 'semantic-v1',
+        'entry': {'form': 'reference'},
+        'narrative': {'title': 'External reading', 'body': 'I read an author describing a preference for mystery stories.'},
+        'entities': [{'name': 'Unknown document author', 'entity_type': 'third_party'}],
+        'statements': [{'content': 'The external author describes a preference for mystery stories.',
+            'subject_ref': 'e1', 'classification': {'kind': 'preference', 'stability': None,
+                'modality': 'assertion', 'basis': 'reported'},
+            'time': None, 'conditions': None, 'evidence_refs': ['source:1']}],
+        'retrieval': {'keywords': ['external reading', 'mystery stories']},
+    }
+    doc = engine._memory_l1_daily_document({
+        'document': assemble_document(model_document), 'source_refs': ['source:1'],
+        '_l1_sources': [source], '_l1_generation': {
+            'prompt_revision': None, 'model_route_revision': None,
+            'task_id': key, 'actor': 'daily_chat_first_pass',
+        },
+    }, ident)
+    body, semantic = split_document(doc)
+    proposal = MemoryProposal.from_mapping({
+        'proposal_id': ident, 'source_type': 'attachment_document',
+        'proposed_body': body, 'source_refs': [source['source_key']], 'source_status': 'verified',
+        'memory_type': 'key_event', 'confidence': 0.95, 'requested_mode': 'review',
+        'owner_explicit': False, 'metadata': {'memory_l1': semantic, 'attachment_preparation_key': key},
+    })
+    queue = MemoryCandidatePreparation(engine.memory_authority_store)
+    receipt = queue.prepare(key, [proposal], engine.memory_ingestion_policy, scope=key,
+        source_fingerprint=source['source_key'], generated_count=1)
+    assert receipt['candidate_ids'] == [ident]
+    return engine.memory_authority_store.get_candidate(ident)
 
 
 @pytest.mark.parametrize('mode', ['auto', 'review'])
-def test_no_new_raw_daily_actual_engine_commits_and_generates_ready_l2(tmp_path, monkeypatch, mode):
+def test_daily_skips_attachment_only_generation_and_preserves_old_review(tmp_path, monkeypatch, mode):
     monkeypatch.setenv('OMBRE_CANONICAL_BRIDGE_TOKEN', 'test-only')
     async def run():
         upstream = await fixture(code=True)
         try:
-            engine, manager, turns, raw, calls = engine_for(tmp_path, upstream, mode, fail_first=mode == 'auto')
-            first = await daily(engine, manager, turns, raw)
-            if mode == 'auto':
-                assert first['results'][0]['status'] == 'blocked'
-                assert not engine.memory_authority_store.list_candidates(status='all')
-                first = await daily(engine, manager, turns, raw)
-            assert first['status'] == 'completed', first
-            rows = engine.memory_authority_store.list_candidates(status='all')
-            assert len(rows) == 1
-            candidate = rows[0]
-            if mode == 'review':
-                assert candidate['status'] == 'pending'
-                assert await manager.list_all() == []
-                adopted = await engine._memory_l1_adopt_candidate(candidate, manager, request_id='owner-review', owner=True)
-                assert adopted['status'] == 'created'
+            engine, manager, turns, raw, calls = engine_for(tmp_path, upstream, mode)
+            await daily(engine, manager, turns, raw)
+            assert not engine.memory_authority_store.list_candidates(status='all')
+            assert not calls
+            candidate = await seed_pending_attachment(engine, upstream)
+            await daily(engine, manager, turns, raw)
+            assert engine.memory_authority_store.list_candidates(status='all') == [candidate]
+            assert candidate['status'] == 'pending'
+            assert not calls
+            assert await manager.list_all() == []
+            adopted = await engine._memory_l1_adopt_candidate(candidate, manager, request_id='owner-review', owner=True)
+            assert adopted['status'] == 'created'
             ident = candidate['candidate_id']
             assert engine.memory_authority_store.get_candidate(ident)['status'] == 'committed'
             assert (await manager.get(ident))['content']
@@ -164,14 +183,6 @@ def test_no_new_raw_daily_actual_engine_commits_and_generates_ready_l2(tmp_path,
             assert '（代码块）' in source['text'] and 'secret_code()' not in source['text']
             resource = chat_attachments.get(upstream.store, 'owner', 'c', upstream.raw_block['resource_id'])
             assert b'secret_code()' in b''.join(chat_attachments.iter_bytes(upstream.store, resource))
-            model_material = next(call['payload'] for call in reversed(calls) if call['stage'] == 'auto_l1')
-            assert '（代码块）' in json.dumps(model_material, ensure_ascii=False)
-            assert 'secret_code()' not in json.dumps(model_material)
-            queue = MemoryCandidatePreparation(engine.memory_authority_store)
-            assert queue.get(first['results'][0]['key'])['candidate_ids'] == [ident]
-            before = len(calls)
-            await daily(engine, manager, turns, raw)
-            assert len(calls) == before
             l2 = MemoryL2Service(engine, revisions)
             result = await l2.run_once(10)
             assert result['results'][0]['state'] == 'ready', result
@@ -203,10 +214,8 @@ def test_review_adoption_blocked_after_success_event_withdrawal(tmp_path, monkey
     async def run():
         upstream = await fixture()
         try:
-            engine, manager, turns, raw, calls = engine_for(tmp_path, upstream, 'review')
-            result = await daily(engine, manager, turns, raw)
-            assert result['status'] == 'completed', result
-            row = engine.memory_authority_store.list_candidates(status='all')[0]
+            engine, manager, _, _, _ = engine_for(tmp_path, upstream, 'review')
+            row = await seed_pending_attachment(engine, upstream)
             upstream.store.withdraw_message('c', target_event_id=upstream.assistant['id'], source_event_id='withdraw-adoption')
             with pytest.raises(L1OwnerError, match='source_not_currently_readable'):
                 await engine._memory_l1_adopt_candidate(row, manager, request_id='withdrawn-review', owner=True)

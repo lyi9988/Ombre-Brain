@@ -4,10 +4,22 @@ from __future__ import annotations
 import os
 import json
 import sqlite3
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from memory_authority import normalize_alias
+
+
+def portrait_l1_v2_block_reason(sync_scope, guards) -> str:
+    if sync_scope is not None:
+        return "l1_sync_required"
+    scopes = [guard.get("scope") or {} for guard in guards]
+    if any(scope.get("unknown_scope") is not False for scope in scopes):
+        return "relation_guard_scope_unknown"
+    if any(scope.get("historical_only") is not True for scope in scopes):
+        return "relation_guard_current"
+    return ""
 
 
 class MemoryAuthorityRecallView:
@@ -316,7 +328,7 @@ class MemoryAuthorityRecallView:
         }
 
     def memory_index_metadata_map(
-        self, bucket_ids: list[str]
+        self, bucket_ids: list[str], *, for_portrait: bool = False,
     ) -> dict[str, dict[str, Any]]:
         """Resolve eligible bucket projections to their committed revision.
 
@@ -332,17 +344,19 @@ class MemoryAuthorityRecallView:
         if not ids or not self.available():
             return {}
         conn = self._connect()
+        dependency_versions = {}
         try:
             # This is the index eligibility pool, not a 64-result owner tool.
             # Batch bind variables without silently losing the tail of Memory.
             conn.execute("BEGIN")
             rows = []
+            schema_column = ",json_extract(r.metadata_json,'$.memory_l1.schema_version') " if for_portrait else " "
             for offset in range(0, len(ids), 400):
                 chunk = ids[offset:offset + 400]
                 placeholders = ",".join("?" for _ in chunk)
                 rows.extend(conn.execute(
                     "SELECT m.memory_id,COALESCE(NULLIF(m.bucket_id,''),m.memory_id),"
-                    "m.active_revision,COALESCE(r.body_sha256,'') "
+                    "m.active_revision,COALESCE(r.body_sha256,'')" + schema_column +
                     "FROM memories AS m LEFT JOIN memory_revisions AS r "
                     "ON r.memory_id=m.memory_id AND r.revision=m.active_revision "
                     "WHERE m.state='active' AND m.recall_policy='enabled' "
@@ -350,6 +364,10 @@ class MemoryAuthorityRecallView:
                     f"OR m.memory_id IN ({placeholders}))",
                     [*chunk, *chunk],
                 ).fetchall())
+            if for_portrait:
+                from memory_l1_v2 import SCHEMA_VERSION
+                from memory_relation_dependencies import cache_versions
+                dependency_versions = cache_versions(conn, [str(row[0]) for row in rows if row[4] == SCHEMA_VERSION])
         except sqlite3.Error:
             return {}
         finally:
@@ -377,9 +395,98 @@ class MemoryAuthorityRecallView:
                 "revision": int(row[2] or 0),
                 "body_sha256": str(row[3] or ""),
             }
+            if str(row[0]) in dependency_versions:
+                result[bucket_id]["dependency_token"] = dependency_versions[str(row[0])]
         return result
 
-    def memory_l1_recall_map(self, bucket_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+    def portrait_candidate_source_states(self, memory_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Return positive lifecycle facts for committed portrait sources, including tombstones."""
+        ids = list(dict.fromkeys(memory_ids))
+        if not ids or not self.available():
+            return {}
+        conn = self._connect()
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN")
+            result = {}
+            for offset in range(0, len(ids), 400):
+                chunk = ids[offset:offset + 400]
+                marks = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    "SELECT m.memory_id,COALESCE(NULLIF(m.bucket_id,''),m.memory_id) AS bucket_id,"
+                    "m.active_revision AS revision,m.state,"
+                    "json_extract(r.metadata_json,'$.valid_until') AS valid_until,"
+                    "json_extract(r.metadata_json,'$.expires_at') AS expires_at,"
+                    "(json_type(r.metadata_json,'$.withdrawn')='true' OR "
+                    "json_type(r.metadata_json,'$.retracted')='true') AS withdrawn "
+                    "FROM memories m JOIN memory_revisions r ON r.memory_id=m.memory_id AND r.revision=m.active_revision "
+                    "JOIN commit_log c ON c.operation_id=r.operation_id "
+                    f"WHERE c.status='committed' AND m.memory_id IN ({marks})", chunk,
+                )
+                result.update((row["memory_id"], dict(row)) for row in rows)
+            return result
+        finally:
+            conn.close()
+
+    def portrait_l1_v2_pending(self, reviewed: dict[str, int], *, limit: int,
+                               retry_order: dict[str, str], blocked: dict[str, dict]
+                               ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Uninspected current L1 v2 commits, independent of bucket activity dates.
+
+        Checkpoint exact memory/revision pairs rather than a wall-clock cutoff.
+        Concurrent commits, restored eligibility and retries can then leave a
+        gap without losing any other current revision. Unchanged dependency
+        blocks do not consume slots. Never-tried cards precede failed attempts.
+        """
+        if not self.enabled or limit <= 0:
+            return [], {}
+        from memory_l1_v2 import SCHEMA_VERSION
+        from memory_relation_dependencies import dependency_snapshot
+
+        conn = self._connect()
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN")
+            rows = conn.execute(
+                "WITH inspected AS (SELECT key,value FROM json_each(?)), "
+                "blocked AS (SELECT key FROM json_each(?)) "
+                "SELECT m.memory_id,COALESCE(NULLIF(m.bucket_id,''),m.memory_id) AS bucket_id,r.revision FROM memories m "
+                "JOIN memory_revisions r ON m.memory_id=r.memory_id AND m.active_revision=r.revision "
+                "JOIN commit_log c ON c.operation_id=r.operation_id "
+                "LEFT JOIN json_each(?) retry ON retry.key=m.memory_id || ':' || r.revision "
+                "WHERE c.status='committed' AND c.operation_kind='memory_revision' "
+                "AND m.state='active' AND m.recall_policy='enabled' "
+                "AND json_extract(r.metadata_json,'$.memory_l1.schema_version')=? "
+                "AND (json_extract(r.metadata_json,'$.memory_l1.stability')='stable' "
+                "OR m.memory_id IN (SELECT key FROM inspected) OR m.memory_id IN (SELECT key FROM blocked)) "
+                "AND m.memory_id || ':' || r.revision NOT IN "
+                "(SELECT key || ':' || value FROM inspected) "
+                "ORDER BY COALESCE(retry.value,''), r.rowid",
+                (json.dumps(reviewed), json.dumps(blocked), json.dumps(retry_order), SCHEMA_VERSION),
+            )
+            pending, unchanged = [], Counter()
+            for row in rows:
+                memory_id, revision = row["memory_id"], row["revision"]
+                try:
+                    dependency = dependency_snapshot(conn, memory_id)
+                except (sqlite3.Error, ValueError, TypeError, KeyError):
+                    pending.append({**dict(row), "dependency_token": "", "block_reason": ""})
+                else:
+                    reason = portrait_l1_v2_block_reason(dependency["sync_scope"], dependency["guards"])
+                    checkpoint = {"revision": revision, "dependency_token": dependency["token"]}
+                    if reason and blocked.get(memory_id) == checkpoint:
+                        unchanged[reason] += 1
+                        continue
+                    pending.append({**dict(row), "dependency_token": dependency["token"], "block_reason": reason})
+                if len(pending) >= limit:
+                    break
+            return pending, dict(unchanged)
+        finally:
+            conn.close()
+
+    def memory_l1_recall_map(
+        self, bucket_ids: Iterable[str], *, for_portrait: bool = False,
+    ) -> dict[str, dict[str, Any]]:
         """Batch current semantic data; stale/missing indexes do not hide L1.
 
 Read the committed revision metadata as the fallback, never rebuild the
@@ -389,6 +496,10 @@ database during chat. Source readability is verified separately, per binding.
         if not ids or not self.available():
             return {}
         conn = self._connect()
+        if for_portrait:
+            conn.row_factory = sqlite3.Row
+            from memory_l1_v2 import SCHEMA_VERSION
+            from memory_relation_dependencies import dependency_snapshot
         result = {}
         try:
             conn.execute("BEGIN")
@@ -414,6 +525,15 @@ database during chat. Source readability is verified separately, per binding.
                             row["state"] = "semantic_mismatch"
                         else:
                             row.update(document=semantic, state="l1")
+                            if for_portrait and semantic.get("schema_version") == SCHEMA_VERSION:
+                                try:
+                                    dependency = dependency_snapshot(conn, memory_id)
+                                except (sqlite3.Error, ValueError, TypeError, KeyError):
+                                    row["state"] = "dependency_unavailable"
+                                else:
+                                    row.update(l1_sync_required=dependency["l1_sync_required"],
+                                               sync_scope=dependency["sync_scope"], relation_guards=dependency["guards"],
+                                               relation_dependency_token=dependency["token"])
                             entry = semantic.get("entry") or {}
                             parent = entry.get("parent_ref")
                             if parent:

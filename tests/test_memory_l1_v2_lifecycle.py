@@ -13,7 +13,7 @@ from memory_authority import MemoryAuthorityStore, MemoryIngestionPolicy, Memory
 from memory_candidate_edit import save_owner_candidate
 from memory_commit_service import BucketMemoryProjection, MemoryCommitService
 from memory_l0_sources import MemoryL0Sources
-from memory_l1_contract import L1ContractError
+from memory_l1_contract import L1ContractError, make_text_anchor
 from memory_l1_features import read_features
 from memory_l1_ingestion import bind_sources
 from memory_l1_reads import MemoryL1Reads
@@ -110,6 +110,65 @@ def test_retained_v2_auto_candidate_returns_to_review_after_permission_removed(t
     assert current['revision'] == row['revision'] + 1
     assert current['policy']['requires_owner_confirmation'] is True
     assert authority.get_memory('waiting-auto') is None
+
+
+def test_canonical_source_is_shared_across_anchors_but_rechecked_next_batch(tmp_path):
+    _, authority, _, service, first, snapshots = setup_v2(tmp_path)
+    source, = snapshots
+    second = deepcopy(first)
+    anchor = make_text_anchor(source["text"], target_namespace="l0", target_id=source["source_id"],
+                              target_revision=source["source_revision"], text_view_id=source["text_view_id"],
+                              start=0, end=5)
+    anchor["quote_sha256"] = "0" * 64
+    second["evidence_bindings"][0]["anchors"] = [anchor]
+    observations = []
+    mode = "available"
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def read(binding):
+        observations.append(binding["source_id"])
+        if mode == "pause":
+            entered.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+        return {"state": "withdrawn"} if mode == "withdrawn" else source
+
+    reads = MemoryL1Reads(service, MemoryL0Sources(
+        authority, [SimpleNamespace(namespace=source["source_namespace"], read=read)]))
+
+    async def scenario():
+        nonlocal mode
+        request = []
+        for memory_id, document in (("original-anchor", first), ("other-anchor", second)):
+            body, semantic = split_document(document)
+            await service.commit.commit_memory(
+                memory_id=memory_id, bucket_id=memory_id, expected_revision=0, body=body,
+                metadata={"name": document["title"], "memory_l1": semantic}, source_refs=["test-source"],
+                decision_source="test", idempotency_key=memory_id, actor="owner", l1_write_intent=True,
+            )
+            request.append({"memory_id": memory_id, "revision": 1, "binding_ids": semantic["source_refs"]})
+        result = await reads.recall_source_status(request)
+        assert observations == [source["source_id"]]
+        assert result["diagnostics"]["unique_binding_reads"] == 2
+        assert result["diagnostics"]["unique_canonical_source_reads"] == 1
+        assert [next(iter(row["sources"].values()))["eligible_source"] for row in result["items"]] == [True, False]
+        mode = "withdrawn"
+        next_result = await reads.recall_source_status(request)
+        assert observations == [source["source_id"]] * 2
+        assert all(not next(iter(row["sources"].values()))["eligible_source"] for row in next_result["items"])
+        assert [row["dependency_token"] for row in next_result["items"]] == [
+            row["dependency_token"] for row in result["items"]]
+        mode = "pause"
+        pending = asyncio.create_task(reads.recall_source_status(request))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert cancelled.is_set() and observations == [source["source_id"]] * 3
+
+    asyncio.run(scenario())
 
 
 def test_v2_retry_honors_saved_owner_acceptance_when_auto_is_disallowed(tmp_path):

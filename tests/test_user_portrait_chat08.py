@@ -1,6 +1,5 @@
 """Synthetic evidence only: user portrait's single writer and read-only projection."""
 import asyncio
-import copy
 import hashlib
 import json
 from datetime import datetime
@@ -38,9 +37,7 @@ def setup(tmp_path):
     state["portrait"]["persona"]["stable"] = "PERSONA EXCLUDED"
     state["portrait"]["relationship"]["stable"] = "RELATIONSHIP EXCLUDED"
     engine.save_state(state)
-    mgr = SimpleNamespace(get=AsyncMock(side_effect=lambda bid: copy.deepcopy(sources.get(bid))))
-    engine._test_sources = sources
-    return engine, sources, mgr, authority
+    return engine, sources, SimpleNamespace(), authority
 
 
 def claim(*ids, kind="revisable_impression", **extra):
@@ -48,19 +45,19 @@ def claim(*ids, kind="revisable_impression", **extra):
             "evidence": [{"bucket_id": bid} for bid in ids], **extra}
 
 
-def install(engine, mgr, claims=None):
-    claims = copy.deepcopy(claims or [claim("source-1")])
-    # These are the versions the synthetic review actually read.
-    sources = engine._test_sources
+def seed_reviewed_claims(engine, sources, claims=None):
+    claims = claims or [claim("source-1")]
     bound = engine._bind_user_sources(sources)
     for row in claims:
         for ref in row["evidence"]:
-            bid = ref["bucket_id"]
-            if bid in bound:
-                ref.update(source_revision=source_revision(bound[bid]),
-                           memory_revision=bound[bid]["_portrait_authority"]["memory_revision"])
-    return asyncio.run(engine.install_reviewed_user_claims(
-        claims, mgr, expected_revision=3))
+            source = bound[ref["bucket_id"]]
+            ref.update(source_revision=source_revision(source),
+                       memory_revision=source["_portrait_authority"]["memory_revision"])
+    normalized, reason = engine._normalize_user_claims(claims, bound, reviewed=True)
+    assert normalized is not None, reason
+    state = engine.load_state()
+    engine._replace_user_claims(state["portrait"]["user"], normalized)
+    engine.save_state(state)
 
 
 def projection(engine, sources, **kwargs):
@@ -84,16 +81,20 @@ def test_legacy_never_enters_chat_or_other_scopes(setup):
     ("valid_from", "2099-06-01"), ("effective_from", "unresolved-date"),
 ])
 def test_outside_or_unknown_source_window_stays_out_of_chat(setup, key, value):
-    engine, sources, mgr, _ = setup
-    install(engine, mgr)
+    engine, sources, _, _ = setup
+    seed_reviewed_claims(engine, sources)
     sources["source-1"]["metadata"][key] = value
     assert not source_is_current(sources["source-1"])
     assert projection(engine, sources)["text"] == ""
 
 
-def test_reviewed_install_preserves_same_history_and_is_revisable(setup):
-    engine, sources, mgr, _ = setup
-    assert install(engine, mgr) == {"status": "updated", "revision": 4, "claim_count": 1}
+def test_daily_maintenance_preserves_prior_version_and_source_proof(setup):
+    engine, sources, _, _ = setup
+    bound = engine._bind_user_sources(sources)
+    rows, reason = engine._normalize_user_claims([claim("source-1", "source-2")], bound)
+    assert not reason
+    engine._finish_maintenance(engine.load_state(), {"rewrite_stable": [{"scope": "user", "chat_claims": rows}]},
+                               "2026-11-05", False, [], {"buckets": [], "persona_events": []})
     user = engine.load_state()["portrait"]["user"]
     assert user["stable_source"] == "model" and user["chat_claims_revision"] == 4
     assert user["stable_history"][-1]["text"] == "LEGACY WHOLE PARAGRAPH"
@@ -108,8 +109,8 @@ def test_reviewed_install_preserves_same_history_and_is_revisable(setup):
 
 @pytest.mark.parametrize("change", ["deleted", "retracted", "content", "disabled", "revision", "dependency"])
 def test_invalidation_precedes_regeneration(setup, change):
-    engine, sources, mgr, authority = setup
-    install(engine, mgr)
+    engine, sources, _, authority = setup
+    seed_reviewed_claims(engine, sources)
     if change == "deleted":
         sources.pop("source-1")
     elif change == "retracted":
@@ -131,16 +132,17 @@ def test_invalidation_precedes_regeneration(setup, change):
 
 
 def test_activation_does_not_invalidate_semantic_source(setup):
-    engine, sources, mgr, _ = setup
-    install(engine, mgr)
+    engine, sources, _, _ = setup
+    seed_reviewed_claims(engine, sources)
     sources["source-1"]["metadata"].update(last_active="2099-01-01", activation=0.8, updated_at="new")
     assert projection(engine, sources)["status"] == "ready"
 
 
 def test_ambiguous_summary_cannot_become_explicit_preference(setup):
-    engine, _, mgr, _ = setup
-    result = install(engine, mgr, [claim("source-1", kind="explicit_preference")])
-    assert result["reason"] == "user_preference_needs_attributed_quote"
+    engine, sources, _, _ = setup
+    clean, reason = engine._normalize_user_claims([claim("source-1", kind="explicit_preference")],
+                                                 engine._bind_user_sources(sources))
+    assert clean is None and reason == "user_preference_needs_attributed_quote"
     assert engine.load_state()["portrait"]["user"]["stable_revision"] == 3
 
 
@@ -170,39 +172,29 @@ def test_multiple_day_rule_and_historical_date(setup):
 
 
 def test_historical_claim_never_poses_as_current_context(setup):
-    engine, sources, mgr, _ = setup
-    install(engine, mgr, [claim("source-1", kind="historical", as_of="2026-10-01")])
+    engine, sources, _, _ = setup
+    seed_reviewed_claims(engine, sources, [claim("source-1", kind="historical", as_of="2026-10-01")])
     assert projection(engine, sources)["text"] == ""
     assert chat_evidence_ids(engine.load_state()) == []
     assert "2026-10-01" in engine.load_state()["portrait"]["user"]["stable"]
 
 
 def test_owner_edit_lock_cas_and_rollback_remain_effective(setup):
-    engine, sources, mgr, _ = setup
-    install(engine, mgr)
+    engine, sources, _, _ = setup
+    seed_reviewed_claims(engine, sources)
     assert engine.edit_stable("user", "OWNER EDIT", 3)["status"] == "conflict"
     assert engine.edit_stable("user", "OWNER EDIT", 4, locked=True)["revision"] == 5
     assert projection(engine, sources)["text"] == "OWNER EDIT"
     assert projection(engine, sources, enabled=False)["text"] == ""
-    assert asyncio.run(engine.install_reviewed_user_claims([claim("source-1")], mgr, 5))["reason"] == "stable_locked"
+    assert engine.set_stable_lock("user", False, 4)["reason"] == "revision_mismatch"
     assert engine.rollback_stable("user", 4, 5)["revision"] == 6
     assert projection(engine, sources)["status"] == "ready"
     assert engine.load_state()["portrait"]["user"]["stable_locked"] is True
 
 
-def test_cas_rechecks_edit_and_lock_during_source_read(setup):
-    engine, sources, mgr, _ = setup
-    async def get(bid):
-        engine.set_stable_lock("user", True, 3)
-        return copy.deepcopy(sources[bid])
-    mgr.get.side_effect = get
-    assert install(engine, mgr)["reason"] == "user_changed_during_review"
-    assert engine.load_state()["portrait"]["user"]["stable_revision"] == 3
-
-
 def test_background_adopts_claims_and_can_remove_all(setup):
-    engine, sources, mgr, _ = setup
-    install(engine, mgr)
+    engine, sources, _, _ = setup
+    seed_reviewed_claims(engine, sources)
     state = engine.load_state()
     bound = engine._bind_user_sources(sources)
     claims, reason = engine._normalize_user_claims([claim("source-1", "source-2")], bound)
@@ -221,8 +213,8 @@ def test_background_adopts_claims_and_can_remove_all(setup):
 
 
 def test_reviewed_claim_can_be_preserved_when_other_claims_change(setup):
-    engine, sources, mgr, _ = setup
-    install(engine, mgr)
+    engine, sources, _, _ = setup
+    seed_reviewed_claims(engine, sources)
     prior = engine.load_state()["portrait"]["user"]["chat_claims"]
     clean, reason = engine._normalize_user_claims([claim("source-1")], engine._bind_user_sources(sources),
                                                 previous_claims=prior)
@@ -230,8 +222,8 @@ def test_reviewed_claim_can_be_preserved_when_other_claims_change(setup):
 
 
 def test_background_uses_single_writer_and_owner_changes_win(setup):
-    engine, sources, mgr, _ = setup
-    install(engine, mgr)
+    engine, sources, _, _ = setup
+    seed_reviewed_claims(engine, sources)
     state = engine.load_state()
     bound = engine._bind_user_sources(sources)
     materials = {"buckets": [], "persona_events": [], "_user_sources": bound,
@@ -259,8 +251,8 @@ def test_legacy_patch_cannot_overwrite_user(setup):
 
 
 def test_shared_reader_is_read_only_and_no_model(setup):
-    engine, sources, mgr, _ = setup
-    install(engine, mgr)
+    engine, sources, _, _ = setup
+    seed_reviewed_claims(engine, sources)
     before = open(engine.state_path, "rb").read()
     assert projection(engine, sources)["status"] == "ready"
     assert open(engine.state_path, "rb").read() == before
@@ -299,11 +291,11 @@ def test_retired_relationship_impressions_are_never_user_evidence(setup, tag):
 
 
 def test_reviewed_source_must_match_the_version_actually_read(setup):
-    engine, _, mgr, _ = setup
+    engine, sources, _, _ = setup
     refs = [claim("source-1")]
     refs[0]["evidence"][0].update(source_revision="AN_OLDER_REVIEW", memory_revision=1)
-    result = asyncio.run(engine.install_reviewed_user_claims(refs, mgr, 3))
-    assert result["reason"] == "review_source_version_mismatch"
+    clean, reason = engine._normalize_user_claims(refs, engine._bind_user_sources(sources), reviewed=True)
+    assert clean is None and reason == "review_source_version_mismatch"
 
 
 def test_cross_process_owner_cas_uses_the_same_file_lock(setup):
@@ -357,6 +349,8 @@ def test_unreviewed_version_can_adopt_new_evidence_but_access_is_not_freshness(s
     assert [item["scope"] for item in rows] == ["user"]
     patch["rewrite_stable"] = rows
     engine._finish_maintenance(state, patch, "2026-11-05", False, [], materials)
-    assert engine.load_state()["portrait"]["user"]["stable_revision"] == 4
-    assert engine.load_state()["portrait"]["user"]["stable_history"][-1]["text"] == "LEGACY WHOLE PARAGRAPH"
-    assert projection(engine, sources)["status"] == "ready"
+    user = engine.load_state()["portrait"]["user"]
+    assert user["stable_revision"] == 4
+    assert user["stable_history"][-1]["text"] == "LEGACY WHOLE PARAGRAPH"
+    assert user["chat_claims"][0]["evidence"][0]["quote"] == sources["source-1"]["content"]
+    assert projection(engine, sources)["text"] == ""

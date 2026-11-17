@@ -5,12 +5,14 @@ tests do not claim that a real model judges the value of receipt/chat wording.
 """
 import asyncio
 from copy import deepcopy
+from datetime import datetime, timedelta
 import json
 from types import SimpleNamespace as NS
 
 import pytest
 
 from memory_candidate_preparation import MemoryCandidatePreparation
+from memory_chat_segments import ChatSegmentProgress
 from memory_l1_contract import verify_text_anchor
 from memory_l1_ingestion import source_snapshot
 from memory_l0_sources import MemoryL0Sources
@@ -204,9 +206,11 @@ def test_public_runner_two_events_review_queue_then_owner_admission_and_l2(tmp_p
         assert SUMMARY_MARKER not in json.dumps(call['payload'], ensure_ascii=False)
     assert [row['title'] for row in result['candidates']] == [point for point, _ in groups]
     first_id = result['candidates'][0]['id']
+    h.engine.config['reflection']['daily_chat_memory_extraction_mode'] = 'whole_window_v2'
     approve_and_l2(h, first_id)
     assert len(h.service.authority.list_memories()) == 1
     assert len(h.service.authority.list_candidates(status='pending')) == 1
+    h.engine.config['reflection']['daily_chat_memory_extraction_mode'] = 'event_first'
     before = len(h.calls)
     assert run_day(h)['reason'] == 'no_new_raw_events'
     assert len(h.calls) == before
@@ -322,6 +326,53 @@ def test_one_model_call_budget_restarts_at_assembly_without_reselection_or_dupli
     assert not repeated and not finished['partial'] and kinds(resumed) == [ASSEMBLY]
     assert len(resumed.service.authority.list_candidates(status='all')) == 1
     assert not resumed.service.authority.list_memories()
+
+
+def test_v2_leaves_legacy_checkpoint_for_explicit_rollback(tmp_path):
+    text = '我把约定改成周六上午，周五不去。'
+    h = harness(tmp_path, [('user', text)], [('约定改到周六', [text])], calls_per_run=1)
+    engine = h.engine
+    # Stop after the first batch to exercise a persisted, resumable checkpoint.
+    first = asyncio.run(engine._run_daily_chat_memory_impl(h.service.buckets,
+        conversation_turn_store=FakeTurns([]), raw_event_store=FakeRawEvents(h.events), key=DAY))
+    assert first['status'] == 'partial' and first['reason'] == 'window_budget_exhausted', first
+    assert kinds(h) == [SELECTION]
+    engine.enabled = engine.auto_enabled = True
+    engine.diary_memory_extract_enabled = False
+    scheduled_at = datetime.fromisoformat(DAY).replace(tzinfo=engine.tz) + timedelta(days=2, hours=10)
+    engine._local_now = lambda now=None: now or scheduled_at
+    audits = engine._load_daily_chat_memory_run_audit()
+    task_id = audits[-1]['event_progress']['task_id']
+    progress = ChatSegmentProgress(h.service.authority)
+    checkpoint = progress.get(task_id)
+    assert checkpoint['progress']['events']
+    cursor = engine.daily_chat_memory_run_cursor()
+    engine.config['reflection']['daily_chat_memory_extraction_mode'] = 'whole_window_v2'
+
+    reads = []
+
+    class ScheduledRawEvents(FakeRawEvents):
+        def list_events_between(self, **kwargs):
+            reads.append(kwargs['end_at'].date().isoformat())
+            return []
+
+    asyncio.run(engine.run_due(h.service.buckets, conversation_turn_store=FakeTurns([]),
+                              raw_event_store=ScheduledRawEvents()))
+    assert reads == [(scheduled_at.date() - timedelta(days=1)).isoformat()]
+    for force in (False, True):
+        blocked = run_day(h, force=force)
+        assert blocked['status'] == 'needs_review' and not blocked['cursor_updated']
+        assert blocked['reason'] == 'legacy_daily_chat_memory_requires_legacy_mode'
+    assert kinds(h) == [SELECTION]
+    assert engine._load_daily_chat_memory_run_audit() == audits
+    assert progress.get(task_id) == checkpoint
+    assert engine.daily_chat_memory_run_cursor() == cursor
+
+    engine.config['reflection']['daily_chat_memory_extraction_mode'] = 'event_first'
+    resumed = run_day(h, force=True)
+    assert resumed['status'] == 'pending' and resumed['cursor_updated'], resumed
+    assert kinds(h) == [SELECTION, ASSEMBLY]
+    assert len(h.service.authority.list_candidates(status='pending')) == 1
 
 
 @pytest.mark.parametrize('stage', [SELECTION, ASSEMBLY])

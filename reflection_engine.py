@@ -1192,7 +1192,7 @@ class ReflectionEngine(MemoryL1Runtime):
         now_local = self._local_now()
         results = []
         chat_candidates: list[dict] = []
-        from memory_l1_v2_generation import PROTOCOL, enabled as daily_v2_enabled
+        from memory_l1_v2_generation import PROTOCOL, enabled as daily_v2_enabled, paused_legacy_checkpoint
 
         v2_active = daily_v2_enabled(self.config)
         if self.daily_chat_memory_mode != "off" and now_local.hour >= self.daily_chat_memory_hour:
@@ -1211,6 +1211,9 @@ class ReflectionEngine(MemoryL1Runtime):
             outstanding, unresolved = [], {}
             resume_problem = None
             for date_key, prior in sorted(latest_by_date.items()):
+                if v2_active and (paused := paused_legacy_checkpoint(prior, profile_id)):
+                    unresolved[date_key] = paused
+                    continue
                 if prior.get("status") not in {"partial", "needs_review"}:
                     continue
                 fallback = prior.get("turn_source") == "conversation_turns"
@@ -2654,7 +2657,8 @@ class ReflectionEngine(MemoryL1Runtime):
                     queued_count = sum(count["queued"] for count in counts)
                     receipt_progress = tuple(sorted((key, len(receipts.get(key)["processed_ids"])) for key in keys))
                 audits = self._load_daily_chat_memory_run_audit()
-                audit = audits[-1] if audits and audits[-1].get("run_id") == result.get("run_id") else {}
+                run_id = result.get("run_id")
+                audit = audits[-1] if run_id and audits and audits[-1].get("run_id") == run_id else {}
                 if result.get("reason") == "l1_v2_daily_window_superseded":
                     audit = {}
                 next_cursor = {"raw": int(audit.get("processed_until_seq", 0)),
@@ -2699,14 +2703,6 @@ class ReflectionEngine(MemoryL1Runtime):
                     result["status"] = "pending" if effective_mode == "review" else "created"
             if not chat_windows_only and self.memory_authority_enabled and self.memory_authority_store:
                 result['action_memory_preparation'] = await self._memory_l1_action_tasks(bucket_mgr, mode=effective_mode)
-                if not getattr(self, '_daily_chat_memory_cancel_requested', False):
-                    try:
-                        result['attachment_memory_preparation'] = await self._memory_l1_attachment_tasks(
-                            bucket_mgr, day=key or (now or datetime.now(timezone.utc)).astimezone(self.tz).date().isoformat(),
-                            mode=effective_mode)
-                    except Exception as exc:
-                        result['attachment_memory_preparation'] = {'status': 'blocked',
-                            'reason': getattr(exc, 'code', type(exc).__name__)}
             return result
         finally:
             self._daily_chat_memory_run_lock_release()
@@ -2739,18 +2735,18 @@ class ReflectionEngine(MemoryL1Runtime):
         if source_cursor is not None:
             raw_event_cursor_id = source_cursor["raw"]
             turn_cursor_id = source_cursor["turn"]
-        if self.memory_authority_enabled and self.memory_authority_store:
-            from memory_l1_v2_generation import enabled, has_daily_window, run_daily
-            if enabled(self.config):
-                if force and source_cursor is None and not has_daily_window(
-                        self.memory_authority_store, profile_id, key, raw_event_cursor_id, turn_cursor_id):
-                    raw_event_cursor_id = turn_cursor_id = 0
-                result = await run_daily(self, bucket_mgr, key=key, start=start, end=end, profile_id=profile_id,
-                    mode=effective_mode, force=force, raw_event_store=raw_event_store,
-                    conversation_turn_store=conversation_turn_store, raw_cursor=raw_event_cursor_id,
-                    turn_cursor=turn_cursor_id)
-                if result is not None:
-                    return result
+        from memory_l1_v2_generation import enabled, has_daily_window, run_daily
+        if enabled(self.config):
+            if not (self.memory_authority_enabled and self.memory_authority_store):
+                return {"status": "failed", "reason": "memory_authority_unavailable", "date": key,
+                        "profile_id": profile_id, "mode": effective_mode, "cursor_updated": False}
+            if force and source_cursor is None and not has_daily_window(
+                    self.memory_authority_store, profile_id, key, raw_event_cursor_id, turn_cursor_id):
+                raw_event_cursor_id = turn_cursor_id = 0
+            return await run_daily(self, bucket_mgr, key=key, start=start, end=end, profile_id=profile_id,
+                mode=effective_mode, force=force, raw_event_store=raw_event_store,
+                conversation_turn_store=conversation_turn_store, raw_cursor=raw_event_cursor_id,
+                turn_cursor=turn_cursor_id)
         if force and source_cursor is None:
             raw_event_cursor_id = turn_cursor_id = 0
         if not conversation_turn_store:
@@ -4365,7 +4361,6 @@ class ReflectionEngine(MemoryL1Runtime):
         window_index: int = 1,
         window_total: int = 1,
         mode: str | None = None,
-        attachment_sources=(),
         segment_context=None,
         saved_response=None,
         response_checkpoint=None,
@@ -4393,8 +4388,8 @@ class ReflectionEngine(MemoryL1Runtime):
         support_segment = segment_context
         if self.memory_authority_enabled and self.memory_authority_store:
             if selected_event is None:
-                l1_payload, l1_sources, l1_catalog_context = self._memory_l1_daily_context(window,
-                    attachment_sources=attachment_sources, segment_context=segment_context)
+                l1_payload, l1_sources, l1_catalog_context = self._memory_l1_daily_context(
+                    window, segment_context=segment_context)
                 prompt, prompt_context = self._memory_l1_prompt("ombre.daily_chat_memory_prompt",
                     runtime_values={"max_candidates": max(1, int(max_candidates or self.daily_chat_memory_max_per_day or 1))})
             else:
@@ -4488,9 +4483,8 @@ class ReflectionEngine(MemoryL1Runtime):
         if l1_sources is not None:
             from memory_l1_api import validate_candidate_items
             rejected = {}
-            # Unknown callers and non-chat sources retain strict behavior. Use
-            # the actual run mode, never the config's default normalization.
-            layout_repairs = {} if mode == 'review' and window and not attachment_sources else None
+            # Use the actual chat run mode, never the config's default normalization.
+            layout_repairs = {} if mode == 'review' and window else None
             candidates, stats['schema_error'] = validate_candidate_items(response, rejected_drafts=rejected,
                     repair_slots=list(candidate_repairs or ()), review_layout_repairs=layout_repairs)
             if layout_repairs:

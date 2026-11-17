@@ -6,6 +6,7 @@ import asyncio
 import time
 
 from memory_authority import MemoryNotFound
+from memory_l0_sources import CANONICAL_EVENT_NAMESPACE
 from memory_l1_contract import L1ContractError
 from memory_l1_index import INDEX_VERSION, MemoryL1Index, scene_memory_id
 from memory_l1_service import L1OwnerError
@@ -117,9 +118,14 @@ class MemoryL1Reads:
             requests.append((item, bindings, "ok"))
         semaphore = asyncio.Semaphore(8)
         tasks = {}
+        canonical_reads = {}
+
         async def check(binding):
             async with semaphore:
+                if binding.get("source_namespace") == CANONICAL_EVENT_NAMESPACE:
+                    return await self.sources.locate(binding, verify_only=True, canonical_reads=canonical_reads)
                 return await self.sources.locate(binding, verify_only=True)
+
         for _item, bindings, _state in requests:
             for binding in bindings.values():
                 if binding:
@@ -169,13 +175,15 @@ class MemoryL1Reads:
                               "final_authority": max(0, int((time.perf_counter() - final_started) * 1000))},
                 "member_batches": member_batches, "member_cache_hits": member_hits,
                 "unique_binding_reads": len(tasks),
+                "unique_canonical_source_reads": len(canonical_reads),
             }}
         finally:
-            for task in tasks.values():
+            all_reads = [*tasks.values(), *canonical_reads.values()]
+            for task in all_reads:
                 if not task.done():
                     task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks.values(), return_exceptions=True)
+            if all_reads:
+                await asyncio.gather(*all_reads, return_exceptions=True)
 
     def base(self, memory_id, revision):
         memory = self.authority.get_memory(memory_id)

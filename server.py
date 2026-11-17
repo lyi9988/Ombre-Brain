@@ -211,7 +211,18 @@ memory_commit_service = (
     else None
 )
 decay_engine.memory_state_service = memory_commit_service
-portrait_engine = DailyPortraitMaintainer(config, prompt_plan_mirror)  # Daily portrait state / 每日画像状态
+
+
+def _new_portrait_maintainer():
+    source_reader = (
+        reflection_engine._memory_l1_sources()
+        if reflection_engine.memory_authority_enabled and reflection_engine.memory_authority_store is not None
+        else None
+    )
+    return DailyPortraitMaintainer(config, prompt_plan_mirror, l1_source_reader=source_reader)
+
+
+portrait_engine = _new_portrait_maintainer()
 dream_engine = DreamEngine(config, prompt_plan_mirror) # Night dream worker / 夜梦
 identity_semantic_store = IdentitySemanticStore(config) # Private relationship alias index / 私有关系语义索引
 word_map_store = WordMapStore(config)                   # Derived generic word co-occurrence index / 派生通用词图
@@ -1653,13 +1664,6 @@ def _self_anchor_text(bucket: dict) -> str:
     return _self_anchor_body_text(bucket, include_reflection=False, max_chars=260)
 
 
-def _format_handoff_self_anchor(all_buckets: list[dict], limit: int = 1) -> str:
-    bucket = _select_self_anchor_entry_bucket(all_buckets)
-    if not bucket:
-        return ""
-    return _self_anchor_text(bucket)
-
-
 def _is_self_anchor_tag_read_request(query: str) -> bool:
     aliases = {
         SELF_ANCHOR_TAG,
@@ -1760,307 +1764,7 @@ async def _read_self_anchor_domain_breath(query: str = "", max_tokens: int = 100
     return "=== 自我分段 ===\n" + ("\n---\n".join(rows) if rows else "没有找到相关自我分段。")
 
 
-def _normalize_breath_mode(value: object) -> str:
-    mode = str(value or "").strip().lower()
-    return mode if mode in {"", "handoff"} else ""
-
-
-def _trim_handoff_text_to_token_budget(text: str, token_budget: int) -> str:
-    clean = str(text or "").strip()
-    if token_budget <= 0 or not clean:
-        return ""
-    if count_tokens_approx(clean) <= token_budget:
-        return clean
-    kept: list[str] = []
-    for line in (line.strip() for line in clean.splitlines() if line.strip()):
-        remaining = token_budget - count_tokens_approx("\n".join(kept))
-        if remaining <= 0:
-            break
-        if count_tokens_approx(line) <= remaining:
-            kept.append(line)
-            continue
-        sentences = [part.strip() for part in re.split(r"(?<=[。！？!?；;])", line) if part.strip()]
-        sentence_rows: list[str] = []
-        for sentence in sentences:
-            candidate = "".join([*sentence_rows, sentence])
-            if count_tokens_approx(candidate) > remaining:
-                break
-            sentence_rows.append(sentence)
-        if sentence_rows:
-            kept.append("".join(sentence_rows))
-            break
-        low, high = 0, len(line)
-        while low < high:
-            middle = (low + high + 1) // 2
-            candidate = line[:middle].rstrip("，,；;：: ") + "…"
-            if count_tokens_approx(candidate) <= remaining:
-                low = middle
-            else:
-                high = middle - 1
-        if low > 0:
-            kept.append(line[:low].rstrip("，,；;：: ") + "…")
-        break
-    return "\n".join(kept)
-
-
-def _format_budgeted_handoff_sections(
-    intro: str,
-    sections: list[tuple[str, str, int, bool]],
-    max_tokens: int,
-) -> str:
-    budget = max(0, int(max_tokens or 0))
-    if budget <= 0:
-        return ""
-    active = [row for row in sections if str(row[1] or "").strip()]
-    header_tokens = count_tokens_approx(intro) + sum(
-        count_tokens_approx(f"\n\n=== {title} ===\n") for title, _, _, _ in active
-    )
-    content_budget = max(0, budget - header_tokens)
-    desired = [
-        min(max(0, cap), count_tokens_approx(str(content or "").strip()))
-        for _, content, cap, _ in active
-    ]
-    desired_total = sum(desired)
-    scale = min(1.0, content_budget / desired_total) if desired_total else 0.0
-    rendered = []
-    for (title, content, _, line_mode), desired_tokens in zip(active, desired):
-        allocated = int(desired_tokens * scale)
-        if allocated <= 0:
-            continue
-        trimmed = (
-            _trim_lines_to_token_budget(content, allocated)
-            if line_mode
-            else _trim_handoff_text_to_token_budget(content, allocated)
-        )
-        if not trimmed and str(content or "").strip():
-            trimmed = _trim_handoff_text_to_token_budget(content, allocated)
-        if trimmed:
-            rendered.append((title, trimmed))
-    result = intro
-    for title, content in rendered:
-        result += f"\n\n=== {title} ===\n{content}"
-    return result
-
-
-def _handoff_portrait_stable_body(value: object) -> str:
-    text = str(value or "").strip()
-    return re.sub(r"^Stable:\s*", "", text, count=1, flags=re.IGNORECASE).strip()
-
-
-async def _build_handoff_breath(max_tokens: int = 1200, session_id: str = "", debug: bool = False) -> str:
-    try:
-        all_buckets = await bucket_mgr.list_all(include_archive=False)
-    except Exception as e:
-        logger.warning("Handoff breath bucket list failed / handoff 列桶失败: %s", e)
-        all_buckets = []
-
-    try:
-        portrait_sections = portrait_engine.build_handoff_sections(max_recent_items=3)
-    except Exception as e:
-        logger.warning("Handoff portrait state failed / handoff portrait 状态失败: %s", e)
-        portrait_sections = {}
-
-    user_portrait = str(portrait_sections.get("user") or "").strip()
-    persona_portrait = str(portrait_sections.get("persona") or "").strip()
-    relationship_portrait = str(portrait_sections.get("relationship") or "").strip()
-    current_focus = str(portrait_sections.get("current_focus") or "").strip()
-    portrait_recent_continuity = str(portrait_sections.get("recent_continuity") or "").strip()
-    live_recent_continuity = _format_handoff_personal_recent_continuity(all_buckets, limit=3)
-    if _handoff_recent_continuity_is_natural(portrait_recent_continuity):
-        recent_continuity = _merge_handoff_recent_continuity(
-            portrait_recent_continuity,
-            live_recent_continuity,
-            max_lines=3,
-        )
-    else:
-        recent_continuity = _merge_handoff_recent_continuity(
-            live_recent_continuity,
-            portrait_recent_continuity,
-            max_lines=3,
-        )
-    if not recent_continuity:
-        recent_continuity = _format_handoff_recent_continuity(all_buckets, limit=3)
-    recent_continuity = _remove_handoff_current_focus_overlap(
-        recent_continuity,
-        current_focus,
-    )
-    self_anchor = _format_handoff_self_anchor(all_buckets, limit=1)
-    anchors = _format_handoff_anchors(all_buckets, limit=2)
-    care_memos = _format_handoff_care_memos(session_id=session_id, limit=3)
-    self_core = _trim_handoff_text_to_token_budget(self_anchor, 110)
-    self_growth = _trim_handoff_text_to_token_budget(
-        _handoff_portrait_stable_body(persona_portrait),
-        70,
-    )
-    self_context = "\n\n".join(
-        part
-        for part in (
-            self_core,
-            f"现在的我：\n{self_growth}" if self_growth else "",
-        )
-        if part
-    )
-
-    sections = [
-        (SELF_ANCHOR_TAG, self_context, 180, False),
-        ("User Portrait", user_portrait, 140, False),
-        ("Current Focus", current_focus, 120, True),
-        ("Relationship Portrait", relationship_portrait, 160, False),
-        ("Recent Continuity", recent_continuity, 650, True),
-        ("照顾备忘", care_memos, 180, True),
-        ("Optional Anchors", anchors, 90, True),
-    ]
-    intro = "\n".join([
-        "=== Handoff Context ===",
-        "Use this compact private block to restore identity and life context in a new window. "
-        "Do not treat it as a broad memory dump; use breath(query=...) for concrete events.",
-    ])
-    if debug:
-        sections.append(
-            (
-                "Handoff Debug",
-                f"portrait_state_path: {portrait_sections.get('state_path', getattr(portrait_engine, 'state_path', ''))}\n"
-                f"portrait_updated_at: {portrait_sections.get('updated_at', '')}\n"
-                f"portrait_last_run_date: {portrait_sections.get('last_run_date', '')}",
-                100,
-                True,
-            )
-        )
-    return _format_budgeted_handoff_sections(intro, sections, max_tokens)
-
-
-def _format_handoff_darkroom_door() -> str:
-    try:
-        status = darkroom_store.status()
-    except Exception as exc:
-        logger.warning("Handoff darkroom status failed / handoff 暗房状态失败: %s", exc)
-        return ""
-    count = int(status.get("count") or 0)
-    last_entered = str(status.get("last_entered_at") or "").strip()
-    lines = [
-        str(status.get("door") or "暗房存在。门口只显示状态，不显示未显影正文。"),
-        "darkroom_enter opens a new room by default; use new_room=false only when explicitly continuing the current active room. Unreleased draft text stays private until darkroom_view allows it.",
-    ]
-    if count:
-        detail = f"entries={count}"
-        if last_entered:
-            detail += f", last_entered={last_entered}"
-        lines.append(detail)
-    else:
-        lines.append("entries=0")
-    return "\n".join(lines)
-
-
-def _format_handoff_profile_facts(all_buckets: list[dict], limit: int = 6) -> str:
-    facts = [bucket for bucket in all_buckets if _is_profile_fact_bucket(bucket)]
-    facts.sort(
-        key=lambda bucket: str(
-            bucket.get("metadata", {}).get("updated_at")
-            or bucket.get("metadata", {}).get("last_active")
-            or bucket.get("metadata", {}).get("created")
-            or ""
-        ),
-        reverse=True,
-    )
-    lines = []
-    for bucket in facts[: max(0, limit)]:
-        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-        sections = _profile_fact_sections(bucket.get("content", ""))
-        fact = sections.get("fact") or strip_wikilinks(bucket.get("content", "")).strip()
-        fact = _clip_text(fact, 220)
-        if not fact:
-            continue
-        evidence = (
-            meta.get("evidence_bucket_id")
-            or meta.get("evidence_moment_id")
-            or meta.get("source_bucket_id")
-            or meta.get("source_moment_id")
-        )
-        bits = [f"bucket_id:{bucket.get('id', '')}"]
-        if evidence:
-            bits.append(f"evidence:{evidence}")
-        lines.append(f"- [{' '.join(bits)}] {fact}")
-    return "\n".join(lines)
-
-
-def _format_handoff_relationship_weather(all_buckets: list[dict]) -> str:
-    weather = []
-    for bucket in all_buckets:
-        if is_self_anchor_bucket(bucket):
-            continue
-        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-        tags = {str(tag) for tag in meta.get("tags", []) or []}
-        if not ({"relationship_weather", "daily_impression", "weekly_impression"} & tags):
-            continue
-        weather.append(bucket)
-    weather.sort(
-        key=lambda bucket: str(
-            bucket.get("metadata", {}).get("updated_at")
-            or bucket.get("metadata", {}).get("created")
-            or ""
-        ),
-        reverse=True,
-    )
-    lines = []
-    recent_dates = _handoff_recent_date_keys()
-    for index, bucket in enumerate(weather[:3]):
-        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-        date_key = _bucket_handoff_date(bucket)
-        bucket_id = str(bucket.get("id") or "")
-        is_recent = bool(date_key and date_key in recent_dates)
-        if is_recent or index == 0:
-            text = _clip_text(_handoff_clean_summary_text(bucket.get("content", "")), 220)
-            if text:
-                prefix = f"{date_key}: " if date_key else ""
-                lines.append(f"- [relationship_weather bucket_id:{bucket_id}] {prefix}{text}")
-        else:
-            text = _handoff_short_summary(bucket.get("content", ""), max_chars=72)
-            if text:
-                date_part = f"{date_key}: " if date_key else ""
-                query = f"{date_key} 关系天气" if date_key else str(meta.get("name") or "关系天气")
-                hint = _handoff_query_hint(query)
-                suffix = f"；{hint}" if hint else ""
-                lines.append(f"- [relationship_weather bucket_id:{bucket_id}] {date_part}{text}{suffix}")
-    return "\n".join(lines)
-
-
-def _format_handoff_recent_continuity(all_buckets: list[dict], limit: int = 3) -> str:
-    candidates = []
-    cutoff_hours = 24 * 4
-    for bucket in all_buckets:
-        if is_self_anchor_bucket(bucket):
-            continue
-        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-        if meta.get("pinned") or meta.get("protected") or meta.get("anchor"):
-            continue
-        if meta.get("active") is False or meta.get("deprecated"):
-            continue
-        if meta.get("type") == "feel":
-            tags = {str(tag) for tag in meta.get("tags", []) or []}
-            if not ({"relationship_weather", "daily_impression"} & tags):
-                continue
-        age = _bucket_age_hours(bucket)
-        if age is None or age > cutoff_hours:
-            continue
-        candidates.append(bucket)
-    candidates.sort(
-        key=lambda bucket: str(
-            bucket.get("metadata", {}).get("updated_at")
-            or bucket.get("metadata", {}).get("created")
-            or ""
-        ),
-        reverse=True,
-    )
-    lines = []
-    for bucket in candidates[: max(0, limit)]:
-        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-        name = str(meta.get("name") or bucket.get("id") or "").strip()
-        created = str(meta.get("created") or "")[:10]
-        text = _clip_text(bucket_content_for_recall(bucket), 160)
-        if not text:
-            continue
-        lines.append(f"- [{created}] [bucket_id:{bucket.get('id', '')}] {name}: {text}")
-    return "\n".join(lines)
+BREATH_HANDOFF_RETIRED = "旧换窗模式已退役。可以用 query 或 date 查找记忆。"
 
 
 def _is_pending_followup_domain(domain_key: str) -> bool:
@@ -2075,114 +1779,6 @@ def _breath_query_requests_pending_followups(query: str) -> bool:
     if any(term in compact for term in ("待办", "没做完", "没做", "未完成", "还没做")):
         return True
     return any(term in text for term in ("todo", "pending", "unfinished", "followup", "follow-up"))
-
-
-def _format_handoff_personal_recent_continuity(all_buckets: list[dict], limit: int = 3) -> str:
-    from relationship_impressions import is_retired_impression
-    rows = []
-    recent_dates = _handoff_recent_date_keys()
-    for bucket in all_buckets:
-        if is_retired_impression(bucket):
-            continue
-        if is_self_anchor_bucket(bucket):
-            continue
-        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-        tags = {str(tag) for tag in meta.get("tags", []) or []}
-        if not ({"relationship_weather", "daily_impression"} & tags):
-            continue
-        date_key = _bucket_handoff_date(bucket)
-        if date_key and date_key not in recent_dates:
-            continue
-        text = _handoff_clean_summary_text(bucket.get("content", ""))
-        if not text:
-            continue
-        rows.append((date_key, str(meta.get("updated_at") or meta.get("created") or ""), text))
-    rows.sort(key=lambda item: (item[0] or "", item[1]), reverse=True)
-    lines = []
-    for date_key, _updated, text in rows[: max(0, limit)]:
-        trace = _handoff_persona_trace_for_date(date_key)
-        weather = _handoff_recent_weather_phrase(text, max_chars=120 if trace else 180)
-        date_label = date_key or "recent"
-        if trace and weather:
-            lines.append(f"- {date_label}: {trace}。关系天气：{weather}")
-        elif trace:
-            lines.append(f"- {date_label}: {trace}")
-        elif weather:
-            lines.append(f"- {date_label}: 关系天气：{weather}")
-    return "\n".join(lines)
-
-
-def _handoff_persona_trace_for_date(date_key: str, *, limit: int = 2) -> str:
-    if not date_key or not hasattr(persona_engine, "_list_events"):
-        return ""
-    try:
-        events = persona_engine._list_events(max(80, limit * 8))
-    except Exception as exc:
-        logger.warning("Handoff persona trace lookup failed / handoff persona trace 读取失败: %s", exc)
-        return ""
-    matched = []
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        created = _handoff_parse_local_datetime(event.get("created_at"))
-        if created and created.date().isoformat() == date_key:
-            matched.append(event)
-    selected = select_persona_events(matched, limit=limit)
-    if not selected:
-        return ""
-    phrases = []
-    for event in selected:
-        phrase = _handoff_persona_event_phrase(event)
-        if phrase:
-            phrases.append(phrase)
-    if not phrases:
-        return ""
-    return _clip_text("；".join(phrases), 180)
-
-
-def _handoff_persona_event_phrase(event: dict) -> str:
-    identity = _identity()
-    user_name = identity.get("user_display_name") or identity.get("user_name") or "用户"
-    ai_name = identity.get("ai_name") or "AI"
-    user_excerpt = _handoff_clean_excerpt(event.get("user_excerpt"))
-    assistant_excerpt = _handoff_clean_excerpt(event.get("assistant_excerpt"))
-    parts = []
-    if user_excerpt:
-        parts.append(f"{user_name}说“{user_excerpt}”")
-    if assistant_excerpt:
-        parts.append(f"{ai_name}回“{assistant_excerpt}”")
-    if not parts:
-        return ""
-    return _clip_text("；".join(parts), 150)
-
-
-def _handoff_clean_excerpt(value: object, *, max_chars: int = 72) -> str:
-    text = strip_wikilinks(str(value or "")).strip()
-    if not text:
-        return ""
-    text = re.sub(r"\s*<attachment\b[^>]*>.*?</attachment>\s*", " ", text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r"【当前时间】[^\n\r]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return _clip_text(text, max_chars)
-
-
-def _handoff_recent_weather_phrase(text: str, *, max_chars: int = 150) -> str:
-    clean = _handoff_clean_summary_text(text)
-    clean = re.sub(r"^今天(?:的)?关系天气[：:]\s*", "", clean)
-    clean = re.sub(r"^今天[：:]\s*", "", clean)
-    return _clip_text(clean, max_chars)
-
-
-def _handoff_parse_local_datetime(value: object) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(_handoff_timezone())
 
 
 def _merge_handoff_recent_continuity(*blocks: str, max_lines: int = 5) -> str:
@@ -2226,62 +1822,6 @@ def _remove_handoff_current_focus_overlap(recent: str, current_focus: str) -> st
             continue
         kept.append(line)
     return "\n".join(kept)
-
-
-def _handoff_recent_continuity_is_natural(block: str) -> bool:
-    lines = [line.strip() for line in str(block or "").splitlines() if line.strip()]
-    if not lines:
-        return False
-    return any(
-        re.match(r"^-\s+\d{4}-\d{2}-\d{2}:", line)
-        and " / " not in line
-        and not any(label in line for label in ("trace:", "personal:", "trigger:", "residue:"))
-        for line in lines
-    )
-
-
-def _format_handoff_anchors(all_buckets: list[dict], limit: int = 2) -> str:
-    lines = []
-    for bucket in _select_anchor_buckets(all_buckets, limit=limit):
-        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-        title = str(meta.get("name") or bucket.get("id") or "").strip()
-        text = _handoff_short_summary(bucket.get("content", ""), max_chars=72)
-        query = title or str(bucket.get("id") or "")
-        hint = _handoff_query_hint(query)
-        suffix = f"；{hint}" if hint else ""
-        lines.append(f"- [bucket_id:{bucket.get('id', '')}] {title}: {text}{suffix}")
-    return "\n".join(lines)
-
-
-def _format_handoff_care_memos(session_id: str = "", limit: int = 3) -> str:
-    safe_session = str(session_id or "").strip()
-    try:
-        next_round = gateway_state_store.get_current_round(safe_session) + 1
-    except Exception:
-        next_round = 0
-    try:
-        items = reminder_store.due(
-            session_id=safe_session,
-            channels=["gateway", "bridge"],
-            round_id=next_round,
-            now=datetime.now(LOCAL_TZ),
-            limit=max(0, int(limit or 3)),
-        )
-    except Exception as exc:
-        logger.warning("Handoff care memo lookup failed / handoff 照顾备忘读取失败: %s", exc)
-        return ""
-    rows: list[str] = []
-    for item in items:
-        date_hint = str(item.get("next_due_at") or item.get("start_at") or item.get("created_at") or "").strip()
-        date_hint = date_hint[:10] if date_hint else "未定日期"
-        title = _clip_text(item.get("title") or "照顾备忘", 40)
-        content = _clip_text(item.get("content") or "", 90)
-        if not content:
-            continue
-        rows.append(f"- {date_hint} {title}: {content}")
-        if len(rows) >= max(0, int(limit or 3)):
-            break
-    return "\n".join(rows)
 
 
 def _has_favorite_tag(tags: list | set | tuple | None) -> bool:
@@ -3346,88 +2886,12 @@ async def health_check(request):
 
 
 # =============================================================
-# /breath-hook endpoint: Dedicated hook for SessionStart
-# 会话启动专用挂载点
-# =============================================================
+# Legacy session-start route. Old clients receive a terminal response.
 @mcp.custom_route("/breath-hook", methods=["GET"])
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
-    try:
-        requested_mode = str(request.query_params.get("mode") or "").strip().lower()
-        if requested_mode in {"", "handoff"}:
-            max_tokens = _int_between(request.query_params.get("max_tokens"), 1200, 0, 1600)
-            session_id = str(request.query_params.get("session_id") or "").strip()
-            return PlainTextResponse(
-                await breath(
-                    mode="handoff",
-                    max_tokens=max_tokens,
-                    session_id=session_id,
-                    include_core=False,
-                    include_related=False,
-                )
-            )
-        all_buckets = await bucket_mgr.list_all(include_archive=False)
-        # pinned
-        pinned = [
-            b for b in all_buckets
-            if not is_self_anchor_bucket(b)
-            and (b["metadata"].get("pinned") or b["metadata"].get("protected"))
-        ]
-        # top 2 unresolved by score
-        unresolved = [b for b in all_buckets
-                      if not is_self_anchor_bucket(b)
-                      and not b["metadata"].get("resolved", False)
-                      and b["metadata"].get("type") not in ("permanent", "feel")
-                      and not b["metadata"].get("anchor", False)
-                      and not b["metadata"].get("pinned")
-                      and not b["metadata"].get("protected")]
-        scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
-        anchors = _select_anchor_buckets(all_buckets, limit=2)
 
-        parts = []
-        token_budget = 10000
-        for b in pinned:
-            summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), {k: v for k, v in b["metadata"].items() if k != "tags"})
-            parts.append(f"📌 [核心准则] {summary}")
-            token_budget -= count_tokens_approx(summary)
-
-        for b in anchors:
-            if token_budget <= 0:
-                break
-            summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), {k: v for k, v in b["metadata"].items() if k != "tags"})
-            entry = f"⚓ [长期锚点] [bucket_id:{b['id']}] {summary}"
-            entry_tokens = count_tokens_approx(entry)
-            if entry_tokens > token_budget:
-                break
-            parts.append(entry)
-            token_budget -= entry_tokens
-
-        # Diversity: top-1 fixed + shuffle rest from top-20
-        candidates = list(scored)
-        if len(candidates) > 1:
-            top1 = [candidates[0]]
-            pool = candidates[1:min(20, len(candidates))]
-            random.shuffle(pool)
-            candidates = top1 + pool + candidates[min(20, len(candidates)):]
-        # Hard cap: max 20 surfacing buckets in hook
-        candidates = candidates[:20]
-
-        for b in candidates:
-            if token_budget <= 0:
-                break
-            summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), {k: v for k, v in b["metadata"].items() if k != "tags"})
-            summary_tokens = count_tokens_approx(summary)
-            if summary_tokens > token_budget:
-                break
-            parts.append(summary)
-            token_budget -= summary_tokens
-
-        if not parts:
-            return PlainTextResponse("")
-        return PlainTextResponse("[Ombre Brain - 记忆浮现]\n" + "\n---\n".join(parts))
-    except Exception as e:
-        logger.warning(f"Breath hook failed: {e}")
-        return PlainTextResponse("")
+    return PlainTextResponse(BREATH_HANDOFF_RETIRED, status_code=410)
 
 
 # =============================================================
@@ -3595,15 +3059,6 @@ def _handoff_timezone():
     return ZoneInfo("Asia/Shanghai")
 
 
-def _handoff_today_key() -> str:
-    return datetime.now(_handoff_timezone()).date().isoformat()
-
-
-def _handoff_recent_date_keys() -> set[str]:
-    today = datetime.fromisoformat(_handoff_today_key()).date()
-    return {today.isoformat(), (today - timedelta(days=1)).isoformat()}
-
-
 def _bucket_handoff_date(bucket: dict) -> str:
     meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
     explicit = str(meta.get("date") or "").strip()
@@ -3635,24 +3090,6 @@ def _handoff_clean_summary_text(content: str, *, include_detail_sections: bool =
         )[0]
     text = re.sub(r"^#+\s*\S+\s*", "", text.strip())
     return " ".join(strip_wikilinks(text).split())
-
-
-def _handoff_short_summary(content: str, *, max_chars: int = 72) -> str:
-    text = _handoff_clean_summary_text(content)
-    if not text:
-        text = _handoff_clean_summary_text(content, include_detail_sections=True)
-    match = re.search(r"[。！？!?；;]", text)
-    if match and match.end() >= 18:
-        text = text[:match.end()]
-    return _clip_text(text, max_chars)
-
-
-def _handoff_query_hint(query: str) -> str:
-    query = str(query or "").strip()
-    if not query:
-        return ""
-    escaped = query.replace("\\", "\\\\").replace('"', '\\"')
-    return f"细节用 breath(query=\"{escaped}\") 查。"
 
 
 async def _refresh_bucket_embedding(bucket_id: str) -> bool:
@@ -7439,7 +6876,13 @@ async def breath(
     mode: str = "",
     session_id: str = "",
 ) -> str:
-    """只读检索记忆。查主题用 query；新窗口轻交接用 mode="handoff"；date 或 query 里的日期可查当天普通记忆；domain="feel"/"whisper" 读私密通道，domain="daily_impression" 才读日印象。日期支持 2026-06-15、2026.06.15、2026年6月15日、25年6月15日、6月15日。"""
+    """只读检索记忆。查主题用 query；date 或 query 里的日期可查当天普通记忆；domain="feel"/"whisper" 读私密通道，domain="daily_impression" 才读日印象。日期支持 2026-06-15、2026.06.15、2026年6月15日、25年6月15日、6月15日。"""
+    is_session_start = _bool_value(is_session_start, False)
+    if str(mode or "").strip().lower() == "handoff" or (
+        is_session_start and not any(str(value or "").strip() for value in (query, domain, date))
+    ):
+        return BREATH_HANDOFF_RETIRED
+
     await decay_engine.ensure_started()
     max_results = _int_between(max_results, 20, 1, 50)
     max_tokens = _int_between(max_tokens, 10000, 0, 20000)
@@ -7448,13 +6891,11 @@ async def breath(
     edge_min_confidence = _float_between(edge_min_confidence, 0.55, 0.0, 1.0)
     include_core = _bool_value(include_core, True)
     core_limit = _int_between(core_limit, 3, 0, 20)
-    is_session_start = _bool_value(is_session_start, False)
     debug = _bool_value(debug, False)
     surface_key = str(surface or "manual").strip().lower()
     auto_surface = surface_key in {"auto", "automatic", "bridge", "gateway"}
     direct_render_mode = _normalize_direct_render_mode(direct_render_mode)
     retrieval_mode = _normalize_retrieval_mode(retrieval_mode)
-    mode_key = _normalize_breath_mode(mode)
     domain_key = domain.strip().lower()
     raw_date = str(date or "").strip()
     date_hint = parse_human_date_reference(raw_date or query)
@@ -7465,16 +6906,6 @@ async def breath(
     if date_hint and (raw_date or _breath_query_requests_date_read(query)):
         date_key = date_hint["date"]
         date_label = date_hint.get("label", date_key)
-
-    if not mode_key and is_session_start and not str(query or "").strip() and not domain_key:
-        mode_key = "handoff"
-
-    if mode_key == "handoff":
-        return await _build_handoff_breath(
-            max_tokens=min(max_tokens or 1200, 1600),
-            session_id=session_id,
-            debug=debug,
-        )
 
     if _is_self_anchor_domain(domain_key):
         return await _read_self_anchor_domain_breath(
@@ -10160,12 +9591,11 @@ async def _self_anchor_entry_payload() -> dict:
 
 async def _portrait_state_payload() -> dict:
     state = portrait_engine.load_state()
-    handoff_sections = {}
-    if hasattr(portrait_engine, "build_handoff_sections"):
-        try:
-            handoff_sections = portrait_engine.build_handoff_sections(max_recent_items=3)
-        except Exception as exc:
-            logger.warning("Portrait handoff preview failed: %s", exc)
+    try:
+        current_focus = portrait_engine.format_current_focus(state)
+    except Exception as exc:
+        logger.warning("Portrait current focus preview failed: %s", exc)
+        current_focus = ""
     return {
         "state_path": getattr(portrait_engine, "state_path", ""),
         "enabled": bool(getattr(portrait_engine, "enabled", True)),
@@ -10174,10 +9604,12 @@ async def _portrait_state_payload() -> dict:
         "daily_enabled": bool(getattr(portrait_engine, "daily_enabled", True)),
         "updated_at": state.get("updated_at", ""),
         "last_run_date": state.get("last_run_date", ""),
+        "daily_failure": state.get("daily_failure", {}),
         "portrait": state.get("portrait", {}),
         "recent_activities": state.get("recent_activities", []),
         "recent_timeline": state.get("recent_timeline", []),
-        "current_focus": str(handoff_sections.get("current_focus") or ""),
+        "current_focus": current_focus,
+        "l1_v2_review": state.get("l1_v2_review", {}),
         "stable_candidates": state.get("stable_candidates", []),
         "profile_fact_candidates": state.get("profile_fact_candidates", []),
         "self_anchor_entry": await _self_anchor_entry_payload(),
@@ -10185,7 +9617,7 @@ async def _portrait_state_payload() -> dict:
 
 
 async def portrait_state() -> dict:
-    """读取当前 portrait state，供检查 handoff 画像来源。"""
+    """读取当前画像、近期状态和送检状态。"""
     return await _portrait_state_payload()
 
 
@@ -10569,6 +10001,7 @@ async def api_portrait_state_item_delete(request):
         layer=str(body.get("layer") or ""),
         index=index,
         text=str(body.get("text") or ""),
+        candidate_id=str(body.get("candidate_id") or ""),
     )
     status = str(result.get("status") or "")
     if status == "deleted":
@@ -10605,7 +10038,7 @@ def _portrait_expected_revision(body: dict) -> int | None:
 
 @mcp.custom_route("/api/portrait-state/stable", methods=["PUT"])
 async def api_portrait_stable_edit(request):
-    """Manually replace one stable portrait paragraph with optimistic locking."""
+    """Save a manual portrait edit or adopt a reviewed portrait fact."""
     from starlette.responses import JSONResponse
 
     err = _require_dashboard_auth(request)
@@ -10620,6 +10053,19 @@ async def api_portrait_stable_edit(request):
     expected_revision = _portrait_expected_revision(body)
     if expected_revision is None:
         return JSONResponse({"error": "expected_revision is required"}, status_code=400)
+    if "candidate_id" in body:
+        candidate_id = body["candidate_id"]
+        if (
+            body.get("scope") != "user"
+            or not isinstance(candidate_id, str)
+            or not candidate_id.strip()
+            or {"text", "locked"} & body.keys()
+        ):
+            return JSONResponse({"error": "invalid user portrait candidate request"}, status_code=400)
+        result = await portrait_engine.approve_l1_v2_portrait_candidate(
+            candidate_id, bucket_mgr, expected_revision=expected_revision, display_text=body.get("display_text"),
+        )
+        return _portrait_mutation_response(result)
     locked = _bool_value(body.get("locked"), False) if "locked" in body else None
     result = portrait_engine.edit_stable(
         scope=str(body.get("scope") or ""),
@@ -14580,6 +14026,7 @@ async def api_config_update(request):
             if memory_authority_store is not None
             else None
         )
+        portrait_engine = _new_portrait_maintainer()
 
     # --- Portrait maintainer config ---
     if "portrait" in body:
@@ -14627,7 +14074,7 @@ async def api_config_update(request):
             os.environ["OMBRE_PORTRAIT_BASE_URL"] = portrait_cfg["base_url"]
         if "model" in p and portrait_cfg.get("model"):
             os.environ["OMBRE_PORTRAIT_MODEL"] = portrait_cfg["model"]
-        portrait_engine = DailyPortraitMaintainer(config, prompt_plan_mirror)
+        portrait_engine = _new_portrait_maintainer()
 
     # --- Dream config ---
     if "dream" in body:
@@ -15668,7 +15115,7 @@ if __name__ == "__main__":
             await asyncio.sleep(25)
             local_bucket_mgr = BucketManager(config)
             local_persona_engine = make_b1_persona_engine(config)
-            local_portrait_engine = DailyPortraitMaintainer(config, prompt_plan_mirror)
+            local_portrait_engine = _new_portrait_maintainer()
             while True:
                 try:
                     results = await local_portrait_engine.run_due(
@@ -15676,7 +15123,11 @@ if __name__ == "__main__":
                         local_persona_engine,
                     )
                     if results:
-                        logger.info("Portrait run-due results / 画像定时结果: %s", results)
+                        summaries = [
+                            {key: value for key, value in result.items() if key != "rejected"}
+                            for result in results
+                        ]
+                        logger.info("Portrait run-due results / 画像定时结果: %s", summaries)
                 except Exception as e:
                     logger.warning("Portrait scheduler failed / 画像定时器失败: %s", e)
                 await asyncio.sleep(local_portrait_engine.check_interval_minutes * 60)

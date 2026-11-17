@@ -193,8 +193,13 @@ def test_fixed_detail_has_factory_and_live_body_only():
             "authority",
         }
         assert detail["body_kind"] == "fixed_prompt"
-        retired = source_id in {'ombre.memory_detail_request_prompt', 'ombre.memory_reading_policy_prompt',
-                                'ombre.date_boundary_prompt'}
+        retired = source_id in {
+            "ombre.memory_detail_request_prompt",
+            "ombre.memory_reading_policy_prompt",
+            "ombre.date_boundary_prompt",
+            "ombre.handoff_hint_prompt",
+            "ombre.handoff_date_hint_prompt",
+        }
         assert bool(detail["factory_body"]) is not retired
         assert bool(detail["live_body"]) is not retired
         assert detail["source_revision"]

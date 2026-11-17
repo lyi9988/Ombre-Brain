@@ -179,7 +179,7 @@ def event_envelope(engine, source_views, fragments, *, core_source=None, core_ra
                          for index, row in enumerate(fragments)}}
     from memory_l1_runtime import MemoryL1Runtime
     result = MemoryL1Runtime._memory_l1_daily_context(engine, [],
-        attachment_sources=deepcopy(source_views), segment_context=segment)
+        source_views=deepcopy(source_views), segment_context=segment)
     projected = result[0]['source_texts']
     if len(projected) != len(fragments):
         _fail('event_source_view_invalid', 'source_texts')

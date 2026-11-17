@@ -141,24 +141,3 @@ def test_portrait_materials_drop_only_old_impressions_and_keep_original_state(tm
     assert 'RETIRED_DAILY_ONLY' not in serialized and 'RETIRED_WEEKLY_ONLY' not in serialized
     assert buckets == before and state == state_before  # Read-only filtering retains history.
     bucket_mgr.list_all.assert_awaited_once_with(include_archive=False)
-
-
-def test_handoff_recent_summary_ignores_old_flattened_impressions_but_keeps_original_turns():
-    value = DailyPortraitMaintainer.__new__(DailyPortraitMaintainer)
-    value.recent_continuity_days = 3
-    value.identity = {'user_display_name': '主人', 'ai_name': '顾衍'}
-    materials = {'buckets': [
-        {'bucket_id': 'old-daily', 'source_date': '2026-11-02',
-         'tags': ['relationship_weather', 'daily_impression'], 'text': 'RETIRED_DAILY_ONLY'},
-        {'bucket_id': 'old-weekly', 'source_date': '2026-11-02',
-         'tags': ['relationship_weather', 'weekly_impression'], 'text': 'RETIRED_WEEKLY_ONLY'},
-    ], 'persona_events': [{'source_date': '2026-11-02',
-                          'user_excerpt': 'ORIGINAL_OWNER_TURN',
-                          'assistant_excerpt': 'ORIGINAL_AI_TURN'}]}
-
-    result = value._build_handoff_recent_summaries(materials, {}, '2026-11-02')
-    summary = result['2026-11-02']
-    assert '主人说“ORIGINAL_OWNER_TURN”' in summary
-    assert '顾衍回“ORIGINAL_AI_TURN”' in summary
-    assert 'RETIRED_DAILY_ONLY' not in summary and 'RETIRED_WEEKLY_ONLY' not in summary
-    assert '关系天气' not in summary
