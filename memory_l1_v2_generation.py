@@ -8,6 +8,7 @@ from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
+import re
 from time import monotonic
 
 import frontmatter
@@ -37,6 +38,15 @@ AUTO_L1_BAD_REQUEST_RETRIES = 2
 _WINDOW_PREFIX = 'daily_chat_l1_v2_window:'
 _EVENT_TIME_ERRORS = {'event_date_missing_from_body', 'invalid_event_time',
                       'reversed_event_range', 'inconsistent_event_timezone'}
+_CHAT_WALL_TIME = r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?'
+_CHAT_OFFSET = r'Z|[+-]\d{2}:\d{2}'
+_CHAT_TIMESTAMP = re.compile(rf'{_CHAT_WALL_TIME}(?P<offset>{_CHAT_OFFSET})?')
+_CHAT_STATED_TIME = re.compile(rf'(?<![\d:]){_CHAT_WALL_TIME}(?:{_CHAT_OFFSET})(?![\d:.])')
+_CHAT_TIME_FORMAT = (
+    '只写事件本身的发生时间。年、月、日分别用 YYYY、YYYY-MM、YYYY-MM-DD。'
+    '写到时分或秒时，start 和 end 都须使用带 Z 或 ±HH:MM 偏移的 ISO 8601，保留引用材料中有依据的偏移。'
+    '只有聊天本身就是该事件时才用对应消息的时间戳。不要用稿件提交时间或猜测时区；没有依据就填 null。'
+)
 _PROMPTS = Path(__file__).with_name('resources') / 'l1_v2'
 
 
@@ -73,6 +83,59 @@ def _local_time(value, tz):
         return parsed.astimezone(tz).isoformat() if parsed.tzinfo else None
     except ValueError:
         return None
+
+
+def _chat_event_time_with_evidence(event, observed, snapshots, tz):
+    """Recover only omitted offsets for the same wall time in cited material."""
+    if (not isinstance(event, dict) or set(event) - {'start', 'end', 'precision', 'sources'}
+            or event.get('precision') not in ('year', 'month', 'day', 'minute', 'second', 'approximate')):
+        return event
+    refs = event.get('sources')
+    if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) or ref not in observed for ref in refs):
+        return event  # Leave malformed time/source metadata to the existing validator.
+    missing = {}
+    for key in ('start', 'end') if 'end' in event else ('start',):
+        value = event.get(key)
+        match = _CHAT_TIMESTAMP.fullmatch(value) if isinstance(value, str) else None
+        if match is None:
+            return event
+        try:
+            datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return event
+        if match['offset'] is None:
+            missing[key] = value
+    if not missing:
+        return event
+
+    stamps = []
+    for ref in dict.fromkeys(refs):
+        snapshot = snapshots[int(ref[1:]) - 1]
+        if snapshot['source_namespace'] == 'snapshot.aiz.canonical_event':
+            # Use the time as shown to the model. The draft's recorded_at is
+            # its submission time, so it must never supply an event offset.
+            stamps.append(_local_time(snapshot.get('recorded_at'), tz))
+        for left, right in observed[ref]:
+            stamps.extend(match[0] for match in _CHAT_STATED_TIME.finditer(snapshot['text'][left:right]))
+    offsets = {key: set() for key in missing}
+    for raw in stamps:
+        if not raw or raw.endswith('-00:00'):
+            continue
+        try:
+            stamp = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        except ValueError:
+            continue
+        suffix = stamp.strftime('%z')
+        if len(suffix) != 5:
+            continue
+        wall = stamp.replace(tzinfo=None).isoformat(timespec='microseconds')
+        for key, value in missing.items():
+            # The model can cite a minute from a message recorded to the microsecond.
+            if wall.startswith(value):
+                offsets[key].add(suffix[:3] + ':' + suffix[3:])
+    if any(len(values) != 1 for values in offsets.values()):
+        return None
+    return {**event, **{key: value + next(iter(offsets[key])) for key, value in missing.items()}}
 
 
 def _diagnostic(engine, task_id, stage, data):
@@ -275,6 +338,8 @@ class Generation:
             native = build_chat_response_format(source_refs, [person['ref'] for person in self.people],
                 self.catalog, has_title=bool(self.common['agent_draft']['title'].strip()),
                 include_review=self.include_review)
+            fields = native['json_schema']['schema']['properties']['cards']['items']['properties']
+            fields['event_time']['description'] = _CHAT_TIME_FORMAT
             wire = [{'role': 'system', 'content': self.prompt},
                     {'role': 'user', 'content': canonical_json(envelope)}]
             return self._request_with_budget(wire, native, source_refs, observed)
@@ -487,6 +552,12 @@ class Generation:
         if self.origin == 'chat_l1':
             self._attach_chat_draft(card)
             generation['prompt_source_id'] = draft.get('_prompt_source_id', PROMPT_ID)
+            event = card.get('event_time')
+            resolved = _chat_event_time_with_evidence(event, draft['_observed'], self.snapshots, self.engine.tz)
+            if resolved is not event:
+                card['event_time'] = resolved
+                _diagnostic(self.engine, self.task_id, 'chat_event_time', {
+                    'outcome': 'offset_restored' if resolved else 'no_unique_cited_offset'})
         source_ref_map, bindings = {}, []
         for ref, ranges in draft['_observed'].items():
             index = int(ref[1:]) - 1

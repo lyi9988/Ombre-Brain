@@ -835,6 +835,70 @@ def test_chat_v2_model_io_groups_fallback_calls_with_the_original_preparation(tm
     assert schema['error']['http_status'] == 400 and schema['raw_output'] is None
     assert invalid['error']['failure_phase'] == 'response_processing'
     assert invalid['raw_output'] == invalid_output and invalid['finish_reason'] == 'stop'
+    native_fields = requests[0]['response_format']['json_schema']['schema']['properties']['cards']['items']['properties']
+    fallback_fields = json.loads(requests[1]['messages'][-1]['content'])['output_schema']['properties']['cards']['items']['properties']
+    assert '±HH:MM' in native_fields['event_time']['description']
+    assert native_fields['event_time']['description'] == fallback_fields['event_time']['description']
+
+
+@pytest.mark.parametrize('bounds,refs,stated,expected', [
+    pytest.param(('2026-11-12T01:19', '2026-11-12T01:23'), ['m2', 'm3'], '',
+                 ('2026-11-12T01:19+08:00', '2026-11-12T01:23+08:00'), id='matched-range'),
+    pytest.param(('2026-11-12T01:19+08:00', '2026-11-12T01:23'), ['m3'], '',
+                 ('2026-11-12T01:19+08:00', '2026-11-12T01:23+08:00'), id='only-end-missing'),
+    pytest.param(('2026-11-12T01:19',), ['m1'], '2026-11-12T01:19-04:00',
+                 ('2026-11-12T01:19-04:00',), id='explicit-time-in-draft'),
+    pytest.param(('2026-11-12T01:19-04:00',), ['m1'], '2026-11-12T01:19-04:00',
+                 ('2026-11-12T01:19-04:00',), id='already-zoned'),
+    pytest.param(('2026-11-12T01:19',), ['m1', 'm2'], '2026-11-12T01:19-04:00', None, id='conflicting-offsets'),
+    pytest.param(('2026-11-12T01:19',), ['m1'], '', None, id='submission-and-uncited-message-do-not-count'),
+    pytest.param(('2026-11-12T01:19', '2026-11-12T01:23'), ['m2'], '', None, id='unproved-end'),
+    pytest.param(('2026-02-30T01:19',), ['m2'], '', 'invalid_event_time', id='invalid-calendar-date'),
+])
+def test_chat_event_time_uses_only_evidenced_offsets(tmp_path, monkeypatch, bounds, refs, stated, expected):
+    from memory_chat_preparation import ChatMemoryPreparation
+
+    body = '我记得那次我们一起谈起雨声。' + stated
+    event = {**dict(zip(('start', 'end'), bounds)), 'precision': 'minute', 'sources': refs}
+    metadata = {'kind': 'life_experience', 'stability': 'episode', 'keywords': ['雨声'],
+                'people': [], 'sources': [], 'primary_topic': 'daily_life', 'event_time': event}
+    engine, calls = _engine(tmp_path, lambda _payload: [metadata])
+
+    async def locate(_binding, *, verify_only=False):
+        return {'eligible_source': True}
+
+    monkeypatch.setattr(engine, '_memory_l1_sources',
+                        lambda: SimpleNamespace(retain_copy=lambda _snapshot: None, locate=locate))
+    tasks = ChatMemoryPreparation(engine.memory_authority_store)
+    submission = tasks.enqueue({
+        'operation_id': 'op-' + '9' * 32, 'arguments': {'narrative': {'title': '谈起雨声', 'body': body}},
+        'context': {'conversation_id': 'canonical-main', 'request_id': 'r1', 'turn_id': 'e2', 'sources': [
+            {'event_id': 'e1', 'version_id': 'v1', 'role': 'user', 'text': '我们聊到了雨声。',
+             'created_at': '2026-11-11T17:19:10.142000+00:00'},
+            {'event_id': 'e2', 'version_id': 'v2', 'role': 'user', 'text': '我也记得。',
+             'created_at': '2026-11-11T17:23:02.058000+00:00'},
+        ]}}, generation_protocol='whole_window_v2')
+    task_id = submission['task_id']
+    submitted = '2026-11-11T17:19:40+00:00'
+    task = {**tasks.get(task_id), 'created_at': submitted}
+    engine.memory_authority_store.set_meta(tasks.prefix + task_id, task)
+    result = asyncio.run(prepare_chat_tasks(engine, None))['results'][0]
+    record, = MemoryModelIO(engine.memory_authority_store).list(task_id)['items']
+    assert len(calls) == 1 and json.loads(record['raw_output']) == {'cards': [metadata]}
+    assert tasks.get(task_id)['envelope'] == task['envelope']
+    candidate = engine.memory_authority_store.get_candidate(task_id)
+    if expected == 'invalid_event_time':
+        assert result['issue']['code'] == expected and candidate is None
+        return
+    assert candidate['status'] == 'pending' and candidate['proposal']['proposed_body'] == body
+    assert engine.memory_authority_store.get_memory(task_id) is None
+    doc = candidate['proposal']['metadata']['memory_l1']
+    assert doc['generation']['submitted_at'] == submitted
+    if expected is None:
+        assert doc.get('event_time') is None
+    else:
+        assert doc['event_time'] == {**event, **dict(zip(('start', 'end'), expected)),
+                                     'sources': ['source:' + ref[1:] for ref in refs]}
 
 
 def test_chat_v2_accepts_a_staged_window_over_the_legacy_message_cap(tmp_path, monkeypatch):
