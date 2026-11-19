@@ -108,8 +108,9 @@ def _b1_projection(state,updated_at,profile_id):
       "relationship":{"weather":weather,"closeness":level(affinity,.45,.78),"trust":level(trust,.45,.72),"source":"ombre_relationship_frozen"},
       "updated_at":str(updated_at or state.get("updated_at") or ""),"revision":state.get("revision"),"policy_revision":state.get("policy_revision"),"source":"b1_candidate","state_schema":STATE_SCHEMA,"slow_axes":slow_safe,"tendencies":tendencies,"tendency_sources":tendency_sources,"fatigue_state":fatigue_state,"fatigue":_unit(state.get("fatigue",{}).get("value")) if isinstance(state.get("fatigue"),dict) else None}
     from persona_relation_dynamics import PROFILE
-    if state.get('relation_profile') == PROFILE:
-        projected['relation_profile'] = PROFILE
+    from persona_relation_episodes import PROFILE as B15, public_episodes
+    if state.get('relation_profile') in (PROFILE, B15):
+        projected['relation_profile'] = state['relation_profile']
         view = projected['affect']
         view.pop('tenderness')
         view.pop('session_defensiveness')
@@ -124,6 +125,12 @@ def _b1_projection(state,updated_at,profile_id):
             stance_at=stamp if refs else None,
             label_times={label: _stamp(label_times.get(label)) for label in labels if isinstance(label_times, dict) and label in label_times},
             label_until={'yearning': expiry} if expiry and 'yearning' in labels else {})
+        if projected['relation_profile'] == B15:
+            projected['episodes'] = public_episodes(state.get('episodes'))
+            for key in ('fatigue', 'fatigue_state', 'drive'):
+                projected.pop(key)
+            for key in ('subtypes', 'mixed', 'connection_phase', 'growth_coverage', 'empathy_load', 'conflict_episode'):
+                view.pop(key)
     return projected
 
 

@@ -221,10 +221,12 @@ class MemoryReactionResolver:
         return None, 'legacy_authority_current' if legacy and not bindings else 'bound_source_current'
 
 
-def settle_reactions(state, policy, observations, context, validation, occurred_at, interaction_directions, *, relation_rows=()):
+def settle_reactions(state, policy, observations, context, validation, occurred_at, interaction_directions, *,
+                     relation_rows=(), relation_source=None, event_id=None):
     """Mutate only the existing short axes inside their owner's transaction."""
     from persona_memory_reactions import RULES_VERSION, repeat_factor, apply_dimension
     from persona_relation_dynamics import RETIRED, memory_direction, overlaps
+    import persona_relation_episodes as episodes
     history = state.setdefault('memory_reaction_history', {})
     valid = (isinstance(validation, dict) and validation.get('state') == 'available'
         and validation.get('delivery_receipt_id') == context['delivery_receipt_id']
@@ -243,7 +245,8 @@ def settle_reactions(state, policy, observations, context, validation, occurred_
         if 'relation_dynamics' in policy and key in RETIRED:
             results[row['reaction_id']] = {**result, 'status': 'retired_dimension'}
             continue
-        before = state['values'][key]
+        episode_key = episodes.enabled(policy) and key in episodes.KEYS
+        before = state['values'].get(key) if episode_key else state['values'][key]
         result.update(before=before, after=before)
         if row['reaction'] in {'continuing', 'uncertain', 'none'}:
             results[row['reaction_id']] = {**result, 'status': 'no_new_pulse', 'reason': row['reaction']}
@@ -280,9 +283,12 @@ def settle_reactions(state, policy, observations, context, validation, occurred_
         # The original legal range of each short axis already has lower bound
         # zero. Keep a higher explicit ordinary-relief floor when present;
         # time-law targets and intimacy/tool satisfaction amounts are unrelated.
-        floor = (policy.get('events', {}).get('soothing', {}).get(key) or {}).get('floor', 0.0)
-        calculation = apply_dimension(before, effect=row['effect'], direction=row['direction'], strength=row['strength'],
-            floor=floor, factor=factor, emotion_inertia=key in {'valence', 'arousal'}, reaction=row['reaction'])
+        if episode_key:
+            calculation = _settle_episode(state, policy, row, factor, occurred_at, event_id, relation_source)
+        else:
+            floor = (policy.get('events', {}).get('soothing', {}).get(key) or {}).get('floor', 0.0)
+            calculation = apply_dimension(before, effect=row['effect'], direction=row['direction'], strength=row['strength'],
+                floor=floor, factor=factor, emotion_inertia=key in {'valence', 'arousal'}, reaction=row['reaction'])
         if key == 'grieve' and calculation.get('requested_delta', 0) > 0 and policy.get('security_grief_policy'):
             modulation, security = policy['security_grief_policy'], state['values'].get('slow_security')
             if security is None:
@@ -294,7 +300,8 @@ def settle_reactions(state, policy, observations, context, validation, occurred_
                 calculation['after'] = min(1.0, max(0.0, before + calculation['requested_delta']))
                 calculation['delta'] = calculation['after'] - before
                 calculation['status'] = 'applied' if calculation['delta'] else 'no_change'
-        state['values'][key] = calculation['after']
+        if not episode_key:
+            state['values'][key] = calculation['after']
         result.update(calculation)
         results[row['reaction_id']] = result
         if calculation['status'] in {'applied', 'no_change'}:
@@ -303,3 +310,34 @@ def settle_reactions(state, policy, observations, context, validation, occurred_
             history[repeat_key] = {'occurred_at': occurred_at, 'reaction_id': row['reaction_id'],
                 'reaction': row['reaction'], 'memory_ref': deepcopy(row['memory_ref']), 'evidence_hash': row['evidence_hash']}
     return [results[row['reaction_id']] for row in observations]
+
+
+def _settle_episode(state, policy, row, factor, occurred_at, event_id, turn):
+    """Verified memory can revive, or relieve only its own exact source group."""
+    from datetime import datetime
+    from persona_inner_state import source_ref
+    from persona_memory_reactions import EASE, EVOKE
+    from persona_relation_episodes import change, origin
+
+    key, direction, strength = row['dimension'], row['direction'], row['strength']
+    if direction == 'unknown' or strength == 'unknown':
+        return {'status': 'unknown_not_updated', 'reason': 'reaction_unknown'}
+    if row['effect'] == 'ease' and direction != 'decrease':
+        return {'status': 'unknown_not_updated', 'reason': 'reaction_direction_mismatch'}
+    phase = 'rise' if direction == 'increase' else 'ease'
+    binding = {'kind': 'memory',
+        'group': digest([turn['conversation_key'] if turn else 'autonomy', row['memory_ref']['source_group_id']])}
+    related = [item for item in state['relation_episodes'].values() if item['key'] == key and item.get('binding') == binding]
+    if len(related) > 1:
+        return {'status': 'episode_target_required', 'reason': 'memory_target_ambiguous'}
+    if not related and phase == 'ease':
+        return {'status': 'episode_target_required', 'reason': 'memory_target_requires_matching_source'}
+    fractional = row['effect'] == 'ease'
+    amount = (EASE if fractional else EVOKE)[strength] * factor
+    ref = source_ref('conversation' if turn else 'operation', event_id, occurred_at, row['reaction_id'])
+    result = change(state, policy['relation_dynamics'], key, phase, datetime.fromisoformat(occurred_at), ref,
+        episode_id=related[0]['id'] if related else None, amount=amount, original=origin(turn, row['evidence_spans']),
+        binding=binding, fractional_ease=fractional)
+    if result['status'] == 'applied':
+        result['delta'] = result['after'] - result['before']
+    return {**result, 'repeat_factor': factor, 'source_ref': ref}

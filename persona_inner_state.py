@@ -49,10 +49,10 @@ def safe_source_refs(refs):
                 continue
             if 'observation_id' in ref:
                 obs = ref['observation_id']
-                if (not isinstance(obs, str) or not obs.startswith(('obs:', 'rel:'))
+                if (not isinstance(obs, str) or not obs.startswith(('obs:', 'rel:', 'mr:'))
                         or obs.startswith('rel:') and ref['kind'] != 'conversation'):
                     continue
-                hash_value(obs[4:])
+                hash_value(obs.partition(':')[2])
         except (ValueError, TypeError):
             continue
         key = (ref['kind'], ref['event_id'], ref['occurred_at'], ref.get('observation_id'))

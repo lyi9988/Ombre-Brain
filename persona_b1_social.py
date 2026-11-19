@@ -64,7 +64,7 @@ def cap_loads(state):
         if amount>total and amount:
             for row in rows:row['value']*=total/amount
 
-def apply_empathy(state,p,d,accepted,now):
+def apply_empathy(state,p,d,accepted,now,*,episode_context=None):
     validate_empathy_detail(d,accepted)
     if d['identity_status']=='unresolved' or d['closeness']=='unknown':return {'status':'unknown_closeness','key':SUBS[d['sub']]}
     if not p:return {'status':'policy_not_configured','key':SUBS[d['sub']]}
@@ -77,30 +77,60 @@ def apply_empathy(state,p,d,accepted,now):
     state['empathy_seen'][identity]=now.isoformat()
     weight=p['weights'][d['closeness']]
     add=p['base']*weight
+    episode_result={}
     if key:
-        value=state['values'][key]
-        if value is None:return {'status':'unknown_state','key':key}
         cap=p['caps'][d['closeness']]
-        relevant=sum(x['value'] for x in state['empathy_loads'].values() if x['key']==key and x['closeness']==d['closeness'])
-        if cap is not None:add=min(add,max(0,cap-(value if d['closeness']=='owner' else relevant)))
+        if episode_context is None:
+            value=state['values'][key]
+            if value is None:return {'status':'unknown_state','key':key}
+            relevant=sum(x['value'] for x in state['empathy_loads'].values() if x['key']==key and x['closeness']==d['closeness'])
+            if d['closeness']=='owner':relevant=value
+        else:
+            related=[x for x in state['relation_episodes'].values() if x['key']==key
+                     and x.get('binding',{}).get('kind')=='empathy']
+            relevant=sum(x['intensity'] for x in related if x['binding']['closeness']==d['closeness'])
+        if cap is not None:add=min(add,max(0,cap-relevant))
         today=day(now,p['offset_minutes']);daily_key=today+':'+d['closeness'];used=state['empathy_daily'].get(daily_key,0);dailycap=p['daily_caps'][d['closeness']]
         if dailycap is not None:add=min(add,max(0,dailycap-used))
-        add=min(add,1-value);state['values'][key]+=add;state['empathy_daily'][daily_key]=used+add
-        if d['closeness']!='owner' and add:
-            row=state['empathy_loads'].setdefault(identity,{'key':key,'value':0,'subject_ref':d['subject_ref'],'incident_ref':d['incident_ref'],'sub':d['sub'],'closeness':d['closeness']})
-            row['value']+=add
+        if episode_context is None:
+            add=min(add,1-value);state['values'][key]+=add
+            if d['closeness']!='owner' and add:
+                row=state['empathy_loads'].setdefault(identity,{'key':key,'value':0,'subject_ref':d['subject_ref'],'incident_ref':d['incident_ref'],'sub':d['sub'],'closeness':d['closeness']})
+                row['value']+=add
+            if add:state['subtypes'].setdefault(key,{})[d['sub']]=min(1,state['subtypes'].get(key,{}).get(d['sub'],0)+add)
+        elif add:
+            from persona_relation_episodes import change
+            binding={'kind':'empathy','incident':identity,'closeness':d['closeness']}
+            exact=[x for x in related if x['binding']['incident']==identity]
+            target=exact[0] if len(exact)==1 else None
+            if target:add=min(add,1-target['intensity'])
+            if add:
+                episode_result=change(state,episode_context['settings'],key,'rise',now,episode_context['source_ref'],
+                    episode_id=target['id'] if target else None,original=episode_context['origin'],binding=binding,amount=add)
         if not add:return {'status':'capped','key':key}
-        if add:state['subtypes'].setdefault(key,{})[d['sub']]=min(1,state['subtypes'].get(key,{}).get(d['sub'],0)+add)
+        state['empathy_daily'][daily_key]=used+add
     for coordinate,delta in p['impulses'][d['sub']].items():
         v=state['values'][coordinate]
         if v is not None:state['values'][coordinate]=min(1,max(0,v+delta*weight*((1-v) if delta>0 else v)))
-    return {'status':'applied' if add or key is None else 'capped','key':key,'observation_id':d['observation_id'],'subject_ref':d['subject_ref'],'incident_ref':d['incident_ref']}
+    return {'status':'applied' if add or key is None else 'capped','key':key,'observation_id':d['observation_id'],'subject_ref':d['subject_ref'],'incident_ref':d['incident_ref'],**episode_result}
 
-def help_share(state,p,subject_ref,incident_ref,sub):
+def help_share(state,p,subject_ref,incident_ref,sub,*,episode_context=None):
     if sub not in SUBS or not subject_ref or not incident_ref:raise ValueError('help result must identify corresponding incident')
     key=SUBS[sub]
     if key=='expression':return {'status':'aiz_owned'}
     if key is None or not p:return {'status':'no_brain_share'}
+    if episode_context is not None:
+        from b1_protocol import digest
+        from persona_relation_episodes import change
+        identity=digest([subject_ref,incident_ref,sub])
+        matches=[x for x in state['relation_episodes'].values() if x['key']==key
+                 and x.get('binding',{}).get('kind')=='empathy' and x['binding']['incident']==identity]
+        if len(matches)!=1:return {'status':'no_corresponding_share'}
+        result=change(state,episode_context['settings'],key,'ease',episode_context['now'],episode_context['source_ref'],
+            episode_id=matches[0]['id'],amount=p['helped_relief'],fractional_ease=True)
+        if result['status']=='applied':
+            result.update(status='relieved', amount=result['before']-result['after'])
+        return result
     if state['values'][key] is None:return {'status':'unknown_state'}
     dropped=0
     for row in state['empathy_loads'].values():

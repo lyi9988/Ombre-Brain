@@ -113,29 +113,38 @@ def validate_profile(config, number):
     number(dynamics['stance']['half_life_hours'], .001, 168)
 
 
-def verify_rows(raw, source_hash, source):
+def verify_rows(raw, source_hash, source, *, episodes=False):
     """Return independently verified rows and source-safe rejection diagnostics."""
     if not isinstance(raw, list) or len(raw) > 32:
         raise ValueError('bounded relationship observations required')
+    if episodes:
+        from persona_relation_episodes import PHASES as phases, KEYS, is_episode_id
+    else:
+        phases = PHASES
     good, rejected = [], []
     for index, row in enumerate(raw):
         try:
-            if not isinstance(row, dict) or set(row) != ROWS:
+            if not isinstance(row, dict) or set(row) - ({'episode_id'} if episodes else set()) != ROWS:
                 raise ValueError('incomplete_observation')
             dimension, phase = row['dimension'], row['phase']
-            if not isinstance(dimension, str) or dimension not in PHASES or phase not in PHASES[dimension]:
+            if not isinstance(dimension, str) or dimension not in phases or phase not in phases[dimension]:
                 raise ValueError('unsupported_phase_or_dimension')
+            linked = {}
+            if 'episode_id' in row:
+                if dimension not in KEYS or not is_episode_id(row['episode_id']):
+                    raise ValueError('invalid_episode_target')
+                linked['episode_id'] = row['episode_id']
             spans = evidence_spans(row['evidence_spans'])
             if not any(span['role'] == 'assistant' for span in spans):
                 raise ValueError('assistant_evidence_required')
             verify_original_spans(row, source, source_hash)
             if row['observation_id'] != 'rel:' + digest({
-                    'source_hash': source_hash, 'dimension': dimension, 'phase': phase, 'evidence_spans': spans}):
+                    'source_hash': source_hash, 'dimension': dimension, 'phase': phase, 'evidence_spans': spans, **linked}):
                 raise ValueError('observation_identity_mismatch')
         except ValueError as exc:
             rejected.append({'index': index, 'status': 'rejected', 'reason': str(exc),
                 **({'dimension': row['dimension']} if isinstance(row, dict)
-                    and isinstance(row.get('dimension'), str) and row['dimension'] in PHASES else {})})
+                    and isinstance(row.get('dimension'), str) and row['dimension'] in phases else {})})
         else:
             good.append(row)
     return good, rejected
@@ -166,7 +175,7 @@ def legacy_yearnings(source_hash, originals, bindings, modes, current):
 
 
 def memory_direction(row):
-    return 'increase' if row['phase'] == 'rise' else 'decrease'
+    return 'increase' if row['phase'] in ('rise', 'unresolved') else 'decrease'
 
 
 def advance_non_numeric(state, settings, start, end):
