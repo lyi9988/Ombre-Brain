@@ -201,6 +201,11 @@ def change(state, settings, key, phase, now, ref, *, episode_id=None, original=N
         return {'status': 'episode_target_unavailable'}
     if row and any(old == ref for old in row['source_refs']):
         return {'status': 'same_cause_already_settled', 'episode_id': row['id']}
+    if row and row['status'] == 'unresolved' and phase == 'unresolved':
+        # The current turn confirms the existing concern; it is not another
+        # pulse. Keep the confirmation in the event receipt, not the episode.
+        return {'status': 'still_unresolved', 'episode_id': row['id'],
+            'before': row['intensity'], 'after': row['intensity']}
     if phase in ('rise', 'unresolved'):
         if row is None:
             episode_id = 'ep:' + digest([key, ref])

@@ -142,6 +142,37 @@ def test_short_feelings_fade_and_coarse_row_does_not_create_fine_scores(tmp_path
     assert {r['status'] for r in adapter.store.receipt('fixture', src['user_id'])['relation_observations']} == {'applied'}
 
 
+def test_linked_still_unresolved_confirms_without_pulse_but_new_rise_can_raise(tmp_path):
+    adapter = prepare(tmp_path)
+    first = source('检查结果还没定。', '复诊结果出来前，我还惦记着。', 'u-pending')
+    opened = send(adapter, first, [relation_row(first, 'protective_drive', 'unresolved')])
+    episode_id = opened['episodes'][0]['id']
+    quiet = by_id(advance(adapter, 24))[episode_id]
+
+    next_turn = source('报告仍然没到。', '这件事果然还没定。', 'u-still-pending')
+    still = identity(relation_row(next_turn, 'protective_drive', 'unresolved'), next_turn, episode_id)
+    unchanged = send(adapter, next_turn, [still], hours=24)
+    receipt, = diagnostics(unchanged)
+    assert receipt['status'] == 'still_unresolved'
+    assert receipt['episode_id'] == episode_id
+    assert receipt['before'] == receipt['after'] == quiet['intensity']
+    assert receipt['source_ref']['observation_id'] == still['observation_id']
+    assert by_id(unchanged)[episode_id] == quiet
+    assert adapter.store.receipt('fixture', 'u-still-pending')['relation_observations'] == [receipt]
+    assert send(adapter, next_turn, [still], hours=24)['b1_receipt']['replayed']
+
+    different = source('医院发现了新问题。', '听到这个新发现，我一下又担心起来。', 'u-new-risk')
+    rise = identity(relation_row(different, 'protective_drive', 'rise'), different, episode_id)
+    raised = send(adapter, different, [rise], hours=24)
+    impact, = diagnostics(raised)
+    assert impact['status'] == 'applied' and impact['before'] == quiet['intensity']
+    assert impact['after'] > impact['before']
+    after = by_id(raised)[episode_id]
+    assert after['status'] == 'unresolved'
+    assert after['updated_at'] != quiet['updated_at']
+    assert len(after['source_refs']) == len(quiet['source_refs']) + 1
+
+
 def test_cross_conversation_target_and_wrong_hash_do_not_block_a_valid_feeling(tmp_path):
     adapter = prepare(tmp_path)
     original = source('还没能见面。', '我想你，现在还见不到。', 'u-original')
