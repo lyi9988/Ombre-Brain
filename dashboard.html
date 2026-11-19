@@ -4267,6 +4267,16 @@ const portraitCandidateVisible = {
   profile_fact_candidates: PORTRAIT_CANDIDATE_PAGE_SIZE
 };
 let profileFacts = [];
+const PORTRAIT_DRAFT_STORAGE = 'ombre:portrait-review-drafts';
+const DASHBOARD_AUTH_EVENT = 'ombre:dashboard-auth-change';
+let portraitReviewSession = '';
+let portraitAuthEpoch = 0;
+let portraitLoadSequence = 0;
+const portraitReviewDrafts = new Map();
+
+window.addEventListener('storage', function(event) {
+  if (event.key === DASHBOARD_AUTH_EVENT) clearPortraitReviewSession();
+});
 let profileFactProposals = [];
 let anchorProposals = [];
 let wordMapData = null;
@@ -4325,8 +4335,11 @@ function authUrl(path) {
 }
 
 async function authFetch(url, options) {
+  const epoch = portraitAuthEpoch;
   const response = await fetch(url, options);
+  if (epoch !== portraitAuthEpoch) return null;
   if (response.status === 401) {
+    clearPortraitReviewSession();
     showAuthOverlay(false);
     return null;
   }
@@ -4365,9 +4378,11 @@ function clearAuthSensitiveFields(password) {
 }
 
 async function checkAuth() {
+  const epoch = portraitAuthEpoch;
   try {
-    const response = await fetch(authUrl('/auth/status'));
+    const response = await fetch(authUrl('/auth/status'), {cache: 'no-store'});
     const data = await response.json();
+    if (epoch !== portraitAuthEpoch) return false;
     if (data.identity) {
       if (data.identity.user_name) dashboardCommentAuthor = data.identity.user_name;
       if (data.identity.ai_name) dashboardAiAuthor = data.identity.ai_name;
@@ -4376,9 +4391,11 @@ async function checkAuth() {
       document.getElementById('auth-overlay').style.display = 'none';
       return true;
     }
+    if (response.ok || response.status === 401) clearPortraitReviewSession();
     showAuthOverlay(Boolean(data.setup_needed));
     return false;
   } catch (e) {
+    if (epoch !== portraitAuthEpoch) return false;
     showAuthOverlay(false);
     showAuthError('认证状态读取失败: ' + e.message);
     return false;
@@ -4396,6 +4413,7 @@ async function doSetup() {
     body: JSON.stringify({password: p1}),
   });
   if (response.ok) {
+    notifyDashboardAuthChange();
     document.getElementById('auth-overlay').style.display = 'none';
     clearAuthSensitiveFields(p1);
     loadBuckets();
@@ -4413,6 +4431,7 @@ async function doLogin() {
     body: JSON.stringify({password}),
   });
   if (response.ok) {
+    notifyDashboardAuthChange();
     document.getElementById('auth-overlay').style.display = 'none';
     clearAuthSensitiveFields(password);
     setTimeout(function() { clearAuthSensitiveFields(password); }, 80);
@@ -4423,8 +4442,16 @@ async function doLogin() {
 }
 
 async function doLogout() {
-  await fetch(authUrl('/auth/logout'), { method: 'POST' });
-  showAuthOverlay(false);
+  notifyDashboardAuthChange();
+  const epoch = portraitAuthEpoch;
+  try {
+    await fetch(authUrl('/auth/logout'), { method: 'POST' });
+  } finally {
+    if (epoch === portraitAuthEpoch) {
+      clearPortraitReviewSession();
+      showAuthOverlay(false);
+    }
+  }
 }
 
 document.querySelectorAll('.tab').forEach(tab => {
@@ -5335,24 +5362,100 @@ function setPortraitMaintainMessage(message, tone) {
   });
 }
 
+function persistPortraitReviewDrafts() {
+  try {
+    if (portraitReviewSession && portraitReviewDrafts.size) {
+      sessionStorage.setItem(PORTRAIT_DRAFT_STORAGE, JSON.stringify({
+        session: portraitReviewSession,
+        drafts: Array.from(portraitReviewDrafts)
+      }));
+    } else {
+      sessionStorage.removeItem(PORTRAIT_DRAFT_STORAGE);
+    }
+  } catch (e) {
+    // The current page can still retain drafts when browser storage is unavailable.
+  }
+}
+
+function clearPortraitReviewSession() {
+  portraitAuthEpoch++;
+  portraitState = null;
+  portraitReviewSession = '';
+  portraitReviewDrafts.clear();
+  persistPortraitReviewDrafts();
+  Object.keys(portraitCandidateVisible).forEach(function(area) {
+    portraitCandidateVisible[area] = PORTRAIT_CANDIDATE_PAGE_SIZE;
+  });
+  var content = document.getElementById('portrait-state-content');
+  var summary = document.getElementById('portrait-state-summary');
+  if (content) content.textContent = '';
+  if (summary) summary.textContent = '请重新读取画像';
+  if (portraitEditorScope) {
+    document.getElementById('detail-panel').classList.remove('open');
+    document.getElementById('detail-content').textContent = '';
+    portraitEditorScope = '';
+  }
+  setPortraitMaintainMessage('', '');
+}
+
+function notifyDashboardAuthChange() {
+  clearPortraitReviewSession();
+  try {
+    localStorage.setItem(DASHBOARD_AUTH_EVENT, Date.now() + ':' + Math.random());
+  } catch (e) {}
+}
+
+function readPortraitReviewSession(session) {
+  if (session === portraitReviewSession) return;
+  if (portraitReviewSession) clearPortraitReviewSession();
+  portraitReviewSession = session;
+  try {
+    var raw = sessionStorage.getItem(PORTRAIT_DRAFT_STORAGE);
+    var saved = raw && JSON.parse(raw);
+    if (saved && saved.session === session && Array.isArray(saved.drafts)) {
+      saved.drafts.forEach(function(entry) {
+        if (Array.isArray(entry) && typeof entry[0] === 'string' && typeof entry[1] === 'string') {
+          portraitReviewDrafts.set(entry[0], entry[1]);
+        }
+      });
+    }
+  } catch (e) {}
+  // Discard storage from another session, or unusable storage.
+  persistPortraitReviewDrafts();
+}
+
+function isCurrentPortraitReview(epoch, session) {
+  return !!session && epoch === portraitAuthEpoch && session === portraitReviewSession;
+}
+
 async function loadPortraitState() {
   var content = document.getElementById('portrait-state-content');
   var summary = document.getElementById('portrait-state-summary');
   if (!content || !summary) return;
   var maintenance = document.getElementById('portrait-maintenance-candidates');
   var maintenanceOpen = maintenance && maintenance.open;
+  var epoch = portraitAuthEpoch;
+  var sequence = ++portraitLoadSequence;
   content.innerHTML = '<div class="loading">加载 Portrait State…</div>';
   summary.textContent = '读取中…';
   try {
-    var res = await authFetch(BASE + '/api/portrait-state');
-    if (!res) return;
+    var res = await authFetch(BASE + '/api/portrait-state', { cache: 'no-store' });
+    if (!res || epoch !== portraitAuthEpoch || sequence !== portraitLoadSequence) return;
     var data = await res.json().catch(function() { return {}; });
+    if (epoch !== portraitAuthEpoch || sequence !== portraitLoadSequence) return;
     if (!res.ok) throw new Error(data.error || '加载失败');
+    if (typeof data.review_session !== 'string' || !/^[0-9a-f]{64}$/.test(data.review_session)) {
+      throw new Error('无法确认画像审核会话');
+    }
+    readPortraitReviewSession(data.review_session);
     portraitState = data;
     renderPortraitState(data);
-    if (maintenanceOpen) document.getElementById('portrait-maintenance-candidates').open = true;
+    if (maintenanceOpen && epoch === portraitAuthEpoch) {
+      document.getElementById('portrait-maintenance-candidates').open = true;
+    }
     if (portraitEditorScope) renderPortraitEditorPanel(portraitEditorScope);
   } catch (e) {
+    if (epoch !== portraitAuthEpoch || sequence !== portraitLoadSequence) return;
     summary.textContent = '读取失败';
     content.innerHTML = '<div class="loading">加载失败: ' + esc(e.message) + '</div>';
   }
@@ -5460,8 +5563,61 @@ function renderPortraitState(data) {
           renderPortraitCandidates('profile_fact_candidates', 'Profile Fact Candidates', state.profile_fact_candidates,
             Number((portrait.user || {}).stable_revision || 0)) +
         '</div>' +
+        renderUnmatchedPortraitDrafts(state.profile_fact_candidates) +
       '</div>' +
     '</details>';
+}
+
+function portraitL1ReviewReasonLabel(reason) {
+  switch (reason) {
+    case 'l1_sync_required': return '等待记忆同步';
+    case 'relation_guard_current': return '相关记忆仍可能有效，暂未采用';
+    case 'relation_guard_scope_unknown': return '相关记忆的适用范围待确认';
+    case 'l1_dependency_unavailable': return '暂时无法核对相关记忆';
+    case 'authority_disabled': return '记忆来源核验未启用';
+    case 'authority_unavailable':
+    case 'authority_read_failed': return '暂时无法读取记忆来源';
+    case 'owner_identity_unavailable': return '暂时无法确认主人身份';
+    case 'ineligible_stability': return '持续程度不适合进入画像';
+    case 'ineligible_kind': return '记忆类别不适合进入画像';
+    case 'retired_source':
+    case 'source_revoked':
+    case 'source_withdrawn':
+    case 'source_deleted': return '来源已失效或撤回';
+    case 'bucket_unavailable':
+    case 'source_not_found': return '未找到来源';
+    case 'bucket_read_failed':
+    case 'source_unavailable':
+    case 'source_read_failed':
+    case 'source_copy_unavailable':
+    case 'source_http_error':
+    case 'source_timeout': return '暂时取不到原话';
+    case 'user_source_wrong_scope': return '来源不适用于主人画像';
+    case 'no_owner_binding':
+    case 'no_verified_owner_excerpt':
+    case 'l1_v2_claim_needs_verified_owner_quote': return '没有可核实的主人原话';
+    case 'source_quote_changed':
+    case 'source_changed':
+    case 'source_mismatch':
+    case 'l1_source_changed_before_review':
+    case 'l1_source_changed_during_review':
+    case 'review_source_version_mismatch': return '来源已变化，需要重新核对';
+    case 'source_participant_mismatch':
+    case 'source_anchor_verification_failed': return '原话的发言人或位置未能核实';
+    case 'l1_dependency_changed_during_review': return '相关记忆在检查中变化';
+    case 'concurrent_checkpoint': return '另一轮送检已先完成';
+    case 'model_unavailable':
+    case 'model_response_invalid_json': return portraitDailyFailureLabel(reason);
+    case 'missing_review_response':
+    case 'invalid_review_response':
+    case 'missing_card_decision':
+    case 'duplicate_card_decision':
+    case 'invalid_candidates_list': return '模型没有返回完整的审核结果';
+    case 'candidate_quote_required':
+    case 'candidate_binding_required': return '候选缺少可核对的原话出处';
+    case 'all_candidates_rejected': return '本卡候选均未通过核对';
+    default: return '其他送检原因';
+  }
 }
 
 function renderPortraitL1Review(review) {
@@ -5479,7 +5635,16 @@ function renderPortraitL1Review(review) {
   var checkedAt = review.checked_at && new Date(review.checked_at).toLocaleString('zh-CN', {
     timeZone: 'Asia/Shanghai', hour12: false
   });
-  var details = Object.keys(reasons).map(function(reason) {
+  var reasonKeys = Object.keys(reasons);
+  var reasonCounts = new Map();
+  reasonKeys.forEach(function(reason) {
+    var label = portraitL1ReviewReasonLabel(reason);
+    reasonCounts.set(label, (reasonCounts.get(label) || 0) + Number(reasons[reason] || 0));
+  });
+  var details = Array.from(reasonCounts, function(entry) {
+    return esc(entry[0]) + ' × ' + esc(entry[1]);
+  }).join('，');
+  var diagnostics = reasonKeys.map(function(reason) {
     return esc(reason) + ' × ' + esc(reasons[reason]);
   }).join('，');
   return '<section class="portrait-candidates">' +
@@ -5489,7 +5654,8 @@ function renderPortraitL1Review(review) {
       (checkedAt ? ' · ' + esc(checkedAt) : '') + '</div>' +
       (review.checked_at ? '<div class="portrait-row-meta">检查 ' + esc(counts.attempted || 0) +
         ' 张 · 生成候选 ' + esc(counts.candidates || 0) + ' 条</div>' : '') +
-      (details ? '<div class="portrait-row-meta">' + details + '</div>' : '') +
+      (details ? '<div class="portrait-row-meta">' + details + '</div>' +
+        '<details class="portrait-row-meta"><summary>查看诊断码</summary>' + diagnostics + '</details>' : '') +
     '</div>' +
   '</section>';
 }
@@ -5875,6 +6041,39 @@ function portraitRowDateLabel(item) {
   return item.updated_at || item.created_at || '';
 }
 
+function portraitCandidateDraftKey(item) {
+  if (!item || item.origin !== 'l1_v2' || item.scope !== 'user' ||
+      item.status !== 'candidate' || !item.candidate_id) return '';
+  var source = portraitRows(item.evidence)[0] || {};
+  var memoryId = item.memory_id || source.memory_id;
+  var revision = item.memory_revision ?? source.memory_revision;
+  if (!memoryId || revision == null || !source.binding_id || source.source_revision == null) return '';
+  return JSON.stringify([item.candidate_id, memoryId, revision, source.bucket_id,
+    source.source_revision, source.binding_id, source.quote_start, source.quote_end]);
+}
+
+function rememberPortraitWording(input) {
+  var key = input.dataset.portraitDraftKey;
+  if (!portraitReviewSession || !key || !input.isConnected) return;
+  portraitReviewDrafts.set(key, input.value);
+  persistPortraitReviewDrafts();
+}
+
+function renderUnmatchedPortraitDrafts(candidates) {
+  var live = new Set(portraitRows(candidates).map(portraitCandidateDraftKey));
+  var drafts = Array.from(portraitReviewDrafts).filter(function(entry) {
+    return !live.has(entry[0]);
+  });
+  if (!drafts.length) return '';
+  return '<details class="portrait-candidates" id="portrait-unmatched-drafts">' +
+    '<summary>待核对的旧草稿（' + drafts.length + '）</summary>' +
+    '<p>原候选或来源已变化。以下文字留作对照，不会填到新候选。</p>' +
+    drafts.map(function(entry) {
+      return '<div class="portrait-row"><div class="portrait-row-text">' + esc(entry[1]) + '</div></div>';
+    }).join('') +
+  '</details>';
+}
+
 function renderPortraitRow(item) {
   item = item || {};
   var text = item.text || item.summary || item.fact || item.reason || '';
@@ -5898,9 +6097,13 @@ function renderPortraitRow(item) {
       '" onclick="approvePortraitFact(this)">采用到主人画像</button>'
     : '';
   var buttons = approveButton + deleteButton;
+  var draftKey = item._approve ? portraitCandidateDraftKey(item) : '';
+  var draft = draftKey ? portraitReviewDrafts.get(draftKey) : undefined;
   var content = item._approve
     ? '<label class="portrait-wording-label">给顾衍看的句子' +
-      '<input type="text" data-portrait-wording value="' + escAttr(item.display_text || '') + '"></label>' +
+      '<input type="text" data-portrait-wording' +
+      (draftKey ? ' data-portrait-draft-key="' + escAttr(draftKey) + '" oninput="rememberPortraitWording(this)"' : '') +
+      ' value="' + escAttr(draft ?? item.display_text ?? '') + '"></label>' +
       '<div class="portrait-row-text">来源原话 · ' + esc(text) + '</div>'
     : '<div class="portrait-row-text">' + esc(text) + '</div>';
   return '<div class="portrait-row">' +
@@ -5913,27 +6116,46 @@ function renderPortraitRow(item) {
 }
 
 async function approvePortraitFact(button) {
-  var wording = button.closest('.portrait-row').querySelector('[data-portrait-wording]').value.trim();
+  var session = portraitReviewSession;
+  var epoch = portraitAuthEpoch;
+  if (!session || !button.isConnected || button.disabled) return;
+  var input = button.closest('.portrait-row').querySelector('[data-portrait-wording]');
+  var key = input.dataset.portraitDraftKey;
+  var candidateId = button.dataset.candidateId;
+  var typed = input.value;
+  var wording = typed.trim();
   if (!wording) {
     setPortraitMaintainMessage('请先填写给顾衍看的句子。', 'error');
     return;
   }
+  if (key && (portraitReviewDrafts.has(key) || typed !== input.defaultValue)) rememberPortraitWording(input);
   button.disabled = true;
   try {
     var res = await authFetch(BASE + '/api/portrait-state/stable', {
       method: 'PUT',
-      headers: {'Content-Type': 'application/json'},
+      headers: {'Content-Type': 'application/json', 'X-Portrait-Review-Session': session},
       body: JSON.stringify({
         scope: 'user',
-        candidate_id: button.dataset.candidateId,
+        candidate_id: candidateId,
         expected_revision: Number(button.dataset.revision),
         display_text: wording
       })
     });
-    if (!res) return;
+    if (!res || !isCurrentPortraitReview(epoch, session)) return;
     var data = await res.json().catch(function() { return {}; });
+    if (!isCurrentPortraitReview(epoch, session)) return;
     if (res.status === 409) {
-      setPortraitMaintainMessage('画像或来源已更新。请刷新后核对候选。', 'error');
+      if (data.reason === 'portrait_review_session_changed') {
+        clearPortraitReviewSession();
+        setPortraitMaintainMessage('登录会话已变化，请重新读取候选。', 'error');
+        return;
+      }
+      if (portraitReviewDrafts.has(key) && ['source_version_changed', 'source_quote_changed'].includes(data.reason)) {
+        portraitReviewDrafts.set('unmatched:' + key, portraitReviewDrafts.get(key));
+        portraitReviewDrafts.delete(key);
+        persistPortraitReviewDrafts();
+      }
+      setPortraitMaintainMessage('画像或来源已更新。草稿已保留，请刷新后核对候选。', 'error');
       return;
     }
     if (!res.ok) {
@@ -5943,12 +6165,18 @@ async function approvePortraitFact(button) {
       }
       throw new Error(data.error || data.reason || '采用失败');
     }
+    if (data.candidate_id !== candidateId) throw new Error('未确认采用结果，请刷新核对');
+    if (portraitReviewDrafts.get(key) === typed) {
+      portraitReviewDrafts.delete(key);
+      persistPortraitReviewDrafts();
+    }
     await loadPortraitState();
+    if (!isCurrentPortraitReview(epoch, session)) return;
     var details = document.getElementById('portrait-maintenance-candidates');
     if (details) details.open = true;
     setPortraitMaintainMessage('已采用到主人画像。', 'ok');
   } catch (e) {
-    setPortraitMaintainMessage('采用失败，' + e.message, 'error');
+    if (isCurrentPortraitReview(epoch, session)) setPortraitMaintainMessage('采用失败，' + e.message, 'error');
   } finally {
     button.disabled = false;
   }
@@ -5962,21 +6190,40 @@ async function deletePortraitStateItem(specJson) {
     alert('删除参数错误。');
     return;
   }
+  var session = portraitReviewSession;
+  var epoch = portraitAuthEpoch;
+  var headers = {'Content-Type': 'application/json'};
+  var key = '';
+  if (spec.candidate_id) {
+    if (!session || !portraitState) return;
+    var candidate = portraitRows(portraitState.profile_fact_candidates).find(function(row) {
+      return row && row.candidate_id === spec.candidate_id;
+    });
+    key = portraitCandidateDraftKey(candidate);
+    headers['X-Portrait-Review-Session'] = session;
+  }
   if (!confirm('删除这条画像记录？')) return;
   spec.confirm = 'DELETE';
   try {
     var res = await authFetch(BASE + '/api/portrait-state/items', {
       method: 'DELETE',
-      headers: {'Content-Type': 'application/json'},
+      headers: headers,
       body: JSON.stringify(spec)
     });
-    if (!res) return;
+    if (!res || epoch !== portraitAuthEpoch) return;
     var data = await res.json().catch(function() { return {}; });
+    if (epoch !== portraitAuthEpoch) return;
+    if (res.status === 409 && data.reason === 'portrait_review_session_changed') {
+      clearPortraitReviewSession();
+      setPortraitMaintainMessage('登录会话已变化，请重新读取候选。', 'error');
+      return;
+    }
     if (!res.ok) throw new Error(data.error || data.reason || '删除失败');
+    if (key && portraitReviewDrafts.delete(key)) persistPortraitReviewDrafts();
     await loadPortraitState();
-    setPortraitMaintainMessage('已删除画像记录。', 'ok');
+    if (epoch === portraitAuthEpoch) setPortraitMaintainMessage('已删除画像记录。', 'ok');
   } catch (e) {
-    setPortraitMaintainMessage('删除失败: ' + e.message, 'error');
+    if (epoch === portraitAuthEpoch) setPortraitMaintainMessage('删除失败: ' + e.message, 'error');
   }
 }
 
