@@ -221,9 +221,10 @@ class MemoryReactionResolver:
         return None, 'legacy_authority_current' if legacy and not bindings else 'bound_source_current'
 
 
-def settle_reactions(state, policy, observations, context, validation, occurred_at, interaction_directions):
+def settle_reactions(state, policy, observations, context, validation, occurred_at, interaction_directions, *, relation_rows=()):
     """Mutate only the existing short axes inside their owner's transaction."""
     from persona_memory_reactions import RULES_VERSION, repeat_factor, apply_dimension
+    from persona_relation_dynamics import RETIRED, memory_direction, overlaps
     history = state.setdefault('memory_reaction_history', {})
     valid = (isinstance(validation, dict) and validation.get('state') == 'available'
         and validation.get('delivery_receipt_id') == context['delivery_receipt_id']
@@ -239,6 +240,9 @@ def settle_reactions(state, policy, observations, context, validation, occurred_
         if key not in BRAIN_DIMENSIONS:
             results[row['reaction_id']] = {**result, 'status': 'owned_by_aiz'}
             continue
+        if 'relation_dynamics' in policy and key in RETIRED:
+            results[row['reaction_id']] = {**result, 'status': 'retired_dimension'}
+            continue
         before = state['values'][key]
         result.update(before=before, after=before)
         if row['reaction'] in {'continuing', 'uncertain', 'none'}:
@@ -250,8 +254,10 @@ def settle_reactions(state, policy, observations, context, validation, occurred_
                 'reason': reason or (validation or {}).get('reason', 'memory_delivery_not_verified')}
             continue
         result['source_qualification'] = (validation.get('qualifications') or {}).get(row['memory_ref']['fragment_id'], 'verified_delivery_source')
-        if any(row['direction'] in interaction_directions.get((observation, key), set())
-                for observation in row['interaction_observation_ids']):
+        if (any(row['direction'] in interaction_directions.get((observation, key), set())
+                for observation in row['interaction_observation_ids'])
+                or any(key == direct['dimension'] and row['direction'] == memory_direction(direct)
+                    and overlaps(row['evidence_spans'], direct['evidence_spans']) for direct in relation_rows)):
             results[row['reaction_id']] = {**result, 'status': 'same_cause_already_settled'}
             continue
         repeat_key = digest([row['memory_ref']['source_group_id'], key, row['direction']])

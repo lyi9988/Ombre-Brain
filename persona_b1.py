@@ -30,6 +30,7 @@ from persona_inner_state import (STATE_SCHEMA, DECISION_SCHEMA, TENDENCIES,
     evidence_spans, hash_value, observation_id, bound_observation,
     verify_original_spans, subject_binding, new_state_fields, migrate_state,
     normalize_tendencies, upgrade_policy_v2, source_ref, safe_source_refs)
+import persona_relation_dynamics as relation
 def ident(x):
     if not isinstance(x,str) or not x.strip() or len(x)>256:raise ValueError('bounded identity required')
     return x
@@ -45,8 +46,11 @@ def values(x):
     if not isinstance(x,dict) or set(x)!=set(FIELDS):raise ValueError('complete state with explicit unknowns required')
     return {k:None if v is None else number(v) for k,v in x.items()}
 
-def _coordinates(state):
-    return {**state['values'],'fatigue':state['fatigue'].get('value'),
+def _coordinates(state, config=None):
+    values = state['values']
+    if config and 'relation_dynamics' in config:
+        values = {key: value for key, value in values.items() if key not in relation.RETIRED}
+    return {**values,'fatigue':state['fatigue'].get('value'),
             'slow_mood':state['slow_mood'].get('value')}
 
 def _differences(before,after):
@@ -61,7 +65,7 @@ def _unique_refs(refs):
     return result
 def policy(x):
     x=deepcopy(x)
-    if set(x)-{'soothing_policy','conflict_policy','empathy_policy','light_policy','presence_policy','security_grief_policy','correction_confidence_delta','growth_policy','rhythm_policy','fatigue_policy','pressure_policy','display_policy'}!={'revision','laws','events','repeat_hours','repeat_factor','couplings','subtype_policy','mixed_policy','cling_relief','sleep_multipliers','initial_sleeping','mood_policy','presentation','slow_axis_events','proof_policy'}:raise ValueError('explicit policy required')
+    if set(x)-{'soothing_policy','conflict_policy','empathy_policy','light_policy','presence_policy','security_grief_policy','correction_confidence_delta','growth_policy','rhythm_policy','fatigue_policy','pressure_policy','display_policy','relation_dynamics'}!={'revision','laws','events','repeat_hours','repeat_factor','couplings','subtype_policy','mixed_policy','cling_relief','sleep_multipliers','initial_sleeping','mood_policy','presentation','slow_axis_events','proof_policy'}:raise ValueError('explicit policy required')
     x.setdefault('soothing_policy',{})
     if x['soothing_policy']:
         if set(x['soothing_policy'])!={'repeat_hours','repeat_factor'}:raise ValueError('explicit soothing repetition policy')
@@ -195,6 +199,8 @@ def policy(x):
         for key in ('anger','grieve'):
             r=x['laws'][key]
             if r['target']!=0 or r['growth_per_hour']!=0 or 'rest_ceiling' in r:raise ValueError('conflict transfer requires explicit zero-target decaying anger/grief')
+    if 'relation_dynamics' in x:
+        relation.validate_profile(x, number)
     return x
 
 def decision_check_v1(d):
@@ -339,6 +345,8 @@ class PersonaB1Store:
             if r:
                 if r['seed_hash']!=seed:raise Conflict('different initial seed or policy')
                 return self._state(r)
+            if config.get('relation_dynamics') and db.execute('SELECT 1 FROM b1_state LIMIT 1').fetchone():
+                raise Conflict('relationship candidate requires a freshly initialized isolated ledger')
             state={'values':initial,'plateaus':{},'last_by_kind':{},'labels':[],'labels_updated_at':None,'causes':[],'subtypes':{},'mixed':{},'sleeping':config['initial_sleeping'],'mood_days':{},'slow_mood':{'value':None,'unit':'0..1','covered_hours':0,'unknown_hours':0},'base_label':None,'pending_base':None,'cause_label':None,'current_labels':[],'uncertain_labels':[],'proof_days':{},'label_times':{},'grudge':None,'conflict_episode':None,'empathy_loads':{},'empathy_seen':{},'empathy_daily':{},'light_taps':[],'heart_days':{},'lit':None,'light_marks':[],'last_conversation_at':None,'growth_coverage':{},'fatigue':{'value':config['fatigue_policy'].get('initial'),'as_of':when,'status':'initial_explicit' if config['fatigue_policy'] else 'unconfigured'},**new_state_fields()}
             if tendencies is not None or tendency_sources is not None:
                 vals,sources,evidence,issues=normalize_tendencies(tendencies,tendency_sources)
@@ -370,6 +378,8 @@ class PersonaB1Store:
             migrated=migrate_state({**raw,'at':row['at']},**supplied);stored=self._stored(migrated)
             target_revision=policy_revision if policy_revision is not None else (upgraded_policy['revision'] if upgraded_policy is not None else None)
             upgraded=policy(upgrade_policy_v2(old_policy if upgraded_policy is None else upgraded_policy,target_revision))
+            if old_policy.get('relation_dynamics', {}).get('profile') != upgraded.get('relation_dynamics', {}).get('profile'):
+                raise Conflict('relationship candidate requires a freshly initialized isolated ledger')
             if old_policy.get('conflict_policy') or 'reconciliation' in old_policy['events'] or 'reconciliation' in old_policy['slow_axis_events']:
                 if not stored['state_migrations']:
                     stored['state_migrations'].append({'from_schema':raw.get('state_schema'),'to_schema':STATE_SCHEMA,'at':row['at']})
@@ -402,6 +412,8 @@ class PersonaB1Store:
             row=db.execute('SELECT * FROM b1_state WHERE scope=?',(scope,)).fetchone()
             if row is None:raise KeyError('scope not initialized')
             raw=json.loads(row['state']);prior=json.loads(row['policy'])
+            if prior.get('relation_dynamics', {}).get('profile') != approved.get('relation_dynamics', {}).get('profile'):
+                raise Conflict('relationship candidate requires a freshly initialized isolated ledger')
             if raw.get('state_schema')!=STATE_SCHEMA:raise Conflict('explicit inner-state schema migration required first')
             if canonical(prior)==canonical(approved):return {'migrated':False,'state':self._state(row)}
             if row['revision']!=expected_revision:raise Conflict('stale policy upgrade revision')
@@ -437,7 +449,8 @@ class PersonaB1Store:
                 (scope,state['revision'])).fetchall()
             return state,config,[json.loads(item[0]) for item in rows]
     def _save_numeric(self,db,scope,revision,when,state,config):
-        numeric={'scope':scope,'revision':revision,'as_of':when,'policy_revision':config['revision'],'values':{**state['values'],'fatigue':state['fatigue']['value'],**state['tendencies']}}
+        numeric={'scope':scope,'revision':revision,'as_of':when,'policy_revision':config['revision'],'values':{**_coordinates(state,config),**state['tendencies']}}
+        numeric['values'].pop('slow_mood')
         db.execute('INSERT INTO b1_numeric VALUES(?,?,?,?)',(scope,revision,when,canonical(numeric)))
     def update_tendencies(self,scope,event_id,changes,sources,*,expected_revision,occurred_at):
         """Internal CAS update at an already settled checkpoint, without learning.
@@ -496,15 +509,21 @@ class PersonaB1Store:
     def receipt(self,scope,event_id):
         with closing(self._connect(True)) as db:
             r=db.execute('SELECT receipt FROM b1_events WHERE scope=? AND event_id=?',(ident(scope),ident(event_id))).fetchone();return json.loads(r[0]) if r else None
-    def settle(self,envelope,*,expected_revision,memory_validation=None):
+    def settle(self,envelope,*,expected_revision,memory_validation=None,relation_source=None):
         native = envelope.get('namespace') == 'b1-autonomy-memory-v1'
         if native:
             if (set(envelope) - {'interaction_modes'} != {'namespace','scope','event_id','occurred_at','policy_revision','decision','labels','memory_context','memory_reactions'}
                     or envelope['decision'].get('accepted') or envelope['decision'].get('rejected') or envelope['labels']
                     or envelope['memory_context'].get('scope', {}).get('consumer_kind') != 'autonomy'):
                 raise ValueError('native memory-only event required')
-        elif set(envelope)-{'nuances','tone','phase','operation_result','empathy_details','light_details','interaction_modes','feeling_sources','conversation_observed_at','correction_details','growth_frames','pressure_frames','phase_source_kind','memory_context','memory_reactions'}!={'namespace','scope','event_id','occurred_at','policy_revision','decision','labels'} or envelope['namespace']!='b1-completed-turn-v2':raise ValueError('internal v2 completed-turn envelope required')
+        elif set(envelope)-{'nuances','tone','phase','operation_result','empathy_details','light_details','interaction_modes','feeling_sources','conversation_observed_at','correction_details','growth_frames','pressure_frames','phase_source_kind','memory_context','memory_reactions','relation_observations'}!={'namespace','scope','event_id','occurred_at','policy_revision','decision','labels'} or envelope['namespace']!='b1-completed-turn-v2':raise ValueError('internal v2 completed-turn envelope required')
         e=deepcopy(envelope);e['scope']=ident(e['scope']);e['event_id']=ident(e['event_id']);e['occurred_at']=at(e['occurred_at']);e['decision']=decision_check(e['decision'])
+        relation_rows, relation_rejected = [], []
+        if 'relation_observations' in e:
+            if not isinstance(relation_source, dict) or digest(relation_source)!=e['decision']['source_hash']:
+                raise Conflict('canonical completed turn required for relationship observations')
+            relation_rows, relation_rejected = relation.verify_rows(e['relation_observations'],
+                e['decision']['source_hash'], relation_source)
         memory_rows=[]
         if 'memory_context' in e or 'memory_reactions' in e:
             from persona_memory_reaction_context import validate_reactions
@@ -621,7 +640,11 @@ class PersonaB1Store:
                 existing=db.execute('SELECT frame_json FROM b1_pressure_frames WHERE scope=? AND frame_id=?',(e['scope'],fid)).fetchone()
                 if existing and existing[0]!=raw:raise Conflict('pressure frame identity conflict')
                 if not existing:db.execute('INSERT INTO b1_pressure_frames VALUES(?,?,?)',(e['scope'],fid,raw))
-            before=deepcopy(s['values']);state_before=_coordinates(s);points={start,end}
+            dynamics = p.get('relation_dynamics')
+            if 'relation_observations' in e and not dynamics:
+                raise Conflict('relationship observations require explicit versioned Brain policy')
+            relation_results = relation.advance_non_numeric(s, dynamics, start, end) if dynamics else []
+            before=deepcopy(s['values']);state_before=_coordinates(s,p);points={start,end}
             for frame in frames+pressure_frames:
                 for key in ('grid_start','grid_end'):
                     boundary=datetime.fromisoformat(frame[key])
@@ -725,10 +748,14 @@ class PersonaB1Store:
                 for key,weights in s['subtypes'].items():
                     half=segment_laws[key]['half_life_hours'];retention=math.exp(-math.log(2)*hstep/half) if half else 1
                     for label in weights:weights[label]*=retention
-            time_state=_coordinates(s);effects=[];deferred=[];event_sources={};event_reasons={};interaction_directions={}
+            time_state=_coordinates(s,p);effects=[];deferred=[];event_sources={};event_reasons={};interaction_directions={}
             accepted_ids={row['observation_id'] for row in e['decision']['accepted']}
+            def trace_coordinate(key, prior, value, reason, ref):
+                if prior is not None and value is not None and prior!=value:
+                    event_sources.setdefault(key,[]).append(ref)
+                    event_reasons.setdefault(key,[]).append(reason)
             def trace(prior,reason,refs):
-                for key,value in _coordinates(s).items():
+                for key,value in _coordinates(s,p).items():
                     if prior.get(key) is not None and value is not None and prior[key]!=value:
                         event_sources.setdefault(key,[]).extend(refs)
                         event_reasons.setdefault(key,[]).append(reason)
@@ -853,11 +880,18 @@ class PersonaB1Store:
                 if s['values'][key] is not None:
                     weights=s['subtypes'].setdefault(key,{})
                     weights[label]=min(1,weights.get(label,0)+p['subtype_policy']['bump'])
+            settled_relation_rows=[]
+            if dynamics:
+                legacy_rows = relation.legacy_yearnings(e['decision']['source_hash'], e['decision']['accepted'],
+                    feeling_sources, modes, relation_rows) if relation_source is not None else []
+                settled_relation_rows, results = relation.apply_rows(s,dynamics,relation_rows+legacy_rows,e,end,trace_coordinate)
+                relation_results.extend(relation_rejected + results)
             memory_results=[]
             if memory_rows:
                 from persona_memory_reaction_context import settle_reactions
                 event_before=_coordinates(s)
-                memory_results=settle_reactions(s,p,memory_rows,e['memory_context'],memory_validation,e['occurred_at'],interaction_directions)
+                memory_results=settle_reactions(s,p,memory_rows,e['memory_context'],memory_validation,e['occurred_at'],interaction_directions,
+                    relation_rows=settled_relation_rows)
                 trace(event_before,'memory_reaction',[source_ref('operation' if native else 'conversation',e['event_id'],e['occurred_at'])])
             if p['subtype_policy']:
                 for key in list(s['subtypes']):
@@ -881,15 +915,21 @@ class PersonaB1Store:
                     else:s['mixed'].pop(pair,None)
             # Labels are evidence-supported simultaneous feelings, never inferred
             # from missing values or forced into a single winner.
-            if applied_labels and applied_interactions:
-                s['labels']=list(dict.fromkeys((s['labels'] if p['presentation'] else [])+applied_labels));s['labels_updated_at']=e['occurred_at']
-                for label in applied_labels:
+            visible_labels = applied_labels
+            if dynamics:
+                # A qualified old binding was handled above by the same
+                # expiring coarse-feeling mechanism as an independent one.
+                retired_labels = {'yearning', 'guarded', 'tender'}
+                visible_labels = [label for label in applied_labels if label not in retired_labels]
+            if visible_labels and applied_interactions:
+                s['labels']=list(dict.fromkeys((s['labels'] if p['presentation'] else [])+visible_labels));s['labels_updated_at']=e['occurred_at']
+                for label in visible_labels:
                     s['label_times'][label]=e['occurred_at']
                     s['label_sources'][label]=safe_source_refs([source_ref('conversation',e['event_id'],e['occurred_at'],binding['observation_id'])
                         for binding in feeling_sources if binding['label']==label and modes.get(binding['observation_id'],'apply')=='apply'])
             if p['presentation']:
                 from persona_b1_layers import update_layers
-                update_layers(s,p,end,applied_labels if applied_interactions else [],update_base=bool(applied_interactions or 'operation_result' in e or (start==end and s['base_label'] is None)))
+                update_layers(s,p,end,visible_labels if applied_interactions else [],update_base=bool(applied_interactions or 'operation_result' in e or (start==end and s['base_label'] is None)))
             if e['decision']['accepted']:
                 s['causes']=[{'observation_id':r['observation_id'],'kind':r['type'],'evidence_hash':r['evidence_hash'],
                     'source_kind':'conversation','event_id':e['event_id'],'occurred_at':e['occurred_at']} for r in e['decision']['accepted']]
@@ -898,13 +938,16 @@ class PersonaB1Store:
                 s['last_conversation_at']=e['occurred_at']
             stored=self._stored(s)
             receipt={'scope':e['scope'],'event_id':e['event_id'],'source_hash':e['decision']['source_hash'],'occurred_at':e['occurred_at'],'before_revision':s['revision'],'after_revision':s['revision']+1,'before':before,'after':s['values'],'effects':effects,'growth_frame_hashes':[frame['frame_hash'] for frame in frames],'pressure_frame_hashes':[frame['frame_hash'] for frame in pressure_frames],'observed_labels':labels,'applied_labels':applied_labels,'interaction_modes':{r['observation_id']:modes.get(r['observation_id'],'apply') for r in e['decision']['accepted']},'time_methods':time_methods,'deferred':deferred,'rejected':e['decision']['rejected'],'status':'candidate_applied','global_personality_changed':False,'production_applied':False}
+            if dynamics:
+                receipt['relation_observations'] = relation_results
+                receipt['applied_labels'] = visible_labels
             if 'memory_context' in e:
                 from persona_memory_reactions import RULES_VERSION
                 receipt['memory_reactions']={'schema':'memory-reaction-receipt-v1','rules_version':RULES_VERSION,
                     'delivery_receipt_id':e['memory_context']['delivery_receipt_id'],
                     'delivery_sha256':e['memory_context']['delivery_sha256'],'observations':memory_results}
                 if native: receipt['source_kind'] = 'autonomy'
-            state_after=_coordinates(s);recent=[]
+            state_after=_coordinates(s,p);recent=[]
             clock_ref={'kind':'clock','event_id':e['event_id'],'occurred_at':e['occurred_at']}
             for key,value in state_before.items():
                 middle,after=time_state[key],state_after[key]
@@ -917,7 +960,8 @@ class PersonaB1Store:
                         'source_refs':_unique_refs(event_sources[key])})
             receipt.update(schema='persona-inner-receipt-v1',unit='0..1',state_before=state_before,time_state=time_state,state_after=state_after,
                 time_deltas=_differences(state_before,time_state),event_deltas=_differences(time_state,state_after),
-                recent_changes=recent,source_refs=_unique_refs([ref for change in recent for ref in change['source_refs']]))
+                recent_changes=recent,source_refs=_unique_refs([ref for change in recent for ref in change['source_refs']]
+                    + [result['source_ref'] for result in relation_results if result.get('status') in ('applied','no_change')]))
             db.execute('UPDATE b1_state SET revision=?,at=?,state=? WHERE scope=?',(s['revision']+1,e['occurred_at'],canonical(stored),e['scope']))
             db.execute('INSERT INTO b1_events VALUES(?,?,?,?)',(e['scope'],e['event_id'],h,canonical(receipt)))
             self._save_numeric(db,e['scope'],s['revision']+1,e['occurred_at'],s,p)
@@ -968,6 +1012,27 @@ class PersonaB1Adapter:
         affect['unattributed_labels']=[label for label in candidates if not label_sources[label]]
         affect['labels']=[label for label in candidates if label_sources[label]]
         affect['label_sources']={label:label_sources[label] for label in affect['labels']}
+        relation_view = {}
+        if dynamics := p.get('relation_dynamics'):
+            retired = {'yearning', 'guarded', 'tender'}
+            for key in relation.RETIRED:
+                affect.pop(key, None)
+            for name in ('labels', 'uncertain_labels', 'unattributed_labels'):
+                affect[name] = [label for label in affect[name] if label not in retired]
+            for name in ('label_sources','label_times'):
+                affect[name] = {key: value for key, value in affect[name].items() if key not in retired}
+            active = sorted(s.get('relation_yearnings', {}).values(), key=lambda row: row['ref']['occurred_at'])
+            affect['label_until'] = {}
+            if active:
+                affect['labels'].insert(0, 'yearning')
+                affect['label_sources']['yearning'] = safe_source_refs([row['ref'] for row in active])
+                affect['label_times']['yearning'] = active[-1]['ref']['occurred_at']
+                affect['label_until']['yearning'] = max(row['until'] for row in active)
+            stance = s.get('relation_stance')
+            affect.update(relational_stance=stance['value'] if stance else None,
+                stance_source_refs=safe_source_refs([stance['ref']]) if stance else [],
+                stance_at=stance['ref']['occurred_at'] if stance else None)
+            relation_view['relation_profile'] = dynamics['profile']
         affect['mood_label']=affect['labels'][0] if affect['labels'] else None
         if affect['cause_label'] and affect['cause_label']['label'] not in affect['label_sources']:affect['cause_label']=None
         active_lit=s['lit'] if s['lit'] and datetime.fromisoformat(s['lit']['until'])>datetime.fromisoformat(s['at']) else None
@@ -981,7 +1046,7 @@ class PersonaB1Adapter:
             r=p['presence_policy'];pv=v['possessiveness'];cv=v['cling']
             if pv is not None and cv is not None and pv>=r['possessiveness_min']:
                 if cv>=r['cling_min']:affect['connection_phase']='想黏着'
-                elif s['last_conversation_at'] and (datetime.fromisoformat(s['at'])-datetime.fromisoformat(s['last_conversation_at'])).total_seconds()>=r['absence_hours']*3600:affect['connection_phase']='想念'
+                elif not dynamics and s['last_conversation_at'] and (datetime.fromisoformat(s['at'])-datetime.fromisoformat(s['last_conversation_at'])).total_seconds()>=r['absence_hours']*3600:affect['connection_phase']='想念'
         from persona_b1_layers import display_choice
         affect['display']=display_choice(affect,datetime.fromisoformat(s['at']),p['display_policy'])
         affect['last_conversation_at']=s['last_conversation_at'];affect['growth_coverage']=deepcopy(s['growth_coverage'])
@@ -990,9 +1055,9 @@ class PersonaB1Adapter:
                 'personality':deepcopy(self.global_snapshot.get('personality',{})),'updated_at':s['at'],'revision':s['revision'],
                 'conflict_episode':None,'slow_axes':{'security':v['slow_security'],'confidence':v['slow_confidence'],'mood':deepcopy(s['slow_mood'])},'sleeping':s['sleeping'],'tendencies':deepcopy(s['tendencies']),
                 'state_schema':s['state_schema'],'policy_revision':p['revision'],'tendency_sources':deepcopy(s['tendency_sources']),'migration_issues':deepcopy(s['migration_issues']),
-                'fatigue':deepcopy(s['fatigue']),'source':'b1_candidate','private_narrative_included':False,
+                'fatigue':deepcopy(s['fatigue']),'source':'b1_candidate','private_narrative_included':False,**relation_view,
                 'recent_changes':[deepcopy(change) for receipt in history for change in receipt.get('recent_changes',[])],
-                'source_refs':_unique_refs([ref for receipt in history for ref in receipt.get('source_refs',[])]+[ref for refs in affect['label_sources'].values() for ref in refs]+(affect['lit']['source_refs'] if affect['lit'] else []))}
+                'source_refs':_unique_refs([ref for receipt in history for ref in receipt.get('source_refs',[])]+[ref for refs in affect['label_sources'].values() for ref in refs]+(affect['lit']['source_refs'] if affect['lit'] else [])+affect.get('stance_source_refs',[]))}
     def advance_clock(self,event_id,when,policy_revision,growth_frames=None,pressure_frames=None):
         result=self.store.advance_clock(self.scope,event_id,when,policy_revision,growth_frames,pressure_frames)
         return {**self.snapshot(),'b1_receipt':result}
@@ -1085,5 +1150,6 @@ class PersonaB1Adapter:
     def settle(self,envelope,turn,*,memory_validation=None):
         _src,checked=self._validated_turn(envelope,turn)
         envelope=deepcopy(envelope);envelope['decision']=checked;envelope['conversation_observed_at']=at(envelope['occurred_at'])
-        r=self.store.settle(envelope,expected_revision=self.store.read(self.scope)['revision'],memory_validation=memory_validation)
+        r=self.store.settle(envelope,expected_revision=self.store.read(self.scope)['revision'],memory_validation=memory_validation,
+            relation_source=_src)
         return {**self.snapshot(),'b1_receipt':r}

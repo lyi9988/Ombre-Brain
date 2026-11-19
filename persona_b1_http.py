@@ -115,7 +115,7 @@ def register_candidate_route(mcp,engine_getter,authorized_internal,*,memory_cont
             # public/owner projection is the separate allowlist below.
             return JSONResponse({'status':'candidate_applied','replayed':result_receipt['replayed'],
                 'scope':receipt['scope'],'event_id':receipt['event_id'],'source_hash':receipt['source_hash'],
-                'revision':receipt['after_revision'],'b1_receipt':{'receipt':{k:receipt[k] for k in ('scope','event_id','source_hash','occurred_at','after_revision','status','memory_reactions') if k in receipt},'replayed':result_receipt['replayed']},'projection':safe_persona_projection(result)})
+                'revision':receipt['after_revision'],'b1_receipt':{'receipt':{k:receipt[k] for k in ('scope','event_id','source_hash','occurred_at','after_revision','status','memory_reactions','relation_observations') if k in receipt},'replayed':result_receipt['replayed']},'projection':safe_persona_projection(result)})
         except ModulationSourceUnavailable as exc:return _source_unavailable(exc)
         except Conflict:return JSONResponse({'error':'b1_identity_or_revision_conflict'},status_code=409)
         except (ValueError,TypeError,KeyError,OverflowError):return JSONResponse({'error':'invalid_b1_candidate_input'},status_code=400)

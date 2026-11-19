@@ -49,7 +49,8 @@ def safe_source_refs(refs):
                 continue
             if 'observation_id' in ref:
                 obs = ref['observation_id']
-                if not isinstance(obs, str) or not obs.startswith('obs:'):
+                if (not isinstance(obs, str) or not obs.startswith(('obs:', 'rel:'))
+                        or obs.startswith('rel:') and ref['kind'] != 'conversation'):
                     continue
                 hash_value(obs[4:])
         except (ValueError, TypeError):
