@@ -9935,6 +9935,21 @@ async def api_domain_taxonomy(request):
     return JSONResponse({"domains": domain_options()})
 
 
+def _portrait_review_session(request) -> str:
+    # Correlate dashboard requests without exposing the HttpOnly credential.
+    token = request.cookies["ombre_session"]
+    return hashlib.sha256(b"ombre-portrait-review\x00" + token.encode("ascii")).hexdigest()
+
+
+def _portrait_review_session_conflict(request):
+    from starlette.responses import JSONResponse
+
+    supplied = request.headers.get("x-portrait-review-session")
+    if supplied is not None and supplied != _portrait_review_session(request):
+        return JSONResponse({"status": "conflict", "reason": "portrait_review_session_changed"}, status_code=409)
+    return None
+
+
 @mcp.custom_route("/api/portrait-state", methods=["GET"])
 async def api_portrait_state(request):
     """Read maintained portrait state for dashboard inspection."""
@@ -9943,7 +9958,14 @@ async def api_portrait_state(request):
     if err:
         return err
     try:
-        return JSONResponse(await _portrait_state_payload())
+        payload = await _portrait_state_payload()
+        err = _require_dashboard_auth(request)
+        if err:
+            return err
+        return JSONResponse(
+            {**payload, "review_session": _portrait_review_session(request)},
+            headers={"Cache-Control": "no-store"},
+        )
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -9989,6 +10011,10 @@ async def api_portrait_state_item_delete(request):
         return JSONResponse({"error": "json body must be an object"}, status_code=400)
     if body.get("confirm") != "DELETE":
         return JSONResponse({"error": "confirmation required"}, status_code=400)
+    if body.get("candidate_id"):
+        conflict = _portrait_review_session_conflict(request)
+        if conflict is not None:
+            return conflict
 
     raw_index = body.get("index")
     try:
@@ -10054,6 +10080,9 @@ async def api_portrait_stable_edit(request):
     if expected_revision is None:
         return JSONResponse({"error": "expected_revision is required"}, status_code=400)
     if "candidate_id" in body:
+        conflict = _portrait_review_session_conflict(request)
+        if conflict is not None:
+            return conflict
         candidate_id = body["candidate_id"]
         if (
             body.get("scope") != "user"
