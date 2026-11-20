@@ -1,8 +1,10 @@
 """Normal Reflection ingestion and native v2 requests with a scripted provider."""
 import asyncio
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -741,6 +743,187 @@ def test_explicit_retry_keeps_unfinished_nonzero_window(tmp_path, monkeypatch):
     resumed = _run(engine, store, force=True)
     assert resumed['source_start_seq'] == 1 and resumed['processed_until_seq'] == 2
     assert len(calls) == 2 and len(engine.memory_authority_store.list_candidates(status='pending')) == 2
+
+
+def _source_recheck_fixture(tmp_path, monkeypatch):
+    from memory_source_provenance import BRIDGE_VERSION, canonical_source
+
+    def reply(payload):
+        a, b = (payload['messages'][i][0] for i in (0, 2))
+        review = {'confidence': .99, 'sensitive': False, 'transient': False, 'generic': False}
+        return [{**_card([a]), 'review': review},
+                {**_card([b]), 'title': '还书的约定', 'body': '2026年11月12日，我答应还书。',
+                 'keywords': ['还书'], 'review': review}]
+
+    engine, model_calls = _engine(tmp_path, reply, mode='auto')
+    engine.memory_ingestion_policy.source_modes['daily_chat'] = 'auto'
+    engine.config['gateway']['canonical_continuation']['base_url'] = 'https://source.invalid'
+    monkeypatch.setenv('OMBRE_CANONICAL_BRIDGE_TOKEN', 'test-only')
+    store = RawEventStore(engine.config)
+    canonical = {}
+    base = datetime.fromisoformat(DAY).replace(tzinfo=timezone.utc)
+    records = []
+    for i in range(6):
+        when = (base + timedelta(days=-1 if i < 2 else 0, seconds=i)).isoformat()
+        text = f'原始材料 {i}：我们说好了。'
+        role = 'user' if i % 2 == 0 else 'assistant'
+        metadata = {'profile_id': 'profile', 'round_id': i // 2}
+        if i in (2, 4):
+            canonical[f'msg-{i}'] = (when, text)
+            source = canonical_source({'event_id': f'msg-{i}', 'version_id': f'msg-{i}:1',
+                'role': role, 'text': text, 'created_at': when}, conversation_id='canonical-main', profile_id='profile')
+            metadata['canonical_source'] = {**source, 'bridge_version': BRIDGE_VERSION}
+        records.append({'source_event_id': f'e{i}', 'role': role, 'text': text, 'created_at': when,
+                        'session_id': 'main', 'conversation_id': 'main', 'metadata': metadata})
+    assert store.ingest(records, source='gateway')['inserted'] == 6
+    assert engine._update_daily_chat_memory_raw_cursor('profile', 2, '2026-11-11')
+
+    source = {'outcome': 'connect_error', 'reads': []}
+
+    def read(request):
+        assert request.url.host == 'source.invalid' and request.url.path == '/bridge/v1/memory-source'
+        msg_id, version = (request.url.params[key] for key in ('source_id', 'version'))
+        assert version == f'{msg_id}:1'
+        source['reads'].append((msg_id, version))
+        outcome = source['outcome']
+        if outcome == 'connect_error':
+            raise httpx.ConnectError('fixture disconnect', request=request)
+        if outcome == 'timeout':
+            raise httpx.ReadTimeout('fixture timeout', request=request)
+        if outcome in ('503', '403'):
+            return httpx.Response(int(outcome))
+        when, text = canonical[msg_id]
+        if outcome == 'withdrawn':
+            return httpx.Response(200, json={'source': {'state': 'withdrawn', 'eligible_source': False}})
+        return httpx.Response(200, json={'source': {'state': 'available', 'eligible_source': True,
+            'source_id': msg_id, 'source_revision': version, 'role': 'user', 'recorded_at': when,
+            'text': text if outcome == 'available' else '已更正的正文。'}})
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kw: client(transport=httpx.MockTransport(read), **kw))
+    return engine, store, source, model_calls
+
+
+@pytest.mark.parametrize('scenario', ['durable-recheck', 'same-day', 'old-generic-audit'])
+def test_daily_source_recheck_recovers_original_drafts_after_restart(tmp_path, monkeypatch, scenario):
+    engine, store, source, calls = _source_recheck_fixture(tmp_path, monkeypatch)
+    first = _run(engine, store)
+    run_id = first['run_id']
+    task_key = 'l1-v2:' + run_id
+    drafts = ChatSegmentProgress(engine.memory_authority_store).get(task_key)['progress']['drafts']
+    assert first['reason'] == 'source_not_currently_readable' and first['source_recheck_state'] == 'waiting'
+    assert first['issue']['source_diagnostic']['failure_kind'] == 'connection'
+    assert len(drafts) == 2 and len(calls) == 1 and not engine.memory_authority_store.list_candidates(status='pending')
+    if scenario == 'old-generic-audit':
+        window_key = 'daily_chat_l1_v2_window:' + run_id
+        window = engine.memory_authority_store.get_meta(window_key)
+        window.pop('source_recheck')
+        engine.memory_authority_store.set_meta(window_key, window)
+        engine._store_daily_chat_memory_run_audit({k: v for k, v in {**first, 'status': 'needs_review'}.items()
+                                                  if k not in ('source_recheck_state', 'issue')})
+    else:
+        # A later day's audit retention must not drop the recovery checkpoint.
+        Path(engine.daily_chat_memory_run_audit_path).write_text('[]', encoding='utf-8')
+    _append_event(store, '冻结后才到的同日新消息。')
+    advanced = scenario != 'same-day'
+    if advanced:
+        assert engine._update_daily_chat_memory_raw_cursor('profile', 7, '2026-11-13')
+
+    restarted = ReflectionEngine(engine.config)
+    restarted.enabled = restarted.auto_enabled = True
+    restarted.diary_memory_extract_enabled = False
+    # The retry must work with no model/route available, against the same archive.
+    def no_generation(_stage):
+        pytest.fail('source-only recovery loaded a generation route')
+    monkeypatch.setattr(restarted, '_memory_task_route', no_generation)
+    when = datetime.fromisoformat(DAY).replace(tzinfo=restarted.tz) + timedelta(days=2 if advanced else 1, hours=10)
+    monkeypatch.setattr(restarted, '_local_now', lambda now=None: now or when)
+    owner = SimpleNamespace(profile_id='profile')
+    # A second transient error should stay available for recovery.
+    source['outcome'] = '503'
+    asyncio.run(restarted.run_due(None, persona_engine=owner, raw_event_store=store))
+    count = len(restarted._load_daily_chat_memory_run_audit())
+    source['outcome'] = 'timeout'
+    asyncio.run(restarted.run_due(None, persona_engine=owner, raw_event_store=store))
+    assert len(restarted._load_daily_chat_memory_run_audit()) == count
+
+    source['outcome'] = 'available'
+    source['reads'].clear()
+    recovered, = asyncio.run(restarted.run_due(None, persona_engine=owner, raw_event_store=store))
+    assert recovered['run_id'] == run_id and recovered['source_end_seq'] == 6
+    assert recovered['status'] == 'pending' and recovered['pending_count'] == 2
+    assert recovered['model_call_count'] == 0 and recovered['cursor_updated'] is (not advanced) and len(calls) == 1
+    assert [row['content'] for row in recovered['candidates']] == [draft['body'] for draft in drafts]
+    assert all(row['mode'] == 'review' for row in recovered['candidates'])
+    assert source['reads'] == [('msg-2', 'msg-2:1'), ('msg-4', 'msg-4:1')]
+    assert restarted._daily_chat_memory_last_raw_event_id('profile') == (7 if advanced else 6)
+    if advanced:
+        assert asyncio.run(restarted.run_due(None, persona_engine=owner, raw_event_store=store)) == []
+    stale_button = asyncio.run(restarted.run_daily_chat_memory(None, raw_event_store=store,
+        persona_engine=owner, key=DAY, chat_windows_only=True, source_recheck_run_id=run_id))
+    assert stale_button['reason'] == 'source_recheck_not_pending'
+    assert len(restarted.memory_authority_store.list_candidates(status='pending')) == 2
+    assert source['reads'] == [('msg-2', 'msg-2:1'), ('msg-4', 'msg-4:1')]
+
+
+@pytest.mark.parametrize('after', ['withdrawn', 'changed', '403', 'missing_drafts', 'missing_window'])
+def test_daily_source_recheck_fails_closed_without_model_or_cursor_changes(tmp_path, monkeypatch, after):
+    engine, store, source, calls = _source_recheck_fixture(tmp_path, monkeypatch)
+    first = _run(engine, store)
+    assert first['source_recheck_state'] == 'waiting'
+    if after == 'missing_drafts':
+        with closing(engine.memory_authority_store._connect()) as db, db:
+            db.execute('DELETE FROM memory_chat_segment_progress WHERE task_id=?', ('l1-v2:' + first['run_id'],))
+    if after == 'missing_window':
+        with closing(engine.memory_authority_store._connect()) as db, db:
+            db.execute('DELETE FROM authority_meta WHERE key=?', ('daily_chat_l1_v2_window:' + first['run_id'],))
+    source['outcome'] = after
+    # The old date-only button must also pin to the saved window.
+    stopped = _run(engine, store, force=True)
+    assert stopped['run_id'] == first['run_id'] and stopped['status'] == 'needs_review'
+    assert stopped['source_recheck_state'] == 'blocked' and stopped['model_call_count'] == 0
+    assert not stopped['cursor_updated'] and engine._daily_chat_memory_last_raw_event_id('profile') == 2
+    assert len(calls) == 1 and not engine.memory_authority_store.list_candidates(status='pending')
+    source['reads'].clear()
+    assert _run(engine, store, force=True)['source_recheck_state'] == 'blocked'
+    assert source['reads'] == [] and len(calls) == 1
+
+
+def test_review_lists_filter_l1_generation_before_counting_and_paging(tmp_path):
+    from memory_l1_source_tasks import MemoryL1SourceTasks
+    from test_memory_authority_r1 import proposal
+
+    engine, _ = _engine(tmp_path, lambda payload: [_card([payload['messages'][0][0]])])
+    store = _events(engine, [('user', '我还记得我们怎么等的。')])
+    fresh = _run(engine, store)
+    assert fresh['status'] == 'pending'
+    authority = engine.memory_authority_store
+    old_card = proposal(proposal_id='zz-legacy-card', requested_mode='review')
+    with closing(authority._connect()) as db, db:
+        authority._put_candidate(db, old_card, engine.memory_ingestion_policy.evaluate(old_card))
+    engine._store_daily_chat_memory_run_audit({
+        'date': DAY, 'prompt_version': 'daily_chat_memory_v4.2', 'status': 'failed', 'run_id': 'legacy-run'})
+
+    sources = MemoryL1SourceTasks(authority)
+    current = sources.enqueue_action({'action_id': 'new-action', 'artifact_id': 'v1', 'request_id': 'now'},
+                                     generation_protocol='whole_window_v2')['task_id']
+    failed = sources.transition(current, 'prepared', 'failed', issue={'code': 'LITELLM_ERROR'})
+    assert failed['phase'] == 'failed'
+    prior = sources.enqueue_action({'action_id': 'old-action', 'artifact_id': 'v1', 'request_id': 'old'})['task_id']
+
+    for generation, card, run, task in (
+        ('v2', fresh['candidates'][0]['id'], fresh['run_id'], current),
+        ('legacy', old_card.proposal_id, 'legacy-run', prior),
+    ):
+        cards = engine.daily_chat_memory_pending_page(status='review_visible', generation=generation, limit=1)
+        assert [item['id'] for item in cards['items']] == [card]
+        assert cards['total'] == cards['saved_total'] == 1 and not cards['has_more']
+        assert engine.list_daily_chat_memory_run_audit(limit=1, generation=generation)[0]['run_id'] == run
+        page = sources.page_with_chat(limit=1, generation=generation)
+        assert [item['task_id'] for item in page['tasks']] == [task]
+        assert page['total'] == 1 and not page['has_more']
+    assert sources.page_with_chat(limit=1, generation='v2')['tasks'][0]['phase'] == 'failed'
+    assert authority.count_candidates() == 2 and sources.page_with_chat()['total'] == 2
 
 
 @pytest.mark.parametrize('has_title', [True, False])

@@ -11914,6 +11914,12 @@ async def api_daily_chat_memory_run(request):
     try:
         retry_only = _bool_value(body.get("retry_failed_windows"), False)
         force = _bool_value(body.get("force"), False)
+        source_recheck_id = body.get("source_recheck_run_id")
+        if "source_recheck_run_id" in body:
+            if (not isinstance(source_recheck_id, str)
+                    or not re.fullmatch(r"l1-v2-daily-[0-9a-f]{32}", source_recheck_id)):
+                return JSONResponse({"error": "invalid_source_recheck_run_id"}, status_code=400)
+            retry_only, force = True, False
         result = await reflection_engine.run_daily_chat_memory(
             bucket_mgr,
             conversation_turn_store=gateway_state_store,
@@ -11922,8 +11928,9 @@ async def api_daily_chat_memory_run(request):
             embedding_engine=embedding_engine,
             key=str(body.get("date") or ""),
             mode=str(body.get("mode") or ""),
-            force=force or retry_only,
+            force=force or (retry_only and not source_recheck_id),
             chat_windows_only=retry_only and not force,
+            **({"source_recheck_run_id": source_recheck_id} if source_recheck_id else {}),
         )
         if retry_only and not force:
             result["daily_activity_summary"] = {"status": "skipped", "reason": "only_failed_memory_windows_requested"}
@@ -12038,10 +12045,14 @@ async def api_daily_chat_memory_pending(request):
     if err:
         return err
     params = request.query_params
+    generation = str(params.get("generation") or "")
+    if generation not in ("", "v2", "legacy"):
+        return JSONResponse({"error": "invalid_l1_generation"}, status_code=400)
     page = reflection_engine.daily_chat_memory_pending_page(
         status=str(params.get("status") or "pending"),
         limit=_int_between(params.get("limit"), 50, 1, 200),
         offset=_int_between(params.get("offset"), 0, 0, 2147483647),
+        **({"generation": generation} if generation else {}),
     )
     return JSONResponse({"status": "ok", **page})
 
@@ -12436,13 +12447,17 @@ async def api_memory_l1_source_tasks(request):
                 task = tasks.get(str(task_id))
                 if task is None: raise L1OwnerError('task_not_found', status=404, field_path='task_id')
                 return JSONResponse({'status': 'ok', 'task': task, 'adoption_is_separate': True}, headers=headers)
-            if set(request.query_params) - {"limit", "offset"} or any(len(request.query_params.getlist(key)) > 1 for key in ('limit', 'offset')):
+            allowed = {"limit", "offset", "generation"}
+            if set(request.query_params) - allowed or any(len(request.query_params.getlist(key)) > 1 for key in allowed):
                 raise L1OwnerError("invalid_task_query", field_path="query")
             value = request.query_params.get("limit", "100")
             if not value.isascii() or not value.isdigit(): raise L1OwnerError("invalid_task_page_limit", field_path="limit")
             offset = request.query_params.get("offset", "0")
             if not offset.isascii() or not offset.isdigit(): raise L1OwnerError("invalid_task_page_limit", field_path="offset")
-            page = tasks.page_with_chat(limit=int(value), offset=int(offset))
+            generation = request.query_params.get("generation", "")
+            if generation not in ("", "v2", "legacy"):
+                raise L1OwnerError("invalid_l1_generation", field_path="generation")
+            page = tasks.page_with_chat(limit=int(value), offset=int(offset), generation=generation)
             return JSONResponse({"status": "ok", **page,
                 "adoption_is_separate": True}, headers=headers)
         raw = await request.body()
@@ -12770,12 +12785,17 @@ async def api_daily_chat_memory_runs(request):
     if err:
         return err
     limit = _int_between(request.query_params.get("limit"), 20, 1, 200)
+    generation = str(request.query_params.get("generation") or "")
+    if generation not in ("", "v2", "legacy"):
+        return JSONResponse({"error": "invalid_l1_generation"}, status_code=400)
     profile_id = str(getattr(persona_engine, "profile_id", "") or "default")
     return JSONResponse(
         {
             "status": "ok",
             "cursor": reflection_engine.daily_chat_memory_run_cursor(profile_id),
-            "runs": reflection_engine.list_daily_chat_memory_run_audit(limit=limit),
+            "runs": reflection_engine.list_daily_chat_memory_run_audit(
+                limit=limit, **({"generation": generation} if generation else {})),
+            "generation": generation,
         }
     )
 

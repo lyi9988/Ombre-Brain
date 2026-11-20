@@ -1192,14 +1192,28 @@ class ReflectionEngine(MemoryL1Runtime):
         now_local = self._local_now()
         results = []
         chat_candidates: list[dict] = []
-        from memory_l1_v2_generation import PROTOCOL, enabled as daily_v2_enabled, paused_legacy_checkpoint
+        from memory_l1_v2_generation import (PROTOCOL, SOURCE_NOT_READABLE, daily_source_rechecks,
+                                            enabled as daily_v2_enabled, paused_legacy_checkpoint)
 
         v2_active = daily_v2_enabled(self.config)
         if self.daily_chat_memory_mode != "off" and now_local.hour >= self.daily_chat_memory_hour:
             chat_date = (now_local - timedelta(days=1)).date()
             profile_id = str(getattr(persona_engine, "profile_id", "") or "default")
+            audits = self._load_daily_chat_memory_run_audit()
+            source_rechecks = ([row for row in daily_source_rechecks(self.memory_authority_store, audits, profile_id)
+                                if row['date'] <= chat_date.isoformat()]
+                               if v2_active and self.memory_authority_enabled else [])
+            recheck_dates = {row['date'] for row in source_rechecks}
+            recheck_date, recheck_result = '', None
+            if source_rechecks:
+                pinned = source_rechecks[0]
+                recheck_date = pinned['date']
+                recheck_result = await self.run_daily_chat_memory(
+                    bucket_mgr, conversation_turn_store=conversation_turn_store, raw_event_store=raw_event_store,
+                    persona_engine=persona_engine, key=recheck_date, chat_windows_only=True,
+                    source_recheck_run_id=pinned['run_id'])
             latest_by_date = {}
-            for row in reversed(self._load_daily_chat_memory_run_audit()):
+            for row in reversed(audits):
                 date_key = str(row.get("date") or "")
                 if (date_key and date_key <= chat_date.isoformat()
                         and row.get("profile_id", profile_id) == profile_id):
@@ -1208,9 +1222,16 @@ class ReflectionEngine(MemoryL1Runtime):
                                  "candidate_budget_exhausted_prepared", "retained_candidates_need_processing",
                                  "candidate_kind_retry_ready"}
             v2_recovery = {"candidate_persistence_failed", "l1_v2_daily_cursor_not_persisted"}
-            outstanding, unresolved = [], {}
+            outstanding = []
+            unresolved = {day: {"status": "partial", "reason": SOURCE_NOT_READABLE,
+                                "date": day, "profile_id": profile_id, "cursor_updated": False}
+                          for day in recheck_dates}
+            if recheck_result and recheck_result.get('source_recheck_state') in {'completed', 'blocked'}:
+                unresolved.pop(recheck_date, None)
             resume_problem = None
             for date_key, prior in sorted(latest_by_date.items()):
+                if date_key in recheck_dates:
+                    continue  # This date is not eligible for ordinary generation on this pass.
                 if v2_active and (paused := paused_legacy_checkpoint(prior, profile_id)):
                     unresolved[date_key] = paused
                     continue
@@ -1239,6 +1260,8 @@ class ReflectionEngine(MemoryL1Runtime):
                     outstanding.append(date_key)
             if outstanding:
                 chat_date = date.fromisoformat(outstanding[0])
+            elif recheck_result is not None and chat_date.isoformat() == recheck_date:
+                resume_problem = recheck_result
             elif chat_date.isoformat() in unresolved:
                 resume_problem = unresolved[chat_date.isoformat()]
             chat_target = datetime.combine(chat_date, time.max, tzinfo=self.tz)
@@ -1260,6 +1283,9 @@ class ReflectionEngine(MemoryL1Runtime):
             if remaining_dates:
                 chat_result["remaining_dates"] = sorted(set(remaining_dates))
                 chat_result["next_date"] = min(remaining_dates)
+            if (recheck_result is not None and recheck_date != chat_date.isoformat()
+                    and recheck_result.get('source_recheck_state') in {'completed', 'blocked'}):
+                results.append({"kind": "daily_chat_memory_source_recheck", **recheck_result})
             if chat_result.get("status") not in {"disabled", "skipped"}:
                 results.append(chat_result)
             chat_candidates = [
@@ -2611,6 +2637,7 @@ class ReflectionEngine(MemoryL1Runtime):
         force: bool = False,
         chat_windows_only: bool = False,
         now: datetime | None = None,
+        source_recheck_run_id: str = "",
     ) -> dict:
         """Run daily chat memory with a per-process concurrency lock.
 
@@ -2629,6 +2656,43 @@ class ReflectionEngine(MemoryL1Runtime):
                 "mode": effective_mode,
             }
         try:
+            if source_recheck_run_id or (force and chat_windows_only and key):
+                from memory_l1_v2_generation import daily_source_rechecks, enabled as daily_v2_enabled
+
+                if daily_v2_enabled(self.config) and self.memory_authority_enabled and self.memory_authority_store:
+                    profile_id = str(getattr(persona_engine, "profile_id", "") or "default")
+                    audits = self._load_daily_chat_memory_run_audit()
+                    pins = daily_source_rechecks(self.memory_authority_store, audits, profile_id,
+                                                 day=key or None, include_closed=True)
+                    if source_recheck_run_id:
+                        pinned = next((pin for pin in pins if pin['run_id'] == source_recheck_run_id), None)
+                    else:
+                        # A previously loaded date-only button must not start
+                        # generation for a failed or resolved source check.
+                        latest = next((row for row in reversed(audits) if row.get('date') == key
+                                       and row.get('profile_id') == profile_id), {})
+                        pinned = next((pin for pin in pins if pin['run_id'] == latest.get('run_id')), None)
+                        if not latest:
+                            pinned = next((pin for pin in pins if pin['state'] == 'waiting'), None)
+                        elif not pinned and latest.get('source_recheck_state') == 'blocked':
+                            return {"status": "needs_review", "reason": latest['error_category'], "date": key,
+                                    "source_recheck_state": "blocked", "model_call_count": 0, "cursor_updated": False}
+                    if pinned and pinned['state'] == 'waiting':
+                        if ((self.config.get("reflection") or {}).get("daily_chat_memory_mode", effective_mode) == "off"
+                                or getattr(self, "_daily_chat_memory_cancel_requested", False)):
+                            return {"status": "partial", "reason": "cancelled_or_disabled", "date": pinned['date']}
+                        return await self._run_daily_chat_memory_impl(
+                            bucket_mgr, conversation_turn_store=conversation_turn_store, raw_event_store=raw_event_store,
+                            persona_engine=persona_engine, key=pinned['date'], mode=mode, source_recheck=pinned)
+                    if pinned and pinned['state'] == 'blocked':
+                        return {"status": "needs_review", "reason": pinned['detail']['code'], "date": pinned['date'],
+                                "source_recheck_state": "blocked", "model_call_count": 0, "cursor_updated": False}
+                    if pinned or source_recheck_run_id:
+                        return {"status": "skipped", "reason": "source_recheck_not_pending", "date": key,
+                                "model_call_count": 0, "cursor_updated": False}
+                elif source_recheck_run_id:
+                    return {"status": "skipped", "reason": "source_recheck_not_available", "date": key,
+                            "model_call_count": 0, "cursor_updated": False}
             continuing = {"window_budget_exhausted", "candidate_budget_exhausted", "source_batch_exhausted",
                           "candidate_budget_exhausted_prepared", "retained_candidates_need_processing"}
             all_candidates, progress_keys = {}, {}
@@ -2720,6 +2784,7 @@ class ReflectionEngine(MemoryL1Runtime):
         force: bool = False,
         now: datetime | None = None,
         source_cursor: dict | None = None,
+        source_recheck: dict | None = None,
     ) -> dict:
         effective_mode = self._normalize_daily_chat_memory_mode(mode or self.daily_chat_memory_mode)
         if effective_mode == "off" or self._daily_chat_memory_candidate_limit(effective_mode) <= 0:
@@ -2735,6 +2800,9 @@ class ReflectionEngine(MemoryL1Runtime):
         if source_cursor is not None:
             raw_event_cursor_id = source_cursor["raw"]
             turn_cursor_id = source_cursor["turn"]
+        if source_recheck is not None:
+            raw_event_cursor_id = source_recheck["source_start_seq"]
+            turn_cursor_id = source_recheck["source_start_turn_id"]
         from memory_l1_v2_generation import enabled, has_daily_window, run_daily
         if enabled(self.config):
             if not (self.memory_authority_enabled and self.memory_authority_store):
@@ -2746,7 +2814,7 @@ class ReflectionEngine(MemoryL1Runtime):
             return await run_daily(self, bucket_mgr, key=key, start=start, end=end, profile_id=profile_id,
                 mode=effective_mode, force=force, raw_event_store=raw_event_store,
                 conversation_turn_store=conversation_turn_store, raw_cursor=raw_event_cursor_id,
-                turn_cursor=turn_cursor_id)
+                turn_cursor=turn_cursor_id, recheck=source_recheck)
         if force and source_cursor is None:
             raw_event_cursor_id = turn_cursor_id = 0
         if not conversation_turn_store:
@@ -3201,7 +3269,8 @@ class ReflectionEngine(MemoryL1Runtime):
     def list_daily_chat_memory_pending(self, *, status: str = "pending", limit: int = 50, offset: int = 0) -> list[dict]:
         return self.daily_chat_memory_pending_page(status=status, limit=limit, offset=offset)["items"]
 
-    def daily_chat_memory_pending_page(self, *, status: str = "pending", limit: int = 50, offset: int = 0) -> dict:
+    def daily_chat_memory_pending_page(self, *, status: str = "pending", limit: int = 50, offset: int = 0,
+                                       generation: str = "") -> dict:
         """Strictly read-only listing. Never mutates or persists anything.
 
         Opening/refreshing/leaving this page must not change candidate status;
@@ -3214,13 +3283,20 @@ class ReflectionEngine(MemoryL1Runtime):
             authority_status = {"confirmed": "committed", "applied": "committed",
                                 "applying": "accepted", "apply_failed": "commit_failed"}.get(safe_status, safe_status)
             mode = "auto" if safe_status == "applied" else "review" if safe_status == "confirmed" else None
-            total = self.memory_authority_store.count_candidates(status=authority_status, requested_mode=mode)
-            saved_total = self.memory_authority_store.count_candidates(status="all")
+            filter_kwargs = {"generation": generation} if generation else {}
+            total = self.memory_authority_store.count_candidates(status=authority_status, requested_mode=mode,
+                                                                 **filter_kwargs)
+            saved_total = self.memory_authority_store.count_candidates(status="all", **filter_kwargs)
             rows = self.memory_authority_store.list_candidates(status=authority_status, requested_mode=mode,
-                                                               limit=safe_limit, offset=offset)
+                                                                limit=safe_limit, offset=offset, **filter_kwargs)
             items = [self._authority_candidate_legacy_item(row) for row in rows]
         else:
             items = self._load_daily_chat_memory_pending()
+            if generation:
+                from memory_l1_v2 import is_v2
+
+                items = [item for item in items
+                         if is_v2((item.get("candidate") or {}).get("l1_document")) == (generation == "v2")]
             saved_total = len(items)
             if safe_status == "review_visible":
                 safe_status = "pending"
@@ -3933,9 +4009,14 @@ class ReflectionEngine(MemoryL1Runtime):
         except OSError as exc:
             logger.warning("Daily chat memory run audit write failed: %s", exc)
 
-    def list_daily_chat_memory_run_audit(self, *, limit: int = 20) -> list[dict]:
+    def list_daily_chat_memory_run_audit(self, *, limit: int = 20, generation: str = "") -> list[dict]:
         safe_limit = max(1, min(200, int(limit or 20)))
-        return self._load_daily_chat_memory_run_audit()[-safe_limit:]
+        rows = self._load_daily_chat_memory_run_audit()
+        if generation:
+            from memory_l1_v2_generation import PROTOCOL
+
+            rows = [row for row in rows if (row.get("prompt_version") == PROTOCOL) == (generation == "v2")]
+        return rows[-safe_limit:]
 
     def daily_chat_memory_diagnostics(self, run_id, *, limit=100):
         from memory_l1_v2_diagnostics import MemoryV2Diagnostics

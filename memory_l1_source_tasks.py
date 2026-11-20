@@ -169,7 +169,7 @@ class MemoryL1SourceTasks:
             return [json.loads(row['value']) for row in rows]
         finally: db.close()
 
-    def page_with_chat(self, *, limit=100, offset=0):
+    def page_with_chat(self, *, limit=100, offset=0, generation=""):
         """One ordered SQL page across the two existing task families."""
         if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0:
             raise L1OwnerError('invalid_task_page_limit', field_path='limit')
@@ -179,6 +179,10 @@ class MemoryL1SourceTasks:
         action_prefix = PREFIX + 'action_source_'
         where = '((key>=? AND key<?) OR (key>=? AND key<?) OR (key>=? AND key<?) OR (key>=? AND key<?))'
         params = (action_prefix, action_prefix + '\uffff', CHAT_PREFIX, CHAT_PREFIX + '\uffff', BROWSE_PREFIX, BROWSE_PREFIX + '\uffff', SUMMARY_PREFIX, SUMMARY_PREFIX + '\uffff')
+        if generation:
+            comparison = '=' if generation == 'v2' else '!='
+            where += f" AND COALESCE(json_extract(value,'$.generation_protocol'),''){comparison}?"
+            params = (*params, 'whole_window_v2')
         db = self.authority._connect()
         try:
             total = db.execute('SELECT count(*) FROM authority_meta WHERE ' + where, params).fetchone()[0]

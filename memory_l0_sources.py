@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import json
 
+from httpx import NetworkError, RemoteProtocolError
+
 from memory_l1_contract import L1ContractError, canonical_json, make_text_anchor, verify_text_anchor
 
 DIARY_NAMESPACE = "snapshot.ombre.diary_mcp"
@@ -127,7 +129,9 @@ class MemoryL0Sources:
             name = type(exc).__name__
             failure_kind = ('timeout' if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
                 or name in {'ReadTimeout', 'ConnectTimeout', 'PoolTimeout', 'WriteTimeout'}
-                else 'http_status' if name == 'HTTPStatusError' else 'read_error')
+                else 'http_status' if name == 'HTTPStatusError'
+                else 'connection' if isinstance(exc, (ConnectionError, NetworkError, RemoteProtocolError))
+                else 'read_error')
             status = getattr(getattr(exc, 'response', None), 'status_code', None)
             if failure_kind == 'http_status' and type(status) is int and 100 <= status <= 599:
                 http_status = status

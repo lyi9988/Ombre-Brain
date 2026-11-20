@@ -599,8 +599,7 @@ class MemoryAuthorityStore:
         finally:
             conn.close()
 
-    def list_candidates(self, *, status: str = "pending", limit: int = 100, offset: int = 0,
-                        requested_mode: str | None = None) -> list[dict[str, Any]]:
+    def _candidate_listing_filter(self, status: str, requested_mode: str | None, generation: str):
         clauses: list[str] = []
         params: list[Any] = []
         if status == "review_visible":
@@ -611,7 +610,18 @@ class MemoryAuthorityStore:
         if requested_mode is not None:
             clauses.append("COALESCE(json_extract(proposal_json,'$.requested_mode'),'review')=?")
             params.append(requested_mode)
+        if generation:
+            from memory_l1_v2 import SCHEMA_VERSION
+
+            operator = "=" if generation == "v2" else "!="
+            clauses.append(f"COALESCE(json_extract(proposal_json,'$.metadata.memory_l1.schema_version'),''){operator}?")
+            params.append(SCHEMA_VERSION)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
+
+    def list_candidates(self, *, status: str = "pending", limit: int = 100, offset: int = 0,
+                         requested_mode: str | None = None, generation: str = "") -> list[dict[str, Any]]:
+        where, params = self._candidate_listing_filter(status, requested_mode, generation)
         conn = self._connect()
         rows = conn.execute(
             f"SELECT * FROM candidates{where} ORDER BY created_at DESC,candidate_id DESC LIMIT ? OFFSET ?",
@@ -620,17 +630,8 @@ class MemoryAuthorityStore:
         conn.close()
         return [self._candidate_row(row) or {} for row in rows]
 
-    def count_candidates(self, *, status: str = "all", requested_mode: str | None = None) -> int:
-        clauses, params = [], []
-        if status == "review_visible":
-            clauses.append(self._review_visible_candidates_sql())
-        elif status and status != "all":
-            clauses.append("status=?")
-            params.append(status)
-        if requested_mode is not None:
-            clauses.append("COALESCE(json_extract(proposal_json,'$.requested_mode'),'review')=?")
-            params.append(requested_mode)
-        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    def count_candidates(self, *, status: str = "all", requested_mode: str | None = None, generation: str = "") -> int:
+        where, params = self._candidate_listing_filter(status, requested_mode, generation)
         conn = self._connect()
         try:
             return int(conn.execute("SELECT count(*) FROM candidates" + where, params).fetchone()[0])

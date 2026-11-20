@@ -2,6 +2,7 @@
 import ast
 import asyncio
 from pathlib import Path
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,8 @@ import pytest
     ({'date': '2026-10-17', 'retry_failed_windows': True}, True, None),
     ({'date': '2026-10-17'}, False, False),
     ({'date': '2026-10-17', 'force': True}, True, True),
+    ({'date': '2026-10-17', 'source_recheck_run_id': 'l1-v2-daily-' + 'a' * 32, 'force': True}, False, None),
+    ({'date': '2026-10-17', 'source_recheck_run_id': 'wrong-task'}, None, None),
 ])
 def test_failed_window_retry_targets_memory_without_forcing_summary(payload, memory_force, summary_force):
     tree = ast.parse((Path(__file__).parents[1] / 'server.py').read_text(encoding='utf-8'))
@@ -26,7 +29,7 @@ def test_failed_window_retry_targets_memory_without_forcing_summary(payload, mem
         return {'status': 'skipped'}
     async def impression(date): return None
     async def body(): return payload
-    scope = {'_require_dashboard_auth': lambda request: None,
+    scope = {'re': re, '_require_dashboard_auth': lambda request: None,
         '_bool_value': lambda value, default: value if isinstance(value, bool) else default,
         'reflection_engine': SimpleNamespace(run_daily_chat_memory=memory, run_daily_activity_summary=summary),
         'bucket_mgr': None, 'gateway_state_store': None, 'raw_event_store': None,
@@ -36,10 +39,14 @@ def test_failed_window_retry_targets_memory_without_forcing_summary(payload, mem
         'logger': SimpleNamespace(warning=lambda *args: None)}
     exec(compile(ast.Module(body=[endpoint], type_ignores=[]), 'server-retry-route', 'exec'), scope)
     response = asyncio.run(scope['api_daily_chat_memory_run'](SimpleNamespace(json=body)))
+    if memory_force is None:
+        assert response.status_code == 400 and not calls
+        return
     assert response.status_code == 200
     assert calls['memory']['key'] == '2026-10-17'
     assert calls['memory']['force'] is memory_force
     assert calls['memory']['chat_windows_only'] is (summary_force is None)
+    assert calls['memory'].get('source_recheck_run_id') == payload.get('source_recheck_run_id')
     if summary_force is None:
         assert 'summary' not in calls
     else:

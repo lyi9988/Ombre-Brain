@@ -36,6 +36,7 @@ CROSS_DAY_MINUTES = 30
 AUTO_L1_BAD_REQUEST_RETRIES = 2
 
 _WINDOW_PREFIX = 'daily_chat_l1_v2_window:'
+SOURCE_NOT_READABLE = 'source_not_currently_readable'
 _EVENT_TIME_ERRORS = {'event_date_missing_from_body', 'invalid_event_time',
                       'reversed_event_range', 'inconsistent_event_timezone'}
 _CHAT_WALL_TIME = r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?'
@@ -216,15 +217,38 @@ def _people(engine, snapshots, sources):
     return list(participants.values()), refs, narrator or {'name': narrator_name}, direct
 
 
+class _AutoSourceCheckError(L1OwnerError):
+    def __init__(self, result, source_ref):
+        super().__init__(SOURCE_NOT_READABLE, status=409, field_path='sources')
+        detail = result.get('source_diagnostic') or {}
+        # Only retry known transport failures. A missing/withdrawn version,
+        # a mismatched anchor, and a 401/403 are not transport failures.
+        self.retryable = result.get('state') == 'unavailable' and (
+            detail.get('failure_kind') in {'timeout', 'connection'}
+            or (detail.get('failure_kind') == 'http_status'
+                and detail.get('http_status') in {408, 502, 503, 504}))
+        self.detail = {name: detail[name] for name in ('failure_kind', 'http_status', 'reason_code')
+                       if name in detail}
+        self.detail['source_ref'] = source_ref
+        state = result.get('state')
+        if isinstance(state, str) and state in {
+                'unavailable', 'changed', 'withdrawn', 'revoked', 'deleted', 'forbidden', 'mismatch'}:
+            self.detail['state'] = state
+
+
 class Generation:
     def __init__(self, engine, *, origin, task_id, sources, context=None, include_review=False,
-                 active_reading=False, candidate_id=None, chat_model_io=None):
-        from memory_l1_v2 import catalog
-
+                 active_reading=False, candidate_id=None, chat_model_io=None, assemble_only=False):
         self.engine, self.origin, self.task_id = engine, origin, task_id
         self.model_calls = 0
         if origin not in L1_V2_SOURCE_RULES:
             raise L1OwnerError('l1_v2_unknown_source_kind', field_path='input_kind')
+        if assemble_only:
+            # Saved drafts can be verified even if the former model is no
+            # longer configured or the generation prompt has been edited.
+            self._bind_material(sources)
+            self.generation = {'origin': origin, 'task_id': task_id, 'prompt_source_id': PROMPT_ID}
+            return
         self.model_io = MemoryModelIO(engine.memory_authority_store)
         self.model_io_id = candidate_id or task_id
         self.chat_model_io = chat_model_io or {}
@@ -251,10 +275,7 @@ class Generation:
         self.compress_window = origin == 'auto_l1'
         # Leave space for the first pass output in the original-source request.
         self.planning_input_limit = INPUT_TOKENS - (COMPRESSION_OUTPUT_TOKENS if self.compress_window else 0)
-        self.sources = sources
-        self.snapshots, self.bindings = bind_sources(sources, config=engine.config)
-        self.people, self.speakers, narrator, direct = _people(engine, self.snapshots, sources)
-        self.catalog = catalog()
+        narrator, direct = self._bind_material(sources)
         self.include_review = include_review
         context = dict(context or {})
         if active_reading:
@@ -285,6 +306,15 @@ class Generation:
             self.common['agent_draft'] = {**self.common['agent_draft'], 'submitted_at': local_submission_time}
         self.views = [(index, anchor['start'], anchor['end'])
                       for index, binding in enumerate(self.bindings) for anchor in binding['anchors']]
+
+    def _bind_material(self, sources):
+        from memory_l1_v2 import catalog
+
+        self.sources = sources
+        self.snapshots, self.bindings = bind_sources(sources, config=self.engine.config)
+        self.people, self.speakers, narrator, direct = _people(self.engine, self.snapshots, sources)
+        self.catalog = catalog()
+        return narrator, direct
 
     def _attach_chat_draft(self, card):
         card['body'] = self.snapshots[0]['text']
@@ -546,9 +576,9 @@ class Generation:
         from memory_l1_v2 import prepare_card
 
         card = {key: value for key, value in draft.items()
-                if key not in {'_observed', '_prompt_revision', '_prompt_source_id', 'review'}}
-        generation = {**self.generation, 'prompt_revision': draft.get('_prompt_revision',
-            self.generation['prompt_revision'])}
+                if key not in {'_observed', '_prompt_revision', '_prompt_source_id', '_generation', 'review'}}
+        generation = {**draft.get('_generation', self.generation),
+                      'prompt_revision': draft.get('_prompt_revision', self.generation.get('prompt_revision'))}
         if self.origin == 'chat_l1':
             self._attach_chat_draft(card)
             generation['prompt_source_id'] = draft.get('_prompt_source_id', PROMPT_ID)
@@ -572,12 +602,15 @@ class Generation:
     async def verify(self, document):
         reader = self.engine._memory_l1_sources()
         wanted = {binding['binding_id']: binding for binding in document['evidence_bindings']}
-        for snapshot, binding in zip(self.snapshots, self.bindings, strict=True):
+        for index, (snapshot, binding) in enumerate(zip(self.snapshots, self.bindings, strict=True), 1):
             chosen = wanted.get(binding['binding_id'])
             if chosen:
                 reader.retain_copy(snapshot)
-                if not (await reader.locate(chosen, verify_only=True))['eligible_source']:
-                    raise L1OwnerError('source_not_currently_readable', status=409, field_path='sources')
+                result = await reader.locate(chosen, verify_only=True)
+                if not result['eligible_source']:
+                    if self.origin == 'auto_l1':
+                        raise _AutoSourceCheckError(result, f'm{index}')
+                    raise L1OwnerError(SOURCE_NOT_READABLE, status=409, field_path='sources')
 
 
 def _continuation(drafts, refs):
@@ -638,7 +671,7 @@ def _eligible_daily_cards(job, cards, core_refs, source_refs, *, part, prior_dra
     return accepted
 
 
-def _fold(drafts, cards, core_refs, context_refs, observed, *, prompt_revision):
+def _fold(drafts, cards, core_refs, context_refs, observed, *, prompt_revision, generation=None):
     from memory_l1_v2 import referenced_sources
 
     for card in cards:
@@ -651,6 +684,8 @@ def _fold(drafts, cards, core_refs, context_refs, observed, *, prompt_revision):
                  and (prior['title'] == card['title'] or set(prior['keywords']).intersection(card['keywords']))]
         refs = referenced_sources(card)
         value = {**card, '_observed': {ref: observed[ref] for ref in refs}, '_prompt_revision': prompt_revision}
+        if generation is not None:
+            value['_generation'] = {**generation, 'prompt_revision': prompt_revision}
         if len(peers) == 1:
             prior = drafts[peers[0]]
             if prior.get('review') and value.get('review'):
@@ -789,7 +824,7 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                    candidate_id=None, policy=None, owner_explicit=False, metadata=None,
                    required_source_ref=None, required_any_source_refs=None, before_prepare=None,
                    prepare_policy=None, expected_source_fingerprint=None, before_progress_save=None,
-                   active_reading=False, chat_model_io=None):
+                   active_reading=False, chat_model_io=None, source_recheck=False):
     """Durably prepare once, resume per range, and drain through the normal policy."""
     authority = engine.memory_authority_store
     queue = MemoryCandidatePreparation(authority)
@@ -803,17 +838,20 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
     if receipt is None:
         if effective_mode == 'off':
             raise L1OwnerError('memory_source_disabled', status=409, field_path='mode')
-        job = Generation(engine, origin=origin, task_id=task_id, sources=sources, context=context,
-                         include_review=effective_mode == 'auto' and not owner_explicit,
-                         active_reading=active_reading, candidate_id=candidate_id, chat_model_io=chat_model_io)
-        fingerprint = semantic_sha256({'sources': job.bindings, 'context': context, 'core_start': core_start})
-        if expected_source_fingerprint is not None and fingerprint != expected_source_fingerprint:
-            raise L1OwnerError('l1_v2_source_changed', status=409, field_path='sources')
         store = ChatSegmentProgress(authority)
         prior = store.get(key)
         state = prior['progress'] if prior else {'phase': 'ready', 'offset': 0, 'split': 0, 'parts': 0, 'drafts': []}
+        if source_recheck and (state['phase'] != 'generated' or not state['drafts']):
+            raise L1OwnerError('l1_v2_saved_drafts_unavailable', status=409, field_path='generation')
+        job = Generation(engine, origin=origin, task_id=task_id, sources=sources, context=context,
+                         include_review=effective_mode == 'auto' and not owner_explicit,
+                         active_reading=active_reading, candidate_id=candidate_id, chat_model_io=chat_model_io,
+                         assemble_only=source_recheck)
+        fingerprint = semantic_sha256({'sources': job.bindings, 'context': context, 'core_start': core_start})
+        if expected_source_fingerprint is not None and fingerprint != expected_source_fingerprint:
+            raise L1OwnerError('l1_v2_source_changed', status=409, field_path='sources')
         revision = prior['revision'] if prior else 0
-        if state.get('fingerprint', fingerprint) != fingerprint:
+        if state.get('fingerprint', None if source_recheck else fingerprint) != fingerprint:
             raise L1OwnerError('l1_v2_source_changed', status=409, field_path='sources')
         if state['phase'] in ('dispatched', 'failed') and not force:
             code = ('model_outcome_unknown_requires_retry_decision' if state['phase'] == 'dispatched'
@@ -832,9 +870,9 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                     exc, (L1OwnerError, ValueError)):
                 save({**state, 'phase': 'failed', 'issue': error})
 
-        base = [view for view in job.views if view[0] < core_start]
-        original_core = [view for view in job.views if view[0] >= core_start]
         if state['phase'] != 'generated':
+            base = [view for view in job.views if view[0] < core_start]
+            original_core = [view for view in job.views if view[0] >= core_start]
             while state['offset'] < len(original_core):
                 if getattr(engine, '_daily_chat_memory_cancel_requested', False):
                     raise L1OwnerError('cancelled_or_disabled', field_path='generation')
@@ -893,7 +931,8 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
                     elif active_reading:
                         cards = [job.prepare_reading_response(card) for card in cards]
                     prompt_revision = 'prompt_sha256:' + _digest(job._wire_prompt(wire[0]))
-                    _fold(drafts, cards, core_refs, context_refs, wire[4], prompt_revision=prompt_revision)
+                    _fold(drafts, cards, core_refs, context_refs, wire[4], prompt_revision=prompt_revision,
+                          generation=job.generation if origin == 'auto_l1' else None)
                 except Exception as exc:
                     # A known provider rejection/validation failure can be
                     # surfaced precisely. A timeout may already have run.
@@ -944,6 +983,8 @@ async def generate(engine, bucket_mgr, *, origin, task_id, source_type, mode, so
     for row in queue.remaining(receipt):
         identifier = row['candidate_id']
         if row['status'] == 'accepted':
+            if source_recheck:
+                continue  # Leave any owner decision to its existing consumer.
             try:
                 outcome = await engine._memory_l1_adopt_candidate(row, bucket_mgr, request_id=task_id + ':' + identifier)
             except Exception as exc:
@@ -1211,17 +1252,67 @@ def _save_daily_window(authority, key, window, *, previous=None):
         return current
 
 
+def daily_source_rechecks(authority, audits, profile_id, *, day=None, include_closed=False):
+    """Use the pinned window, not the profile's latest cursor, as retry identity."""
+    if authority is None:
+        return []
+    with closing(authority._connect()) as db:
+        rows = db.execute(
+            "SELECT key, json_extract(value,'$.task_id') AS task_id, "
+            "json_extract(value,'$.source_recheck') AS receipt FROM authority_meta "
+            "WHERE key>=? AND key<? AND json_extract(value,'$.source_recheck.profile_id')=?",
+            (_WINDOW_PREFIX, _WINDOW_PREFIX + '\uffff', profile_id)).fetchall()
+    pinned = {}
+    for row in rows:
+        run_id = row['key'][len(_WINDOW_PREFIX):]
+        pinned[run_id] = {**json.loads(row['receipt']), 'run_id': run_id, 'generation_task_id': row['task_id']}
+
+    # Older persisted failures have only a generic audit code. Give that
+    # exact saved window one source-only check; record a terminal stop if
+    # the version is actually unavailable or the drafts are missing.
+    seen = set(pinned)
+    for row in reversed(audits):
+        run_id = row.get('run_id')
+        if not run_id or run_id in seen or row.get('profile_id') != profile_id:
+            continue
+        seen.add(run_id)
+        waiting = row.get('source_recheck_state') == 'waiting'
+        old_unreadable = not row.get('source_recheck_state') and row.get('error_category') == SOURCE_NOT_READABLE
+        if (row.get('prompt_version') != PROTOCOL or row.get('status') not in {'partial', 'needs_review'}
+                or not (waiting or old_unreadable)
+                or not row.get('date') or (day is not None and row['date'] != day)):
+            continue
+        if run_id != _daily_run_id(profile_id, row['date'], row.get('source_start_seq'), row.get('source_start_turn_id')):
+            continue
+        pinned[run_id] = {**row, 'state': 'waiting', 'checked_at': row.get('completed_at', '')}
+    return sorted((row for row in pinned.values() if (day is None or row['date'] == day)
+                   and (include_closed or row['state'] == 'waiting')),
+                  key=lambda row: (row.get('checked_at', ''), row['date'], row['run_id']))
+
+
+def _record_source_recheck(authority, window_key, audit, state, detail=None):
+    receipt = {name: audit[name] for name in ('date', 'profile_id', 'source_start_seq', 'source_start_turn_id')}
+    receipt.update(state=state, checked_at=datetime.now(timezone.utc).isoformat(), detail=detail or {})
+    with closing(authority._connect()) as db, db:
+        db.execute("UPDATE authority_meta SET value=json_set(value,'$.source_recheck',json(?)) "
+                   "WHERE key=? AND json_extract(value,'$.task_id')=?",
+                   (canonical_json(receipt), window_key, audit.get('generation_task_id')))
+
+
 async def run_daily(engine, bucket_mgr, *, key, start, end, profile_id, mode, force,
-                    raw_event_store, conversation_turn_store, raw_cursor, turn_cursor):
+                    raw_event_store, conversation_turn_store, raw_cursor, turn_cursor, recheck=None):
     for row in reversed(engine._load_daily_chat_memory_run_audit()):
         if row.get('date') == key and row.get('profile_id', profile_id) == profile_id:
-            if paused := paused_legacy_checkpoint(row, profile_id):
+            if recheck is None and (paused := paused_legacy_checkpoint(row, profile_id)):
                 return {**paused, 'mode': mode}
             break
     run_id = _daily_run_id(profile_id, key, raw_cursor, turn_cursor)
     window_key = _WINDOW_PREFIX + run_id
     authority = engine.memory_authority_store
     queue = MemoryCandidatePreparation(authority)
+    source_only = recheck is not None
+    if source_only:
+        force, mode = False, 'review'
     audit = {'run_id': run_id, 'date': key, 'mode': mode, 'profile_id': profile_id, 'prompt_version': PROTOCOL,
              'source_start_seq': raw_cursor, 'source_start_turn_id': turn_cursor,
              'processed_until_seq': raw_cursor, 'processed_until_turn_id': turn_cursor,
@@ -1233,8 +1324,13 @@ async def run_daily(engine, bucket_mgr, *, key, start, end, profile_id, mode, fo
             raw_cursor=raw_cursor, turn_cursor=turn_cursor, source_kind=source_kind, through=through,
             cross_day_minutes=cross_day_minutes)
 
+    window, write_audit = None, True
     try:
         window = authority.get_meta(window_key)
+        if source_only:
+            audit['generation_task_id'] = recheck.get('generation_task_id') or run_id
+            if (run_id != recheck['run_id'] or not window or window['task_id'] != audit['generation_task_id']):
+                raise L1OwnerError('l1_v2_daily_window_superseded', status=409, field_path='sources')
         previous_cards = []
         if window is None:
             generation_key = 'l1-v2:' + run_id
@@ -1316,15 +1412,19 @@ async def run_daily(engine, bucket_mgr, *, key, start, end, profile_id, mode, fo
         audit.update(turn_source=turn_source, window_count=1, eligible_turn_count=count,
                      source_end_seq=watermark if turn_source == 'raw_events' else raw_cursor,
                      source_end_turn_id=watermark if turn_source == 'conversation_turns' else turn_cursor)
-        _diagnostic(engine, run_id, 'sources', {'origin': 'auto_l1', 'source_count': window['core_count'],
-                    'boundary_source_count': window['boundary_count'], 'source_kind': turn_source, 'turn_count': count,
-                    'source_from': start.isoformat(), 'source_to_exclusive': frozen_end.isoformat(),
-                    'source_watermark': watermark, 'source_manifest_sha256': window['manifest_sha256']})
+        if not source_only:
+            _diagnostic(engine, run_id, 'sources', {'origin': 'auto_l1', 'source_count': window['core_count'],
+                        'boundary_source_count': window['boundary_count'], 'source_kind': turn_source, 'turn_count': count,
+                        'source_from': start.isoformat(), 'source_to_exclusive': frozen_end.isoformat(),
+                        'source_watermark': watermark, 'source_manifest_sha256': window['manifest_sha256']})
         def evaluate(proposal):
             from memory_authority import PolicyDecision
 
             _record_day_continuation(proposal, previous_cards)
             decision = engine.memory_ingestion_policy.evaluate(proposal)
+            if source_only and decision.action == 'auto_accept':
+                return PolicyDecision('queue_review', ('REVIEW_RESUMED_SOURCE_CHECK',), 'review',
+                    requires_owner_confirmation=True)
             if decision.action == 'auto_accept' and proposal.metadata.get('l1_v2_continuation'):
                 # Neither equal topics nor an overlapping reply authorizes
                 # overwriting an existing experience or adopting a duplicate.
@@ -1332,13 +1432,14 @@ async def run_daily(engine, bucket_mgr, *, key, start, end, profile_id, mode, fo
                     decision.decision_policy, requires_owner_confirmation=True)
             return decision
 
-        if window['core_count']:
+        if window['core_count'] or source_only:
             guard_preceding_cards()
             result = await generate(engine, bucket_mgr, origin='auto_l1', task_id=task_id, source_type='daily_chat',
                 mode=mode, sources=sources, context=envelope, core_start=window['boundary_count'], force=force,
                 expected_source_fingerprint=window['source_fingerprint'],
                 before_prepare=guard_preparation, before_progress_save=guard_active_window,
-                metadata={'date': key}, prepare_policy=evaluate if previous_cards else None)
+                metadata={'date': key}, prepare_policy=evaluate if previous_cards or source_only else None,
+                source_recheck=source_only)
         else:
             # Explicitly revalidated withdrawal of every source in the frozen
             # prefix needs no model request. Persist the empty preparation.
@@ -1361,10 +1462,10 @@ async def run_daily(engine, bucket_mgr, *, key, start, end, profile_id, mode, fo
                 guard_preparation(db)
             status = 'pending' if pending else 'created' if adopted else 'zero_candidates'
             raw = turn_source == 'raw_events'
-            continuation = _daily_sources(engine, start=start, end=end, profile_id=profile_id,
-                raw_event_store=raw_event_store, conversation_turn_store=conversation_turn_store,
-                raw_cursor=watermark if raw else raw_cursor, turn_cursor=turn_cursor if raw else watermark,
-                source_kind=turn_source)
+            has_more = not source_only and bool(_daily_sources(engine, start=start, end=end, profile_id=profile_id,
+                 raw_event_store=raw_event_store, conversation_turn_store=conversation_turn_store,
+                 raw_cursor=watermark if raw else raw_cursor, turn_cursor=turn_cursor if raw else watermark,
+                 source_kind=turn_source)[1])
             update_cursor = (engine._update_daily_chat_memory_raw_cursor if raw
                              else engine._update_daily_chat_memory_conversation_cursor)
             current_cursor = (engine._daily_chat_memory_last_raw_event_id if raw
@@ -1376,9 +1477,12 @@ async def run_daily(engine, bucket_mgr, *, key, start, end, profile_id, mode, fo
             except Exception as exc:
                 raise L1OwnerError('l1_v2_daily_cursor_not_persisted', status=503, field_path='cursor') from exc
             audit['processed_until_seq' if raw else 'processed_until_turn_id'] = watermark
-            if continuation[1]:
+            if has_more:
                 audit['source_batch_has_more'] = True
                 status, reason = 'partial', 'source_batch_exhausted'
+            if source_only:
+                _record_source_recheck(authority, window_key, audit, 'completed')
+                audit['source_recheck_state'] = 'completed'
         audit.update(status=status, error_category=reason, processed_window_count=int(not result['adoption_issues']),
                      cursor_updated=cursor_updated)
         return {**audit, 'reason': reason, 'candidates': candidates, 'turns': count,
@@ -1389,9 +1493,30 @@ async def run_daily(engine, bucket_mgr, *, key, start, end, profile_id, mode, fo
             current = authority.get_meta(window_key)
             if current and current['task_id'] != audit['generation_task_id']:
                 issue = model_error_details(L1OwnerError('l1_v2_daily_window_superseded', status=409, field_path='sources'))
-        audit.update(status='partial', error_category=issue['code'], cursor_updated=False)
-        _diagnostic(engine, run_id, 'generation_issue', {'origin': 'auto_l1', 'issue': issue})
+        status = 'partial'
+        if source_only and issue['code'] == 'l1_v2_daily_window_superseded':
+            # The old audit may survive removal or replacement of its window.
+            # Close that retry without changing the current window or selecting another.
+            issue = model_error_details(L1OwnerError('l1_v2_source_recheck_window_unavailable',
+                                                     status=409, field_path='sources'))
+        if (isinstance(exc, _AutoSourceCheckError) or source_only) and issue['code'] != 'l1_v2_daily_window_superseded':
+            temporary = (isinstance(exc, _AutoSourceCheckError) and exc.retryable
+                         or issue['code'] == 'l1_v2_daily_cursor_not_persisted')
+            state = 'waiting' if temporary else 'blocked'
+            if isinstance(exc, _AutoSourceCheckError):
+                issue['source_diagnostic'] = exc.detail
+            if window:
+                _record_source_recheck(authority, window_key, audit, state, issue)
+            # Keep one failure entry per state transition, not one per poll.
+            write_audit = not (source_only and state == 'waiting'
+                               and ((window or {}).get('source_recheck') or {}).get('state') == state)
+            audit['source_recheck_state'] = state
+            status = 'partial' if temporary else 'needs_review'
+        audit.update(status=status, error_category=issue['code'], cursor_updated=False)
+        if write_audit:
+            _diagnostic(engine, run_id, 'generation_issue', {'origin': 'auto_l1', 'issue': issue})
         return {**audit, 'reason': issue['code'], 'issue': issue}
     finally:
-        if audit.get('error_category') != 'l1_v2_daily_window_superseded' and (audit['window_count'] or audit.get('error_category')):
+        if (write_audit and audit.get('error_category') != 'l1_v2_daily_window_superseded'
+                and (audit['window_count'] or audit.get('error_category'))):
             engine._store_daily_chat_memory_run_audit({**audit, 'completed_at': datetime.now(timezone.utc).isoformat()})
