@@ -228,6 +228,7 @@ def test_dashboard_historical_task_can_be_read_but_not_retried(tmp_path, monkeyp
     assert json.loads(listing.body)['tasks'][0]['source_kind'] == 'owner_summary'
     detail = invoke('GET', '/' + ident, ident)
     assert detail.status_code == 200 and json.loads(detail.body)['task']['task_id'] == ident
+    assert json.loads(detail.body)['receipt']['retryable'] is False
     retry = invoke('POST', '/' + ident + '/retry', ident)
     assert retry.status_code == 410 and json.loads(retry.body)['error'] == 'owner_summary_l1_retired'
     assert f.tasks.get(ident) == original and not f.calls

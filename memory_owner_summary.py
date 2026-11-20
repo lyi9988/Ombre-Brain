@@ -212,7 +212,7 @@ class OwnerSummaryPreparation(ChatMemoryPreparation):
         row = self.get(mid)
         if not row: raise L1OwnerError('task_not_found', status=404, field_path='task_id')
         return {'task': self.public(row), 'draft': copy.deepcopy(row['envelope']['summary']),
-            'receipt': self.receipt(mid), 'history': [], 'editable': False,
+            'receipt': self.historical_receipt(mid), 'history': [], 'editable': False,
             'preparation_output': {'windows': [{'ranges':copy.deepcopy(w['ranges']),
                 'draft_range':copy.deepcopy(w['draft_range']), 'state':w['state'],
                 'output':copy.deepcopy(w.get('output')), 'candidate_ids':list(w['candidate_ids'])}
@@ -310,6 +310,9 @@ class OwnerSummaryPreparation(ChatMemoryPreparation):
             'memory_ids': memory_ids, 'memories': items, 'linked_memories': linked, 'issue': effective_issue,
             'windows': {'completed': len(completed), 'total': len(row.get('windows') or [])},
             'recall_guaranteed': False}
+
+    def historical_receipt(self, mid):
+        return {**self.receipt(mid), 'retryable': False}
 
     def _active_prompt(self, row):
         from memory_l1_v2_generation import PROMPT_ID, PROTOCOL
@@ -563,8 +566,8 @@ async def owner_summary_response(request, engine, authority):
     if authority is None or engine is None or not engine.memory_authority_enabled:
         return JSONResponse({'error':'memory_authority_unavailable'}, status_code=503, headers=headers)
     try:
-        receipt = OwnerSummaryPreparation(authority, engine).receipt(task_id(request.path_params['operation_id']))
-        return JSONResponse({**receipt, 'retryable': False}, headers=headers)
+        receipt = OwnerSummaryPreparation(authority, engine).historical_receipt(task_id(request.path_params['operation_id']))
+        return JSONResponse(receipt, headers=headers)
     except L1OwnerError as exc:
         return JSONResponse({'error':exc.code, 'field_path':exc.field_path}, status_code=exc.status, headers=headers)
     except (ValueError, TypeError, KeyError, UnicodeError):
