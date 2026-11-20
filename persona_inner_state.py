@@ -49,9 +49,10 @@ def safe_source_refs(refs):
                 continue
             if 'observation_id' in ref:
                 obs = ref['observation_id']
-                if not isinstance(obs, str) or not obs.startswith('obs:'):
+                if (not isinstance(obs, str) or not obs.startswith(('obs:', 'rel:', 'mr:'))
+                        or obs.startswith('rel:') and ref['kind'] != 'conversation'):
                     continue
-                hash_value(obs[4:])
+                hash_value(obs.partition(':')[2])
         except (ValueError, TypeError):
             continue
         key = (ref['kind'], ref['event_id'], ref['occurred_at'], ref.get('observation_id'))
@@ -76,20 +77,20 @@ def hash_value(value):
     return value
 
 
-def evidence_spans(spans):
+def evidence_spans(spans, *, roles=('user', 'assistant')):
     if not isinstance(spans, list) or not spans:
         raise ValueError('nonempty evidence spans required')
     keys = []
     for span in spans:
         if not isinstance(span, dict) or set(span) != {'role', 'start', 'end', 'evidence_hash'}:
             raise ValueError('complete evidence span required')
-        if span['role'] not in ('user', 'assistant'):
+        if span['role'] not in roles:
             raise ValueError('source role required')
         if (any(isinstance(span[k], bool) or not isinstance(span[k], int) for k in ('start', 'end'))
                 or not 0 <= span['start'] < span['end']):
             raise ValueError('bounded evidence span required')
         hash_value(span['evidence_hash'])
-        keys.append((0 if span['role'] == 'user' else 1, span['start'], span['end']))
+        keys.append((roles.index(span['role']), span['start'], span['end']))
     if keys != sorted(set(keys)):
         raise ValueError('canonical sorted unique evidence spans required')
     return deepcopy(spans)
@@ -202,7 +203,7 @@ def new_state_fields():
     tendencies, sources, _, _ = normalize_tendencies()
     return {'state_schema': STATE_SCHEMA, 'tendencies': tendencies,
             'tendency_sources': sources, 'tendency_evidence': {},
-            'migration_issues': [], 'state_migrations': [], 'label_sources': {}}
+            'migration_issues': [], 'state_migrations': [], 'label_sources': {}, 'memory_reaction_history': {}}
 
 
 def migrate_state(raw, *, tendencies=None, tendency_sources=None):
@@ -251,4 +252,5 @@ def migrate_state(raw, *, tendencies=None, tendency_sources=None):
     state['state_schema'] = STATE_SCHEMA
     state.setdefault('state_migrations', [])
     state.setdefault('label_sources', {})
+    state.setdefault('memory_reaction_history', {})
     return state

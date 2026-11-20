@@ -102,11 +102,36 @@ def _b1_projection(state,updated_at,profile_id):
     if isinstance(raw_fatigue,dict) and raw_fatigue.get('status') in ('initial_explicit','unconfigured','unchanged','unknown_seed','sleep_recovery','unknown_sleep_phase','unknown_pressure','high_pressure','known_pressure_below_or_equal'):
         fatigue_state={'value':_unit(raw_fatigue.get('value')),'as_of':_stamp(raw_fatigue.get('as_of')),'status':raw_fatigue['status']}
         if 'last_known' in raw_fatigue:fatigue_state.update(last_known=_unit(raw_fatigue.get('last_known')),last_known_at=_stamp(raw_fatigue.get('last_known_at')))
-    return {"profile_id":str(state.get("profile_id") or profile_id),
+    projected = {"profile_id":str(state.get("profile_id") or profile_id),
       "affect":{"label":labels[0] if labels else None,"labels":labels,"label_sources":label_sources,"unattributed_labels":unattributed,"labels_updated_at":_stamp(affect.get("labels_updated_at")),"subtypes":subtypes,"mixed":mixed,"lit":lit,"growth_coverage":coverage,"display":display,"light_marks":marks[-128:],"empathy_load":loads,"conflict_episode":episode,"connection_phase":affect.get("connection_phase") if affect.get("connection_phase") in ("想黏着","想念") else None,"last_conversation_at":_stamp(affect.get("last_conversation_at")),"base_label":base,"cause_label":cause_safe,"uncertain_labels":uncertain,"intensity":level(affect.get("arousal"),.24,.62),"valence":_unit(affect.get("valence")),"arousal":_unit(affect.get("arousal")),"tenderness":_unit(affect.get("tenderness")),"session_defensiveness":_unit(affect.get("session_defensiveness")),"source":"brain_b1_candidate"},
       "drive":{"labels":drive_labels,"longing":_unit(affect.get("longing")),"protective":_unit(affect.get("protective_drive")),"longing_level":level(affect.get("longing"),.20,.45),"protective_level":level(affect.get("protective_drive"),.35,.62),"possessiveness":_unit(affect.get("possessiveness")),**{k:_unit(affect.get(k)) for k in ("libido","grieve","anger","favored","cling")},"source":"brain_b1_candidate"},
       "relationship":{"weather":weather,"closeness":level(affinity,.45,.78),"trust":level(trust,.45,.72),"source":"ombre_relationship_frozen"},
       "updated_at":str(updated_at or state.get("updated_at") or ""),"revision":state.get("revision"),"policy_revision":state.get("policy_revision"),"source":"b1_candidate","state_schema":STATE_SCHEMA,"slow_axes":slow_safe,"tendencies":tendencies,"tendency_sources":tendency_sources,"fatigue_state":fatigue_state,"fatigue":_unit(state.get("fatigue",{}).get("value")) if isinstance(state.get("fatigue"),dict) else None}
+    from persona_relation_dynamics import PROFILE
+    from persona_relation_episodes import PROFILE as B15, public_episodes
+    if state.get('relation_profile') in (PROFILE, B15):
+        projected['relation_profile'] = state['relation_profile']
+        view = projected['affect']
+        view.pop('tenderness')
+        view.pop('session_defensiveness')
+        stamp = _stamp(affect.get('stance_at'))
+        refs = safe_source_refs(affect.get('stance_source_refs'))
+        until = affect.get('label_until', {})
+        label_times = affect.get('label_times', {})
+        expiry = _stamp(until.get('yearning')) if isinstance(until, dict) else None
+        view.update(security=_unit(affect.get('security')),
+            relational_stance=_unit(affect.get('relational_stance')) if stamp and refs else None,
+            stance_source_refs=refs if stamp else [],
+            stance_at=stamp if refs else None,
+            label_times={label: _stamp(label_times.get(label)) for label in labels if isinstance(label_times, dict) and label in label_times},
+            label_until={'yearning': expiry} if expiry and 'yearning' in labels else {})
+        if projected['relation_profile'] == B15:
+            projected['episodes'] = public_episodes(state.get('episodes'))
+            for key in ('fatigue', 'fatigue_state', 'drive'):
+                projected.pop(key)
+            for key in ('subtypes', 'mixed', 'connection_phase', 'growth_coverage', 'empathy_load', 'conflict_episode'):
+                view.pop(key)
+    return projected
 
 
 

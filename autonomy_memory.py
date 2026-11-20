@@ -349,3 +349,45 @@ def validate_usage_source(query, actual):
             if (not isinstance(text, str) or type(start) is not int or type(end) is not int
                     or not 0 <= start < end <= len(text) or sha(text[start:end]) != ref.get('text_sha256')):
                 raise ValueError('autonomy_memory_use_source_mismatch')
+
+
+SCOPE_FIELDS = {'consumer_kind', 'conversation_id', 'identity_id', 'activity_id',
+                'activity_revision', 'source_scope', 'cycle_id', 'operation_id'}
+ROLES = ('planning_output', 'step_outcome')
+
+
+def validate_scope(scope):
+    if not isinstance(scope, dict) or set(scope) != SCOPE_FIELDS or scope['consumer_kind'] != 'autonomy':
+        raise ValueError('native autonomy scope required')
+    for key in SCOPE_FIELDS - {'activity_id', 'activity_revision'}:
+        if not isinstance(scope[key], str) or not scope[key] or len(scope[key]) > 400:
+            raise ValueError('native autonomy identity required')
+    if scope['activity_id'] is None:
+        if scope['activity_revision'] is not None: raise ValueError('activity revision mismatch')
+    elif (not isinstance(scope['activity_id'], str) or not scope['activity_id']
+          or type(scope['activity_revision']) is not int or scope['activity_revision'] < 1):
+        raise ValueError('activity revision required')
+    return scope
+
+
+def source_hash(source):
+    if (not isinstance(source, dict) or set(source) != {'schema', 'scope', 'request_id',
+            'input_sha256', 'planning_output', 'step_outcome', 'source_events'}
+            or source['schema'] != 'autonomy-memory-source-v1'
+            or not isinstance(source.get('scope'), dict)
+            or source.get('request_id') != source['scope'].get('cycle_id')
+            or not isinstance(source.get('input_sha256'), str)
+            or len(source['input_sha256']) != 64
+            or any(char not in '0123456789abcdef' for char in source['input_sha256'])
+            or any(not isinstance(source[r], str) for r in ROLES)
+            or not isinstance(source['source_events'], dict)
+            or not {'planning_output'} <= set(source['source_events']) <= set(ROLES)
+            or len(set(source['source_events'].values())) != len(source['source_events'])):
+        raise ValueError('native autonomy memory source required')
+    validate_scope(source['scope'])
+    for role in ROLES:
+        if not source[role] and role not in source['source_events']: continue
+        if not isinstance(source['source_events'].get(role), str) or not source['source_events'][role]:
+            raise ValueError('original planning result reference required')
+    from b1_protocol import digest as source_digest
+    return source_digest(source)
