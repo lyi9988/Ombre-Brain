@@ -179,18 +179,68 @@ def request(method, token='', payload=None, operation_id='owner-summary.fixture'
         'headers':[(b'authorization',('Bearer '+token).encode())], 'path_params':{'operation_id':operation_id}},receive)
 
 
-def test_private_api_auth_no_store_queued_conflict_and_source_changed(tmp_path, monkeypatch):
+def test_private_api_retires_writes_and_preserves_read_only_receipt(tmp_path, monkeypatch):
     f = setup(tmp_path, monkeypatch)
     invoke = lambda req: asyncio.run(owner_summary_response(req,f.engine,f.env['authority']))
-    assert invoke(request('POST','ordinary-memory-writer',f.envelope)).status_code == 401
-    response = invoke(request('POST','synthetic-private-bridge',f.envelope))
-    assert response.status_code == 202 and json.loads(response.body)['status'] == 'queued'
-    assert response.headers['cache-control'] == 'no-store' and not f.calls
-    changed = copy.deepcopy(f.envelope); changed['context']['branch_id'] = 'another'
-    assert invoke(request('POST','synthetic-private-bridge',changed)).status_code == 409
-    f.current.valid = False
-    response = invoke(request('GET','synthetic-private-bridge'))
-    assert response.status_code == 200 and json.loads(response.body)['status'] == 'source_changed'
+    token = 'synthetic-private-bridge'
+    original = f.tasks.get(f.receipt['task_id'])
+    new_submission = {**f.envelope, 'operation_id': 'owner-summary.never-queued'}
+    retry = {'operation_id': f.envelope['operation_id'], 'retry': True, 'expected_task_revision': original['revision']}
+    assert invoke(request('POST', 'ordinary-memory-writer', new_submission)).status_code == 401
+    assert invoke(request('GET', 'ordinary-memory-writer')).status_code == 401
+    for payload in (new_submission, retry):
+        response = invoke(request('POST', token, payload))
+        assert response.status_code == 410 and json.loads(response.body)['error'] == 'owner_summary_l1_retired'
+        assert response.headers['cache-control'] == 'no-store'
+    assert f.tasks.get(task_id(new_submission['operation_id'])) is None
+
+    async def unavailable(*args, **kwargs):
+        raise AssertionError('historical GET must not fetch live source or mutate the original task')
+
+    monkeypatch.setattr(OwnerSummarySourceReader, 'sources', unavailable)
+    response = invoke(request('GET', token))
+    receipt = json.loads(response.body)
+    assert response.status_code == 200 and response.headers['cache-control'] == 'no-store'
+    assert receipt['task_id'] == original['task_id'] and receipt['task_revision'] == original['revision']
+    assert receipt['status'] == 'queued' and receipt['retryable'] is False
+    assert f.tasks.get(original['task_id']) == original
+    assert not f.calls
+
+
+def test_dashboard_historical_task_can_be_read_but_not_retried(tmp_path, monkeypatch):
+    import server
+    f = setup(tmp_path, monkeypatch)
+    ident = f.receipt['task_id']
+    original = f.tasks.update(ident, expected_revision=1, transform=lambda row: {**row, 'phase': 'failed'})
+    monkeypatch.setattr(server, 'memory_authority_store', f.env['authority'])
+    monkeypatch.setattr(server, 'reflection_engine', f.engine)
+    monkeypatch.setattr(server, '_dashboard_authenticated', lambda request: True)
+
+    def invoke(method, path, task_id=None):
+        async def receive():
+            return {'type': 'http.request', 'body': b'{"expected_phase":"failed"}', 'more_body': False}
+        req = Request({'type': 'http', 'method': method, 'path': '/api/memory-authority/source-tasks' + path,
+            'query_string': b'', 'path_params': {'task_id': task_id} if task_id else {}, 'headers': []}, receive)
+        return asyncio.run(server.api_memory_l1_source_tasks(req))
+
+    listing = invoke('GET', '')
+    assert listing.status_code == 200
+    assert json.loads(listing.body)['tasks'][0]['source_kind'] == 'owner_summary'
+    detail = invoke('GET', '/' + ident, ident)
+    assert detail.status_code == 200 and json.loads(detail.body)['task']['task_id'] == ident
+    retry = invoke('POST', '/' + ident + '/retry', ident)
+    assert retry.status_code == 410 and json.loads(retry.body)['error'] == 'owner_summary_l1_retired'
+    assert f.tasks.get(ident) == original and not f.calls
+
+
+def test_legacy_config_cannot_dispatch_summary_tasks_in_background(tmp_path, monkeypatch):
+    from memory_browse_preparation import prepare_memory_tasks
+    f = setup(tmp_path, monkeypatch)
+    original = f.tasks.get(f.receipt['task_id'])
+    assert f.engine.config['reflection']['owner_summary_l1_enabled'] is True
+    asyncio.run(prepare_memory_tasks(f.engine, f.env['buckets']))
+    assert f.tasks.get(original['task_id']) == original
+    assert not f.calls
 
 
 def test_lost_worker_unknown_outcome_never_implicitly_repeats_model(tmp_path, monkeypatch):
@@ -220,23 +270,22 @@ def test_saved_window_output_survives_crash_without_second_model(tmp_path, monke
     assert len(f.calls) == 1
 
 
-def test_known_failed_retry_uses_same_operation_and_window_cas(tmp_path, monkeypatch):
+def test_failed_task_keeps_its_receipt_but_cannot_be_retried(tmp_path, monkeypatch):
     f = setup(tmp_path, monkeypatch)
-    original = f.engine._daily_chat_memory_create_completion
     async def bad(client, **kwargs):
         return NS(choices=[NS(message=NS(content='{"unexpected":true}'),finish_reason='stop')])
     f.engine._daily_chat_memory_create_completion = bad
     receipt = run(f)['results'][0]
-    assert receipt['status'] == 'failed' and receipt['retryable'] is True
+    assert receipt['status'] == 'failed'
+    previous = f.tasks.get(receipt['task_id'])
     payload = {'operation_id':f.envelope['operation_id'],'retry':True,'expected_task_revision':receipt['task_revision']}
-    invoke = lambda: asyncio.run(owner_summary_response(request('POST','synthetic-private-bridge',payload),f.engine,f.env['authority']))
-    assert json.loads(invoke().body)['status'] == 'queued'
-    assert json.loads(invoke().body)['status'] == 'queued'
-    f.engine._daily_chat_memory_create_completion = original
-    result = run(f)['results'][0]
-    assert result['status'] == 'review' and result['retryable'] is False
-    assert len(f.calls) == 1
-    assert invoke().status_code == 409
+    token = 'synthetic-private-bridge'
+    blocked = asyncio.run(owner_summary_response(request('POST', token, payload), f.engine, f.env['authority']))
+    assert blocked.status_code == 410
+    current = asyncio.run(owner_summary_response(request('GET', token), f.engine, f.env['authority']))
+    assert json.loads(current.body) == {**receipt, 'retryable': False}
+    assert f.tasks.get(receipt['task_id']) == previous
+    assert not f.calls
 
 
 def test_original_l2_worker_ready_then_owner_text_remains_protected(tmp_path, monkeypatch):

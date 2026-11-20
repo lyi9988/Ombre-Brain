@@ -318,28 +318,6 @@ class OwnerSummaryPreparation(ChatMemoryPreparation):
         return self.engine._memory_l1_prompt('ombre.daily_chat_memory_prompt', runtime_values={
             'max_candidates': max(1, int(self.engine.daily_chat_memory_max_per_day or 1))})[0].strip()
 
-    def retry(self, operation_id, expected_revision):
-        mid = task_id(operation_id)
-        row = self.get(mid)
-        if not row: raise L1OwnerError('task_not_found', status=404, field_path='operation_id')
-        if type(expected_revision) is not int:
-            raise L1OwnerError('invalid_retry_revision', field_path='expected_task_revision')
-        if row['phase'] in ('queued','generating'):
-            return self.receipt(mid)
-        if row['revision'] != expected_revision:
-            raise L1OwnerError('submission_revision_conflict', status=409, field_path='expected_task_revision')
-        if not self.receipt(mid)['retryable']:
-            raise L1OwnerError('owner_summary_not_retryable', status=409, field_path='status')
-        def reset(current):
-            for window in current['windows'] or []:
-                if window['state'] == 'prepared': continue
-                if window.get('output'):
-                    window.setdefault('failed_outputs', []).append(window.pop('output'))
-            current.update(phase='queued', issue=None, lease_until=0, claim_token=None, manual_generation_retry=True)
-            return current
-        self.update(mid, expected_revision=expected_revision, transform=reset)
-        return self.receipt(mid)
-
     def put_window(self, claimed, index, proposals, links):
         """One transaction publishes all candidates and the completed range."""
         with closing(self.authority._connect()) as db, db:
@@ -374,8 +352,8 @@ async def prepare_owner_summary_tasks(engine, bucket_mgr, *, max_jobs=None):
         return {'status': 'disabled', 'results': []}
     # Owner summaries are kept in Aiz's own summary store and reach the chat
     # context through the Composer summary block. They are not L1 memories.
-    # Submission, task records and the read API stay intact; this worker only
-    # refrains from claiming L1 work and calling the model.
+    # This historical implementation is exercised only by isolated legacy
+    # fixture tooling; the runtime scheduler no longer dispatches it.
     if not (engine.config.get('reflection') or {}).get('owner_summary_l1_enabled', False):
         return {'status': 'not_applicable', 'reason': 'owner_summary_not_l1', 'results': []}
     if getattr(engine, '_owner_summary_preparation_running', False): return {'status': 'locked', 'results': []}
@@ -572,48 +550,21 @@ async def prepare_owner_summary_tasks(engine, bucket_mgr, *, max_jobs=None):
 
 
 async def owner_summary_response(request, engine, authority):
-    """Private owner-service ingress; ordinary memory writer is insufficient."""
+    """Private, read-only access to historical owner Summary L1 receipts."""
     import hmac
     from starlette.responses import JSONResponse
-    from memory_l1_runtime import task_options
     headers = {'Cache-Control': 'no-store'}
     token = os.environ.get('OMBRE_CANONICAL_BRIDGE_TOKEN', '')
     authorization = request.headers.get('authorization', '')
     if not token or not authorization.startswith('Bearer ') or not hmac.compare_digest(authorization[7:], token):
         return JSONResponse({'error':'unauthorized'}, status_code=401, headers=headers)
+    if request.method == 'POST':
+        return JSONResponse({'error':'owner_summary_l1_retired'}, status_code=410, headers=headers)
     if authority is None or engine is None or not engine.memory_authority_enabled:
         return JSONResponse({'error':'memory_authority_unavailable'}, status_code=503, headers=headers)
     try:
-        tasks = OwnerSummaryPreparation(authority, engine)
-        if request.method == 'POST':
-            payload = await request.json()
-            # No narrative/source clipping or chat-tool request-size cap: a
-            # long explicit selection is durably processed over bounded jobs.
-            if isinstance(payload, dict) and payload.get('retry') is True:
-                if set(payload) != {'operation_id','retry','expected_task_revision'}:
-                    raise L1OwnerError('invalid_owner_summary_retry', field_path='retry')
-                row = tasks.get(task_id(payload['operation_id']))
-                if not row: raise L1OwnerError('task_not_found', status=404, field_path='operation_id')
-                await OwnerSummarySourceReader(engine.config, authority).sources(row['envelope'])
-                receipt = tasks.retry(payload['operation_id'],payload['expected_task_revision'])
-            else:
-                from memory_l1_v2_generation import PROTOCOL, enabled
-                receipt = tasks.enqueue(payload, budget=task_options(engine.config)['daily_chat_memory_window_max_input_chars'],
-                    generation_protocol=PROTOCOL if enabled(engine.config) else None)
-        else:
-            mid = task_id(request.path_params['operation_id'])
-            row = tasks.get(mid)
-            if not row: raise L1OwnerError('task_not_found', status=404, field_path='operation_id')
-            try:
-                await OwnerSummarySourceReader(engine.config, authority).sources(row['envelope'])
-            except L1OwnerError as exc:
-                if exc.code != 'owner_summary_source_changed': raise
-                tasks.update(mid, expected_revision=row['revision'], transform=lambda value: {**value,
-                    'phase':'source_changed', 'issue':issue(exc), 'lease_until':0, 'claim_token':None})
-            receipt = tasks.receipt(mid)
-        return JSONResponse(receipt, status_code=202 if request.method == 'POST' else 200, headers=headers)
-    except IdempotencyConflict:
-        return JSONResponse({'error':'idempotency_conflict'}, status_code=409, headers=headers)
+        receipt = OwnerSummaryPreparation(authority, engine).receipt(task_id(request.path_params['operation_id']))
+        return JSONResponse({**receipt, 'retryable': False}, headers=headers)
     except L1OwnerError as exc:
         return JSONResponse({'error':exc.code, 'field_path':exc.field_path}, status_code=exc.status, headers=headers)
     except (ValueError, TypeError, KeyError, UnicodeError):

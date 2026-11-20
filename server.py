@@ -12459,6 +12459,10 @@ async def api_memory_l1_source_tasks(request):
             chat_tasks = browse_tasks
         elif is_summary:
             chat_tasks = summary_tasks
+            if request.method != 'GET' and request.url.path.endswith('/retry'):
+                if not _dashboard_authenticated(request):
+                    return _require_dashboard_auth(request)
+                raise L1OwnerError('owner_summary_l1_retired', status=410, field_path='task_id')
         if task_id and (str(task_id).startswith('chat_memory_') or is_browse or is_summary) and not request.url.path.endswith('/retry'):
             # Draft bodies/edit are owner-only. The writer token can submit
             # its canonical envelope, not read/edit arbitrary owner drafts.
@@ -12497,7 +12501,7 @@ async def api_memory_l1_source_tasks(request):
             # retries the source action or changes its completion status.
             if not isinstance(payload, dict) or set(payload) != {"expected_phase"} or payload["expected_phase"] not in {"failed", "generating"}:
                 raise L1OwnerError("invalid_source_task_retry", field_path="expected_phase")
-            if str(task_id).startswith('chat_memory_') or is_browse or is_summary:
+            if str(task_id).startswith('chat_memory_') or is_browse:
                 if not _dashboard_authenticated(request):
                     return _require_dashboard_auth(request)
                 current = chat_tasks.get(str(task_id))
@@ -12505,10 +12509,6 @@ async def api_memory_l1_source_tasks(request):
                     raise L1OwnerError('task_phase_changed', status=409, field_path='expected_phase')
                 if current['phase'] == 'generating' and current.get('lease_until', 0) > __import__('time').time():
                     raise L1OwnerError('memory_preparation_in_progress', status=409, field_path='task_id')
-                if is_summary:
-                    from memory_owner_summary import OwnerSummarySourceReader
-                    await OwnerSummarySourceReader(config, memory_authority_store).sources(current['envelope'])
-                    return JSONResponse(chat_tasks.retry(current['operation_id'], current['revision']), headers=headers)
                 def retry(row):
                     row.update(phase='queued', lease_until=0, claim_token=None, issue=None,
                                manual_generation_retry=True)

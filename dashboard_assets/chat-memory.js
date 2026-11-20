@@ -1846,8 +1846,12 @@
   function renderActionSourceTask(task, target) {
     var row = document.createElement('div'); row.className = 'chat-memory-card';
     var status = document.createElement('p');
+    var historicalSummary = task.source_kind === 'owner_summary';
     var labels = { queued:'等待整理', generating:'处理中', prepared:'候选已生成', failed:'整理失败' };
-    status.textContent = (labels[task.phase] || task.phase) + ' · ' + task.action_id; row.appendChild(status);
+    status.textContent = historicalSummary
+      ? '摘要记忆旧记录 · ' + (labels[task.phase] || task.phase) + '（历史状态）'
+      : (labels[task.phase] || task.phase) + ' · ' + task.action_id;
+    row.appendChild(status);
     if (task.issue) { var issue = document.createElement('code'); issue.textContent = task.issue.code || '未完成'; row.appendChild(issue); }
     if (task.candidate_ids && task.candidate_ids.length) {
       var refs = document.createElement('p'); refs.textContent = '对应候选：' + task.candidate_ids.join('、') + '；采用状态以候选和正式记忆回执为准。'; row.appendChild(refs);
@@ -1859,7 +1863,7 @@
       if (taskIoId) modelIoIds.push(taskIoId);
     }
     var actions = document.createElement('div'); actions.className = 'chat-memory-card-actions';
-    if (task.phase === 'failed' || task.phase === 'generating') {
+    if (!historicalSummary && (task.phase === 'failed' || task.phase === 'generating')) {
       var retry = document.createElement('button'); retry.type = 'button'; retry.textContent = task.phase === 'failed' ? '重试整理' : '中断后恢复整理';
       retry.addEventListener('click', async function() {
         if (!window.confirm('重新排队整理此来源；可能再次调用已配置模型，不会重新执行原行动。')) return;
