@@ -81,7 +81,7 @@ from favorite_tags import has_favorite_memory_tag, is_flavor_tag
 from identity import identity_names
 from gateway_state import GatewayStateStore
 from turn_clock import use_clock, clock_metadata, reference_now
-from model_request_trace import ModelRequestTraceStore
+from model_request_trace import ModelRequestTraceStore, TRACE_READ_VIEWS
 from prompt_plan_mirror import (
     PromptPlanMirrorConflict,
     PromptPlanMirrorError,
@@ -7057,9 +7057,13 @@ class GatewayService:
             return auth_result
         trace_id = str(request.path_params.get("trace_id") or request.query_params.get("trace_id") or "").strip()
         view = str(request.query_params.get("view") or "metadata").strip().lower()
-        if view not in {"metadata", "resolved", "raw_redacted", "full_owner_body"}:
+        if view not in TRACE_READ_VIEWS:
             return JSONResponse({"error": "invalid view"}, status_code=400, headers={"Cache-Control": "no-store"})
-        item = self.model_request_trace.get(trace_id, view=view) if trace_id else None
+        attempt_id = str(request.query_params.get("attempt_id") or "").strip() or None
+        if attempt_id is not None and len(attempt_id) > 256:
+            return JSONResponse({"error": "invalid attempt_id"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        item = self.model_request_trace.get(trace_id, view=view, attempt_id=attempt_id) if trace_id else None
         if item is None:
             return JSONResponse({"error": "trace not found"}, status_code=404, headers={"Cache-Control": "no-store"})
         return JSONResponse(item, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})

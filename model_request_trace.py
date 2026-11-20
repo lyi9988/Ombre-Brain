@@ -29,10 +29,23 @@ SENSITIVE_KEY_RE = re.compile(
 )
 SIGNED_QUERY_RE = re.compile(r"(?:sig|signature|token|key|expires|credential)", re.I)
 BODY_MODES = {"metadata", "resolved", "raw_redacted", "full_owner_body"}
+# Read-only presentation views are deliberately separate from BODY_MODES:
+# only the latter may be persisted as a capture setting.
+TRACE_READ_VIEWS = BODY_MODES | {"text_owner_body"}
 REASONING_VISIBILITY = {"hidden", "metadata_only", "provider_exposed"}
 REASONING_BODY_KEYS = {
     "reasoning_content", "reasoning_text", "thinking_content", "reasoning_trace",
 }
+TEXT_EVENT_SCALARS = (
+    "request_id", "logical_request_id", "request_ordinal", "request_type",
+    "attempt_id", "attempt_ordinal", "provider", "upstream", "model", "alias",
+    "retry_reason", "outcome", "status", "result_status", "http_status",
+    "duration_ms", "raw_available", "view_mode", "capture_mode", "body_visibility",
+    "returned", "replay_required", "replayed", "omitted", "tool_call_id", "tool_name",
+)
+TEXT_EVENT_MAPS = ("usage", "timing")
+IMAGE_DATA_URL_RE = re.compile(r"^data:(image/[^;,]+);base64,", re.I)
+IMAGE_DATA_RE = re.compile(r"^data:(image/[^;,]+)(?:;[^,]*)?,", re.I)
 
 
 class _TraceConnection(sqlite3.Connection):
@@ -105,6 +118,141 @@ def sanitize_for_owner(value: Any, *, reasoning_visibility: str = "hidden",
     if isinstance(value, str):
         return _redact_url(value)
     return value
+
+
+def _image_placeholder(value: Any, *, mime: Any = None) -> str:
+    """Describe image transport without copying its URI or encoded bytes."""
+    if not isinstance(value, str):
+        return "[image payload omitted]"
+    declared_mime = str(mime or "").strip()
+    match = IMAGE_DATA_URL_RE.match(value)
+    if match:
+        image_mime = declared_mime if declared_mime.lower().startswith("image/") else match.group(1)
+        return f"[image omitted · MIME {image_mime} · base64 {len(value) - match.end()} chars]"
+    match = IMAGE_DATA_RE.match(value)
+    if match:
+        image_mime = declared_mime if declared_mime.lower().startswith("image/") else match.group(1)
+        return f"[image omitted · MIME {image_mime} · encoded {len(value) - match.end()} chars]"
+    # Do not feed megabytes of base64 to urllib's cached URL parser.
+    scheme = re.match(r"^([a-z][a-z0-9+.-]{0,24}):", value, re.I)
+    if scheme:
+        return f"[image URI omitted · {scheme.group(1).lower()}]"
+    if declared_mime.lower().startswith("image/"):
+        return f"[image bytes omitted · MIME {declared_mime} · encoded {len(value)} chars]"
+    return "[image URI omitted · URI]"
+
+
+def _mapping_mime(value: dict[str, Any]) -> str:
+    for key, item in value.items():
+        if str(key).lower() in {"mime_type", "mimetype", "media_type", "mediatype"}:
+            if isinstance(item, str) and item.lower().startswith("image/"):
+                return item
+    return ""
+
+
+def _copy_image_url(value: Any, *, mime: Any = None) -> Any:
+    if isinstance(value, str):
+        return _image_placeholder(value, mime=mime)
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            lower = str(key).lower()
+            if lower in {"url", "uri", "file_uri", "fileuri"} and isinstance(item, str):
+                result[key] = _image_placeholder(item, mime=mime)
+            elif lower == "data" and isinstance(item, str):
+                result[key] = _image_placeholder(item, mime=mime or "image/unknown")
+            else:
+                result[key] = _text_owner_body_copy(item)
+        return result
+    return _text_owner_body_copy(value)
+
+
+def _copy_image_source(value: Any, *, mime: Any = None) -> Any:
+    if not isinstance(value, dict):
+        return _text_owner_body_copy(value)
+    source_type = str(value.get("type") or "").lower()
+    source_mime = mime or _mapping_mime(value)
+    if source_type == "base64" and not source_mime:
+        source_mime = "image/unknown"
+    result = {}
+    for key, item in value.items():
+        lower = str(key).lower()
+        if lower in {"data", "url", "uri"} and isinstance(item, str):
+            if source_type in {"base64", "url"} or source_mime.lower().startswith("image/"):
+                result[key] = _image_placeholder(item, mime=source_mime)
+                continue
+        result[key] = _text_owner_body_copy(item)
+    return result
+
+
+def _copy_inline_image(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return _text_owner_body_copy(value)
+    mime = _mapping_mime(value)
+    result = {}
+    for key, item in value.items():
+        lower = str(key).lower()
+        if lower == "data" and isinstance(item, str) and mime:
+            result[key] = _image_placeholder(item, mime=mime)
+        else:
+            result[key] = _text_owner_body_copy(item)
+    return result
+
+
+def _text_owner_body_copy(value: Any) -> Any:
+    """Copy a captured payload while replacing typed image transport only."""
+    if isinstance(value, list):
+        return [_text_owner_body_copy(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    block_type = str(value.get("type") or "").lower()
+    block_mime = _mapping_mime(value)
+    result = {}
+    for key, item in value.items():
+        lower = str(key).lower()
+        if lower in {"image_url", "input_image"} and block_type in {"image", "image_url", "input_image"}:
+            result[key] = _copy_image_url(item, mime=block_mime)
+        elif lower in {"inline_data", "inlinedata"}:
+            result[key] = _copy_inline_image(item)
+        elif lower in {"file_data", "filedata"} and isinstance(item, dict):
+            file_mime = _mapping_mime(item)
+            result[key] = _copy_image_url(item, mime=file_mime) if file_mime else _text_owner_body_copy(item)
+        elif lower == "source" and block_type == "image":
+            result[key] = _copy_image_source(item, mime=block_mime)
+        elif lower in {"url", "uri"} and block_type in {"image", "image_url", "input_image"} and isinstance(item, str):
+            result[key] = _image_placeholder(item, mime=block_mime)
+        elif lower in {"data", "image"} and block_type in {"image", "image_url", "input_image"}:
+            if isinstance(item, str):
+                result[key] = _image_placeholder(item, mime=block_mime or "image/unknown")
+            else:
+                result[key] = _copy_image_url(item, mime=block_mime)
+        else:
+            result[key] = _text_owner_body_copy(item)
+    return result
+
+
+def _text_owner_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Keep event order and status identities without copying large payloads."""
+    payload = event.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    summary = {}
+    for key in TEXT_EVENT_SCALARS:
+        value = payload.get(key)
+        if key in payload and (isinstance(value, (str, int, float, bool)) or value is None):
+            summary[key] = value
+    for key in TEXT_EVENT_MAPS:
+        value = payload.get(key)
+        if isinstance(value, dict):
+            summary[key] = {
+                name: item for name, item in value.items()
+                if isinstance(item, (str, int, float, bool)) or item is None
+            }
+    return {
+        "type": event.get("type"),
+        "payload": summary,
+        "created_at_ms": event.get("created_at_ms"),
+    }
 
 
 def _usage_from_body(body: Any) -> dict | None:
@@ -486,7 +634,8 @@ class ModelRequestTraceStore:
         except Exception:
             return
 
-    def _public(self, row, *, include_raw: bool = False, reasoning_visibility: str = "hidden") -> dict:
+    def _public(self, row, *, include_raw: bool = False, text_owner_body: bool = False,
+                reasoning_visibility: str = "hidden") -> dict:
         item = {"attempt_id": row["attempt_id"], "trace_id": row["trace_id"],
                 "attempt_ordinal": int(row["attempt_ordinal"]), "provider": row["provider"],
                 "upstream": row["upstream"], "model": row["model"], "alias": row["alias"],
@@ -516,20 +665,31 @@ class ModelRequestTraceStore:
                         and reasoning_visibility == "provider_exposed"
                     ),
                 )
+                if text_owner_body:
+                    item["payload"] = _text_owner_body_copy(item["payload"])
         return item
 
-    def get(self, trace_id: str, *, view: str = "metadata") -> dict | None:
+    def get(self, trace_id: str, *, view: str = "metadata",
+            attempt_id: str | None = None) -> dict | None:
         settings = self.settings()
-        view = view if view in BODY_MODES else "metadata"
+        view = view if view in TRACE_READ_VIEWS else "metadata"
         # A later settings change must not hide a body that was already
         # captured.  capture_mode controls future writes; raw_id controls
         # availability of this historical attempt.
-        include_raw = view in {"raw_redacted", "full_owner_body"}
+        include_raw = view in {"raw_redacted", "full_owner_body", "text_owner_body"}
+        attempt_id = str(attempt_id or "").strip() or None
         with self._connect() as db:
             logical = db.execute("SELECT * FROM logical_requests WHERE trace_id=?", (trace_id,)).fetchone()
             if logical is None:
                 return None
-            attempts = db.execute("SELECT * FROM physical_attempts WHERE trace_id=? ORDER BY attempt_ordinal", (trace_id,)).fetchall()
+            if attempt_id is None:
+                attempts = db.execute("SELECT * FROM physical_attempts WHERE trace_id=? ORDER BY attempt_ordinal",
+                                      (trace_id,)).fetchall()
+            else:
+                attempts = db.execute("SELECT * FROM physical_attempts WHERE trace_id=? AND attempt_id=?",
+                                      (trace_id, attempt_id)).fetchall()
+                if not attempts:
+                    return None
             events = db.execute("SELECT event_type,payload_json,created_at_ms FROM trace_events WHERE trace_id=? ORDER BY id", (trace_id,)).fetchall()
         metadata = json.loads(logical["metadata_json"] or "{}")
         event_items = [{"type": row["event_type"], "payload": json.loads(row["payload_json"] or "{}"),
@@ -605,11 +765,18 @@ class ModelRequestTraceStore:
                   "parent_request_id": logical["parent_request_id"], "tool_round": logical["tool_round"],
                   "request_type": logical["request_type"], "outcome": logical["outcome"],
                   "provider": logical["provider"], "model": logical["model"],
-                  "client_id": logical["client_id"], "metadata": metadata,
+                  "client_id": logical["client_id"],
+                  # Keep the owner-safe metadata shape intact in the text view;
+                  # only typed image transport is replaced in this read copy.
+                  "metadata": (_text_owner_body_copy(metadata)
+                               if view == "text_owner_body" else metadata),
                   "attempts": [self._public(row, include_raw=include_raw,
+                                             text_owner_body=(view == "text_owner_body"),
                                              reasoning_visibility=settings["body_visibility"])
                                for row in attempts],
-                  "events": event_items, "preparations": preparations,
+                  "events": ([_text_owner_event(event) for event in event_items]
+                             if view == "text_owner_body" else event_items),
+                  "preparations": preparations,
                   "view": view, "settings_revision": settings["revision_no"]}
         if view == "resolved":
             result["resolved"] = metadata.get("resolved") or metadata
