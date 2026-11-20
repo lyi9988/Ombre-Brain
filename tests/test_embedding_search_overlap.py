@@ -4,6 +4,7 @@ import json
 import sqlite3
 import time
 
+import httpx
 import pytest
 
 from embedding_engine import EmbeddingEngine
@@ -259,6 +260,328 @@ def test_deadline_cancels_and_awaits_query_child(tmp_path, monkeypatch):
         assert provider_started.is_set()
         assert provider_cancelled.is_set()
         assert debug["error_type"] == "TimeoutError"
+        assert not engine._query_batch_inflight
+        _no_pending_tasks()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stopping,exit_kind", [
+    ("starter", "cancel"), ("starter", "deadline"), ("follower", "cancel"), ("follower", "deadline"),
+])
+def test_shared_query_survives_one_waiter_stopping(tmp_path, monkeypatch, stopping, exit_kind):
+    engine = _engine(tmp_path)
+    provider_started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def fake_request(_endpoint, _api_key, _model, input_value, *, deadline=None):
+        nonlocal calls
+        calls += 1
+        provider_started.set()
+        await release.wait()
+        return _query_response(input_value)
+
+    monkeypatch.setattr(engine, "_request_embedding", fake_request)
+
+    async def run():
+        def deadline_for(name):
+            return time.monotonic() + 0.2 if name == stopping and exit_kind == "deadline" else None
+
+        starter = asyncio.create_task(engine.query_embeddings(
+            ["shared query"], deadline=deadline_for("starter"),
+        ))
+        await asyncio.wait_for(provider_started.wait(), timeout=1)
+        debug = {}
+        follower = asyncio.create_task(engine.query_embeddings(
+            ["shared query"], cache_debug=debug, deadline=deadline_for("follower"),
+        ))
+        await asyncio.sleep(0)
+        assert debug["status"] == "singleflight"
+
+        leaving, survivor = (starter, follower) if stopping == "starter" else (follower, starter)
+        if exit_kind == "cancel":
+            leaving.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await leaving
+        else:
+            await asyncio.wait({leaving}, timeout=0.8)
+            assert leaving.done()
+            with pytest.raises(asyncio.TimeoutError):
+                await leaving
+
+        release.set()
+        assert await survivor == [[1.0, 0.0]]
+        assert calls == 1
+        assert not engine._query_batch_inflight
+        _no_pending_tasks()
+
+    asyncio.run(run())
+
+
+def test_last_waiter_recancels_during_close_without_harming_new_flight(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    engine.query_cache_ttl_seconds = 0
+    started, closing, closed = (asyncio.Event() for _ in range(3))
+    started_new, release_old, release_new = (asyncio.Event() for _ in range(3))
+    calls = 0
+
+    async def fake_request(_endpoint, _api_key, _model, input_value, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                closing.set()
+                await release_old.wait()
+                closed.set()
+        started_new.set()
+        await release_new.wait()
+        return _query_response(input_value)
+
+    monkeypatch.setattr(engine, "_request_embedding", fake_request)
+
+    async def run():
+        old = asyncio.create_task(engine.query_embeddings(["same"]))
+        await asyncio.wait_for(started.wait(), 1)
+        old.cancel()
+        await asyncio.wait_for(closing.wait(), 1)
+        old.cancel()
+        new = asyncio.create_task(engine.query_embeddings(["same"]))
+        await asyncio.wait_for(started_new.wait(), 1)
+        assert not old.done() and not closed.is_set()
+        release_old.set()
+        with pytest.raises(asyncio.CancelledError):
+            await old
+        assert closed.is_set()
+        debug = {}
+        peer = asyncio.create_task(engine.query_embeddings(["same"], cache_debug=debug))
+        await asyncio.sleep(0)
+        assert debug["status"] == "singleflight"
+        release_new.set()
+        assert await asyncio.gather(new, peer) == [[[1.0, 0.0]], [[1.0, 0.0]]]
+        assert calls == 2 and not engine._query_batch_inflight
+        _no_pending_tasks()
+
+    asyncio.run(run())
+
+
+def test_last_waiter_during_transport_deadline_does_not_cancel_close_twice(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    engine.REQUEST_BUDGET_SECONDS = 0.05
+    closing, release, closed = (asyncio.Event() for _ in range(3))
+
+    async def fake_request(*_args, **_kwargs):
+        try:
+            await asyncio.Future()
+        finally:
+            closing.set()
+            await release.wait()
+            closed.set()
+
+    monkeypatch.setattr(engine, "_request_embedding", fake_request)
+
+    async def run():
+        leaving = asyncio.create_task(engine.query_embeddings(["same"]))
+        await asyncio.wait_for(closing.wait(), 1)
+        leaving.cancel()  # The transport deadline has already started closing.
+        await asyncio.sleep(0)
+        assert not leaving.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await leaving
+        assert closed.is_set() and not engine._query_batch_inflight
+        _no_pending_tasks()
+
+    asyncio.run(run())
+
+
+def test_late_waiter_hits_cache_when_completion_and_cancel_coincide(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    returned = asyncio.Event()
+    calls = 0
+
+    async def fake_request(_endpoint, _api_key, _model, input_value, **_kwargs):
+        nonlocal calls
+        calls += 1
+        returned.set()
+        return _query_response(input_value)
+
+    monkeypatch.setattr(engine, "_request_embedding", fake_request)
+
+    async def run():
+        leaving = asyncio.create_task(engine.query_embeddings(["same"]))
+        await returned.wait()
+        assert not leaving.done()
+        leaving.cancel()  # The validated vector is already published; the caller has not resumed.
+        debug = {}
+        assert await engine.query_embeddings(["same"], cache_debug=debug) == [[1.0, 0.0]]
+        assert debug["status"] == "hit" and calls == 1
+        with pytest.raises(asyncio.CancelledError):
+            await leaving
+        assert not engine._query_batch_inflight
+        _no_pending_tasks()
+
+    asyncio.run(run())
+
+
+def test_concurrent_query_batches_only_request_missing_vectors(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = []
+
+    async def fake_request(_endpoint, _api_key, _model, input_value, *, deadline=None):
+        inputs = input_value if isinstance(input_value, list) else [input_value]
+        labels = [text.rsplit("Query: ", 1)[-1] for text in inputs]
+        calls.append(set(labels))
+        if len(calls) == 1:
+            first_started.set()
+            await release_first.wait()
+        return 200, {"data": [
+            {"index": i, "embedding": [float(sum(map(ord, label))), 1.0]}
+            for i, label in enumerate(labels)
+        ]}
+
+    monkeypatch.setattr(engine, "_request_embedding", fake_request)
+
+    async def run():
+        first = asyncio.create_task(engine.query_embeddings(["shared", "first-only"]))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        debug = {}
+        second = asyncio.create_task(engine.query_embeddings(
+            ["second-only", "shared", "second-only"], cache_debug=debug,
+        ))
+        await asyncio.sleep(0)
+        release_first.set()
+        first_vectors, second_vectors = await asyncio.gather(first, second)
+        assert calls == [{"shared", "first-only"}, {"second-only"}]
+        assert second_vectors[1] == first_vectors[0]
+        assert second_vectors[0] == second_vectors[2] != second_vectors[1]
+        assert debug["shared_provider_request"] is True
+        assert debug["provider_batch_size"] == 1
+        assert not engine._query_batch_inflight
+        _no_pending_tasks()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cache_state", ["warm", "partial", "overlap"])
+def test_query_rejects_mixed_dimensions_and_can_recover(tmp_path, monkeypatch, cache_state):
+    engine = _engine(tmp_path)
+    started, release = asyncio.Event(), asyncio.Event()
+    coherent = False
+    calls = []
+
+    async def fake_request(_endpoint, _api_key, _model, input_value, **_kwargs):
+        inputs = input_value if isinstance(input_value, list) else [input_value]
+        labels = [text.rsplit("Query: ", 1)[-1] for text in inputs]
+        calls.append(set(labels))
+        if cache_state == "overlap" and len(calls) == 1:
+            started.set()
+            await release.wait()
+        return 200, {"data": [
+            {"index": index, "embedding": [1.0] * (2 if coherent or label == "a" else 3)}
+            for index, label in enumerate(labels)
+        ]}
+
+    monkeypatch.setattr(engine, "_request_embedding", fake_request)
+
+    async def run():
+        nonlocal coherent
+        owner = None
+        if cache_state == "overlap":
+            owner = asyncio.create_task(engine.query_embeddings(["a"]))
+            await asyncio.wait_for(started.wait(), 1)
+        else:
+            assert await engine.query_embeddings(["a"]) == [[1.0, 1.0]]
+            if cache_state == "warm":
+                assert await engine.query_embeddings(["b"]) == [[1.0, 1.0, 1.0]]
+
+        pair = asyncio.create_task(engine.query_embeddings(["a", "b"]))
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(ValueError, match="embedding_batch_dimension_mismatch"):
+            await pair
+        if owner is not None:
+            assert await owner == [[1.0, 1.0]]
+        assert calls == [{"a"}, {"b"}]  # No repeat vector request before the mismatch.
+        assert not engine._query_cache
+
+        coherent = True
+        assert await engine.query_embeddings(["a", "b"]) == [[1.0, 1.0], [1.0, 1.0]]
+        assert calls[-1] == {"a", "b"}
+        assert await engine.query_embeddings(["a", "b"]) == [[1.0, 1.0], [1.0, 1.0]]
+        assert len(calls) == 3
+        _no_pending_tasks()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("initial_failure", [httpx.ConnectError, httpx.PoolTimeout, httpx.ReadTimeout])
+def test_query_connection_fallback_can_be_cancelled_and_still_recovers(
+    tmp_path, monkeypatch, initial_failure,
+):
+    engine = _engine(tmp_path)
+    engine.dimension = 2
+    fallback_started, fallback_closed = asyncio.Event(), asyncio.Event()
+    fallback_calls = 0
+    pooled_requests = []
+
+    class Pooled:
+        async def post(self, endpoint, **kwargs):
+            pooled_requests.append((endpoint, kwargs["headers"], kwargs["json"]))
+            raise initial_failure("synthetic transport failure")
+
+    class Fallback:
+        def __init__(self, *, follow_redirects):
+            assert follow_redirects
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            fallback_closed.set()
+
+        async def post(self, endpoint, **kwargs):
+            nonlocal fallback_calls
+            fallback_calls += 1
+            assert (endpoint, kwargs["headers"], kwargs["json"]) == pooled_requests[-1]
+            assert kwargs["json"]["dimensions"] == 2
+            if fallback_calls == 1:
+                fallback_started.set()
+                await asyncio.Future()
+            return httpx.Response(200, request=httpx.Request("POST", endpoint),
+                                  json=_query_response(kwargs["json"]["input"])[1])
+
+    async def get_client():
+        return Pooled()
+
+    def forbidden_sync(*_args, **_kwargs):
+        pytest.fail("shared queries must not leave a synchronous request running")
+
+    monkeypatch.setattr(engine, "_ensure_client", get_client)
+    monkeypatch.setattr(engine, "_request_embedding_sync", forbidden_sync)
+    monkeypatch.setattr(httpx, "AsyncClient", Fallback)
+
+    async def run():
+        if initial_failure is httpx.ReadTimeout:
+            with pytest.raises(httpx.ReadTimeout):
+                await engine.query_embeddings(["same"])
+            assert fallback_calls == 0
+        else:
+            leaving = asyncio.create_task(engine.query_embeddings(["same"]))
+            await asyncio.wait_for(fallback_started.wait(), 1)
+            leaving.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await leaving
+            assert fallback_closed.is_set() and not engine._query_cache
+
+            debug = {}
+            assert await engine.query_embeddings(["same"], cache_debug=debug) == [[1.0, 0.0]]
+            assert fallback_calls == 2 and debug["provider_requests"] == 2
         assert not engine._query_batch_inflight
         _no_pending_tasks()
 

@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -32,6 +33,13 @@ logger = logging.getLogger("ombre_brain.embedding")
 
 # Cooperative scheduling quantum only; this does not cap candidate validation.
 SEARCH_COOPERATIVE_YIELD_EVERY = 64
+
+
+@dataclass(eq=False)
+class _QueryBatch:
+    keys: tuple[str, ...]
+    task: asyncio.Task
+    waiters: int = 0
 
 
 class EmbeddingEngine:
@@ -75,7 +83,7 @@ class EmbeddingEngine:
         )
         self._query_cache: dict[str, tuple[float, list[float]]] = {}
         self._query_inflight: dict[str, asyncio.Task] = {}
-        self._query_batch_inflight: dict[tuple[str, ...], asyncio.Task] = {}
+        self._query_batch_inflight: dict[str, _QueryBatch] = {}
         self._vector_decode_cache = VectorDecodeCache()
         self._runtime = {
             "last_operation": "none",
@@ -254,12 +262,7 @@ class EmbeddingEngine:
     async def query_embeddings(self, texts: list[str], *, deadline: float | None = None,
                                cache_debug: dict | None = None,
                                config_snapshot: dict | None = None) -> list[list[float]]:
-        """Batch missing query vectors; cache values only, validate every index.
-
-        The task owner cancels the request on cancellation. Same-key peers
-        may observe it through shield, but no detached provider task survives
-        the owner's recall deadline.
-        """
+        """Batch new vectors and share pending vectors across recall requests."""
         snapshot = config_snapshot or self._query_config_snapshot()
         if not snapshot["enabled"]:
             if cache_debug is not None:
@@ -267,32 +270,76 @@ class EmbeddingEngine:
             return [[] for _ in texts]
         keys = [self._query_cache_key(text, snapshot=snapshot) for text in texts]
         now = time.monotonic()
-        found = {key: list(value[1]) for key, value in self._query_cache.items() if value[0] > now}
+        found = {key: cached[1] for key in keys
+                 if (cached := self._query_cache.get(key)) is not None and cached[0] > now}
+
+        def validate_dimensions():
+            if len({len(vector) for vector in found.values() if vector}) <= 1:
+                return
+            # With no explicit dimension, we cannot tell which vectors belong
+            # to this query space. Let a fresh batch recover, without dropping
+            # values another flight may already have refreshed.
+            for key, vector in found.items():
+                cached = self._query_cache.get(key)
+                if cached is not None and cached[1] is vector:
+                    del self._query_cache[key]
+            raise ValueError("embedding_batch_dimension_mismatch")
+
+        validate_dimensions()
         missing = {key: text for key, text in zip(keys, texts) if key not in found and text.strip()}
         if not missing:
             self._runtime["last_query_cache_status"] = "hit"
             if cache_debug is not None:
                 cache_debug.update(status="hit", provider_requests=0, http_timing=None)
-            return [found.get(key, []) for key in keys]
+            return [list(found.get(key, [])) for key in keys]
+        if deadline is not None and deadline <= now:
+            if cache_debug is not None:
+                cache_debug.update(status="timeout", provider_requests=0)
+            raise asyncio.TimeoutError("embedding_request_budget_exhausted")
         if not hasattr(self, "_query_batch_inflight"):
             self._query_batch_inflight = {}
-        batch_key = tuple(sorted(missing))
-        task = self._query_batch_inflight.get(batch_key)
-        owner = task is None
+        inflight = self._query_batch_inflight
+        claimed = {key: batch for key in missing
+                   if (batch := inflight.get(key)) is not None and not batch.task.done()}
+        batches = list(dict.fromkeys(claimed.values()))
+        shared = bool(batches)
+        new_keys = tuple(sorted(missing.keys() - claimed.keys()))
 
         async def execute():
             started = time.monotonic()
-            ordered_keys = list(batch_key)
             prepared = [self._prepare_query_snapshot(missing[key], snapshot)[:snapshot["max_chars"]]
-                        for key in ordered_keys]
+                        for key in new_keys]
             self._runtime.update(last_operation="query_batch", last_status="started",
-                                 last_provider_request_count=1, last_batch_size=len(prepared))
-            status, body = await self._request_embedding(
-                f"{snapshot['base_url'].rstrip('/')}/embeddings", snapshot["api_key"], snapshot["model"],
-                prepared if len(prepared) > 1 else prepared[0],
-                deadline=deadline or started + self.REQUEST_BUDGET_SECONDS,
-                **({"dimensions": snapshot["dimension"]} if snapshot.get("dimension") is not None else {}),
-            )
+                                 last_provider_request_count=1, last_batch_size=len(prepared),
+                                 last_transport="persistent_httpx")
+            budget = self.REQUEST_BUDGET_SECONDS
+            task = asyncio.current_task()
+            expired = False
+
+            def expire():
+                nonlocal expired
+                # The last waiter may already have started HTTP cleanup.
+                if not task.done() and not task.cancelling():
+                    expired = task.cancel()
+
+            timer = asyncio.get_running_loop().call_later(budget, expire)
+            try:
+                status, body = await self._request_embedding(
+                    f"{snapshot['base_url'].rstrip('/')}/embeddings", snapshot["api_key"], snapshot["model"],
+                    prepared if len(prepared) > 1 else prepared[0],
+                    deadline=started + budget,
+                    **({"dimensions": snapshot["dimension"]} if snapshot.get("dimension") is not None else {}),
+                )
+            except asyncio.CancelledError:
+                if expired:
+                    raise asyncio.TimeoutError("embedding_request_budget_exhausted") from None
+                raise
+            finally:
+                timer.cancel()
+            if expired:
+                raise asyncio.TimeoutError("embedding_request_budget_exhausted")
+            if task.cancelling():
+                raise asyncio.CancelledError
             data = body.get("data") if isinstance(body, dict) else None
             if not isinstance(data, list) or len(data) != len(prepared):
                 raise ValueError("embedding_batch_cardinality_mismatch")
@@ -313,7 +360,7 @@ class EmbeddingEngine:
                     raise ValueError("embedding_requested_dimension_mismatch")
                 dimension = len(vector)
                 vectors[index] = vector
-            result = {key: list(vectors[i]) for i, key in enumerate(ordered_keys)}
+            result = {key: list(vectors[i]) for i, key in enumerate(new_keys)}
             if self.query_cache_ttl_seconds > 0 and self.query_cache_max_entries > 0:
                 for key, vector in result.items():
                     self._query_cache[key] = (time.monotonic() + self.query_cache_ttl_seconds, vector)
@@ -324,35 +371,64 @@ class EmbeddingEngine:
                                  last_vector_dimension=dimension, last_result_count=len(result))
             return result, dict(body.get("_local_http_timing") or {})
 
-        if owner:
-            task = asyncio.create_task(execute())
-            self._query_batch_inflight[batch_key] = task
+        if new_keys:
+            batch = _QueryBatch(new_keys, asyncio.create_task(execute()))
+            for key in new_keys:
+                inflight[key] = batch
+            batches.insert(0, batch)
+        for batch in batches:
+            batch.waiters += 1
+        status = "miss" if new_keys else "singleflight"
         if cache_debug is not None:
-            cache_debug.update(status="miss" if owner else "singleflight", provider_requests=1 if owner else 0,
-                               shared_provider_request=not owner)
+            cache_debug.update(status=status, provider_requests=int(bool(new_keys)), shared_provider_request=shared)
         try:
-            result, timing = await asyncio.shield(task)
-            found.update(result)
-            self._runtime["last_query_cache_status"] = "miss" if owner else "singleflight"
+            # Each recall has its own budget. Only the last waiter can cancel
+            # the provider request, which has its own transport deadline.
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            async with asyncio.timeout(remaining):
+                replies = await asyncio.gather(*(asyncio.shield(batch.task) for batch in batches))
+            for result, _ in replies:
+                found.update(result)
+            validate_dimensions()
+            self._runtime["last_query_cache_status"] = status
             if cache_debug is not None:
-                cache_debug.update(status="miss" if owner else "singleflight",
-                                   provider_requests=int(timing.get("provider_attempts") or 1) if owner else 0,
-                                   shared_provider_request=not owner, http_timing=timing,
-                                   provider_batch_size=len(batch_key))
-            return [found.get(key, []) for key in keys]
+                _, timing = replies[0]
+                cache_debug.update(
+                    provider_requests=int(timing.get("provider_attempts") or 1) if new_keys else 0,
+                    http_timing=timing, provider_batch_size=len(batches[0].keys),
+                )
+            return [list(found.get(key, [])) for key in keys]
         except asyncio.CancelledError:
-            if owner:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            elif not asyncio.current_task().cancelling():
+            if not asyncio.current_task().cancelling():
                 raise RuntimeError("shared_embedding_request_cancelled") from None
             raise
         except Exception as exc:
             self._runtime.update(last_status="error", last_error_type=type(exc).__name__)
             raise
         finally:
-            if owner and self._query_batch_inflight.get(batch_key) is task:
-                self._query_batch_inflight.pop(batch_key, None)
+            unused = []
+            for batch in batches:
+                batch.waiters -= 1
+                if batch.waiters:
+                    continue
+                for key in batch.keys:
+                    if inflight.get(key) is batch:
+                        del inflight[key]
+                if not batch.task.done() and not batch.task.cancelling():
+                    batch.task.cancel()
+                unused.append(batch.task)
+            if unused:
+                settling = asyncio.gather(*unused, return_exceptions=True)
+                cancelled = None
+                # The outer recall deadline and a disconnect can both arrive
+                # here. Do not forward a second cancellation into HTTP close.
+                while not settling.done():
+                    try:
+                        await asyncio.shield(settling)
+                    except asyncio.CancelledError as exc:
+                        cancelled = exc
+                if cancelled is not None:
+                    raise cancelled
 
     async def generate_and_store(
         self, bucket_id: str, content: str, *, source_revision: int | None = None,
@@ -419,6 +495,7 @@ class EmbeddingEngine:
             http_status, body = await self._request_embedding(
                 endpoint, snapshot["api_key"], snapshot["model"], truncated,
                 deadline=started + self.REQUEST_BUDGET_SECONDS,
+                legacy_sync_fallback=True,
                 **({"dimensions": snapshot["dimension"]} if snapshot.get("dimension") is not None else {}),
             )
             self._runtime["last_http_status"] = http_status
@@ -549,6 +626,7 @@ class EmbeddingEngine:
     async def _request_embedding(
         self, endpoint: str, api_key: str, model: str, input_value: str | list[str],
         *, deadline: float | None = None, dimensions: int | None = None,
+        legacy_sync_fallback: bool = False,
     ) -> tuple[int, dict]:
         """Use the persistent pool with a bounded, connection-only fallback."""
         client = await self._ensure_client()
@@ -587,15 +665,14 @@ class EmbeddingEngine:
                 metrics[fields[phase]] = round((now - phase_started[phase]) * 1000)
                 if phase == "receive_response_headers" and state == "complete":
                     metrics["header_ms"] = round((now - request_started) * 1000)
+        request = {
+            "headers": {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            "json": {"model": model, "input": input_value,
+                     **({"dimensions": dimensions} if dimensions is not None else {})},
+        }
         try:
             response = await client.post(
-                endpoint,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={"model": model, "input": input_value,
-                      **({"dimensions": dimensions} if dimensions is not None else {})},
+                endpoint, **request,
                 timeout=remaining,
                 **({"extensions": {"trace": trace}} if isinstance(client, httpx.AsyncClient) else {}),
             )
@@ -621,16 +698,22 @@ class EmbeddingEngine:
             self._runtime["connection_fallback_count"] = int(
                 self._runtime.get("connection_fallback_count") or 0
             ) + 1
-            self._runtime["last_transport"] = "urllib_fallback"
-            status, body = await asyncio.to_thread(
-                self._request_embedding_sync,
-                endpoint,
-                api_key,
-                model,
-                input_value,
-                timeout_seconds=max(0.1, remaining),
-                **({"dimensions": dimensions} if dimensions is not None else {}),
-            )
+            if legacy_sync_fallback:
+                self._runtime["last_transport"] = "urllib_fallback"
+                status, body = await asyncio.to_thread(
+                    self._request_embedding_sync,
+                    endpoint, api_key, model, input_value,
+                    timeout_seconds=max(0.1, remaining),
+                    **({"dimensions": dimensions} if dimensions is not None else {}),
+                )
+            else:
+                self._runtime["last_transport"] = "async_connection_fallback"
+                # A fresh pool bypasses the failed connection acquisition. It
+                # stays in the provider task so cancellation closes it as well.
+                async with httpx.AsyncClient(follow_redirects=True) as fallback:
+                    response = await fallback.post(endpoint, **request, timeout=remaining)
+                    response.raise_for_status()
+                    status, body = int(response.status_code), response.json()
             metrics.update(source="connect_fallback", provider_attempts=2,
                            connection_reused=False,
                            total_ms=round((time.monotonic() - request_started) * 1000))
