@@ -33,12 +33,13 @@ def queries(query, *, tz):
         another = parse_human_date_reference(remainder, now=now, tz=tz)
         if another and another["date"] != hint["date"]:
             continue
-        offset = _NEXT.search(remainder)
-        offset = max(0, int(next(value for value in offset.groups() if value)) - 1) if offset else 0
+        continuation = _NEXT.search(remainder)
+        position = int(next(value for value in continuation.groups() if value)) if continuation else 0
+        offset = max(0, position - 1)
         focus = re.sub(r"私人日记|日记|手记|日誌|(?:当时|那天|那时)|(?:怎么想|在想什么|什么感受)|"
                        r"写(?:了|过|下了)什么|你(?:的)?|顾衍|\b(?:your|diary|journal|what|did|write)\b",
                        " ", strip_human_date_references(remainder), flags=re.I).strip()
-        item = {"date": hint["date"], "focus": focus[:400], "full": bool(_FULL.search(part)) or offset > 0,
+        item = {"date": hint["date"], "focus": focus[:400], "full": bool(_FULL.search(part)) or position > 0,
                 "offset": offset}
         if item["date"] not in {entry["date"] for entry in output}:
             output.append(item)

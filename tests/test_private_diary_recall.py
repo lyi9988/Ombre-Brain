@@ -75,7 +75,7 @@ def test_dated_adopted_diary_excerpt_has_actual_range_and_full_text_continuation
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("case", ["available", "changed", "other_conversation", "composer_off", "ordinary"])
+@pytest.mark.parametrize("case", ["available", "restart_from_first_char", "changed", "other_conversation", "composer_off", "ordinary"])
 def test_diary_is_owner_scoped_and_only_receipted_on_actual_talk_wire(tmp_path, monkeypatch, case):
     config = _base_config(tmp_path)
     config["gateway"].update(upstream_base_url="https://provider.fixture/v1", upstream_default_model="public-model",
@@ -117,12 +117,16 @@ def test_diary_is_owner_scoped_and_only_receipted_on_actual_talk_wire(tmp_path, 
             service.canonical_adapter = SimpleNamespace(enabled=True, conversation_id=SCOPE["conversation_id"],
                 base_url="http://aiz.fixture", http_client=bridge,
                 _headers=lambda: {"Authorization": "Bearer bridge-fixture"})
+            question = {
+                "ordinary": "今天早上好。",
+                "restart_from_first_char": "2026年11月8日的私人日记，从第1个字继续。",
+            }.get(case, QUESTION)
             response = await client.post("/v1/chat/completions", headers={**auth,
                 "X-Guyan-Conversation-Id": scope["conversation_id"],
                 "X-Ombre-Canonical-Source-Event-Id": scope["user_source_event_id"],
                 "X-Ombre-Canonical-Assistant-Source-Event-Id": scope["assistant_source_event_id"]},
                 json={"model": "public-model", "messages": [{"role": "user",
-                    "content": "今天早上好。" if case == "ordinary" else QUESTION}]})
+                    "content": question}]})
             assert response.status_code == 200, response.text
             wire = "\n".join(payload_texts(sent[-1]))
             lookup = (await client.post("/internal/memory-delivery/lookup", headers=auth, json=scope)).json()
@@ -135,8 +139,15 @@ def test_diary_is_owner_scoped_and_only_receipted_on_actual_talk_wire(tmp_path, 
                 assert lookup["context"]["fragments"] == [], "a diary is not a formal L1 card"
                 debug = service.state_store.list_injection_debug(limit=1)[0]
                 assert MATCH not in json.dumps(debug, ensure_ascii=False)
+            elif case == "restart_from_first_char":
+                assert "focus" not in calls[0] and calls[1]["start"] == "0"
+                page = diary_sources[0]
+                end = page["range"]["end"]
+                assert page["range"]["start"] == 0 and 0 < end < len(BODY)
+                assert BODY[:end] in wire and f"从第 {end + 1} 个字继续" in wire
+                assert page["source_revision"] == "adopted-r1" and page["excerpt_sha256"] == sha(BODY[:end])
             else:
                 assert MATCH not in wire and not diary_sources
-            assert len(calls) == (2 if case in {"available", "changed"} else 0)
+            assert len(calls) == (2 if case in {"available", "restart_from_first_char", "changed"} else 0)
 
     asyncio.run(scenario())
