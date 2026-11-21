@@ -481,6 +481,76 @@ def test_natural_total_timeout_does_not_restart_local_io_after_budget_exhausted(
     ]
 
 
+def test_natural_embedding_wait_timeout_preserves_local_candidate_and_rerank(tmp_path, monkeypatch):
+    import jieba
+
+    # Keep the one-time dictionary startup out of the synthetic recall budget.
+    jieba.initialize()
+    query = "An ordinary query with an exact local anchor."
+    bucket = _natural_bucket("memory-local-after-embedding-timeout", "A committed source-backed fact.")
+    candidate = _natural_candidate(bucket, 0.0, labels=("exact_anchor",))
+    service, calls, metadata = _natural_finish_service(monkeypatch, [bucket], {query: [candidate]})
+    service.embedding_query_timeout_seconds = 0.05
+    service.recall_timeout_seconds = 1.0
+    service._resolve_gateway_background_prompt = lambda _source, _scope, fallback: fallback
+    engine = _embedding_engine(tmp_path)
+    meta = metadata[bucket["id"]]
+    engine._store_embedding(
+        bucket["id"], [1.0, 0.0], source_revision=meta["revision"],
+        source_sha256=meta["body_sha256"], parent_memory_id=meta["memory_id"],
+        source_unit_id="local-unit", input_text=bucket["content"],
+    )
+    service.embedding_engine = engine
+    provider_inputs = []
+    provider_closed = asyncio.Event()
+
+    async def blocked_request(_endpoint, _key, _model, input_value, **_kwargs):
+        provider_inputs.append(input_value)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            provider_closed.set()
+
+    monkeypatch.setattr(engine, "_request_embedding", blocked_request)
+    local_builder = service._dynamic_bucket_candidate_items
+    observed_semantic = []
+
+    async def candidate_builder(*args, natural_input, allow_semantic, **kwargs):
+        if allow_semantic:
+            observed_semantic.append(await service._natural_semantic_candidates(natural_input, {bucket["id"]}))
+        return await local_builder(*args, natural_input=natural_input, allow_semantic=allow_semantic, **kwargs)
+
+    async def selector(selected_query, session_id, buckets, *, natural_input, **_kwargs):
+        return await service._finish_natural_selection(selected_query, session_id, buckets,
+                                                       recall_input=natural_input)
+
+    service._dynamic_bucket_candidate_items = candidate_builder
+    natural_input = {"route": "ordinary", "q_current": query, "q_context": query,
+                     "metadata": {}, "_tasks": []}
+
+    async def run():
+        whole_deadline = time.monotonic() + service.recall_timeout_seconds
+        natural_input["_deadline"] = whole_deadline
+        result = await service._select_recall_with_fallback(
+            selector, query, "session-local-after-wait", [bucket], sentinel_debug={"route": "ordinary"},
+            natural_input=natural_input, allow_semantic=True, allow_query_planner=False, allow_rerank=True,
+        )
+        assert natural_input["_deadline"] == whole_deadline
+        return result
+
+    selected, suppressed, debug = asyncio.run(run())
+    assert natural_input["semantic_debug"]["status"] == "timeout"
+    assert "embedding_wait_timeout" in natural_input["incomplete_reasons"]
+    assert "recall_total_timeout" not in natural_input["incomplete_reasons"]
+    assert provider_closed.is_set() and len(provider_inputs) == 1 and isinstance(provider_inputs[0], str)
+    assert observed_semantic == [{}]
+    assert calls["rerank"][0]["ids"] == [bucket["id"]] and len(calls["rerank"]) == 1
+    assert [row["id"] for row in selected] == [bucket["id"]] and not suppressed
+    assert [(item["phase"], item["status"]) for item in debug["selection_attempts"]] == [
+        ("initial", "completed"),
+    ]
+
+
 def test_natural_timeout_keeps_semantic_checkpoint_without_unbounded_source_adoption():
     query = "An ordinary paraphrase about a shared evening experience."
     bucket = _natural_bucket("memory-timeout-semantic", "A committed source-backed evening fact.")
@@ -855,6 +925,89 @@ def test_natural_semantic_candidates_use_context_view_without_keyword_gate(curre
     assert scores == {"authorized-memory": 0.84}
     assert recall_input["semantic_hits"]["authorized-memory"]["unit_id"] == "moment-1"
     assert [view["semantic_used"] for view in recall_input["metadata"]["query_views"]] == [False, True]
+
+
+@pytest.mark.parametrize(("budget", "whole_remaining", "expected"), [
+    (8.0, 15.0, "embedding"), (8.0, 2.0, "whole"),
+    (0.0, 15.0, "whole"), (0.0, None, "none"),
+], ids=["embedding-first", "whole-first", "zero-keeps-whole", "zero-without-whole"])
+def test_natural_semantic_passes_earlier_wait_deadline(budget, whole_remaining, expected):
+    service = GatewayService.__new__(GatewayService)
+    service.embedding_query_timeout_seconds = budget
+    service.semantic_candidate_top_k = 4
+    passed = []
+
+    async def search(queries, *, deadline, **_kwargs):
+        passed.append((list(queries), deadline))
+        return []
+
+    service.embedding_engine = SimpleNamespace(enabled=True, search_similar_queries=search)
+
+    async def run():
+        natural_input = {"q_current": "one natural query"}
+        before = time.monotonic()
+        whole = before + whole_remaining if whole_remaining is not None else None
+        if whole is not None:
+            natural_input["_deadline"] = whole
+        assert await service._natural_semantic_candidates(natural_input, {"eligible"}) == {}
+        after = time.monotonic()
+        assert natural_input.get("_deadline") == whole
+        assert len(passed) == 1 and passed[0][0] == ["one natural query"]
+        deadline = passed[0][1]
+        if expected == "embedding":
+            assert before + budget <= deadline <= after + budget
+        elif expected == "whole":
+            assert deadline == whole
+        else:
+            assert deadline is None
+
+    asyncio.run(run())
+
+
+def test_natural_semantic_does_not_mislabel_early_provider_timeout():
+    service = GatewayService.__new__(GatewayService)
+    service.embedding_query_timeout_seconds = 8.0
+    service.semantic_candidate_top_k = 4
+
+    async def early_provider_failure(*_args, **_kwargs):
+        raise asyncio.TimeoutError("provider stopped early")
+
+    service.embedding_engine = SimpleNamespace(enabled=True, search_similar_queries=early_provider_failure)
+    natural_input = {"q_current": "one natural query", "_deadline": time.monotonic() + 15.0}
+    assert asyncio.run(service._natural_semantic_candidates(natural_input, {"eligible"})) == {}
+    assert natural_input["semantic_debug"]["status"] == "error"
+    assert "embedding_wait_timeout" not in natural_input.get("incomplete_reasons", [])
+    assert "recall_total_timeout" not in natural_input.get("incomplete_reasons", [])
+
+
+def test_external_natural_semantic_cancellation_is_not_a_wait_timeout():
+    service = GatewayService.__new__(GatewayService)
+    service.embedding_query_timeout_seconds = 8.0
+    service.semantic_candidate_top_k = 4
+    started = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def blocked_search(*_args, **_kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    service.embedding_engine = SimpleNamespace(enabled=True, search_similar_queries=blocked_search)
+    natural_input = {"q_current": "one natural query"}
+
+    async def run():
+        task = asyncio.create_task(service._natural_semantic_candidates(natural_input, {"eligible"}))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert closed.is_set()
+    assert natural_input["semantic_debug"].get("status") != "timeout"
+    assert "embedding_wait_timeout" not in natural_input.get("incomplete_reasons", [])
 
 
 def test_verified_semantic_candidate_can_pass_without_literal_evidence():

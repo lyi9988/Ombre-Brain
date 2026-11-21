@@ -18135,6 +18135,13 @@ class GatewayService:
         if not callable(search):
             diagnostics.update(status="legacy_provider_adapter", coverage_status="incomplete")
             return await self._get_semantic_candidates(query, eligible_ids, cache_debug=diagnostics)
+        # Bound this waiter's vector lookup, not the shared provider task or the
+        # remaining stages of recall. Zero disables only the vector-specific cap.
+        recall_deadline = recall_input.get("_deadline")
+        cap = getattr(self, "embedding_query_timeout_seconds", 0.0)
+        cap_deadline = time.monotonic() + cap if cap > 0 else None
+        capped = cap_deadline is not None and (recall_deadline is None or cap_deadline < recall_deadline)
+        wait_deadline = cap_deadline if capped else recall_deadline
         try:
             preparation = {}
             if callable(getattr(self.embedding_engine, "_query_config_snapshot", None)):
@@ -18149,12 +18156,18 @@ class GatewayService:
             hits = await search(
                 semantic_queries, top_k=self.semantic_candidate_top_k, eligible_ids=eligible_ids,
                 index_metadata=recall_input.get("index_metadata"), cache_debug=diagnostics,
-                deadline=recall_input.get("_deadline"), **preparation,
+                deadline=wait_deadline, **preparation,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             diagnostics.update(status="error", error_type=type(exc).__name__, coverage_status="incomplete")
+            if isinstance(exc, TimeoutError) and capped and time.monotonic() >= cap_deadline:
+                diagnostics["status"] = "timeout"
+                recall_input.setdefault("incomplete_reasons", []).append("embedding_wait_timeout")
+                recall_input["semantic_hits"] = {}
+                recall_input.pop("_completed_semantic", None)
+                return {}
             hits = []
         recall_input["semantic_hits"] = {str(hit["bucket_id"]): hit for hit in hits}
         # Request-local checkpoint: a later Planner/rerank timeout must not
