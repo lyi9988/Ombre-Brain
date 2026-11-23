@@ -200,7 +200,7 @@ def _freshness_config():
     return values
 
 
-def _install_source_http(monkeypatch, *, state="available", presentations=None):
+def _install_source_http(monkeypatch, *, state="available", presentations=None, source_overrides=None):
     class RequestCalls(list):
         pass
 
@@ -239,6 +239,7 @@ def _install_source_http(monkeypatch, *, state="available", presentations=None):
             rows.append({
                 "memory_id": item["memory_id"], "revision": item["revision"],
                 "state": "ok", "sources": sources,
+                **(source_overrides or {}).get(item["memory_id"], {}),
             })
         return httpx.Response(200, json={"items": rows})
 
@@ -574,175 +575,78 @@ def test_usage_card_off_source_does_not_fall_back_to_l1_or_ready_l2(tmp_path, mo
     assert "Ready L2 must remain suppressed" not in final["body"]
 
 
-def test_ready_l2_is_batch_resolved_and_used_with_per_statement_use_constraints(tmp_path, monkeypatch):
-    _authority, view, _records, buckets = _authority_fixture(
-        tmp_path, [("bucket-l2-ready", "L1 raw original sentinel; full source narrative.")],
-    )
+@pytest.mark.parametrize("retired_state", ["ready", "stale"])
+def test_v1_l1_reaches_recall_without_reading_existing_l2(tmp_path, monkeypatch, retired_state):
+    l1_body = "L1 original with its stated condition intact."
+    retired_l2 = "This archived L2 must never enter the new recall."
+    _authority, view, _records, buckets = _authority_fixture(tmp_path, [("bucket-v1", l1_body)])
     source_requests = _install_source_http(monkeypatch, presentations={
-        "memory:bucket-l2-ready": {
-            "state": "ready", "text": "L2 coherent presentation sentinel.",
-            "presentation_revision": 7, "reason": None,
-        },
+        "memory:bucket-v1": {"state": retired_state, "text": retired_l2,
+                             "presentation_revision": 7, "reason": None},
     })
-    service, _calls = _gateway_service(
-        tmp_path, monkeypatch, view, buckets, [], _base_config(),
-    )
+    service, _calls = _gateway_service(tmp_path, monkeypatch, view, buckets, [], _base_config())
     request = _recall_input()
-    raw = "[bucket_id:bucket-l2-ready] L1 raw original sentinel; full source narrative."
-
     sections = asyncio.run(memory_use.project_sections(
         service, request, request["q_context"], buckets,
-        {"direct": (raw, ["bucket-l2-ready"], 4000),
-         "targeted": ("", [], 0), "diffused": ("", [], 0)},
+        {"direct": ("[bucket_id:bucket-v1] " + l1_body, ["bucket-v1"], 400)},
     ))
 
-    assert len(source_requests.presentation_requests) == 1
-    call = source_requests.presentation_requests[0]
-    assert call["url"].endswith("/api/memory-authority/presentations/resolve")
-    assert call["authorization"] == "Bearer synthetic-source-check-token"
-    item = call["payload"]["items"][0]
-    expected_statement_uses = {
-        use["statement_id"]: use["usage"]
-        for use in request["usage_by_bucket"]["bucket-l2-ready"]["items"]
-    }
-    assert item["statement_uses"] == expected_statement_uses
-    assert set(item["allowed_uses"]) == set(expected_statement_uses.values())
-    assert item["narrative_allowed"] is True
-    assert "current_basis" in item["statement_uses"].values()
-    assert "current_basis" not in sections["direct"]
-    assert "historical_evidence" in item["statement_uses"].values()
-    assert "historical_evidence" not in sections["direct"]
-    assert "L2 coherent presentation sentinel." in sections["direct"]
-    assert "L1 raw original sentinel" not in sections["direct"]
-    # Even L1 semantic statement prose is computation-only for ready L2.
-    assert '现住址在白桦街。' not in sections['direct']
-    assert '旧住址在青石路。' not in sections['direct']
-    trace = request["presentation_trace"][0]
-    assert trace["source"] == "l2"
-    assert trace["presentation_revision"] == 7
-    assert trace["fallback_reason"] is None
-
+    assert source_requests and not source_requests.presentation_requests
+    assert l1_body in sections["direct"]
+    assert retired_l2 not in sections["direct"]
+    assert request["injected_usage_bucket_ids"] == ["bucket-v1"]
+    trace, = request["presentation_trace"]
+    assert trace["source"] == "l1" and trace["l1_revision"] == 1
+    assert trace["presentation_revision"] is None
     projection = service._build_memory_recall_projection(
         recalled_memory=sections["direct"], targeted_memory_detail="", related_memory="",
         recalled_moments=[], targeted_memory_detail_debug={},
         memory_sentinel_debug={"route": "natural"}, natural_input=request,
     )
-    assert projection["presentation_trace"] == request["presentation_trace"]
+    assert projection["presentation_trace"] == [trace]
 
 
-def test_stale_l2_falls_back_to_l1_and_records_exact_reason(tmp_path, monkeypatch):
-    _authority, view, _records, buckets = _authority_fixture(
-        tmp_path, [("bucket-l2-stale", "L1 fallback narrative sentinel.")],
+@pytest.mark.parametrize("source_state", ["available", "withdrawn"])
+def test_current_v2_body_uses_its_own_qualified_source_without_l2(tmp_path, monkeypatch, source_state):
+    from memory_l1_v2 import prepare_card
+
+    body = "On weekends the owner prefers a printed book."
+    bid = "bucket-v2"
+    seed, binding_id = _semantic_document(bid, body)
+    doc = prepare_card({
+        "title": "Printed books on weekends", "body": body, "kind": "preference",
+        "stability": "stable", "keywords": ["books", "weekends"], "people": [],
+        "sources": [binding_id], "primary_topic": "interests_preferences", "event_time": None,
+    }, people=[], bindings=seed["evidence_bindings"], generation={"origin": "chat_l1"})
+    doc.pop("body")
+    store = MemoryAuthorityStore({"state_dir": str(tmp_path)})
+    prepared = store.prepare_memory_commit(
+        memory_id=f"memory:{bid}", bucket_id=bid, expected_revision=0,
+        body_sha256=body_sha256(body), snapshot_path="revisions/memory-v2/1.md",
+        metadata={"name": "Printed books on weekends", "memory_l1": doc,
+                  "memory_l1_semantic_sha256": semantic_sha256(doc),
+                  "memory_l1_content_sha256": l1_content_sha256(body, doc)},
+        source_refs=[binding_id], decision_source="gateway-test", idempotency_key="store-v2", actor="test",
     )
-    source_requests = _install_source_http(monkeypatch, presentations={
-        "memory:bucket-l2-stale": {
-            "state": "stale", "text": "Stale L2 must not be used",
-            "presentation_revision": None, "reason": "dependency_version_stale",
-        },
+    store.record_body_written(prepared["operation_id"], observed_body_sha256=body_sha256(body))
+    store.finalize_memory_commit(prepared["operation_id"])
+    view = MemoryAuthorityRecallView({"state_dir": str(tmp_path), "memory_authority": {"enabled": True}})
+    buckets = [{"id": bid, "content": body, "metadata": {"name": bid}}]
+    calls = _install_source_http(monkeypatch, state=source_state, presentations={
+        f"memory:{bid}": {"state": "ready", "text": "ARCHIVED L2", "presentation_revision": 7},
     })
-    service, _calls = _gateway_service(
-        tmp_path, monkeypatch, view, buckets, [], _base_config(),
-    )
-    request = _recall_input()
-    raw = "[bucket_id:bucket-l2-stale] L1 fallback narrative sentinel."
-
+    service, _calls = _gateway_service(tmp_path, monkeypatch, view, buckets, [], _base_config())
+    request = _recall_input("What does the owner prefer to read on weekends?")
     sections = asyncio.run(memory_use.project_sections(
-        service, request, request["q_context"], buckets,
-        {"direct": (raw, ["bucket-l2-stale"], 4000),
-         "targeted": ("", [], 0), "diffused": ("", [], 0)},
+        service, request, request["q_context"], buckets, {"direct": (f"[bucket_id:{bid}] {body}", [bid], 400)},
     ))
-
-    assert len(source_requests.presentation_requests) == 1
-    assert "L1 fallback narrative sentinel." in sections["direct"]
-    assert "Stale L2 must not be used" not in sections["direct"]
-    trace = request["presentation_trace"][0]
-    assert trace["resolver_state"] == "stale"
-    assert trace["source"] == "l1"
-    assert trace["presentation_revision"] is None
-    assert trace["fallback_reason"] == "dependency_version_stale"
-
-
-def test_l2_is_kept_as_a_whole_unit_when_it_exceeds_the_remaining_budget(tmp_path, monkeypatch):
-    _authority, view, _records, buckets = _authority_fixture(
-        tmp_path, [("bucket-l2-large", "Short L1 fallback with its condition preserved.")],
-    )
-    _install_source_http(monkeypatch, presentations={
-        "memory:bucket-l2-large": {
-            "state": "ready",
-            "text": "L2 complete condition unit and its exception. " * 120,
-            "presentation_revision": 8, "reason": None,
-        },
-    })
-    service, _calls = _gateway_service(
-        tmp_path, monkeypatch, view, buckets, [], _base_config(),
-    )
-    request = _recall_input()
-    raw = "[bucket_id:bucket-l2-large] Short L1 fallback with its condition preserved."
-
-    sections = asyncio.run(memory_use.project_sections(
-        service, request, request["q_context"], buckets,
-        {"direct": (raw, ["bucket-l2-large"], 400),
-         "targeted": ("", [], 0), "diffused": ("", [], 0)},
-    ))
-
-    assert "Short L1 fallback with its condition preserved." in sections["direct"]
-    assert "L2 complete condition unit" not in sections["direct"]
-    trace = request["presentation_trace"][0]
-    assert trace["source"] == "l1"
-    assert trace["presentation_revision"] is None
-    assert trace["fallback_reason"] == "presentation_exceeds_remaining_budget"
-
-
-def test_large_l2_selects_complete_units_that_fit_the_existing_budget(tmp_path, monkeypatch):
-    _authority, view, _records, buckets = _authority_fixture(
-        tmp_path, [("bucket-l2-units", "L1 fallback must not replace a fitting L2 unit.")],
-        # The omitted historical unit is unrelated. Old/current addresses both
-        # match this query and cannot demonstrate an optional, droppable unit.
-        old="那时我喜欢咖啡的味道。",
-    )
-    current_unit = (
-        "Complete current unit: the arrangement applies only under its stated condition, "
-        "with the listed exception preserved."
-    )
-    oversized_unit = "Complete historical unit with all conditions. " * 120
-    _install_source_http(monkeypatch, presentations={
-        "memory:bucket-l2-units": {
-            "state": "ready",
-            "text": "Full preferred L2 narrative. " * 120,
-            "presentation_revision": 9,
-            "reason": None,
-            "units": [
-                {"unit_id": "unit:current", "statement_refs": [
-                    "statement:bucket-l2-units:current",
-                ], "text": current_unit},
-                {"unit_id": "unit:historical", "statement_refs": [
-                    "statement:bucket-l2-units:old",
-                ], "text": oversized_unit},
-            ],
-        },
-    })
-    service, _calls = _gateway_service(
-        tmp_path, monkeypatch, view, buckets, [], _base_config(),
-    )
-    request = _recall_input()
-    raw = "[bucket_id:bucket-l2-units] L1 fallback must not replace a fitting L2 unit."
-
-    sections = asyncio.run(memory_use.project_sections(
-        service, request, request["q_context"], buckets,
-        {"direct": (raw, ["bucket-l2-units"], 400),
-         "targeted": ("", [], 0), "diffused": ("", [], 0)},
-    ))
-
-    assert current_unit in sections["direct"]
-    assert oversized_unit not in sections["direct"]
-    assert "Full preferred L2 narrative." not in sections["direct"]
-    assert "L1 fallback must not replace a fitting L2 unit." not in sections["direct"]
-    trace = request["presentation_trace"][0]
-    assert trace["source"] == "l2"
-    assert trace["presentation_revision"] == 9
-    assert trace["selected_unit_ids"] == ["unit:current"]
-    assert trace["partial_presentation"] is True
-    assert trace["fallback_reason"] is None
+    assert calls and not calls.presentation_requests
+    row, = request["presentation_trace"]
+    assert row["presentation_revision"] is None
+    if source_state == "available":
+        assert sections["direct"].count(body) == 1 and row["source"] == "l1_v2"
+    else:
+        assert sections["direct"] == "" and row["source"] == "none"
 
 
 def test_real_configuration_preview_route_accepts_scenario_and_legacy_payload_without_providers(tmp_path):

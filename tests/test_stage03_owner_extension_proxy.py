@@ -2,6 +2,7 @@
 import asyncio
 import ast
 import json
+import os
 from pathlib import Path
 
 import httpx
@@ -13,9 +14,7 @@ from prompt_source_registry import fixed_prompt_source, _MEMORY_L3_SYNC_PROMPT
 
 ROUTES = [
     ('GET', '/presentation/sync-proposals', None),
-    ('POST', '/presentation/sync-proposals/2/prepare', {'expected_revision': 1, 'request_id': 'prepare'}),
-    ('POST', '/presentation/sync-proposals/2/apply', {'expected_revision': 2, 'request_id': 'apply'}),
-    ('POST', '/presentation/sync-proposals/2/retry', {'expected_revision': 3, 'request_id': 'retry'}),
+    ('GET', '/presentation?presentation_revision=2', None),
     ('GET', '/evolution?offset=0&limit=50', None),
     ('POST', '/evolution/notes', {'expected_revision': 1, 'request_id': 'note', 'content': '完整合成说明。'}),
     ('POST', '/evolution/notes/ring-1/retract', {'expected_revision': 1, 'request_id': 'retract', 'expected_content_sha256': 'a' * 64}),
@@ -23,7 +22,7 @@ ROUTES = [
 ]
 
 
-def harness(monkeypatch):
+def harness(monkeypatch, *, retired_followup=False):
     original_client = httpx.AsyncClient
     service = GatewayService.__new__(GatewayService)
     service.gateway_token = 'synthetic-owner-token'
@@ -33,6 +32,8 @@ def harness(monkeypatch):
     seen = []
     def brain(request):
         seen.append(request)
+        if retired_followup:
+            return httpx.Response(410, json={'error': {'code': 'l2_retired'}})
         return httpx.Response(200, json={'status': 'ok', 'memory_id': 'memory-1', 'receipt': {'exact': True}})
     monkeypatch.setenv('OMBRE_MEMORY_INDEX_ADMIN_URL', 'http://brain.test')
     monkeypatch.setenv('OMBRE_MEMORY_WRITE_TOKEN', 'synthetic-internal-token')
@@ -59,8 +60,35 @@ def test_owner_routes_preserve_exact_receipts_and_fixed_paths(monkeypatch, metho
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('suffix', [
+    '/presentation/prepare', '/presentation/revisions', '/presentation/sync-proposals/2/prepare',
+    '/presentation/sync-proposals/2/apply', '/presentation/sync-proposals/2/retry',
+])
+def test_l2_writes_are_retired_with_no_upstream_request(monkeypatch, suffix):
+    client, seen = harness(monkeypatch)
+    path = '/api/memory-authority/memories/memory-1' + suffix
+    async def scenario():
+        async with client:
+            assert (await client.post(path, json={})).status_code == 401
+            response = await client.post(path, json={}, headers={'Authorization': 'Bearer synthetic-owner-token'})
+            assert response.status_code == 409 and response.json()['error']['code'] == 'l2_retired'
+            assert seen == []
+    asyncio.run(scenario())
+
+
+def test_retired_followup_reply_remains_typed_through_the_existing_owner_proxy(monkeypatch):
+    client, seen = harness(monkeypatch, retired_followup=True)
+    async def scenario():
+        async with client:
+            response = await client.post('/api/memory-authority/memories/memory-1/evolution/followups/old-l2/retry',
+                json={'expected_revision': 1, 'request_id': 'old-retry'},
+                headers={'Authorization': 'Bearer synthetic-owner-token'})
+            assert response.status_code == 409 and response.json()['error']['code'] == 'l2_retired'
+            assert len(seen) == 1
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('suffix,payload', [
-    ('/presentation/sync-proposals/2/apply', {'expected_revision': 1, 'request_id': 'x', 'actor': 'owner'}),
     ('/presentation/sync-proposals/2/not-allowed', {'expected_revision': 1, 'request_id': 'x'}),
     ('/evolution/notes', {'expected_revision': True, 'request_id': 'x', 'content': 'body'}),
     ('/evolution/notes', {'expected_revision': 1, 'request_id': 'x', 'content': 'body', 'arbitrary_url': 'http://elsewhere.test'}),
@@ -79,7 +107,8 @@ def test_unapproved_proxy_fields_never_leave_gateway(monkeypatch, suffix, payloa
 def test_l3_source_spec_and_factory_body_are_exact_scoped_mirror():
     spec = fixed_prompt_source('ombre.memory_l3_sync_prompt')
     assert spec.scope == 'memory.reflection'
-    source = Path(__file__).resolve().parents[2] / 'stage03-confirmed-brain' / 'prompt_source_registry.py'
+    brain = Path(os.environ.get('GUYAN_BRAIN_TEST_ROOT') or Path(__file__).resolve().parents[2] / 'stage03-confirmed-brain')
+    source = brain / 'prompt_source_registry.py'
     tree = ast.parse(source.read_text(encoding='utf-8'))
     assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
         and any(isinstance(target, ast.Name) and target.id == '_MEMORY_L3_SYNC_PROMPT' for target in node.targets))

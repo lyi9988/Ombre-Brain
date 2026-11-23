@@ -744,6 +744,8 @@ async def verify_sources(service, request, query, items, *, refresh=False):
                                "source_states": source_states, "query_purpose": use_context["purpose"],
                                'relation_guards': (check or {}).get('relation_guards', [])}
         _apply_sync_scope(usage_by_bucket[bid], (check or {}).get('sync_scope') or record.get('sync_scope'), use_context['purpose'])
+        if usage_by_bucket[bid]["state"] == "excluded":
+            item["admission_reason"] = "l1_sync_required"
         result.append(item)
     if refresh:
         await _relation_dependencies(service, request, query, records, usage_by_bucket, use_context,
@@ -905,7 +907,7 @@ def _relation_render_support(service, request, query, bid, main_text, original, 
 
 
 def render(service, usage, header, original, budget, *, trace=None):
-    """A source-faithful interim L1 view, not the future persisted L2."""
+    """Render source-qualified legacy or v1 prose within the current recall budget."""
     if usage["state"] == "excluded":
         return ""
     # Factory/body/owner_override/off are resolved through the normal Composer
@@ -972,7 +974,7 @@ def required_presentation_statements(usage):
 
 
 def render_presentation(service, usage, header, presentation, budget, *, trace=None):
-    """Render Brain's already-qualified persisted L2 through the existing card."""
+    """Render a saved L2 for historical format checks; live recall uses L1."""
     if usage["state"] == "excluded":
         return "", "usage_excluded", [], False
     from utils import count_tokens_approx
@@ -1061,169 +1063,6 @@ def render_presentation(service, usage, header, presentation, budget, *, trace=N
             return selected_text, None, selected_ids, len(selected_ids) < len(unit_ids)
         selected.pop()
     return "", "no_complete_unit_fits_remaining_budget", [], False
-
-
-def source_diagnostic_trace(value):
-    """Bounded body-free allowlist at the Brain-to-Gateway trace boundary."""
-    if not isinstance(value, dict):
-        return None
-    def sha(value):
-        return isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
-    state = value.get('state')
-    out = {'state': state if isinstance(state, str) and state in {'ok', 'memory_not_current_or_eligible',
-        'revision_unavailable', 'legacy', 'dependency_changed'} else 'unknown', 'failures': []}
-    failures = value.get('failures')
-    if not isinstance(failures, list):
-        failures = []
-    for row in failures[:16]:
-        if not isinstance(row, dict) or not sha(row.get('binding_id_sha256')):
-            continue
-        detail = row.get('detail') if isinstance(row.get('detail'), dict) else {}
-        kind = detail.get('failure_kind')
-        clean = {'failure_kind': kind if isinstance(kind, str) and kind in {'timeout', 'http_status', 'read_error',
-            'identity_mismatch', 'anchor_mismatch', 'unavailable'} else 'unknown', 'field_changes': []}
-        status = detail.get('http_status')
-        if type(status) is int and 100 <= status <= 599:
-            clean['http_status'] = status
-        changes = detail.get('field_changes')
-        for change in (changes[:3] if isinstance(changes, list) else []):
-            if (isinstance(change, dict) and isinstance(change.get('field'), str) and change.get('field') in {'source_namespace', 'source_id', 'source_revision'}
-                and sha(change.get('expected_sha256')) and sha(change.get('current_sha256'))):
-                clean['field_changes'].append({key: change[key] for key in ('field', 'expected_sha256', 'current_sha256')})
-        code = detail.get('reason_code')
-        if isinstance(code, str) and code in {'source_adapter_unconfigured', 'source_read_failed', 'source_anchor_mismatch',
-            'source_not_found', 'source_identity_mismatch', 'source_outside_bound_conversation',
-            'canonical_source_reader_unconfigured', 'upstream_version_unknown', 'configured_source_changed',
-            'binding_not_in_revision', 'source_namespace_changed', 'archive_unavailable', 'turn_archive_unavailable'}:
-            clean['reason_code'] = code
-        out['failures'].append({'binding_id_sha256': row['binding_id_sha256'], 'detail': clean})
-    omitted = value.get('omitted_failures')
-    out['omitted_failures'] = (max(0, omitted) if type(omitted) is int else 0) + max(0, len(failures) - 16)
-    return out
-
-
-async def resolve_presentations(service, candidates, *, request=None):
-    """Resolve only source-qualified, non-targeted L1 memories in one Brain call."""
-    if not candidates:
-        return {}, {}
-    request = request if request is not None else {}
-    items = []
-    for candidate in candidates:
-        usage = candidate["usage"]
-        statement_ids = list(dict.fromkeys(
-            str(item.get("statement_id") or "")
-            for item in usage.get("items", [])
-            if item.get("statement_id") and item.get("usage") != "excluded"
-        ))
-        allowed_uses = list(dict.fromkeys(
-            str(item.get("usage") or "")
-            for item in usage.get("items", [])
-            if item.get("usage") and item.get("usage") != "excluded"
-        ))
-        statement_uses = {
-            str(item["statement_id"]): str(item["usage"])
-            for item in usage.get("items", [])
-            if item.get("statement_id") and item.get("usage") != "excluded"
-        }
-        items.append({
-            "memory_id": candidate["memory_id"],
-            "revision": candidate["revision"],
-            "statement_ids": statement_ids,
-            "allowed_uses": allowed_uses,
-            "statement_uses": statement_uses,
-            "narrative_allowed": bool(usage.get("narrative_allowed")),
-            **({"matched_statement_ids": usage["statement_selection"]["direct_ids"],
-                "support_statement_ids": usage["statement_selection"]["support_ids"]}
-               if (usage.get("statement_selection") or {}).get("direct_ids") else {}),
-        })
-
-    base = os.environ.get("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://ombre-brain:8000").rstrip("/")
-    token = os.environ.get("OMBRE_MEMORY_WRITE_TOKEN") or getattr(service, "gateway_token", "")
-    failure = "brain_unconfigured" if not base or not token else None
-    rows_by_memory = {}
-    try:
-        if failure:
-            raise RuntimeError(failure)
-        payload = await read_batch(service, request, "l2_resolve",
-            "/api/memory-authority/presentations/resolve", {"items": items})
-        if not isinstance(payload, dict) or payload.get("status") != "ok" \
-                or not isinstance(payload.get("items"), list):
-            raise ValueError("invalid_presentation_response")
-        for row in payload["items"]:
-            if isinstance(row, dict) and row.get("memory_id"):
-                rows_by_memory[str(row["memory_id"])] = row
-    except asyncio.CancelledError:
-        raise
-    except asyncio.TimeoutError:
-        failure = "resolver_deadline"
-        request.setdefault("incomplete_reasons", []).append(failure)
-    except RuntimeError:
-        pass
-    except httpx.HTTPStatusError as exc:
-        failure = f"resolver_http_{exc.response.status_code}"
-    except httpx.HTTPError:
-        failure = "resolver_transport_error"
-    except (ValueError, TypeError, KeyError):
-        failure = "resolver_invalid_response"
-
-    presentations, trace = {}, {}
-    for candidate in candidates:
-        bid = candidate["bucket_id"]
-        memory_id = candidate["memory_id"]
-        usage = candidate["usage"]
-        common = {
-            "bucket_id": bid,
-            "memory_id": memory_id,
-            "l1_revision": candidate["revision"],
-            "presentation_revision": None,
-            "resolved_presentation_revision": None,
-            "selected_unit_ids": [],
-            "partial_presentation": False,
-            "resolver_state": None,
-            "source": "l1",
-            "fallback_reason": failure or "resolver_missing_item",
-            "query_purpose": usage.get("query_purpose"),
-            "statement_selection": usage.get("statement_selection"),
-        }
-        row = rows_by_memory.get(memory_id) if not failure else None
-        if row is not None:
-            state = str(row.get("state") or "unknown")
-            reason = str(row.get("reason") or "").strip()
-            common["resolver_state"] = state
-            for key in ('relation_issues', 'relation_guards'):
-                if isinstance(row.get(key), list):
-                    common[key] = row[key]
-            if reason == 'related_memory_dependency_unavailable':
-                common['relation_context_unavailable'] = True
-            if row.get('sync_scope') is not None or reason == 'l1_sync_required':
-                common['sync_scope'] = row.get('sync_scope') or {'statement_ids': [], 'unknown_scope': True}
-            diagnostic = source_diagnostic_trace(row.get("source_diagnostic"))
-            if diagnostic is not None:
-                common["source_diagnostic"] = diagnostic
-            common["fallback_reason"] = None
-            if state != "ready":
-                common["fallback_reason"] = reason or f"presentation_{state}"
-            else:
-                text = row.get("text")
-                revision = row.get("presentation_revision")
-                if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
-                    common["fallback_reason"] = "invalid_presentation_revision"
-                elif not isinstance(text, str) or not text.strip():
-                    common["resolved_presentation_revision"] = revision
-                    common["fallback_reason"] = "empty_ready_presentation"
-                else:
-                    common["resolved_presentation_revision"] = revision
-                    common["fallback_reason"] = None
-                    presentations[bid] = {
-                        "text": text,
-                        "units": row.get("units") if isinstance(row.get("units"), list) else [],
-                        "presentation_revision": revision,
-                        "resolver_state": state,
-                        "coverage": row.get("coverage"),
-                    }
-                    common["l2_coverage"] = row.get("coverage")
-        trace[bid] = common
-    return presentations, trace
 
 
 def hierarchy_pool(service, request, pool):
@@ -1445,61 +1284,26 @@ async def _project_sections(service, request, query, buckets, sections):
 
     records = request.get("_semantic_records", {})
     trace_by_bucket = {}
-    l2_candidates = []
     for bid, key in planned_section.items():
         usage = uses[bid]
         record = records.get(bid) or {}
-        if usage["state"] == "l1_v2":
-            trace_by_bucket[bid] = {
-                "bucket_id": bid, "memory_id": record["memory_id"],
-                "l1_revision": record["revision"], "presentation_revision": None,
-                "source": "l1_v2", "resolver_state": None, "fallback_reason": None,
-            }
-        elif key == "targeted":
-            trace_by_bucket[bid] = {
-                "bucket_id": bid, "memory_id": record.get("memory_id"),
-                "l1_revision": record.get("revision"), "presentation_revision": None,
-                "source": "l1_targeted_original" if usage["state"] == "l1" else "legacy",
-                "resolver_state": None, "fallback_reason": None,
-                "reason": "explicit_targeted_original",
-            }
-        elif usage["state"] == "legacy":
-            trace_by_bucket[bid] = {
-                "bucket_id": bid, "memory_id": None, "l1_revision": None,
-                "presentation_revision": None, "source": "legacy",
-                "resolver_state": None, "fallback_reason": "no_l1_authority",
-            }
-        elif (record.get("state") == "l1" and record.get("memory_id")
-              and isinstance(record.get("revision"), int)):
-            l2_candidates.append({
-                "bucket_id": bid, "memory_id": str(record["memory_id"]),
-                "revision": int(record["revision"]), "usage": usage,
-            })
-        else:
-            trace_by_bucket[bid] = {
-                "bucket_id": bid, "memory_id": record.get("memory_id"),
-                "l1_revision": record.get("revision"), "presentation_revision": None,
-                "source": "l1", "resolver_state": None,
-                "fallback_reason": "l1_revision_unavailable",
-            }
+        state = usage["state"]
+        trace = {
+            "bucket_id": bid, "memory_id": record.get("memory_id"),
+            "l1_revision": record.get("revision"), "presentation_revision": None,
+            "source": state, "resolver_state": None, "fallback_reason": None,
+        }
+        if state == "l1":
+            trace["query_purpose"] = usage.get("query_purpose")
+        elif state == "legacy":
+            trace.update(memory_id=None, l1_revision=None, fallback_reason="no_l1_authority")
+        if key == "targeted" and state != "l1_v2":
+            trace.update(reason="explicit_targeted_original", fallback_reason=None,
+                         source="l1_targeted_original" if state == "l1" else "legacy")
+        trace_by_bucket[bid] = trace
 
-    presentations, resolved_trace = await resolve_presentations(service, l2_candidates, request=request)
-    trace_by_bucket.update(resolved_trace)
-    if any(row.get('relation_context_unavailable') for row in resolved_trace.values()):
-        request.setdefault('incomplete_reasons', []).append('related_memory_dependency_unavailable')
-    invalid_related = {issue['memory_id'] for row in resolved_trace.values() for issue in row.get('relation_issues', [])
-                       if isinstance(issue, dict) and isinstance(issue.get('memory_id'), str)}
-    for bid in list(allowed):
-        if (records.get(bid) or {}).get('memory_id') in invalid_related:
-            allowed.discard(bid)
-            uses[bid] = {'state': 'excluded', 'items': [], 'narrative_allowed': False}
-    if invalid_related:
-        request['_relation_fresh_keys'] = [key for key in request.get('_relation_fresh_keys', [])
-            if (records.get(key) or {}).get('memory_id') not in invalid_related]
-        render_ids_by_section = {key: [bid for bid in ids if bid in allowed]
-                                 for key, ids in render_ids_by_section.items()}
-    # Authority/permission may change while either batch is in flight. This
-    # local metadata read is not another L0/provider round trip.
+    # Recheck the Authority after final source verification. Neither L1 nor
+    # the source guards need a second-pass presentation to qualify this body.
     if getattr(view, "enabled", False) and callable(metadata_reader):
         latest = metadata_reader(list(planned_section))
         for bid in list(allowed):
@@ -1513,16 +1317,11 @@ async def _project_sections(service, request, query, buckets, sections):
         item = candidate_by_bucket.get(bid)
         reason = (item or {}).get("admission_reason") or "l1_source_or_body_not_eligible"
         record = records.get(bid) or {}
-        # Keep the earlier resolver observation, not stale authority/body fields.
-        diagnostic = source_diagnostic_trace((trace_by_bucket.get(bid) or {}).get("source_diagnostic"))
         trace_by_bucket[bid] = {
             "bucket_id": bid, "memory_id": record.get("memory_id"),
             "l1_revision": record.get("revision"), "presentation_revision": None,
             "source": "none", "resolver_state": None, "fallback_reason": reason,
         }
-        if diagnostic is not None:
-            trace_by_bucket[bid]["source_diagnostic"] = diagnostic
-            trace_by_bucket[bid]["source_diagnostic_scope"] = "resolver_observation_before_final_eligibility"
 
     rendered = {}
     spans = []
@@ -1544,7 +1343,6 @@ async def _project_sections(service, request, query, buckets, sections):
                 comments_reader = getattr(service, '_bucket_text_with_comments', None)
                 if uses[bid]['state'] == 'legacy' and callable(comments_reader):
                     original = comments_reader(bucket)
-                presentation = presentations.get(bid)
                 if uses[bid]["state"] == "l1_v2":
                     from memory_readable_projection import fit_units
 
@@ -1560,60 +1358,6 @@ async def _project_sections(service, request, query, buckets, sections):
                         row["body_chars"] = len(original)
                     else:
                         row.update(source="none", render_reason="l1_v2_body_not_adopted")
-                elif presentation:
-                    text, render_reason, selected_unit_ids, partial_presentation = render_presentation(
-                        service, uses[bid], header, presentation, remaining, trace=row,
-                    )
-                    if text:
-                        row["source"] = "l2"
-                        row["presentation_revision"] = presentation["presentation_revision"]
-                        row["selected_unit_ids"] = selected_unit_ids
-                        row["partial_presentation"] = partial_presentation
-                        row["fallback_reason"] = None
-                        coverage = presentation.get("coverage") or {}
-                        selected_set = set(selected_unit_ids)
-                        actual_refs = (coverage.get("used_statement_ids") if not partial_presentation else
-                            list(dict.fromkeys(ref for unit in presentation.get("units") or []
-                                if unit.get("unit_id") in selected_set for ref in unit.get("statement_refs") or [])))
-                        row["injected_statement_ids"] = actual_refs
-                        if actual_refs is not None:
-                            row["uncovered_matched_statement_ids"] = sorted(set(
-                                (uses[bid].get("statement_selection") or {}).get("direct_ids") or []) - set(actual_refs))
-                    else:
-                        row["fallback_reason"] = render_reason
-                        if render_reason in {
-                            "presentation_exceeds_remaining_budget",
-                            "no_complete_unit_fits_remaining_budget",
-                            "no_complete_correction_unit_fits_remaining_budget",
-                            "required_l2_context_missing",
-                        }:
-                            text = render(
-                                service, uses[bid], header,
-                                original, remaining, trace=row,
-                            )
-                            if text:
-                                row["source"] = "l1"
-                            else:
-                                row["source"] = "none"
-                                row.setdefault("render_reason", render_reason)
-                        else:
-                            row["source"] = "none"
-                            row["render_reason"] = render_reason
-                elif row.get('fallback_reason') == 'l1_sync_required':
-                    _apply_sync_scope(uses[bid], row.get('sync_scope') or {'statement_ids': [], 'unknown_scope': True},
-                        context(service, request, query)['purpose'])
-                    text = (render(service, {**uses[bid], 'scope_to_query': key != 'targeted'}, header,
-                        original, remaining, trace=row) if uses[bid]['state'] != 'excluded' else '')
-                    row['source'] = 'l1' if text else 'none'
-                    row['render_reason'] = 'l1_sync_required'
-                elif row.get("fallback_reason") in {"source_dependency_changed", "memory_not_found",
-                        "memory_not_eligible", "l1_revision_mismatch", "l1_dependency_changed",
-                        "l1_parent_dependency_changed", "scene_dependency_mismatch"}:
-                    # Brain has fresher source evidence than the request-local
-                    # selection cache. Never revive the rejected source via L1.
-                    text = ""
-                    row["source"] = "none"
-                    row["render_reason"] = row["fallback_reason"]
                 else:
                     text = render(service, {**uses[bid], "scope_to_query": key != "targeted"}, header,
                                   original, remaining, trace=row)

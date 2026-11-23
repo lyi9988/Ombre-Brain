@@ -6587,12 +6587,17 @@ class GatewayService:
             return JSONResponse({"error": {"code": "memory_l1_unavailable"}}, status_code=503, headers=headers)
 
     async def handle_memory_presentation(self, request: Request) -> JSONResponse:
-        """Authenticated owner proxy for Brain's independent L2 presentation API."""
+        """Authenticated owner proxy for retained L2 history."""
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
             return auth_result
         from urllib.parse import quote
         headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+        if request.method == "POST" and request.path_params.get("action") in {"prepare", "revisions"}:
+            # Existing Aiz owner transport preserves a typed conflict, not 410.
+            return JSONResponse({"error": {"code": "l2_retired"}}, status_code=409, headers=headers)
+        if request.method != "GET":
+            return JSONResponse({"error": {"code": "method_not_allowed"}}, status_code=405, headers=headers)
         base = os.environ.get("OMBRE_MEMORY_INDEX_ADMIN_URL", "http://ombre-brain:8000").rstrip("/")
         token = os.environ.get("OMBRE_MEMORY_WRITE_TOKEN") or self.gateway_token
         if not base or not token:
@@ -6603,38 +6608,20 @@ class GatewayService:
             return JSONResponse({"error": {"code": "memory_not_found"}}, status_code=404,
                                 headers=headers)
         path = "/api/memory-authority/memories/" + quote(memory_id, safe="") + "/presentation"
-        if request.method == "GET":
-            revisions = request.query_params.getlist("presentation_revision")
-            revision_text = revisions[0] if len(revisions) == 1 else ""
-            if revisions and (len(revisions) != 1
-                              or not revision_text
-                              or any(char < "0" or char > "9" for char in revision_text)
-                              or not revision_text.lstrip("0")):
-                return JSONResponse({"error": {"code": "invalid_presentation_revision"}},
-                                    status_code=400, headers=headers)
-        elif request.method == "POST":
-            action = str(request.path_params.get("action") or "")
-            if action not in {"prepare", "revisions"}:
-                return JSONResponse({"error": {"code": "method_not_allowed"}}, status_code=405,
-                                    headers=headers)
-            path += "/" + action
-        else:
-            return JSONResponse({"error": {"code": "method_not_allowed"}}, status_code=405,
-                                headers=headers)
+        revisions = request.query_params.getlist("presentation_revision")
+        revision_text = revisions[0] if len(revisions) == 1 else ""
+        if revisions and (len(revisions) != 1
+                          or not revision_text
+                          or any(char < "0" or char > "9" for char in revision_text)
+                          or not revision_text.lstrip("0")):
+            return JSONResponse({"error": {"code": "invalid_presentation_revision"}},
+                                status_code=400, headers=headers)
         if request.url.query:
             path += "?" + request.url.query
-        raw = await request.body() if request.method == "POST" else None
-        if raw is not None and len(raw) > 524288:
-            return JSONResponse({"error": {"code": "request_too_large"}}, status_code=413,
-                                headers=headers)
         request_headers = {"Authorization": "Bearer " + token}
-        if raw is not None:
-            request_headers["Content-Type"] = request.headers.get("Content-Type", "application/json")
         try:
             async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-                upstream = await client.request(
-                    request.method, base + path, content=raw, headers=request_headers,
-                )
+                upstream = await client.get(base + path, headers=request_headers)
             if upstream.status_code not in {200, 201, 202, 400, 404, 409, 413, 422, 503}:
                 return JSONResponse({"error": {"code": "memory_presentation_unavailable"}},
                                     status_code=503, headers=headers)
@@ -6670,7 +6657,7 @@ class GatewayService:
                     revision = request.path_params.get('presentation_revision')
                     if action not in {'prepare', 'apply', 'retry'} or type(revision) is not int or revision < 1:
                         raise ValueError('invalid_sync_action')
-                    path += '/' + str(revision) + '/' + action
+                    return JSONResponse({'error': {'code': 'l2_retired'}}, status_code=409, headers=headers)
             else:
                 path = base_path + '/evolution'
                 if request.method == 'POST':
@@ -6730,9 +6717,13 @@ class GatewayService:
                 response = await client.request(request.method, base + path,
                     json=payload if request.method == 'POST' else None, headers={'Authorization': 'Bearer ' + token})
             body = response.json()
-            if response.status_code not in {200, 201, 202, 400, 401, 403, 404, 409, 413, 422, 503} or not isinstance(body, dict):
+            status = response.status_code
+            issue = body.get('error') if isinstance(body, dict) else None
+            if status == 410 and isinstance(issue, dict) and issue.get('code') == 'l2_retired':
+                status = 409
+            if status not in {200, 201, 202, 400, 401, 403, 404, 409, 413, 422, 503} or not isinstance(body, dict):
                 raise ValueError('invalid_memory_owner_response')
-            return JSONResponse(body, status_code=response.status_code, headers=headers)
+            return JSONResponse(body, status_code=status, headers=headers)
         except (httpx.HTTPError, ValueError, TypeError):
             return JSONResponse({'error': {'code': 'memory_owner_service_unavailable'}}, status_code=503, headers=headers)
 
@@ -7194,8 +7185,16 @@ class GatewayService:
         states = {f['fragment_id']: {'fragment_id': f['fragment_id'], 'state': 'available'} for f in fragments}
         def reject(fragment, state, reason):
             states[fragment['fragment_id']].update(state=state, reason=reason)
-        modern = [f for f in fragments if type(f.get('l1_revision')) is int and f['l1_revision'] > 0]
-        legacy = [f for f in fragments if f not in modern]
+        current_fragments = []
+        for fragment in fragments:
+            if fragment.get('l2_revision') is not None:
+                # Keep the immutable receipt available as history. A retired
+                # presentation never qualifies again as a live memory source.
+                reject(fragment, 'unavailable', 'memory_presentation_retired')
+            else:
+                current_fragments.append(fragment)
+        modern = [f for f in current_fragments if type(f.get('l1_revision')) is int and f['l1_revision'] > 0]
+        legacy = [f for f in current_fragments if f not in modern]
         view = getattr(self, 'memory_authority_view', None)
         reader = getattr(view, 'memory_index_metadata_map', None)
         current = reader([f['bucket_id'] for f in legacy]) if callable(reader) and legacy else {}
@@ -7297,21 +7296,6 @@ class GatewayService:
                     if not source or source.get('eligible_source') is not True:
                         reject(fragment, 'withdrawn' if source and source.get('state') in {'withdrawn', 'revoked'} else 'changed',
                             'memory_source_no_longer_eligible')
-            from memory_recall_semantics import USAGES
-            l2_items = [{'memory_id': f['memory_id'], 'revision': f['l1_revision'],
-                'statement_ids': f['coverage']['statement_ids'], 'allowed_uses': sorted(USAGES - {'excluded'}),
-                'statement_uses': {}, 'narrative_allowed': True} for f in modern
-                if f.get('l2_revision') is not None and states[f['fragment_id']]['state'] == 'available']
-            if l2_items:
-                result = await memory_use.read_batch(self, request, 'delivery_l2_validation',
-                    '/api/memory-authority/presentations/resolve', {'items': l2_items})
-                rows = {row['memory_id']: row for row in result['items']}
-                for fragment in modern:
-                    if fragment.get('l2_revision') is None or states[fragment['fragment_id']]['state'] != 'available':
-                        continue
-                    row = rows.get(fragment['memory_id']) or {}
-                    if row.get('state') != 'ready' or row.get('presentation_revision') != fragment['l2_revision']:
-                        reject(fragment, 'changed', 'memory_presentation_no_longer_current')
             check_v2_records(require_current=True)
         except (httpx.HTTPError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
             for fragment in modern:

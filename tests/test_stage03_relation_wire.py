@@ -2,6 +2,7 @@
 import asyncio
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -24,19 +25,20 @@ def project_direct(service, view, buckets, *, purpose='current'):
     return request, sections
 
 
-def test_resolver_pending_fact_sync_never_falls_back_to_old_l1_current_fact(tmp_path, monkeypatch):
+def test_pending_fact_sync_from_source_check_blocks_old_l1_current_fact(tmp_path, monkeypatch):
     real_client = memory_use.httpx.AsyncClient
     _authority, service, view, buckets, _plan = _fixture(tmp_path, monkeypatch)
     # _fixture already installs a transport. Restore the original client before
     # replacing it; nesting its installer would silently keep the old handler.
     monkeypatch.setattr(memory_use.httpx, 'AsyncClient', real_client)
-    _install_source_http(monkeypatch, presentations={'memory:bucket-l1': {
-        'state': 'pending_sync', 'reason': 'l1_sync_required', 'text': '', 'presentation_revision': None}})
+    calls = _install_source_http(monkeypatch, source_overrides={'memory:bucket-l1': {
+        'sync_scope': {'statement_ids': [], 'unknown_scope': True}}})
     request, sections = project_direct(service, view, buckets)
     assert '现住址在白桦街' not in sections['direct']
     assert buckets[0]['content'] not in sections['direct']
     assert request['presentation_trace'][0]['source'] == 'none'
     assert request['presentation_trace'][0]['fallback_reason'] == 'l1_sync_required'
+    assert calls and not calls.presentation_requests
 
 
 def test_known_pending_scope_excludes_only_affected_statement_and_never_uses_full_narrative(tmp_path, monkeypatch):
@@ -108,8 +110,9 @@ asyncio.run(c.commit_memory(memory_id='memory-bucket-B',bucket_id='bucket-B',exp
     idempotency_key='owner-B-confirmed-relation',actor='owner',l1_write_intent=True))
 MemoryL1Index(a).ensure('memory:bucket-l1',1)
 '''
+    brain = Path(os.environ.get('GUYAN_BRAIN_TEST_ROOT') or Path(__file__).resolve().parents[2] / 'stage03-confirmed-brain')
     completed = subprocess.run([sys.executable, '-X', 'utf8', '-c', script], input=json.dumps({'state_dir': state_dir, 'body': body, 'metadata': metadata}),
-        text=True, encoding='utf-8', capture_output=True, cwd=Path(__file__).resolve().parents[2] / 'stage03-confirmed-brain')
+        text=True, encoding='utf-8', capture_output=True, cwd=brain)
     assert completed.returncode == 0, completed.stderr
 
 
@@ -174,24 +177,22 @@ def test_verified_counterpart_condition_false_does_not_globally_downgrade_A_curr
     assert LIMIT_TEXT not in sections['direct']
 
 
-def test_late_resolver_withdrawal_discards_prior_counterpart_qualification_and_keeps_unrelated_memory(tmp_path, monkeypatch):
+def test_final_source_check_rejects_unavailable_counterpart_and_keeps_unrelated_memory(tmp_path, monkeypatch):
     real_client = memory_use.httpx.AsyncClient
     authority, service, view, buckets, plan = _fixture(tmp_path, monkeypatch)
     commit_counterpart(authority)
     monkeypatch.setattr(memory_use.httpx, 'AsyncClient', real_client)
-    calls = _install_source_http(monkeypatch, presentations={'memory:bucket-l1': {
-        'state': 'unavailable', 'reason': 'related_memory_dependency_unavailable', 'text': '',
-        'presentation_revision': None, 'relation_issues': [{'memory_id': 'memory-bucket-B', 'state': 'unavailable'}]}})
+    calls = _install_source_http(monkeypatch, source_overrides={'memory-bucket-B': {
+        'state': 'memory_not_current_or_eligible', 'sources': {}}})
     ids = [bucket['id'] for bucket in buckets]
     request = _request(view, ids)
     raw = '\n\n'.join(f"[bucket_id:{bucket['id']}] {bucket['content']}" for bucket in buckets)
     sections = asyncio.run(memory_use.project_sections(service, request, request['q_context'], buckets,
         {'direct': (raw, ids, 4000), 'targeted': ('', [], 0), 'diffused': ('', [], 0)}))
-    assert any(item['memory_id'] == 'memory-bucket-B' for call in calls for item in call['payload']['items']), 'B was qualified by the earlier actual source RPC'
-    assert calls.presentation_requests, 'the later resolver response actually ran'
+    assert any(item['memory_id'] == 'memory-bucket-B' for call in calls for item in call['payload']['items'])
+    assert not calls.presentation_requests
     assert LIMIT_TEXT not in sections['direct']
     assert buckets[1]['content'] in sections['direct'], 'unrelated memory is preserved'
-    assert 'related_memory_dependency_unavailable' in request['incomplete_reasons']
     current = next(item for item in request['usage_by_bucket']['bucket-l1']['items'] if item['statement_id'] == 'statement:bucket-l1:current')
     assert current['usage'] != 'current_basis'
     projection = _projection(service, request, sections)

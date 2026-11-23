@@ -335,17 +335,18 @@ def dependency_snapshot(conn, memory_id):
 def cache_versions(conn, memory_ids):
     """Small per-memory versions; no prose or whole-library invalidation."""
     ids = list(dict.fromkeys(memory_ids))
-    values = {mid: {'relations': None, 'presentation': None, 'sync': []} for mid in ids}
+    values = {mid: {'relations': None, 'sync': []} for mid in ids}
     for offset in range(0, len(ids), 300):
         chunk = ids[offset:offset + 300]
         marks = ','.join('?' for _ in chunk)
-        for table, columns, key in (('memory_relation_generations', 'memory_id,generation', 'relations'),
-                                    ('memory_l2_heads', 'memory_id,presentation_revision', 'presentation')):
-            try:
-                for row in conn.execute('SELECT ' + columns + ' FROM ' + table + ' WHERE memory_id IN (' + marks + ')', chunk):
-                    values[row[0]][key] = row[1]
-            except sqlite3.OperationalError:
-                pass  # Older databases remain distinguishable from generation 0.
+        try:
+            for row in conn.execute('SELECT memory_id,generation FROM memory_relation_generations '
+                    'WHERE memory_id IN (' + marks + ')', chunk):
+                values[row[0]]['relations'] = row[1]
+        except sqlite3.OperationalError:
+            pass  # Older databases remain distinguishable from generation 0.
+        # Pending fact corrections remain a source guard. Saved L2 prose and
+        # presentation versions no longer participate in any live projection.
         try:
             for row in conn.execute('SELECT memory_id,presentation_revision,state FROM memory_l2_sync_proposals '
                     'WHERE memory_id IN (' + marks + ') ORDER BY memory_id,presentation_revision', chunk):
@@ -378,10 +379,4 @@ def propagate_change(conn, memory_id, revision, operation_id, reason='revision_c
         if host and (host['state'] != 'active' or host['recall_policy'] != 'enabled'):
             conn.execute("UPDATE memory_relation_guards SET state='dependency_withdrawn',operation_id=? WHERE host_memory_id=?",
                 (operation_id, mid))
-        row = conn.execute('SELECT m.active_revision,r.metadata_json FROM memories m JOIN memory_revisions r '
-            'ON r.memory_id=m.memory_id AND r.revision=m.active_revision WHERE m.memory_id=? '
-            "AND m.state='active' AND m.recall_policy='enabled'", (mid,)).fetchone()
-        if row and 'memory_l1' in json.loads(row['metadata_json']) and (mid != memory_id or reason != 'revision_committed'):
-            from memory_l2_store import enqueue_in_transaction
-            enqueue_in_transaction(conn, mid, row['active_revision'], request_id='dependency:' + operation_id)
     return sorted(affected)

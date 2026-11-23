@@ -22,14 +22,14 @@ def run(value):
     return asyncio.run(value)
 
 
-def source_fixture(*, bid='bucket-1', text='The supplied past memory has its original meaning.', legacy=False):
+def source_fixture(*, bid='bucket-1', text='The supplied past memory has its original meaning.', legacy=False, l2=True):
     binding = {'binding_id': 'binding-1', 'source_namespace': 'snapshot.canonical',
                'source_id': 'source-1', 'source_revision': 'source-r1'}
     record = {'memory_id': 'memory-' + bid, 'revision': 3, 'body_sha256': sha('original body'),
               'document': None if legacy else {'evidence_bindings': [binding]}}
     projection = {'rendered_memory_spans': [{'bucket_id': bid, 'section': 'direct', 'text': text}],
         'presentation_trace': [{'bucket_id': bid, 'memory_id': record['memory_id'],
-            'l1_revision': None if legacy else 3, 'presentation_revision': None if legacy else 2,
+            'l1_revision': None if legacy else 3, 'presentation_revision': 2 if l2 and not legacy else None,
             'injected_statement_ids': ['statement-1'], 'selected_unit_ids': ['unit-1']}],
         'compiled_memory_blocks': [{'source_id': 'ombre.memory_recall', 'content': 'OWNER WRAPPER\n' + text}]}
     projection['delivery_candidates'] = candidates(projection, {bid: record})
@@ -439,17 +439,20 @@ def test_mixed_unavailable_fragment_does_not_block_known_usage(tmp_path):
 def test_authenticated_lookup_keeps_exact_receipt_and_validates_mixed_sources_separately(tmp_path, monkeypatch):
     service, _ = gateway_service(lambda _: httpx.Response(200, json={}))
     service.memory_delivery = MemoryDeliveryStore(tmp_path / 'gateway.sqlite')
-    _, frozen, wire = source_fixture()
+    _, frozen, wire = source_fixture(l2=False)
+    _, historical, historical_wire = source_fixture(bid='old-l2')
     _, legacy, legacy_wire = source_fixture(bid='legacy', legacy=True)
-    attempt = service.memory_delivery.begin(SCOPE, 'trace-mixed', [*final_fragments(frozen, wire), *final_fragments(legacy, legacy_wire)])
+    attempt = service.memory_delivery.begin(SCOPE, 'trace-mixed',
+        [*final_fragments(frozen, wire), *final_fragments(historical, historical_wire),
+         *final_fragments(legacy, legacy_wire)])
     service.memory_delivery.succeed(attempt)
     context = service.memory_delivery.complete(SCOPE)
     async def get(_):
         return {'content': 'changed old body', 'metadata': {}}
     service.bucket_mgr = SimpleNamespace(get=get)
-    async def read_batch(_service, _request, stage, _path, payload):
-        if stage == 'delivery_l2_validation':
-            return {'items': [{'memory_id': 'memory-bucket-1', 'state': 'ready', 'presentation_revision': 2}]}
+    async def read_batch(_service, _request, stage, path, payload):
+        assert stage == 'delivery_source_validation' and path.endswith('/recall-sources')
+        assert [item['memory_id'] for item in payload['items']] == ['memory-bucket-1']
         return {'items': [{'memory_id': 'memory-bucket-1', 'revision': 3, 'state': 'ok',
             'sources': {'binding-1': {'state': 'available', 'eligible_source': True}}}]}
     monkeypatch.setattr('memory_recall_runtime.read_batch', read_batch)
@@ -462,7 +465,12 @@ def test_authenticated_lookup_keeps_exact_receipt_and_validates_mixed_sources_se
             response = await client.post(path, json=SCOPE, headers={'Authorization': 'Bearer gateway-test-token'})
             result = response.json()
             assert result['context'] == context and result['state'] == 'available'
-            assert sorted(row['state'] for row in result['fragment_states']) == ['available', 'changed']
+            fragment_ids = {row['bucket_id']: row['fragment_id'] for row in context['fragments']}
+            states = {row['fragment_id']: row for row in result['fragment_states']}
+            assert states[fragment_ids['bucket-1']]['state'] == 'available'
+            assert states[fragment_ids['legacy']]['state'] == 'changed'
+            assert states[fragment_ids['old-l2']]['state'] == 'unavailable'
+            assert states[fragment_ids['old-l2']]['reason'] == 'memory_presentation_retired'
         await service.http_client.aclose()
     run(scenario())
 
@@ -502,7 +510,7 @@ def test_completed_review_history_keeps_original_bindings_without_relaxing_curre
                 assert (await client.post(path, json=query)).status_code == 401
                 headers = {'Authorization': 'Bearer gateway-test-token'}
                 normal = (await client.post(path, json=scope, headers=headers)).json()
-                assert normal['fragment_states'][0]['state'] == 'withdrawn'
+                assert normal['fragment_states'][0]['reason'] == 'memory_presentation_retired'
                 historical = (await client.post(path, json=query, headers=headers)).json()
                 assert historical['context'] == normal['context'] == context
                 assert historical['source_qualification'] == 'historical_input'
