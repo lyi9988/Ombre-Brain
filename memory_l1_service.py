@@ -93,7 +93,7 @@ class MemoryL1RevisionService:
                        "coverage": (metadata.get("diary_l1_bundle") or {}).get("coverage"),
                        "semantic_sha256": metadata.get("memory_l1_semantic_sha256"),
                        "l1_content_sha256": metadata.get("memory_l1_content_sha256"),
-                       "preparation": {"l2": {"state": "direct_l1" if isinstance(document, dict) and document.get("schema_version") == "memory-l1-v2" else "tracked" if state == "current" else "not_prepared",
+                       "preparation": {"l2": {"state": "direct_l1" if isinstance(document, dict) and document.get("schema_version") == "memory-l1-v2" else "retired",
                                               "status_url": "/api/memory-authority/memories/" + memory_id + "/presentation"}}}}
 
     def _owner_document(self, submitted, previous, *, memory_id, request_id, catalog, catalog_revision, revision,

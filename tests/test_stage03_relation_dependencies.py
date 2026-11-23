@@ -55,7 +55,7 @@ def confirm(service):
     return asyncio.run(service.save('B', payload)), payload
 
 
-def test_owner_confirmation_creates_actual_receipt_and_bidirectional_dependency_with_targeted_jobs(tmp_path):
+def test_owner_confirmation_creates_actual_receipt_and_bidirectional_dependency_without_l2_jobs(tmp_path):
     authority, service, _docs = setup_relations(tmp_path)
     before = {mid: dependency(authority, mid) for mid in ('A', 'B', 'C')}
     before_jobs = {mid: jobs(authority, mid) for mid in ('A', 'B', 'C')}
@@ -76,7 +76,8 @@ def test_owner_confirmation_creates_actual_receipt_and_bidirectional_dependency_
     assert operation['status'] == 'committed'
     assert dependency(authority, 'A')['generation'] > before['A']['generation']
     assert dependency(authority, 'A')['token'] != before['A']['token']
-    assert len(jobs(authority, 'A')) > len(before_jobs['A'])
+    assert jobs(authority, 'A') == before_jobs['A'] == []
+    assert jobs(authority, 'B') == before_jobs['B'] == []
     assert dependency(authority, 'C') == before['C'] and jobs(authority, 'C') == before_jobs['C']
     # Original owner request recovery must not create another dependency pulse.
     settled = dependency(authority, 'A')
@@ -114,6 +115,7 @@ def test_withdrawal_preserves_scope_guard_and_history_without_reviving_the_previ
     assert dependency(authority, 'A')['generation'] > before['generation']
     assert authority.get_memory_revision('A', 1) == old_a
     assert authority.get_memory_revision('B', 1) and authority.get_memory_revision('B', 2)
+    assert jobs(authority, 'A') == jobs(authority, 'B') == []
     # A new title/version alone cannot turn the same stale statement current.
     title = draft(service, 'A', 'A-title-after-withdrawal')
     title['document']['narrative']['title'] = '标题更新，旧陈述未改'

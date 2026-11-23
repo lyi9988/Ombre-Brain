@@ -19,7 +19,7 @@ import pytest
 from memory_l0_sources import McpDiarySourceAdapter, MemoryL0Sources
 from memory_l1_reads import MemoryL1Reads
 from memory_l1_schema import document_template, generation_template, split_document, statement_template
-from test_memory_l2_p4 import setup as setup_l2
+from test_memory_l2_p4 import seed_historic_l2_job, setup as setup_l2
 
 
 def run(task):
@@ -172,8 +172,9 @@ class _BrainReadTransport(httpx.AsyncBaseTransport):
 
 def test_real_brain_resolve_flows_through_gateway_and_stale_l2_falls_back(tmp_path, monkeypatch):
     runtime = _gateway_runtime(monkeypatch)
-    l2_service, authority, model_calls = setup_l2(tmp_path)
+    l2_service, authority, model_calls = setup_l2(tmp_path, seed_l2=False)
     sources = _source_backed_l1(l2_service, authority)
+    seed_historic_l2_job(authority, 'm2')
     generated = run(l2_service.run_once(10))
     assert any(row.get("task_id") for row in generated["results"])
     assert len(model_calls) >= 1

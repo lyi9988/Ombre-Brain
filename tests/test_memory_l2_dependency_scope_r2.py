@@ -16,7 +16,7 @@ from memory_l1_schema import (
 from memory_l2_service import MemoryL2Service, source_dependency_ids
 from test_memory_diary_l1_p2b import CATALOG_REVISION, DAY, setup_diary
 from test_memory_l1_revisions import request_for
-from test_memory_l2_p4 import run, setup as setup_l2
+from test_memory_l2_p4 import run, seed_historic_l2_job, setup as setup_l2
 
 
 def _persist_source_bound_l1(tmp_path):
@@ -69,6 +69,7 @@ def _persist_source_bound_l1(tmp_path):
     ))
 
     engine_service, _, calls = setup_l2(tmp_path / "engine")
+    seed_historic_l2_job(env['authority'], 'm1')
     service = MemoryL2Service(engine_service.engine, env["revisions"])
     service.engine._memory_l1_sources = lambda: env["sources"]
     return service, env, calls

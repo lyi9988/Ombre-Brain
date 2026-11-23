@@ -100,7 +100,7 @@ def test_review_adopts_same_id_preserves_history_metadata_and_queues_original_l2
     assert generation['origin'] == 'first_pass_model' and generation['actor'] == 'legacy_backfill'
     assert service.authority.get_memory(staged['candidate_id']) is None
     outbox = service.authority.pending_outbox()[-1]['payload']
-    assert outbox['l2_preparation']['state'] == 'pending'
+    assert outbox['l2_preparation']['state'] == 'retired'
     timeline = MemoryL3Records(service.authority, service.revisions.commit).timeline('m1')
     assert any(item['kind'] == 'l1_revision' and item['revision'] == 2 for item in timeline['items'])
     assert next(item for item in timeline['items'] if item['event_id'] == 'l1:2')['details']['edit_note'] == row_reason(staged['candidate'])
@@ -254,7 +254,7 @@ def test_committed_memory_with_lost_candidate_receipt_recovers_once(tmp_path, mo
     assert recovered['revision'] == 2 and recovered['replayed']
     with closing(service.authority._connect()) as db:
         assert db.execute("SELECT count(*) FROM memory_revisions WHERE memory_id='m1'").fetchone()[0] == 2
-        assert db.execute("SELECT count(*) FROM memory_l2_jobs WHERE memory_id='m1'").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM memory_l2_jobs WHERE memory_id='m1'").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize('reported_role', ['user', 'assistant', None])

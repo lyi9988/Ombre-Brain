@@ -378,10 +378,4 @@ def propagate_change(conn, memory_id, revision, operation_id, reason='revision_c
         if host and (host['state'] != 'active' or host['recall_policy'] != 'enabled'):
             conn.execute("UPDATE memory_relation_guards SET state='dependency_withdrawn',operation_id=? WHERE host_memory_id=?",
                 (operation_id, mid))
-        row = conn.execute('SELECT m.active_revision,r.metadata_json FROM memories m JOIN memory_revisions r '
-            'ON r.memory_id=m.memory_id AND r.revision=m.active_revision WHERE m.memory_id=? '
-            "AND m.state='active' AND m.recall_policy='enabled'", (mid,)).fetchone()
-        if row and 'memory_l1' in json.loads(row['metadata_json']) and (mid != memory_id or reason != 'revision_committed'):
-            from memory_l2_store import enqueue_in_transaction
-            enqueue_in_transaction(conn, mid, row['active_revision'], request_id='dependency:' + operation_id)
     return sorted(affected)

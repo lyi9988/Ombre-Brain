@@ -89,7 +89,7 @@ def test_image_only_without_text_is_a_real_reference_but_no_invented_long_term_m
     assert receipt['candidate_ids'] == [] and not f.calls
 
 
-def test_owner_selection_queues_then_original_review_and_commit_l2(tmp_path, monkeypatch):
+def test_owner_selection_queues_then_original_review_and_commit_l1(tmp_path, monkeypatch):
     f = setup(tmp_path, monkeypatch)
     assert f.receipt['status'] == 'queued' and not f.calls
     assert f.tasks.enqueue(f.envelope, budget=256) == f.receipt
@@ -107,8 +107,8 @@ def test_owner_selection_queues_then_original_review_and_commit_l2(tmp_path, mon
     assert asyncio.run(f.readers.locate(binding))['eligible_source'] is True
     asyncio.run(f.engine._memory_l1_adopt_candidate(candidate,f.env['buckets'],owner=True,request_id='synthetic-owner-review'))
     receipt = f.tasks.receipt(f.receipt['task_id'])
-    assert receipt['status'] == 'l1_accepted_l2_pending'
-    assert receipt['memories'][0]['l2_state'] == 'pending'
+    assert receipt['status'] == 'ready'
+    assert receipt['memories'][0]['l2_state'] == 'retired'
     assert len(f.calls) == 1
     run(f)
     assert len(f.calls) == 1
@@ -117,7 +117,7 @@ def test_owner_selection_queues_then_original_review_and_commit_l2(tmp_path, mon
 def test_auto_uses_existing_policy_but_off_cannot_bypass(tmp_path, monkeypatch):
     f = setup(tmp_path / 'auto', monkeypatch, mode='auto')
     result = run(f)
-    assert result['results'][0]['status'] == 'l1_accepted_l2_pending',result
+    assert result['results'][0]['status'] == 'ready', result
     g = setup(tmp_path / 'off', monkeypatch, mode='off')
     assert run(g)['status'] == 'disabled'
     assert g.tasks.receipt(g.receipt['task_id'])['status'] == 'disabled'
@@ -291,6 +291,7 @@ def test_failed_task_keeps_its_receipt_but_cannot_be_retried(tmp_path, monkeypat
 
 def test_original_l2_worker_ready_then_owner_text_remains_protected(tmp_path, monkeypatch):
     from memory_l2_service import MemoryL2Service
+    from test_memory_l2_p4 import seed_historic_l2_job
     f = setup(tmp_path, monkeypatch, mode='auto')
     receipt = run(f)['results'][0]
     mid = receipt['memory_ids'][0]
@@ -304,6 +305,7 @@ def test_original_l2_worker_ready_then_owner_text_remains_protected(tmp_path, mo
         return NS(choices=[NS(message=NS(content=json.dumps(document)),finish_reason='stop')])
     f.engine._daily_chat_memory_create_completion = l2_completion
     service = MemoryL2Service(f.engine,f.env['revisions'])
+    seed_historic_l2_job(f.env['authority'], mid)
     result = asyncio.run(service.run_once(1))
     assert result['processed'] == 1 and result['results'][0]['state'] == 'ready',result
     assert f.tasks.receipt(f.receipt['task_id'])['status'] == 'ready'

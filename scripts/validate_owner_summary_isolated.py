@@ -1,7 +1,7 @@
 """One tiny synthetic owner-summary through the actual configured model routes.
 
-Default is preparation only. --run-real permits at most one auto_l1 and one
-presentation_l2 invocation, SDK retries disabled. All durable writes are under
+Default is preparation only. --run-real permits at most one auto_l1
+invocation, SDK retries disabled. All durable writes are under
 a newly created --output directory; no live messages, source bridge or memory
 database are read. Existing prompt configuration is read and copied, never edited.
 """
@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bucket_manager import BucketManager
 from memory_l0_sources import MemoryL0Sources
 from memory_l1_source_readers import configured_source_readers
-from memory_l2_service import MemoryL2Service
 from memory_owner_summary import OwnerSummaryPreparation, OwnerSummarySourceReader, prepare_owner_summary_tasks
 from memory_system_config import merge_config, read_overlay, runtime_overlay_path
 from reflection_engine import ReflectionEngine
@@ -81,7 +80,7 @@ async def validate(args):
     os.environ.setdefault('OMBRE_CANONICAL_BRIDGE_TOKEN','synthetic-validation-only')
     tasks = OwnerSummaryPreparation(authority,engine)
     receipt = tasks.enqueue(envelope,budget=12000)
-    calls = {'auto_l1':0,'presentation_l2':0}
+    calls = {'auto_l1':0}
     original_completion = engine._daily_chat_memory_create_completion
     async def once(client, **kwargs):
         stage = kwargs['task_stage']
@@ -104,7 +103,6 @@ async def validate(args):
             if candidate['status'] in ('pending','accepted'):
                 result['review_adoption'] = await engine._memory_l1_adopt_candidate(candidate,buckets,
                     owner=True,request_id='synthetic-review-only')
-                result['l2_worker'] = await MemoryL2Service(engine,revisions).run_once(1)
         result['receipt'] = tasks.receipt(receipt['task_id'])
     (output / 'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
     print(json.dumps(result,ensure_ascii=False,indent=2))
@@ -114,7 +112,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',required=True,help='Existing effective configuration; read only.')
     parser.add_argument('--output',required=True,help='New isolated directory; must not already exist.')
-    parser.add_argument('--run-real',action='store_true',help='Explicitly run <= 1 auto_l1 and <= 1 presentation_l2 call.')
-    parser.add_argument('--l1-only',action='store_true',help='Leave generated drafts in original Review; do not adopt or call L2.')
+    parser.add_argument('--run-real',action='store_true',help='Explicitly run at most one auto_l1 call.')
+    parser.add_argument('--l1-only',action='store_true',help='Leave generated drafts in original Review without adopting them.')
     parser.add_argument('--operation-id',default='synthetic.owner-summary.validation',help='Independent synthetic validation identity.')
     asyncio.run(validate(parser.parse_args()))

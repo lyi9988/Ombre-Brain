@@ -213,10 +213,10 @@ def test_config_save_midpoint_never_combines_new_url_with_old_named_key(tmp_path
     asyncio.run(scenario())
 
 
-def test_all_three_background_entrypoints_use_loop_owned_batch_and_teardown():
+def test_current_background_entrypoints_use_loop_owned_batch_and_teardown():
     import ast
     tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
-    for name in ('_reflection_loop', '_chat_memory_preparation_loop', '_memory_l2_preparation_loop'):
+    for name in ('_reflection_loop', '_chat_memory_preparation_loop'):
         function = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == name)
         assert any(isinstance(node, ast.AsyncWith) and any(isinstance(item.context_expr, ast.Call)
             and isinstance(item.context_expr.func, ast.Attribute) and item.context_expr.func.attr == 'batch'
@@ -225,6 +225,26 @@ def test_all_three_background_entrypoints_use_loop_owned_batch_and_teardown():
             for node in ast.walk(function)), name
         assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id == 'ReflectionEngine' for node in ast.walk(function)), name
+
+
+def test_production_preparation_worker_runs_l1_without_starting_legacy_l2():
+    import ast
+    tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
+    node = next(node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == '_memory_preparation_workers')
+    assert any(keyword.arg == 'worker' and isinstance(keyword.value, ast.Name)
+        and keyword.value.id == node.name for call in ast.walk(tree) if isinstance(call, ast.Call)
+        for keyword in call.keywords)
+    calls = []
+    async def l1():
+        calls.append('l1')
+    async def legacy_l2():
+        raise AssertionError('retired L2 worker started')
+    namespace = {'_chat_memory_preparation_loop': l1, '_memory_l2_preparation_loop': legacy_l2,
+                 'asyncio': asyncio}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), 'memory-preparation-worker', 'exec'), namespace)
+    asyncio.run(namespace[node.name]())
+    assert calls == ['l1']
 
 
 def test_actual_owner_config_save_reaches_next_background_sdk_request(config_api, monkeypatch):
@@ -258,9 +278,10 @@ def test_actual_owner_config_save_reaches_next_background_sdk_request(config_api
     asyncio.run(scenario())
 
 
-def test_l2_worker_reuses_durable_queue_and_new_dehydration_client_after_first_batch(tmp_path, monkeypatch):
+def test_legacy_l2_compatibility_reads_historic_queue_after_client_replacement(tmp_path, monkeypatch):
     from test_memory_l2_dependency_scope_r2 import _persist_source_bound_l1
     from memory_l2_service import MemoryL2Service
+    from test_memory_l2_p4 import seed_historic_l2_job
     service, env, _old_calls = _persist_source_bound_l1(tmp_path / 'source')
     config = reflection_config(tmp_path / 'worker', mode='review')
     config['reflection'].update(enabled=True, memory_task_routes={'presentation_l2': {'connection': 'dehydration'}})
@@ -282,6 +303,8 @@ def test_l2_worker_reuses_durable_queue_and_new_dehydration_client_after_first_b
                 'document': deepcopy(detail['l1']['document'])}
         edit['document']['narrative']['body'] += ' 本次局部修订。'
         await env['revisions'].save('m1', edit)
+        assert service.store.pending(10) == []
+        seed_historic_l2_job(env['authority'], 'm1')
         queued = service.store.pending(10)
         assert queued
         config['dehydration'].update(base_url='https://provider-b.invalid/v1', model='l2-B', api_key='synthetic-key-B')

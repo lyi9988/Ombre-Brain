@@ -4,7 +4,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import copy
-import json
 import logging
 from pathlib import Path
 
@@ -13,7 +12,6 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from test_memory_l1_revisions import request_for
 from test_memory_l2_p4 import owner_payload, setup as setup_l2
 
 
@@ -81,7 +79,7 @@ async def _send(app, method, path, *, token="owner-test", content=None, json_bod
         )
 
 
-def test_real_api_handler_routes_owner_versions_save_and_stale_409_preserves_draft(tmp_path):
+def test_retired_presentation_writes_and_authenticated_owner_history(tmp_path):
     service, authority, model_calls = setup_l2(tmp_path)
     app, route_specs = _api_app(service, authority)
     expected_routes = {
@@ -92,89 +90,41 @@ def test_real_api_handler_routes_owner_versions_save_and_stale_409_preserves_dra
     }
     assert {(path, tuple(methods)) for path, methods in route_specs} == expected_routes
 
-    run(service.run_once(1))
-    assert len(model_calls) == 1
-    first = run(_send(
-        app, "GET", "/api/memory-authority/memories/m1/presentation?presentation_revision=1",
-    ))
-    assert first.status_code == 200
-    assert first.json()["l2"]["presentation"]["presentation_revision"] == 1
-    original_text = first.json()["l2"]["presentation"]["document"]["full_injection_text"]
+    run(service.run_once(1))  # Explicit legacy test data, outside the current worker.
+    base = "/api/memory-authority/memories/m1/presentation"
+    model_text = service.detail("m1")["l2"]["presentation"]["document"]["full_injection_text"]
+    edit = owner_payload(service, request="legacy-owner-edit")
+    edit["document"]["full_injection_text"] = "Previously saved owner L2 manuscript."
+    run(service.save("m1", edit))
+    before = copy.deepcopy(service.detail("m1")["l2"])
 
-    edit = owner_payload(service, request="api-owner-edit")
-    edit["document"]["full_injection_text"] = "API owner L2 edit, version two."
-    saved = run(_send(
-        app, "POST", "/api/memory-authority/memories/m1/presentation/revisions",
-        json_body=edit,
-    ))
-    assert saved.status_code == 200
-    assert saved.json()["presentation_revision"] == 2
-    assert saved.json()["l2"]["presentation"]["document"]["full_injection_text"] == edit["document"]["full_injection_text"]
+    for action, payload in (("/prepare", {"expected_l1_revision": 2, "request_id": "retired"}),
+                            ("/revisions", {**edit, "request_id": "no-write"})):
+        denied = run(_send(app, "POST", base + action, json_body=payload, token="internal-read-test"))
+        gone = run(_send(app, "POST", base + action, json_body=payload))
+        assert denied.status_code == 401
+        assert gone.status_code == 410 and gone.json()["error"]["code"] == "l2_retired"
+        assert gone.headers["Cache-Control"] == "no-store"
+    assert service.detail("m1")["l2"] == before and len(model_calls) == 1
 
-    old_read = run(_send(
-        app, "GET", "/api/memory-authority/memories/m1/presentation?presentation_revision=1",
-    ))
-    current_read = run(_send(app, "GET", "/api/memory-authority/memories/m1/presentation"))
-    assert old_read.status_code == current_read.status_code == 200
-    assert old_read.json()["l2"]["presentation"]["document"]["full_injection_text"] == original_text
-    assert current_read.json()["l2"]["presentation"]["document"]["full_injection_text"] == edit["document"]["full_injection_text"]
-
-    # The client retains its exact unsaved draft when its first-pass CAS is old.
-    stale_draft = owner_payload(service, request="api-stale-l1-draft")
-    stale_draft["document"]["full_injection_text"] = "Keep this unsaved draft after 409."
-    draft_bytes = json.dumps(stale_draft, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    changed_l1 = request_for(service.revisions, request_id="api-l1-change")
-    changed_l1["document"]["narrative"]["body"] += " A new first-pass revision."
-    run(service.revisions.save("m1", changed_l1))
-    conflict = run(_send(
-        app, "POST", "/api/memory-authority/memories/m1/presentation/revisions",
-        content=draft_bytes,
-    ))
-    assert conflict.status_code == 409
-    assert conflict.json()["error"]["code"] == "revision_conflict"
-    assert json.loads(draft_bytes)["document"]["full_injection_text"] == "Keep this unsaved draft after 409."
-    historical_read = run(_send(
-        app, "GET", "/api/memory-authority/memories/m1/presentation?presentation_revision=2",
-    ))
-    assert historical_read.status_code == 200
-    assert historical_read.json()["l2"]["presentation"]["document"]["full_injection_text"] == edit["document"]["full_injection_text"]
-    assert len(model_calls) == 1
+    first = run(_send(app, "GET", base + "?presentation_revision=1"))
+    current = run(_send(app, "GET", base))
+    assert first.status_code == current.status_code == 200
+    assert first.json()["retired"] is True
+    assert first.json()["l2"]["presentation"]["document"]["full_injection_text"] == model_text
+    assert current.json()["l2"]["presentation"]["document"]["full_injection_text"] == edit["document"]["full_injection_text"]
 
 
-def test_prepare_api_only_enqueues_without_running_the_model(tmp_path):
-    service, authority, model_calls = setup_l2(tmp_path)
-    app, _routes = _api_app(service, authority)
-    pending_before = service.store.pending(100)
-
-    response = run(_send(
-        app, "POST", "/api/memory-authority/memories/m1/presentation/prepare",
-        json_body={"expected_l1_revision": 2, "request_id": "api-prepare-only"},
-    ))
-
-    assert response.status_code == 200
-    assert response.json()["status"] == "ok"
-    assert response.json()["state"] == "pending"
-    pending_after = service.store.pending(100)
-    assert len(pending_after) >= len(pending_before)
-    assert any(job["task_id"] == response.json()["task_id"] for job in pending_after)
-    assert model_calls == []
-
-
-def test_api_auth_validation_size_limit_and_resolve_are_read_only(tmp_path):
+def test_live_resolver_is_retired_even_for_available_owner_versions(tmp_path):
     service, authority, model_calls = setup_l2(tmp_path)
     run(service.run_once(1))
     app, _routes = _api_app(service, authority)
     assert len(model_calls) == 1
 
-    # The test model's new manuscript requires owner review. Save an owner
-    # version through the real route so resolve exercises a ready product.
+    # The old resolver could return this owner version as a ready product.
     owner_version = owner_payload(service, request="api-resolve-ready-version")
-    approved = run(_send(
-        app, "POST", "/api/memory-authority/memories/m1/presentation/revisions",
-        json_body=owner_version,
-    ))
-    assert approved.status_code == 200
-    assert approved.json()["presentation_revision"] == 2
+    approved = run(service.save("m1", owner_version))
+    assert approved["presentation_revision"] == 2
 
     denied = run(_send(
         app, "GET", "/api/memory-authority/memories/m1/presentation", token="",
@@ -187,17 +137,13 @@ def test_api_auth_validation_size_limit_and_resolve_are_read_only(tmp_path):
     assert invalid_query.status_code == 400
     assert invalid_query.json()["error"]["code"] == "unknown_query_field"
 
-    oversized = run(_send(
-        app, "POST", "/api/memory-authority/memories/m1/presentation/prepare",
-        content=b"x" * 524289,
-    ))
-    assert oversized.status_code == 413
-    assert oversized.json()["error"]["code"] == "request_too_large"
-
     before = copy.deepcopy(service.detail("m1")["l2"])
+    resolve_path = "/api/memory-authority/presentations/resolve"
+    denied = run(_send(app, "POST", resolve_path, token="", json_body={"items": []}))
+    assert denied.status_code == 401
     statement_id = before["presentation"]["document"]["coherent_sections"][0]["statement_refs"][0]
     resolved = run(_send(
-        app, "POST", "/api/memory-authority/presentations/resolve",
+        app, "POST", resolve_path,
         token="internal-read-test",
         json_body={"items": [{
             "memory_id": "m1", "revision": 2,
@@ -206,9 +152,8 @@ def test_api_auth_validation_size_limit_and_resolve_are_read_only(tmp_path):
             "narrative_allowed": True,
         }]},
     ))
-    assert resolved.status_code == 200
-    item = resolved.json()["items"][0]
-    assert item["state"] == "ready" and item["text"]
-    assert item["presentation_revision"] == 2
+    assert resolved.status_code == 410
+    assert resolved.json() == {"error": {"code": "l2_retired"}}
+    assert resolved.headers["Cache-Control"] == "no-store"
     assert service.detail("m1")["l2"] == before
     assert len(model_calls) == 1

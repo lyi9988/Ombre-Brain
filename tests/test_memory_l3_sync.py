@@ -16,6 +16,7 @@ from memory_l1_service import L1OwnerError
 from reflection_engine import ReflectionEngine
 from test_memory_authority_r1 import reflection_config
 from test_memory_l1_revisions import setup_service, request_for
+from test_memory_l2_p4 import seed_historic_l2_job
 
 
 def run(coro):
@@ -35,6 +36,7 @@ def setup(tmp_path, *, decision='revise_l1', before='3号', during=None, two_sta
         second['content'] = '地点在北京。'
         request['document']['statements'].append(second)
     run(revisions.save('m1', request))
+    seed_historic_l2_job(authority, 'm1')
     engine = ReflectionEngine(reflection_config(tmp_path / 'engine', mode='review'))
     engine.memory_authority_store = authority
     engine._memory_l1_revisions = lambda manager=None: revisions
@@ -256,6 +258,7 @@ def test_actual_related_correction_reaches_original_l2_call_and_withdrawal_canno
         return NS(choices=[NS(message=NS(content=json.dumps(output, ensure_ascii=False)), finish_reason='stop')])
     f.engine._daily_chat_memory_create_completion = complete
     l2 = MemoryL2Service(f.engine, revisions)
+    seed_historic_l2_job(authority, 'A')
     generated = run(l2.run_once(3))
     assert any(row.get('state') == 'ready' for row in generated['results']), generated
     a_material = next(row for row in calls if row['l1_document']['statements'][0]['statement_id'] == 'statement-A')
@@ -274,7 +277,7 @@ def test_actual_related_correction_reaches_original_l2_call_and_withdrawal_canno
     assert invalid['text'] == '' and invalid['units'] == [] and invalid['state'] == 'stale'
 
 
-def test_owner_sync_http_auth_fast_queue_cas_and_original_request_recovery(tmp_path):
+def test_retired_owner_sync_http_writes_keep_pending_review_and_guard_unchanged(tmp_path):
     import ast
     from pathlib import Path
     from starlette.responses import JSONResponse
@@ -288,25 +291,26 @@ def test_owner_sync_http_auth_fast_queue_cas_and_original_request_recovery(tmp_p
         '_require_owner_or_internal_index_maintenance': lambda req: None if req.owner else JSONResponse({'error': 'unauthorized'}, status_code=401),
         'logger': NS(warning=lambda *args: None)}
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), 'exec'), namespace)
-    def request(owner=True, payload=None):
+    def request(owner=True, method='POST', action='prepare'):
         async def body():
-            assert owner, 'credentials must be checked before reading payload'
-            return json.dumps(payload).encode()
-        return NS(method='POST', owner=owner, query_params={}, body=body,
-            path_params={'memory_id': 'm1', 'presentation_revision': str(f.owner_revision), 'action': 'prepare'})
+            pytest.fail('retired requests must not consume a body')
+        return NS(method=method, owner=owner, query_params={}, body=body,
+            path_params={'memory_id': 'm1', 'presentation_revision': str(f.owner_revision), 'action': action})
     handler = namespace['api_memory_l3_sync']
-    denied = run(handler(request(False)))
-    assert denied.status_code == 401
-    payload = {'expected_revision': 1, 'request_id': 'owner-http-prepare'}
-    first = run(handler(request(payload=payload)))
-    result = json.loads(first.body)
-    assert first.status_code == 200 and result['proposal']['state'] == 'pending'
+    assert run(handler(request(False))).status_code == 401
+    before = f.sync.detail('m1')['proposals'][0]
+    assert before['state'] == 'pending' and before['allowed_actions']
+    for action in ('prepare', 'apply', 'retry'):
+        result = run(handler(request(action=action)))
+        assert result.status_code == 410 and json.loads(result.body)['error']['code'] == 'l2_retired'
+    read = run(handler(request(method='GET')))
+    assert read.status_code == 200 and json.loads(read.body)['retired'] is True
+    assert json.loads(read.body)['proposals'][0] == {**before, 'allowed_actions': []}
+    assert f.sync.detail('m1')['proposals'][0] == before
+    with f.authority._connect() as db:
+        assert pending_sync_scope(db, 'm1')['unknown_scope'] is True
+    assert f.authority.get_memory('m1')['active_revision'] == 2
     assert not [c for c in f.calls if c[0] == 'memory_l3_sync']
-    replayed = json.loads(run(handler(request(payload=payload))).body)
-    assert replayed['replayed'] is True
-    conflict = run(handler(request(payload={'expected_revision': 1, 'request_id': 'stale-other-request'})))
-    assert conflict.status_code == 409
-    assert json.loads(conflict.body)['proposal']['revision'] == result['proposal']['revision']
 
 
 def test_l1_commit_then_new_owner_wording_is_preserved_and_explicit_retry_only_rebinds(tmp_path, monkeypatch):

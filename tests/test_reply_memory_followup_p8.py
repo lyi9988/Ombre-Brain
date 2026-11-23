@@ -165,81 +165,55 @@ def test_native_l1_adoption_has_exact_receipt_and_no_fake_rebuilt_l2(tmp_path):
     assert after['l1_revision']==3
 
 
-@pytest.mark.parametrize('owner_l2',[False,True])
-def test_l2_only_full_draft_waits_then_exact_owner_save_adopts_without_l1_write(tmp_path, owner_l2):
-    service, l2, calls, payload, _ = native_fixture(tmp_path,layer='l2',owner_l2=owner_l2)
-    old = deepcopy(l2.detail('m1')['l2']['presentation'])
-    task = run(service.submit(payload))['tasks'][0]
-    prepared = run(run_followup_tasks(service.engine,None,max_jobs=1))['results'][0]
-    assert prepared['phase']=='waiting_review' and calls==[]
-    row = service.authority.get_candidate(task['task_id'])
-    assert row['status']=='pending' and row['policy']['requires_owner_confirmation']
-    handoff = run(service.adopt(row,owner=True,request_id='review-l2'))
-    assert handoff['status']=='waiting_review'
-    queued = run(l2.prepare_followup('m1',handoff['review_actions']['prepare_payload']))
-    assert queued['review_required'] and l2.detail('m1')['l2']['presentation']==old
-    assert service.tasks.current_receipt(task['task_id'])['phase']=='queued'
-    generated = run(l2.run_once(1))['results'][0]
-    assert generated['state']=='pending_review', generated
-    draft = l2.detail('m1',generated['presentation_revision'])['l2']['presentation']
-    assert draft['publication']=='candidate' and l2.detail('m1')['l2']['presentation']==old
-    material = json.loads(calls[0]['messages'][1]['content'])['owner_feedback_correction']
-    assert material['original_l2']==old['document']
-    assert material['owner_annotations'][0]['text'].startswith('主人具体指出')
-    assert service.authority.get_memory('m1')['active_revision']==2
-    edit = owner_payload(l2,request='owner-applies-l2')
-    edit.update(followup_task_id=task['task_id'],document=deepcopy(draft['document']))
-    edit['document']['full_injection_text']+=' 主人审核后的补充。'
-    saved = run(l2.save('m1',edit))
-    assert saved['l2']['state']=='ready' and run(l2.save('m1',edit))['replayed']
-    assert saved['l2']['presentation']['document']['coherent_sections'][0]['text'].endswith('主人审核后的补充。')
-    status = FollowupTasks(service.authority).current_receipt(task['task_id'])
-    assert status=={'task_id':task['task_id'],'memory_id':'m1','phase':'adopted',
-        'l1_revision':2,'l2_revision':saved['presentation_revision']}
-    assert service.authority.get_candidate(task['task_id'])['status']=='committed'
-    assert service.authority.get_memory('m1')['active_revision']==2
-    assert l2.detail('m1',old['presentation_revision'])['l2']['presentation']['document']==old['document']
-    assert FollowupTasks(service.authority).current_receipt(task['task_id'])==status
+@pytest.mark.parametrize('owner_l2', [False, True])
+def test_l2_only_feedback_retires_without_creating_a_task_or_touching_history(tmp_path, owner_l2):
+    service, l2, calls, payload, _ = native_fixture(tmp_path, layer='l2', owner_l2=owner_l2)
+    before = deepcopy(l2.detail('m1')['l2'])
+    result = run(service.submit(payload))
+    assert result['tasks'] == [] and result['unavailable_updates'] == []
+    assert result['retired_updates'] == [payload['updates'][0]['update_id']]
+    assert result['retirement_reason'] == 'l2_retired'
+    assert run(service.submit(payload)) == result
+    assert service.tasks.list() == [] and calls == []
+    assert service.authority.get_memory('m1')['active_revision'] == 2
+    assert l2.detail('m1')['l2'] == before
 
 
-def test_l2_source_revocation_during_generation_keeps_head_and_no_adoption(tmp_path):
-    service,l2,calls,payload,actual = native_fixture(tmp_path,layer='l2',owner_l2=True)
-    task = run(service.submit(payload))['tasks'][0]
-    run(run_followup_tasks(service.engine,None,max_jobs=1))
-    row=service.authority.get_candidate(task['task_id'])
-    args=run(service.adopt(row,owner=True,request_id='review'))['review_actions']['prepare_payload']
-    run(l2.prepare_followup('m1',args))
-    old=deepcopy(l2.detail('m1')['l2']['presentation'])
-    original=l2.engine._daily_chat_memory_create_completion
-    async def revoke(client,**kwargs):
-        result=await original(client,**kwargs)
-        actual['reply-feedback:fb-1:r1']['eligible_source']=False
-        return result
-    l2.engine._daily_chat_memory_create_completion=revoke
-    result=run(l2.run_once(1))['results'][0]
-    assert result['state'] in {'failed','stale'}
-    assert l2.detail('m1')['l2']['presentation']==old
-    assert service.tasks.current_receipt(task['task_id'])['phase']!='adopted'
+def legacy_l2_followup(service, payload):
+    from memory_followup_l2 import prepare_candidate
+    task = service.tasks.enqueue_update(payload, payload['updates'][0])
+    claimed = service.tasks.claim(service.tasks.get(task['task_id']), lease_seconds=60)
+    prepared = prepare_candidate(service, claimed, [])
+    service.tasks.finish(claimed, **prepared)
+    return service.authority.get_candidate(task['task_id'])
 
 
-def test_l2_owner_save_revalidates_sources_and_original_head(tmp_path):
-    service,l2,_,payload,actual = native_fixture(tmp_path,layer='l2',owner_l2=True)
-    task=run(service.submit(payload))['tasks'][0]
-    run(run_followup_tasks(service.engine,None,max_jobs=1))
-    edit=owner_payload(l2,request='exact-save')
-    edit.update(followup_task_id=task['task_id'])
-    original=deepcopy(l2.detail('m1')['l2']['presentation'])
-    with pytest.raises(L1OwnerError): run(l2.save('m1',{**edit,'change_kind':'facts'}))
-    actual['reply-feedback:fb-1:r1']['eligible_source']=False
-    with pytest.raises(L1OwnerError): run(l2.save('m1',edit))
-    assert l2.detail('m1')['l2']['presentation']==original
-    actual['reply-feedback:fb-1:r1']['eligible_source']=True
-    other=owner_payload(l2,request='unrelated-owner-edit')
-    other['document']['full_injection_text']='主人另存的新手稿。'
-    run(l2.save('m1',other))
-    with pytest.raises(L1OwnerError): run(l2.save('m1',edit))
-    assert l2.detail('m1')['l2']['presentation']['document']['full_injection_text']=='主人另存的新手稿。'
-    assert service.tasks.current_receipt(task['task_id'])['phase']!='adopted'
+def test_saved_l2_followup_draft_is_readable_but_cannot_be_reopened_or_applied(tmp_path):
+    service, l2, calls, payload, _ = native_fixture(tmp_path, layer='l2', owner_l2=True)
+    candidate = legacy_l2_followup(service, payload)
+    task_id = candidate['candidate_id']
+    before = deepcopy(l2.detail('m1')['l2'])
+    receipt = service.tasks.current_receipt(task_id)
+    assert receipt['phase'] == 'disabled' and receipt['issue']['code'] == 'l2_retired'
+    assert receipt['l2_revision'] == before['current_presentation_revision']
+    for kwargs in ({}, {'edit': {'content': 'Do not replace the original draft'}}):
+        with pytest.raises(L1OwnerError, match='l2_retired') as caught:
+            run(service.adopt(candidate, owner=True, request_id='retired', **kwargs))
+        assert caught.value.status == 410
+    with pytest.raises(L1OwnerError, match='l2_retired'):
+        service.tasks.retry('m1', task_id, {'expected_revision': 1, 'request_id': 'retired'})
+    with pytest.raises(L1OwnerError, match='l2_retired'):
+        service.edit_draft(candidate, {}, request_id='retired')
+    from reflection_engine import ReflectionEngine
+    service.engine._request_ledger_lookup = lambda _request_id: None
+    service.engine._request_ledger_record = lambda _request_id, _receipt: None
+    service.engine._confirm_rate_limit_ok = lambda _now: True
+    for action in ('confirm', 'defer', 'reject'):
+        report = run(ReflectionEngine._confirm_daily_chat_memory_authority(service.engine, [task_id], None,
+            action=action, request_id='legacy-' + action))
+        assert report['results'] == [{'id': task_id, 'status': 'l2_retired', 'reason': 'l2_retired'}]
+    assert service.authority.get_candidate(task_id) == candidate
+    assert l2.detail('m1')['l2'] == before and calls == []
 
 
 def receipt_app(service):
@@ -283,27 +257,18 @@ def test_exact_internal_get_is_authenticated_read_only_and_survives_reopen(tmp_p
     assert len(calls)==1
 
 
-def test_existing_l2_http_prepare_and_owner_save_link_the_original_task(tmp_path):
-    from test_memory_l2_api_p4 import _api_app, _send
-    service,l2,_,payload,_=native_fixture(tmp_path,layer='l2',owner_l2=True)
-    task=run(service.submit(payload))['tasks'][0]
-    run(run_followup_tasks(service.engine,None,max_jobs=1))
-    app,_=_api_app(l2,service.authority)
-    prepare={'expected_l1_revision':2,'request_id':'http-prepare','followup_task_id':task['task_id']}
-    url='/api/memory-authority/memories/m1/presentation'
-    denied=run(_send(app,'POST',url+'/prepare',token=None,json_body=prepare))
-    assert denied.status_code==401
-    queued=run(_send(app,'POST',url+'/prepare',json_body=prepare))
-    assert queued.status_code==200 and queued.json()['review_required']
-    generated=run(l2.run_once(1))['results'][0]
-    draft=l2.detail('m1',generated['presentation_revision'])['l2']['presentation']['document']
-    save=owner_payload(l2,request='http-save')
-    save.update(document=draft,followup_task_id=task['task_id'])
-    applied=run(_send(app,'POST',url+'/revisions',json_body=save))
-    assert applied.status_code==200,applied.text
-    status=FollowupTasks(MemoryAuthorityStore(service.authority.path)).current_receipt(task['task_id'])
-    assert status['phase']=='adopted' and status['l1_revision']==2
-    assert status['l2_revision']==applied.json()['presentation_revision']
+def test_adopted_historical_l2_receipt_keeps_verified_owner_save(tmp_path):
+    service, l2, calls, payload, _ = native_fixture(tmp_path, layer='l2', owner_l2=True)
+    candidate = legacy_l2_followup(service, payload)
+    task_id = candidate['candidate_id']
+    args = owner_payload(l2, request='legacy-applied-save')
+    args['followup_task_id'] = task_id
+    args['document']['full_injection_text'] += ' Owner reviewed L2 wording.'
+    saved = run(l2.save('m1', args))  # Explicitly seed a pre-retirement receipt.
+    status = FollowupTasks(MemoryAuthorityStore(service.authority.path)).current_receipt(task_id)
+    assert status['phase'] == 'adopted' and status['l1_revision'] == 2
+    assert status['l2_revision'] == saved['presentation_revision']
+    assert calls == []
 
 
 def test_candidate_committed_or_task_label_without_authority_adoption_is_not_adopted(tmp_path):
@@ -322,51 +287,22 @@ def test_candidate_committed_or_task_label_without_authority_adoption_is_not_ado
     assert service.tasks.current_receipt(task['task_id'])['phase']=='awaiting_receipt'
 
 
-def test_owner_changed_followup_draft_invalidates_queued_l2_generation(tmp_path):
-    service,l2,calls,payload,_=native_fixture(tmp_path,layer='l2',owner_l2=True)
-    task=run(service.submit(payload))['tasks'][0]
-    run(run_followup_tasks(service.engine,None,max_jobs=1))
-    row=service.authority.get_candidate(task['task_id'])
-    original_actions=run(service.adopt(row,owner=True,request_id='open'))['review_actions']
-    run(l2.prepare_followup('m1',original_actions['prepare_payload']))
-    run(service.adopt(row,owner=True,request_id='owner-edit',edit={'content':'主人补充的具体呈现修订意见。','title':'保留这个标题'}))
-    run(run_followup_tasks(service.engine,None,max_jobs=1))
-    changed=service.authority.get_candidate(task['task_id'])
-    result=run(l2.run_once(1))['results'][0]
-    assert result['state']=='stale' and calls==[]
-    actions=run(service.adopt(changed,owner=True,request_id='reopen'))['review_actions']
-    assert actions['prepare_payload']['request_id']!=original_actions['prepare_payload']['request_id']
-    run(l2.prepare_followup('m1',actions['prepare_payload']))
-    assert run(l2.run_once(1))['results'][0]['state']=='pending_review'
-    assert changed['proposal']['proposed_body']=='主人补充的具体呈现修订意见。'
-    assert changed['proposal']['metadata']['legacy_candidate']['title']=='保留这个标题'
-    assert service.authority.get_memory('m1')['active_revision']==2
-
-
 def resign_native_update(payload):
     update=payload['updates'][0]
     semantic={key:update[key] for key in ('target_key','kind','long_term_value','content','evidence_refs')}
     update['update_id']='ml3:'+digest({'review':payload['review'],**semantic})
 
 
-def test_exact_l2_diagnosis_without_raw_update_enters_original_waiting_review_task(tmp_path):
+def test_exact_l2_diagnosis_without_raw_update_retires_without_editing_source_review(tmp_path):
     service,l2,calls,payload,actual=native_fixture(tmp_path,layer='l2',diagnosis_only=True,owner_l2=True)
     raw=deepcopy(actual['self_review']['text'])
     assert 'memory_updates' not in json.loads(raw)
-    assert actual['self_review']['memory_updates']==[]
-    recorded=run(service.submit(payload))
-    task_id=recorded['tasks'][0]['task_id']
-    prepared=run(run_followup_tasks(service.engine,None,max_jobs=1))['results'][0]
-    assert prepared['task_id']==task_id and prepared['phase']=='waiting_review',prepared
-    assert calls==[] and service.authority.get_memory('m1')['active_revision']==2
-    candidate=service.authority.get_candidate(task_id)
-    assert candidate['status']=='pending' and candidate['proposal']['metadata']['l3_followup']['layer']=='l2'
-    assert candidate['proposal']['proposed_body']==actual['self_review']['feedback_diagnoses'][0]['reason']
-    assert actual['self_review']['text']==raw and actual['self_review']['memory_updates']==[]
-    assert run(service.submit(payload))['tasks'][0]['task_id']==task_id
-    handoff=run(service.adopt(candidate,owner=True,request_id='open-original-l2-review'))
-    assert handoff['status']=='waiting_review' and handoff['review_actions']['save_parameters']['followup_task_id']==task_id
-    assert service.tasks.current_receipt(task_id)['phase']=='waiting_review'
+    result = run(service.submit(payload))
+    assert result['retirement_reason'] == 'l2_retired'
+    assert result['retired_updates'] == [payload['updates'][0]['update_id']]
+    assert result['tasks'] == [] and service.tasks.list() == [] and calls == []
+    assert service.authority.get_memory('m1')['active_revision'] == 2
+    assert actual['self_review']['text'] == raw and actual['self_review']['memory_updates'] == []
 
 
 @pytest.mark.parametrize('bad',['no_contract','wrong_contract','no_origins','l1','reply','unclear','not_chosen',
@@ -408,7 +344,7 @@ def test_diagnosis_draft_requires_an_original_positive_l2_revision(tmp_path,revi
 
 def test_diagnosis_draft_loses_source_after_read_without_adopting_or_calling_model(tmp_path):
     service,_,calls,payload,actual=native_fixture(tmp_path,layer='l2',diagnosis_only=True)
-    recorded=run(service.submit(payload));task_id=recorded['tasks'][0]['task_id']
+    task_id=service.tasks.enqueue_update(payload, payload['updates'][0])['task_id']
     actual['reply-feedback:fb-1:r1']['eligible_source']=False
     failed=run(run_followup_tasks(service.engine,None,max_jobs=1))['results'][0]
     assert failed['task_id']==task_id and failed['phase']=='failed'
@@ -421,4 +357,16 @@ def test_unrelated_malformed_raw_evidence_does_not_block_a_legitimate_diagnosis_
     actual['self_review']['memory_updates']=[{'memory_fragment_ref':'unrelated-target','evidence_refs':123}]
     assert matches_l2_diagnosis_draft(actual['self_review'],payload['updates'][0],actual)
     recorded=run(service.submit(payload))
-    assert recorded['tasks'][0]['phase']=='queued' and calls==[]
+    assert recorded['tasks']==[] and recorded['retirement_reason']=='l2_retired' and calls==[]
+
+
+
+def test_previously_queued_l2_only_followup_does_not_enter_the_l1_model(tmp_path):
+    service, l2, calls, payload, _ = native_fixture(tmp_path, layer='l2', owner_l2=True)
+    task_id = service.tasks.enqueue_update(payload, payload['updates'][0])['task_id']
+    before = deepcopy(l2.detail('m1')['l2'])
+    result = run(run_followup_tasks(service.engine, None, max_jobs=1))['results'][0]
+    assert result['phase'] == 'disabled' and result['issue']['code'] == 'l2_retired'
+    assert service.tasks.current_receipt(task_id)['issue']['code'] == 'l2_retired'
+    assert service.authority.get_candidate(task_id) is None
+    assert l2.detail('m1')['l2'] == before and calls == []

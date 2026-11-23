@@ -142,9 +142,9 @@ def test_chat_auto_and_review_share_source_bound_l1_commit_then_persisted_l2(tmp
     revision = env["authority"].get_memory_revision(memory_id, 1)
     assert revision["source_refs"]
     assert revision["metadata"]["memory_l1"]["evidence_bindings"]
-    assert len(MemoryL2Service(engine, env["revisions"]).store.pending(10)) == 1
+    assert MemoryL2Service(engine, env["revisions"]).store.pending(10) == []
     asyncio.run(prepare_chat_tasks(engine, env["buckets"]))
-    assert len(MemoryL2Service(engine, env["revisions"]).store.pending(10)) == 1
+    assert MemoryL2Service(engine, env["revisions"]).store.pending(10) == []
 
 
 @pytest.mark.parametrize("mode", ["auto", "review"])
@@ -202,12 +202,15 @@ def test_diary_auto_and_review_adopt_full_root_and_scene_into_l2(tmp_path, mode)
     assert root_revision["source_refs"] == child_revision["source_refs"] == [expected_source_ref]
     assert root_revision["decision_source"] == "diary_first_pass"
     assert child_revision["decision_source"] == "diary_scene"
-    assert len(MemoryL2Service(_l2_engine(env["sources"]), env["revisions"]).store.pending(10)) == 2
+    assert MemoryL2Service(_l2_engine(env["sources"]), env["revisions"]).store.pending(10) == []
     replayed = run(env["diary"].adopt(candidate["candidate_id"]))
     assert replayed["status"] == "complete"
     assert env["authority"].get_memory(root_id)["active_revision"] == 1
     assert env["authority"].get_memory(child_id)["active_revision"] == 1
-    assert len(MemoryL2Service(_l2_engine(env["sources"]), env["revisions"]).store.pending(10)) == 2
+    assert MemoryL2Service(_l2_engine(env["sources"]), env["revisions"]).store.pending(10) == []
+    from test_memory_l2_p4 import seed_historic_l2_job
+    for memory_id in (root_id, child_id):
+        seed_historic_l2_job(env["authority"], memory_id)
     awaitless(_run_l2(_l2_engine(env["sources"]), env["revisions"]))
 
 
@@ -311,12 +314,14 @@ def test_auto_daily_complete_semantic_l1_commits_to_authority_and_persists_l2(tm
     source_binding = detail["l1"]["document"]["evidence_bindings"][0]
     current_source = awaitless(engine._memory_l1_sources().locate(source_binding))
     assert current_source["eligible_source"] and current_source["text"] == source_text
-    assert len(MemoryL2Service(_l2_engine(engine._memory_l1_sources()), engine._memory_l1_revisions(buckets)).store.pending(10)) == 1
+    assert MemoryL2Service(_l2_engine(engine._memory_l1_sources()), engine._memory_l1_revisions(buckets)).store.pending(10) == []
 
     replay = awaitless(engine._write_daily_chat_memory_candidates(candidate_batch, buckets))
     assert replay["exists"] == 1 and replay["failed"] == 0
     assert engine.memory_authority_store.get_memory(candidate_id_value)["active_revision"] == 1
-    assert len(MemoryL2Service(_l2_engine(engine._memory_l1_sources()), engine._memory_l1_revisions(buckets)).store.pending(10)) == 1
+    assert MemoryL2Service(_l2_engine(engine._memory_l1_sources()), engine._memory_l1_revisions(buckets)).store.pending(10) == []
+    from test_memory_l2_p4 import seed_historic_l2_job
+    seed_historic_l2_job(engine.memory_authority_store, candidate_id_value)
     awaitless(_run_l2(_l2_engine(engine._memory_l1_sources()), engine._memory_l1_revisions(buckets)))
 
 

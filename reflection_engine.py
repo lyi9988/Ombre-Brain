@@ -835,6 +835,8 @@ class ReflectionEngine(MemoryL1Runtime):
                 'preparation_state': task['phase'] if task else 'unavailable', 'reason': plan.get('reason', ''),
                 'changes': [{'field': patch['path'], 'before': patch['old'], 'after': patch['value']}
                     for patch in plan.get('patch', [])]}
+            if followup.get('layer') == 'l2':
+                candidate['l3_followup']['retired'] = True
             candidate['source_bindings'] = (followup.get('compiled') or {}).get('source_bindings', [])
         if isinstance(metadata.get("memory_l1"), dict):
             from memory_l1_schema import join_document
@@ -3768,6 +3770,15 @@ class ReflectionEngine(MemoryL1Runtime):
                 continue
             from memory_authority import RevisionConflict, InvalidTransition, IdempotencyConflict
             try:
+                followup = row.get('proposal', {}).get('metadata', {}).get('l3_followup') or {}
+                if followup.get('layer') == 'l2':
+                    from memory_l3_followup import FollowupTasks
+                    receipt = FollowupTasks(self.memory_authority_store).current_receipt(followup['task_id'])
+                    if receipt['phase'] == 'adopted':
+                        results.append({'id': candidate_id, 'status': 'exists', **receipt})
+                    else:
+                        results.append({'id': candidate_id, 'status': 'l2_retired', 'reason': 'l2_retired'})
+                    continue
                 item = self._authority_candidate_legacy_item(row)
                 candidate = dict(item.get("candidate") or {})
                 if safe_action in {"defer", "reject"}:

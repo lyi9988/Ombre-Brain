@@ -2313,6 +2313,9 @@
   function renderL3FollowupPreview(followup) {
     if (!followup || typeof followup !== 'object' || Array.isArray(followup)) return '';
     var title = String(followup.target_title || followup.memory_id || '目标记忆未提供');
+    if (followup.retired) {
+      return '<p class="chat-memory-edit-needed">旧 L2 呈现修订已停用，此记录仅供查阅。</p>';
+    }
     var revision = followup.expected_revision == null ? '未提供' : String(followup.expected_revision);
     var state = String(followup.preparation_state || 'prepared');
     var preparing = ['queued', 'pending', 'preparing', 'generating', 'running'].includes(state);
@@ -2372,6 +2375,7 @@
     }
     var id = item.id || '';
     var followup = candidate.l3_followup;
+    var retiredFollowup = Boolean(followup && followup.retired);
     var modelIoId = modelIoMemoryId(followup && followup.memory_id || backfill && backfill.memory_id || id);
     var draft = memoryDrafts.get(id);
     var revision = draft ? draft.revision : Number(item.authority_revision || candidate.authority_revision || 0);
@@ -2460,7 +2464,7 @@
         '</div>' +
         summaryNote + preparationNote + '<div class="chat-memory-semantics">' + (l1Document ? renderL1ReviewDetails(item, l1Draft ? l1Draft.document : l1Document) : renderMemorySemantics(item, draft)) + '</div>' + staleNote + blockedNote + editNote +
         (draft ? '<p class="chat-memory-edit-needed">有未保存修改' + (item.draft_orphan || revision !== item.authority_revision ? '；服务器版本或状态已变化，请核对后再操作' : '') + '。</p>' : '') +
-        '<div class="chat-memory-edit-panel"' + (draft && draft.expanded ? '' : ' hidden') + '>' +
+        '<div class="chat-memory-edit-panel"' + (draft && draft.expanded && !retiredFollowup ? '' : ' hidden') + '>' +
           (l1Document ? renderL1EditPanel(item, l1Document, l1Draft) :
             '<label class="chat-memory-edit-field">标题' +
               '<input type="text" data-field="title" maxlength="100" value="' + escAttr(candidate.title || id) + '" />' +
@@ -2490,12 +2494,12 @@
             '</div>') +
         '</div>' +
         '<div class="chat-memory-card-actions">' +
-          '<button type="button" onclick="toggleDailyChatMemoryEdit(this)">编辑</button>' +
+          (retiredFollowup ? '' : '<button type="button" onclick="toggleDailyChatMemoryEdit(this)">编辑</button>' +
           '<button type="button" onclick="saveDailyChatMemoryEdit(this)">保存修改（仍待审核）</button>' +
-          '<button type="button" onclick="discardDailyChatMemoryDraft(this)">放弃修改／载入新版</button>' +
+          '<button type="button" onclick="discardDailyChatMemoryDraft(this)">放弃修改／载入新版</button>') +
           sourcePreviewButton +
           modelIoButton +
-          '<button type="button"' + confirmDisabled + ' onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'confirm\')">采用并入库</button>' +
+          (retiredFollowup ? '' : '<button type="button"' + confirmDisabled + ' onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'confirm\')">采用并入库</button>' +
           '<button type="button" onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'defer\')">暂缓</button>' +
           '<label class="chat-memory-reject-reason">拒绝原因' +
             '<select id="reject-reason-' + escAttr(id) + '">' +
@@ -2507,7 +2511,7 @@
             '</select>' +
           '</label>' +
           '<input type="text" class="chat-memory-reject-note-inline" id="reject-note-' + escAttr(id) + '" maxlength="120" placeholder="备注(可选)" />' +
-          '<button type="button" class="danger" onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'reject\')">拒绝</button>' +
+          '<button type="button" class="danger" onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'reject\')">拒绝</button>') +
         '</div>' +
         (modelIoId ? '<div data-model-io-slot="review"></div>' : '') +
       '</div>';

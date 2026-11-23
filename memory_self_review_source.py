@@ -288,6 +288,12 @@ def native_feedback_layer(review, update, sources):
     return 'l2' if layers == {'l2'} else 'l1'
 
 
+def native_l2_correction(update, actual):
+    """Classify against the qualified original review, not the edited draft."""
+    return ((update['kind'] == 'correction' or update['long_term_value'] == 'explicit_owner_correction')
+            and native_feedback_layer(actual['self_review'], update, actual) == 'l2')
+
+
 async def native_sources(service, task):
     reader = service.engine._memory_l1_sources()
     update = task['envelope']['updates'][0]
@@ -295,6 +301,8 @@ async def native_sources(service, task):
         service.review_source_reader, with_sources=True)
     if update['update_id'] not in allowed:
         raise L1OwnerError('followup_source_not_currently_readable', status=409, field_path='sources')
+    if native_l2_correction(update, actual_sources):
+        raise L1OwnerError('l2_retired', status=410)
     models, evidence = [], []
     for source in task['envelope']['sources']:
         if source['source_key'] not in update['evidence_refs']:

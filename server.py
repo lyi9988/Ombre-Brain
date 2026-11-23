@@ -12232,31 +12232,8 @@ def _memory_l2_service(worker_engine=None):
     return MemoryL2Service(engine, _memory_l1_revision_service(worker_engine))
 
 
-async def _memory_l2_preparation_loop():
-    from background_reflection_runtime import BackgroundReflectionRuntime
-    runtime = BackgroundReflectionRuntime(prompt_plan_mirror, configuration_source=reflection_configuration_source)
-    try:
-        while True:
-            try:
-                async with runtime.batch(config) as worker_engine:
-                    if worker_engine.memory_authority_store:
-                        await _memory_l2_service(worker_engine).run_once(task_options(worker_engine.config)['memory_l2_jobs_per_run'])
-            except Exception as exc:
-                logger.warning('L2 Memory preparation loop: %s', type(exc).__name__)
-            await asyncio.sleep(task_options(config)['memory_l2_prepare_interval_seconds'])
-    finally:
-        await runtime.close()
-
-
 async def _memory_preparation_workers():
-    """Independent background turns; a long second pass cannot hold the first."""
-    tasks = [asyncio.create_task(_chat_memory_preparation_loop()),
-             asyncio.create_task(_memory_l2_preparation_loop())]
-    try:
-        await asyncio.gather(*tasks)
-    finally:
-        for task in tasks: task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+    await _chat_memory_preparation_loop()
 
 
 @mcp.custom_route('/api/memory-authority/memories/{memory_id}/model-io', methods=['GET'])
@@ -12295,7 +12272,6 @@ async def api_memory_model_io(request):
 @mcp.custom_route('/api/memory-authority/memories/{memory_id}/presentation/revisions', methods=['POST'])
 @mcp.custom_route('/api/memory-authority/presentations/resolve', methods=['POST'])
 async def api_memory_l2(request):
-    import json
     from starlette.responses import JSONResponse
     from memory_authority import IdempotencyConflict, MemoryNotFound, RevisionConflict
     from memory_l1_service import L1OwnerError
@@ -12304,30 +12280,21 @@ async def api_memory_l2(request):
     err = (_require_owner_or_internal_memory_read(request) if resolving
            else _require_owner_or_internal_index_maintenance(request))
     if err: return err
+    if request.method != 'GET':
+        return JSONResponse({'error': {'code': 'l2_retired'}}, status_code=410, headers=headers)
     if reflection_engine is None or memory_authority_store is None or memory_commit_service is None:
         return JSONResponse({'error': {'code': 'memory_authority_unavailable'}}, status_code=503, headers=headers)
     memory_id = str(request.path_params.get('memory_id') or '')
     try:
-        service = _memory_l2_service()
-        if request.method == 'GET':
-            if set(request.query_params) - {'presentation_revision'}:
-                raise L1OwnerError('unknown_query_field')
-            raw_revision = request.query_params.get('presentation_revision')
-            if len(request.query_params.getlist('presentation_revision')) > 1:
-                raise L1OwnerError('duplicate_query_field', field_path='presentation_revision')
-            if raw_revision is not None and (not raw_revision.isascii() or not raw_revision.isdigit() or int(raw_revision) <= 0):
-                raise L1OwnerError('invalid_revision', field_path='presentation_revision')
-            result = service.detail(memory_id, int(raw_revision) if raw_revision else None)
-        else:
-            raw = await request.body()
-            if len(raw) > 524288: raise L1OwnerError('request_too_large', status=413)
-            try: payload = json.loads(raw)
-            except (ValueError, UnicodeError): raise L1OwnerError('invalid_json') from None
-            if resolving: result = await service.resolve(payload)
-            elif request.url.path.endswith('/prepare'):
-                result = (await service.prepare_followup(memory_id, payload)
-                    if isinstance(payload, dict) and 'followup_task_id' in payload else service.prepare(memory_id, payload))
-            else: result = await service.save(memory_id, payload)
+        if set(request.query_params) - {'presentation_revision'}:
+            raise L1OwnerError('unknown_query_field')
+        raw_revision = request.query_params.get('presentation_revision')
+        if len(request.query_params.getlist('presentation_revision')) > 1:
+            raise L1OwnerError('duplicate_query_field', field_path='presentation_revision')
+        if raw_revision is not None and (not raw_revision.isascii() or not raw_revision.isdigit() or int(raw_revision) <= 0):
+            raise L1OwnerError('invalid_revision', field_path='presentation_revision')
+        result = _memory_l2_service().detail(memory_id, int(raw_revision) if raw_revision else None)
+        result['retired'] = True
         return JSONResponse(result, headers=headers)
     except (RevisionConflict, IdempotencyConflict) as exc:
         return JSONResponse({'error': {'code': exc.code}, 'memory_id': memory_id}, status_code=409, headers=headers)
@@ -12344,38 +12311,27 @@ async def api_memory_l2(request):
 @mcp.custom_route('/api/memory-authority/memories/{memory_id}/presentation/sync-proposals/{presentation_revision}/{action}', methods=['POST'])
 async def api_memory_l3_sync(request):
     from starlette.responses import JSONResponse
-    from memory_l3_sync import MemoryL3SyncService, SyncProposals
+    from memory_l3_sync import MemoryL3SyncService
     from memory_l1_service import L1OwnerError
-    from memory_authority import MemoryNotFound, RevisionConflict, IdempotencyConflict
+    from memory_authority import MemoryNotFound
     headers = {'Cache-Control': 'no-store'}
     err = _require_owner_or_internal_index_maintenance(request)
     if err: return err
+    if request.method != 'GET':
+        return JSONResponse({'error': {'code': 'l2_retired'}}, status_code=410, headers=headers)
     if reflection_engine is None or memory_authority_store is None or memory_commit_service is None:
         return JSONResponse({'error': {'code': 'memory_authority_unavailable'}}, status_code=503, headers=headers)
     mid = str(request.path_params.get('memory_id') or '')
-    revision = None
     try:
+        if request.query_params: raise L1OwnerError('unknown_query_field')
         service = MemoryL3SyncService(_memory_l2_service())
-        if request.method == 'GET':
-            if request.query_params: raise L1OwnerError('unknown_query_field')
-            result = service.detail(mid)
-        else:
-            raw_revision = request.path_params.get('presentation_revision', '')
-            if not raw_revision.isascii() or not raw_revision.isdigit() or int(raw_revision) <= 0:
-                raise L1OwnerError('invalid_revision', field_path='presentation_revision')
-            revision = int(raw_revision)
-            raw = await request.body()
-            if len(raw) > 524288: raise L1OwnerError('request_too_large', status=413)
-            result = await service.action(mid, revision, request.path_params.get('action'), _json_lib.loads(raw))
+        result = service.detail(mid)
+        result['retired'] = True
+        for proposal in result['proposals']:
+            proposal['allowed_actions'] = []
         return JSONResponse(result, headers=headers)
-    except (L1OwnerError, RevisionConflict, IdempotencyConflict) as exc:
-        payload = {'error': {'code': exc.code, 'field_path': getattr(exc, 'field_path', '')}}
-        if revision is not None:
-            try:
-                current = SyncProposals.public(SyncProposals(memory_authority_store).get(mid, revision))
-                payload.update(proposal=current, current_revision=current['revision'])
-            except L1OwnerError: pass
-        return JSONResponse(payload, status_code=getattr(exc, 'status', 409), headers=headers)
+    except L1OwnerError as exc:
+        return JSONResponse({'error': {'code': exc.code, 'field_path': exc.field_path}}, status_code=exc.status, headers=headers)
     except MemoryNotFound:
         return JSONResponse({'error': {'code': 'memory_not_found'}}, status_code=404, headers=headers)
     except (ValueError, TypeError, UnicodeError):
@@ -13319,6 +13275,7 @@ async def api_config_get(request):
             "memory_task_routes": reflection_engine.memory_task_models_public()["routes"],
             "memory_task_effective": reflection_engine.memory_task_models_public()["effective"],
             "memory_task_revision": reflection_engine.memory_task_models_public()["revision"],
+            "memory_l2_retired": True,
             "memory_l2_output_schema": memory_l2_output_schema(config),
             "memory_l2_schema_revision": memory_l2_schema_revision(memory_l2_output_schema(config)),
             "generation_parameter_bounds": {key: {"minimum": spec[1], "maximum": spec[2]}

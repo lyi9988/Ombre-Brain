@@ -1028,10 +1028,7 @@ class MemoryAuthorityStore:
                 if is_v2(payload["metadata"]["memory_l1"]):
                     outbox_payload["l2_preparation"] = {"state": "direct_l1"}
                 else:
-                    from memory_l2_store import enqueue_in_transaction
-                    l2_task = enqueue_in_transaction(conn, memory_id, revision)
-                    outbox_payload["l2_preparation"] = {"state": "pending", "task_id": l2_task,
-                        "dependency": payload["metadata"]["memory_l1_content_sha256"]}
+                    outbox_payload["l2_preparation"] = {"state": "retired"}
             conn.execute(
                 "INSERT INTO outbox(event_id,operation_id,event_type,aggregate_id,aggregate_revision,payload_json,"
                 "status,attempts,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,'pending',0,'',?,?)",

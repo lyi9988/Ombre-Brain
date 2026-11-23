@@ -20,6 +20,10 @@ KINDS = {'correction', 'new_experience', 'understanding', 'question'}
 VALUES = {'explicit_owner_correction', 'explicit_remember', 'specific_future_use', 'none'}
 
 
+def _is_l2_candidate(row):
+    return bool(row and (row['proposal'].get('metadata', {}).get('l3_followup') or {}).get('layer') == 'l2')
+
+
 def validate_submission(payload):
     if isinstance(payload, dict) and payload.get('schema') == 'self-review-followup-v1':
         from memory_self_review_source import validate_native_submission
@@ -138,6 +142,7 @@ class FollowupTasks(ChatMemoryPreparation):
                     'SELECT 1 FROM memory_l2_revisions WHERE memory_id=? AND presentation_revision=?',
                     (mid, ref['l2_revision'])).fetchone():
                 l2 = ref['l2_revision']
+            retired = bool(task.get('l2_job_id') or (task.get('issue') or {}).get('code') == 'l2_retired')
             committed = db.execute('SELECT operation_id,status,result_json FROM commit_log WHERE idempotency_key=?',
                 ('program-l1:followup:' + mid + ':' + task_id,)).fetchone()
             adopted = db.execute('SELECT revision FROM memory_revisions WHERE memory_id=? AND revision=? AND operation_id=?',
@@ -168,26 +173,24 @@ class FollowupTasks(ChatMemoryPreparation):
                         or json.loads(presentation['document_json']).get('review', {}).get('required') is False):
                     l2 = presentation['presentation_revision']
             elif task.get('candidate_ids'):
-                candidates = [db.execute('SELECT status FROM candidates WHERE candidate_id=?', (cid,)).fetchone()
+                candidates = [db.execute("SELECT status,json_extract(proposal_json,'$.metadata.l3_followup.layer') AS layer "
+                    'FROM candidates WHERE candidate_id=?', (cid,)).fetchone()
                               for cid in task['candidate_ids']]
                 statuses = {row['status'] for row in candidates if row}
-                if statuses & {'pending', 'deferred'} and phase not in {'failed','source_changed','disabled','queued','generating'}:
-                    phase = 'waiting_review'
-                elif 'rejected' in statuses:
+                if 'rejected' in statuses:
                     phase = 'rejected'
+                elif any(row and row['layer'] == 'l2' for row in candidates):
+                    retired = True
+                elif statuses & {'pending', 'deferred'} and phase not in {'failed','source_changed','disabled','queued','generating'}:
+                    phase = 'waiting_review'
                 elif 'commit_failed' in statuses:
                     phase = 'failed'
                 elif 'committed' in statuses:
                     phase = 'awaiting_receipt'
-            if not (actual_presentation or adopted) and task.get('l2_job_id'):
-                job = db.execute('SELECT state FROM memory_l2_jobs WHERE task_id=? AND memory_id=?',
-                    (task['l2_job_id'], mid)).fetchone()
-                if job and job['state'] in {'failed','stale'}:
-                    phase = 'failed' if job['state'] == 'failed' else 'source_changed'
-                elif job and job['state'] in {'pending','running'}:
-                    phase = 'queued' if job['state'] == 'pending' else 'generating'
-            return {'task_id': task_id, 'memory_id': mid, 'phase': phase,
-                    'l1_revision': l1, 'l2_revision': l2}
+            retired = retired and phase not in {'adopted', 'rejected'}
+            return {'task_id': task_id, 'memory_id': mid, 'phase': 'disabled' if retired else phase,
+                    'l1_revision': l1, 'l2_revision': l2,
+                    **({'issue': {'code': 'l2_retired'}} if retired else {})}
 
     def enqueue_update(self, payload, update):
         task_id = 'followup_' + update['update_id'].split(':', 1)[1]
@@ -218,6 +221,9 @@ class FollowupTasks(ChatMemoryPreparation):
         row = self.get(task_id)
         if row is None or row['memory_id'] != memory_id:
             raise L1OwnerError('followup_not_found', status=404)
+        if (row.get('l2_job_id') or (row.get('issue') or {}).get('code') == 'l2_retired'
+                or _is_l2_candidate(self.authority.get_candidate(task_id))):
+            raise L1OwnerError('l2_retired', status=410)
         fingerprint = semantic_sha256(payload)
         if row['edit_requests'].get(payload['request_id']):
             if row['edit_requests'][payload['request_id']] != fingerprint:
@@ -250,6 +256,13 @@ class MemoryFollowups:
         qualified = set()
         native = payload.get('schema') == 'self-review-followup-v1'
         native_qualified = set()
+        retired = set()
+        if native and missing:
+            from memory_self_review_source import check_native_sources, native_l2_correction
+            native_qualified, actual = await check_native_sources(payload, self.engine.config, self.review_source_reader,
+                with_sources=True)
+            retired = {u['update_id'] for u in missing if u['update_id'] in native_qualified and native_l2_correction(u, actual)}
+            missing = [u for u in missing if u['update_id'] not in retired]
         if missing:
             if self.resolver is None:
                 raise L1OwnerError('memory_delivery_lookup_unconfigured', status=503)
@@ -257,9 +270,6 @@ class MemoryFollowups:
             if validation.get('state') != 'available':
                 raise L1OwnerError(validation.get('reason', 'memory_delivery_unavailable'), status=503)
             qualified = set(validation.get('eligible_fragment_ids', []))
-            if native:
-                from memory_self_review_source import check_native_sources
-                native_qualified = await check_native_sources(payload, self.engine.config, self.review_source_reader)
             for update in missing:
                 fid = update['memory_ref']['fragment_id']
                 reason = validation.get('reasons', {}).get(fid, '')
@@ -269,6 +279,8 @@ class MemoryFollowups:
                     raise L1OwnerError(reason or 'memory_delivery_source_check_failed', status=503)
         receipts, unavailable = [], []
         for update in updates:
+            if update['update_id'] in retired:
+                continue
             task_id = 'followup_' + update['update_id'].split(':', 1)[1]
             if self.tasks.get(task_id) is None and (update['memory_ref']['fragment_id'] not in qualified
                     or native and update['update_id'] not in native_qualified):
@@ -283,7 +295,10 @@ class MemoryFollowups:
                 receipts.append(self.tasks.public(self.tasks.get(task_id)))
                 continue
             receipts.append(self.tasks.enqueue_update(payload, update))
-        return {'status': 'recorded', 'tasks': receipts, 'unavailable_updates': unavailable}
+        result = {'status': 'recorded', 'tasks': receipts, 'unavailable_updates': unavailable}
+        if retired:
+            result.update(retired_updates=sorted(retired), retirement_reason='l2_retired')
+        return result
 
     async def sources(self, task):
         if task['envelope'].get('schema') == 'self-review-followup-v1':
@@ -340,21 +355,17 @@ class MemoryFollowups:
                             if f['fragment_id'] == update['memory_ref']['fragment_id'])
         if detail['current_revision'] != expected or detail['memory']['state'] != 'active' or detail['l1']['state'] != 'current':
             raise L1OwnerError('followup_target_changed', status=409)
-        sources, evidence, reader = await self.sources(claimed)
+        try:
+            sources, evidence, reader = await self.sources(claimed)
+        except L1OwnerError as exc:
+            if exc.code == 'l2_retired':
+                return {'phase': 'disabled', 'issue': {'code': 'l2_retired'}}
+            raise
         # Original current sources remain prerequisites of the complete L1.
         for binding in detail['l1']['document']['evidence_bindings']:
             if not (await reader.locate(binding)).get('eligible_source'):
                 raise L1OwnerError('followup_original_source_unavailable', status=409)
         v2 = is_v2(detail['l1']['document'])
-        if not v2 and claimed['envelope'].get('schema') == 'self-review-followup-v1':
-            from memory_self_review_source import check_native_sources, native_feedback_layer
-            _, actual = await check_native_sources(claimed['envelope'], self.engine.config,
-                self.review_source_reader, with_sources=True)
-            if (update['kind'] == 'correction' or update['long_term_value'] == 'explicit_owner_correction') and native_feedback_layer(
-                    actual['self_review'], update, actual) == 'l2':
-                from memory_followup_l2 import review_context, prepare_candidate
-                await review_context(self, claimed['task_id'])
-                return prepare_candidate(self, claimed, sources)
         related = self.authority.find_candidates_by_sources([s['source_key'] for s in sources]
             + binding_source_keys([row['binding'] for row in evidence]))
         # Exact content + exact source set is reusable; merely sharing a turn
@@ -442,15 +453,10 @@ class MemoryFollowups:
             raise L1OwnerError('not_followup_candidate')
         cid = row['candidate_id']
         if meta.get('layer') == 'l2':
-            from memory_followup_l2 import actions
             status = self.tasks.current_receipt(meta['task_id'])
             if status['phase'] == 'adopted':
                 return {'id': cid, 'status': 'exists', **status}
-            if edit:
-                return self.edit_draft(row, edit, request_id=request_id)
-            await self._check_native_delivery(self.tasks.get(meta['task_id']))
-            return {'id': cid, 'status': 'waiting_review', 'memory_id': meta['memory_id'],
-                    'task_id': meta['task_id'], 'review_actions': actions(self.tasks.get(meta['task_id']))}
+            raise L1OwnerError('l2_retired', status=410)
         if row['status'] == 'committed':
             return {'id': cid, 'status': 'exists', 'memory_id': meta['memory_id']}
         if edit:
@@ -460,10 +466,14 @@ class MemoryFollowups:
             return {'id': cid, 'status': 'preparing', 'memory_id': meta['memory_id'], 'task_id': queued['task_id']}
         if queued and queued['envelope'].get('schema') == 'self-review-followup-v1':
             await self._check_native_delivery(queued)
-            from memory_self_review_source import check_native_sources
-            allowed = await check_native_sources(queued['envelope'], self.engine.config, self.review_source_reader)
-            if queued['envelope']['updates'][0]['update_id'] not in allowed:
+            from memory_self_review_source import check_native_sources, native_l2_correction
+            allowed, actual = await check_native_sources(queued['envelope'], self.engine.config,
+                self.review_source_reader, with_sources=True)
+            update = queued['envelope']['updates'][0]
+            if update['update_id'] not in allowed:
                 raise L1OwnerError('followup_source_not_currently_readable', status=409, field_path='sources')
+            if native_l2_correction(update, actual):
+                raise L1OwnerError('l2_retired', status=410)
         if owner and row['status'] in {'pending', 'deferred', 'commit_failed'}:
             row = self.authority.decide_candidate(cid, action='accept', expected_revision=row['revision'],
                 request_id=request_id + ':accept', actor='owner', reason_codes=['OWNER_ACCEPTED'])
@@ -487,6 +497,8 @@ class MemoryFollowups:
         return {'id': cid, 'status': 'created', 'memory_id': meta['memory_id'], 'receipt': receipt}
 
     def edit_draft(self, row, edit, *, request_id, expected_revision=None):
+        if _is_l2_candidate(row):
+            raise L1OwnerError('l2_retired', status=410)
         allowed = {'content', 'title', 'reason', 'kind', 'domain', 'tags', 'event_date', 'importance', 'confidence'}
         if (not isinstance(edit, dict) or set(edit) - allowed or 'content' not in edit
                 or not isinstance(edit['content'], str) or not edit['content'].strip()):
@@ -557,7 +569,9 @@ async def run_followup_tasks(engine, bucket_mgr, *, max_jobs):
             continue  # Another worker claimed the same durable task.
         try:
             existing = service.authority.get_candidate(claimed['task_id'])
-            if existing and claimed.get('draft_content') is None:
+            if _is_l2_candidate(existing):
+                result = {'phase': 'disabled', 'issue': {'code': 'l2_retired'}}
+            elif existing and claimed.get('draft_content') is None:
                 receipt = await service.adopt(existing) if existing['status'] == 'accepted' else None
                 result = {'phase': 'prepared', 'candidate_ids': [existing['candidate_id']], 'receipt': receipt}
             else:

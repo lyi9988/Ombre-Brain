@@ -369,13 +369,12 @@ async def prepare_browse_tasks(engine, bucket_mgr, *, max_jobs=None):
 
 
 async def prepare_memory_tasks(engine, bucket_mgr):
-    """Share the existing per-run allowance fairly across both task queues."""
+    """Share the existing per-run allowance across L1 and factual followup queues."""
     from memory_chat_preparation import prepare_chat_tasks
     from memory_l1_runtime import task_options
-    from memory_l3_sync import run_sync_tasks
     from memory_l3_followup import run_followup_tasks
     allowance = task_options(engine.config)['chat_memory_jobs_per_run']
-    choices = (prepare_chat_tasks, prepare_browse_tasks, run_sync_tasks, run_followup_tasks)
+    choices = (prepare_chat_tasks, prepare_browse_tasks, run_followup_tasks)
     cursor = getattr(engine, '_memory_preparation_cursor', 0) % len(choices)
     engine._memory_preparation_cursor = (cursor + 1) % len(choices)
     workers = choices[cursor:] + choices[:cursor]

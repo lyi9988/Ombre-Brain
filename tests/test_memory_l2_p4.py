@@ -16,13 +16,24 @@ from test_memory_l1_revisions import setup_service, request_for
 def run(task): return asyncio.run(task)
 
 
-def setup(tmp_path):
+def seed_historic_l2_job(authority, memory_id, revision=None):
+    """Represent a job written by the older worker in a temporary Authority."""
+    from contextlib import closing
+    from memory_l2_store import enqueue_in_transaction
+    revision = revision if revision is not None else authority.get_memory(memory_id)['active_revision']
+    with closing(authority._connect()) as db, db:
+        return enqueue_in_transaction(db, memory_id, revision)
+
+
+def setup(tmp_path, *, seed_l2=True):
     revisions, authority, manager = setup_service(tmp_path)
     request = request_for(revisions)
     stmt = statement_template()
     stmt['content'] = '那次我听见她说想要抱抱。'
     request['document']['statements'] = [stmt]
     run(revisions.save('m1', request))
+    if seed_l2:
+        seed_historic_l2_job(authority, 'm1')
     calls = []
     engine = NS(temperature=0.3)
     engine._memory_l1_prompt = lambda source_id: ('second-pass prompt', {'prompt_revision': 'p1'})
@@ -42,9 +53,11 @@ def setup(tmp_path):
     return MemoryL2Service(engine, revisions), authority, calls
 
 
-def test_commit_enqueues_only_adopted_l1_and_second_pass_is_persisted(tmp_path):
-    service, authority, calls = setup(tmp_path)
-    assert len(service.store.pending(10)) == 1  # legacy seed did not migrate
+def test_l1_commit_does_not_enqueue_and_historic_second_pass_is_readable(tmp_path):
+    service, authority, calls = setup(tmp_path, seed_l2=False)
+    assert service.store.pending(10) == []
+    assert authority.pending_outbox()[-1]['payload']['l2_preparation'] == {'state': 'retired'}
+    seed_historic_l2_job(authority, 'm1')
     result = run(service.run_once(1))
     assert result['results'][0]['state'] == 'ready'
     assert len(calls) == 1 and calls[0]['task_stage'] == 'presentation_l2'
@@ -67,7 +80,7 @@ def test_l1_change_makes_l2_stale_and_auto_queue_does_not_double_generate(tmp_pa
     run(service.revisions.save('m1', payload))
     assert service.detail('m1')['l2']['state'] == 'stale'
     run(service.run_once(10))
-    assert len(calls) == 2  # commit job and dependency scan collapse
+    assert len(calls) == 2  # explicit legacy worker scan only
     assert len(service.detail('m1')['l2']['revisions']) == 2
 
 
@@ -135,7 +148,7 @@ def test_l2_from_before_relation_tracking_reuses_the_saved_head(tmp_path, owner_
     assert stale['state'] == 'stale' and not stale['text']
 
 
-def test_fact_edit_saved_as_l3_pending_sync_then_confirmed_after_l1_revision(tmp_path):
+def test_l1_revision_alone_does_not_confirm_pending_l3_sync(tmp_path):
     service, _, _ = setup(tmp_path)
     run(service.run_once(1))
     payload = owner_payload(service, kind='facts')
@@ -149,9 +162,9 @@ def test_fact_edit_saved_as_l3_pending_sync_then_confirmed_after_l1_revision(tmp
     run(service.revisions.save('m1', edit))
     confirmed = owner_payload(service, 'owner-confirmed')
     confirmed['confirm_sync_proposals'] = [saved['presentation_revision']]
-    final = run(service.save('m1', confirmed))
-    assert final['l2']['state'] == 'ready'
-    assert final['l2']['sync_proposals'][0]['state'] == 'owner_confirmed_after_l1_revision'
+    with pytest.raises(L1OwnerError, match='l3_sync_action_required'):
+        run(service.save('m1', confirmed))
+    assert service.detail('m1')['l2']['sync_proposals'][0]['state'] == 'pending'
 
 
 def test_resolve_uses_l2_but_not_after_dependency_change(tmp_path):
@@ -268,6 +281,7 @@ def test_source_withdrawal_before_or_during_second_pass_blocks_publication(tmp_p
         metadata={'name':'合成','memory_l1':semantic},source_refs=[],decision_source='test',idempotency_key='l1',actor='test',l1_write_intent=True))
     service = MemoryL2Service(service.engine, env['revisions'])
     service.engine._memory_l1_sources = lambda: env['sources']
+    seed_historic_l2_job(env['revisions'].authority, 'm1')
     env['source_state']['record']['revoked'] = True
     assert run(service.run_once(1))['results'][0]['reason'] == 'l2_source_not_available'
     assert not calls and service.detail('m1')['l2']['presentation'] is None
@@ -315,11 +329,9 @@ def test_ordinary_wording_does_not_confirm_pending_fact_proposal(tmp_path):
     assert result['sync_state'] == 'pending_l1'
     explicit = owner_payload(service, 'explicit-confirm')
     explicit['confirm_sync_proposals'] = [first['presentation_revision']]
-    result = run(service.save('m1', explicit))
-    assert result['l2']['state'] == 'ready'
-    proposal = result['l2']['sync_proposals'][0]
-    assert proposal['proposal']['synchronized_l1_revision'] == 3
-    assert proposal['proposal']['confirmed_presentation_revision'] == result['presentation_revision']
+    with pytest.raises(L1OwnerError, match='l3_sync_action_required'):
+        run(service.save('m1', explicit))
+    assert service.detail('m1')['l2']['sync_proposals'][0]['state'] == 'pending'
 
 
 def test_full_text_edit_rebuilds_units_from_exact_owner_paragraphs(tmp_path):
@@ -392,6 +404,7 @@ def test_owner_paragraphs_are_not_qualified_by_only_one_of_multiple_l1_claims(tm
     second['content'] = '另一条仍需独立核对的事实。'
     payload['document']['statements'].append(second)
     run(service.revisions.save('m1', payload))
+    seed_historic_l2_job(service.revisions.authority, 'm1')
     run(service.run_once(10))
     edit = owner_payload(service)
     edit['document']['full_injection_text'] = '主人第一段。\n\n主人第二段。'

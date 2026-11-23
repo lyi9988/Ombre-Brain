@@ -6,7 +6,7 @@
     { id: 'chat_l1', label: '聊天提交 L1' },
     { id: 'action_l1', label: '行动结果 L1' },
     { id: 'diary_l1', label: '日记 L1' },
-    { id: 'presentation_l2', label: '第二遍 L2 注入稿' },
+    { id: 'presentation_l2', label: '第二遍 L2 注入稿（历史配置）' },
     { id: 'chat_summary', label: '聊天摘要' },
     { id: 'activity_summary', label: '活动摘要' },
   ];
@@ -602,6 +602,9 @@
     shell.appendChild(makeElement('h3', 'mtm-heading', '记忆任务模型路由'));
     shell.appendChild(makeElement('p', 'mtm-intro', '为 ' + STAGES.length + ' 类记忆任务选择模型与思考模式。模型留空时继承连接；思考强度仅在明确选择时发送，并取决于供应商支持。'));
     shell.appendChild(makeElement('p', 'mtm-note', '使用模型默认表示不发送 thinking 参数。展开“更多设置”可调整连接、思考强度和输出上限；daily 未配置时会显示不可用原因，不会借用其他连接的凭据。'));
+    state.retirementNote = makeElement('p', 'mtm-note', '旧 L2 已停用。旧模型路由、调度和输出 Schema 保留供核对，不参与日常记忆。');
+    state.retirementNote.hidden = true;
+    shell.appendChild(state.retirementNote);
     state.status = makeElement('div', 'mtm-status', '正在读取路由配置…');
     state.status.setAttribute('role', 'status');
     state.status.setAttribute('aria-live', 'polite');
@@ -876,6 +879,7 @@
 
   function applyConfig(config, options) {
     var reflection = getReflectionConfig(config);
+    if (state.retirementNote) state.retirementNote.hidden = !reflection || reflection.memory_l2_retired !== true;
     var parsedRoutes = parseRoutes(reflection && reflection.memory_task_routes);
     var parsedTaskOptions = parseTaskOptions(reflection);
     var parsedOutputSchema = parseOutputSchema(reflection);

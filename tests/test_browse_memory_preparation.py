@@ -120,7 +120,7 @@ def test_real_store_to_formal_l1_and_l2_queue_without_chat_mode_dependency(tmp_p
     detail = asyncio.run(f.env['revisions'].detail(mid))
     assert detail['body'] == f.kwargs['content'] and detail['l1']['state'] == 'current'
     with f.env['authority']._connect() as db:
-        assert db.execute('SELECT count(*) FROM memory_l2_jobs WHERE memory_id=?', (mid,)).fetchone()[0] == 1
+        assert db.execute('SELECT count(*) FROM memory_l2_jobs WHERE memory_id=?', (mid,)).fetchone()[0] == 0
     asyncio.run(prepare_browse_tasks(f.engine, f.env['buckets']))
     assert len(f.calls) == 1
 
@@ -284,6 +284,8 @@ def test_successful_model_output_survives_failed_adoption_and_retry_reuses_it(tm
 def test_shared_allowance_does_not_double_and_alternates_queues(monkeypatch):
     import memory_browse_preparation as browse
     import memory_chat_preparation as chat
+    import memory_l3_followup as followups
+    import memory_l3_sync as old_l2_sync
     engine = NS(config={'reflection': {'chat_memory_jobs_per_run': 1}})
     calls = []
     async def chat_worker(engine, bucket_mgr, *, max_jobs):
@@ -292,11 +294,19 @@ def test_shared_allowance_does_not_double_and_alternates_queues(monkeypatch):
     async def browse_worker(engine, bucket_mgr, *, max_jobs):
         calls.append(('browse', max_jobs))
         return {'results': [{}]}
+    async def fact_followup_worker(engine, bucket_mgr, *, max_jobs):
+        calls.append(('fact-followup', max_jobs))
+        return {'results': [{}]}
+    async def retired_worker(*args, **kwargs):
+        raise AssertionError('production L1 preparation started the old L2 sync queue')
+    monkeypatch.setattr(followups, 'run_followup_tasks', fact_followup_worker)
+    monkeypatch.setattr(old_l2_sync, 'run_sync_tasks', retired_worker)
     monkeypatch.setattr(chat, 'prepare_chat_tasks', chat_worker)
     monkeypatch.setattr(browse, 'prepare_browse_tasks', browse_worker)
     asyncio.run(browse.prepare_memory_tasks(engine, None))
     asyncio.run(browse.prepare_memory_tasks(engine, None))
-    assert calls == [('chat', 1), ('browse', 1)]
+    asyncio.run(browse.prepare_memory_tasks(engine, None))
+    assert calls == [('chat', 1), ('browse', 1), ('fact-followup', 1)]
 
 
 def test_checkpoint_reused_after_transient_source_read_failure_without_second_model(tmp_path, monkeypatch):

@@ -259,21 +259,10 @@ class OwnerSummaryPreparation(ChatMemoryPreparation):
             if memory and memory['state'] == 'active' and memory['active_revision'] > 0:
                 revision = int(memory['active_revision'])
                 memory_ids.append(cid)
-                from memory_l1_v2 import is_v2
-                if candidate and is_v2(candidate['proposal']['metadata'].get('memory_l1')):
-                    detail.update(memory_id=cid, l1_revision=revision, l2_state='ready', presentation_revision=None)
-                    items.append(detail)
-                    continue
                 with closing(self.authority._connect()) as db, db:
-                    product = db.execute('SELECT p.presentation_revision,p.first_pass_revision,p.publication FROM memory_l2_heads h '
+                    product = db.execute('SELECT p.presentation_revision FROM memory_l2_heads h '
                         'JOIN memory_l2_revisions p USING(memory_id,presentation_revision) WHERE h.memory_id=?', (cid,)).fetchone()
-                    job = db.execute('SELECT state,reason FROM memory_l2_jobs WHERE memory_id=? AND first_pass_revision=? ORDER BY updated_at DESC LIMIT 1', (cid, revision)).fetchone()
-                l2_state = ('requires_dependency_check' if product and product['first_pass_revision'] == revision and product['publication'] == 'active'
-                            else job['state'] if job else 'pending')
-                if self.engine is not None:
-                    from memory_l2_service import MemoryL2Service
-                    l2_state = MemoryL2Service(self.engine, self.engine._memory_l1_revisions()).detail(cid)['l2']['state']
-                detail.update(memory_id=cid, l1_revision=revision, l2_state=l2_state,
+                detail.update(memory_id=cid, l1_revision=revision, l2_state='retired',
                     presentation_revision=product['presentation_revision'] if product else None)
             items.append(detail)
         completed = [w for w in row.get('windows') or [] if w['state'] == 'prepared']
@@ -282,10 +271,9 @@ class OwnerSummaryPreparation(ChatMemoryPreparation):
         elif row['phase'] == 'failed': status = 'partial' if completed else 'failed'
         elif row['phase'] != 'prepared': status = 'partial' if completed else 'queued'
         elif any(i['state'] in ('pending', 'deferred') for i in items): status = 'review'
-        elif any(i['state'] in ('rejected', 'commit_failed', 'unknown') or i.get('l2_state') == 'failed' for i in items): status = 'partial' if memory_ids or linked else 'failed'
+        elif any(i['state'] in ('rejected', 'commit_failed', 'unknown') for i in items): status = 'partial' if memory_ids or linked else 'failed'
         elif any(i['state'] == 'accepted' and not i.get('memory_id') for i in items): status = 'queued'
-        elif any(i.get('memory_id') for i in items) and all(i.get('l2_state') == 'ready' or i['state'] == 'linked' for i in items): status = 'ready'
-        elif memory_ids: status = 'l1_accepted_l2_pending'
+        elif memory_ids: status = 'ready'
         elif linked: status = 'linked'
         else: status = 'no_new_memory'
         effective_issue = row.get('issue')
