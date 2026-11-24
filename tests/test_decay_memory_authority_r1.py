@@ -1,6 +1,9 @@
 import asyncio
-import json
+from datetime import datetime
 from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
 
 import memory_authority as authority_module
 from bucket_manager import BucketManager
@@ -14,7 +17,6 @@ from memory_commit_service import (
 
 
 BODY = "主人把这段内容作为一条可保留正文。"
-UPDATED_BODY = "主人后来修订了这条记忆正文。"
 MEMORY_ID = "managed-memory-id"
 BUCKET_ID = "physical-bucket-id"
 
@@ -24,7 +26,7 @@ def _stack(tmp_path, *, authority_enabled=True):
         "buckets_dir": str(tmp_path / "buckets"),
         "state_dir": str(tmp_path / "state"),
         "memory_authority": {"enabled": authority_enabled},
-        "decay": {"threshold": 10000},
+        "decay": {"threshold": 0.3, "check_interval_hours": 0},
     }
     bucket_manager = BucketManager(config)
     authority = MemoryAuthorityStore(config)
@@ -33,9 +35,9 @@ def _stack(tmp_path, *, authority_enabled=True):
     return config, bucket_manager, authority, service
 
 
-def _seed_managed(service):
+def _seed_managed(service, *, memory_id=MEMORY_ID, last_active="2025-12-01T00:00:00+00:00"):
     return asyncio.run(service.commit_memory(
-        memory_id=MEMORY_ID,
+        memory_id=memory_id,
         bucket_id=BUCKET_ID,
         expected_revision=0,
         body=BODY,
@@ -44,6 +46,7 @@ def _seed_managed(service):
             "importance": 5,
             "domain": ["private"],
             "bucket_type": "dynamic",
+            "last_active": last_active,
         },
         source_refs=["test:source"],
         decision_source="test",
@@ -71,18 +74,6 @@ def _seed_authority_only(authority):
     return authority.finalize_memory_commit(prepared["operation_id"])
 
 
-def _count_archive_calls(bucket_manager):
-    calls = []
-    original = bucket_manager.archive
-
-    async def counted(bucket_id):
-        calls.append(str(bucket_id))
-        return await original(bucket_id)
-
-    bucket_manager.archive = counted
-    return calls
-
-
 def _state_rows(authority, memory_id):
     conn = authority._connect()
     try:
@@ -95,204 +86,88 @@ def _state_rows(authority, memory_id):
         conn.close()
 
 
-def test_decay_archives_managed_bucket_through_authority_projection_once(tmp_path):
-    config, bucket_manager, authority, service = _stack(tmp_path)
-    _seed_managed(service)
-    original_revision = authority.get_memory(MEMORY_ID)["active_revision"]
-    archive_calls = _count_archive_calls(bucket_manager)
+@pytest.mark.parametrize("authority_enabled", [True, False])
+def test_retired_decay_never_scans_archives_or_resolves(tmp_path, monkeypatch, authority_enabled):
+    config, bucket_manager, authority, service = _stack(tmp_path, authority_enabled=authority_enabled)
+    old_date = "2025-10-03T00:00:00+00:00"
+    if authority_enabled:
+        _seed_managed(service, last_active=old_date)
+    else:
+        asyncio.run(bucket_manager.create(
+            BODY, bucket_id=BUCKET_ID, domain=["private"], importance=5, last_active=old_date,
+        ))
+    resolve_id = "old-low-importance"
+    asyncio.run(bucket_manager.create(
+        BODY, bucket_id=resolve_id, domain=["private"], importance=4,
+        last_active="2025-12-01T00:00:00+00:00",
+    ))
+    engine = DecayEngine(config, bucket_manager, service if authority_enabled else None)
+    monkeypatch.setattr(engine, "_now_naive_utc", lambda: datetime(2026, 1, 1))
+    original_archive_candidate = asyncio.run(bucket_manager.get(BUCKET_ID))
+    original_resolve_candidate = asyncio.run(bucket_manager.get(resolve_id))
 
-    result = asyncio.run(DecayEngine(config, bucket_manager, service).run_decay_cycle())
+    # Distinct old triggers: one falls below the normal archive threshold;
+    # the other is over 30 days and importance 4 but still above that threshold.
+    threshold = config["decay"]["threshold"]
+    assert engine.calculate_score(original_archive_candidate["metadata"]) < threshold
+    assert engine.calculate_score(original_resolve_candidate["metadata"]) > threshold
+    assert not original_resolve_candidate["metadata"].get("resolved", False)
+    original_authority = authority.get_memory_state_snapshot(MEMORY_ID)
+    list_buckets = AsyncMock(side_effect=AssertionError("a retired cycle must not list buckets"))
+    monkeypatch.setattr(bucket_manager, "list_all", list_buckets)
 
-    current = authority.get_memory(MEMORY_ID)
-    archived_bucket = asyncio.run(bucket_manager.get(BUCKET_ID))
-    assert result["archived"] == 1
-    assert current["state"] == "archived"
-    assert current["recall_policy"] == "enabled"
-    assert current["active_revision"] == original_revision
-    assert archived_bucket["content"] == BODY
-    assert Path(archived_bucket["path"]).is_relative_to(Path(bucket_manager.archive_dir))
-    assert archive_calls == [BUCKET_ID]
-    events = _state_rows(authority, MEMORY_ID)
-    assert len(events) == 1
-    assert json.loads(events[0]["payload_json"])["state"] == "archived"
+    result = asyncio.run(engine.run_decay_cycle())
 
-
-def test_decay_cas_rejects_owner_revision_race_without_archiving_or_leaking_text(
-    tmp_path, caplog,
-):
-    config, bucket_manager, authority, service = _stack(tmp_path)
-    _seed_managed(service)
-    archive_calls = _count_archive_calls(bucket_manager)
-
-    class RevisionRaceService:
-        def __init__(self, inner):
-            self.inner = inner
-            self.authority = inner.authority
-            self.raced = False
-
-        async def change_memory_state(self, **kwargs):
-            if not self.raced:
-                self.raced = True
-                await self.inner.commit_memory(
-                    memory_id=MEMORY_ID,
-                    bucket_id=BUCKET_ID,
-                    expected_revision=1,
-                    body=UPDATED_BODY,
-                    metadata={
-                        "name": "secret bucket name",
-                        "importance": 5,
-                        "domain": ["private"],
-                        "bucket_type": "dynamic",
-                    },
-                    source_refs=["test:owner-edit"],
-                    decision_source="owner",
-                    idempotency_key="owner-revision-race",
-                    actor="owner",
-                )
-            return await self.inner.change_memory_state(**kwargs)
-
-    decay = DecayEngine(config, bucket_manager, RevisionRaceService(service))
-    result = asyncio.run(decay.run_decay_cycle())
-
-    current = authority.get_memory(MEMORY_ID)
-    bucket = asyncio.run(bucket_manager.get(BUCKET_ID))
-    assert result["archived"] == 0
-    assert current["state"] == "active"
-    assert current["active_revision"] == 2
-    assert bucket["content"] == UPDATED_BODY
-    assert Path(bucket["path"]).is_relative_to(Path(bucket_manager.dynamic_dir))
-    assert archive_calls == []
+    assert result["status"] == "disabled"
+    assert result["archived"] == result["auto_resolved"] == result["checked"] == 0
+    list_buckets.assert_not_awaited()
+    assert asyncio.run(bucket_manager.get(BUCKET_ID)) == original_archive_candidate
+    assert asyncio.run(bucket_manager.get(resolve_id)) == original_resolve_candidate
+    assert authority.get_memory_state_snapshot(MEMORY_ID) == original_authority
     assert _state_rows(authority, MEMORY_ID) == []
-    assert "secret bucket name" not in caplog.text
-    assert BODY not in caplog.text
-    assert UPDATED_BODY not in caplog.text
 
 
-def test_decay_rearchives_after_owner_restore_at_same_revision(tmp_path):
-    config, bucket_manager, authority, service = _stack(tmp_path)
-    _seed_managed(service)
-    archive_calls = _count_archive_calls(bucket_manager)
-    decay = DecayEngine(config, bucket_manager, service)
+def test_legacy_start_entry_points_never_schedule_a_task(monkeypatch):
+    def unexpected_task(coroutine, *args, **kwargs):
+        coroutine.close()
+        pytest.fail("retired decay scheduled a task")
 
-    first = asyncio.run(decay.run_decay_cycle())
-    archived = authority.get_memory(MEMORY_ID)
-    restore = asyncio.run(service.change_memory_state(
-        memory_id=MEMORY_ID,
-        state="active",
-        recall_policy=archived["recall_policy"],
-        idempotency_key="owner-restore-same-revision",
-        actor="owner",
-        expected_revision=archived["active_revision"],
-        expected_state="archived",
-    ))
-    second = asyncio.run(decay.run_decay_cycle())
+    engine = DecayEngine({"decay": {"check_interval_hours": 0}})
+    monkeypatch.setattr(asyncio, "create_task", unexpected_task)
 
-    current = authority.get_memory(MEMORY_ID)
-    bucket = asyncio.run(bucket_manager.get(BUCKET_ID))
-    events = _state_rows(authority, MEMORY_ID)
-    decay_keys = [
-        row["idempotency_key"]
-        for row in _commit_rows(authority, MEMORY_ID)
-        if str(row["idempotency_key"]).startswith("decay-archive:")
-    ]
-    assert first["archived"] == 1
-    assert restore["state"] == "active"
-    assert second["archived"] == 1
-    assert current["state"] == "archived"
-    assert current["active_revision"] == 1
-    assert bucket["content"] == BODY
-    assert Path(bucket["path"]).is_relative_to(Path(bucket_manager.archive_dir))
-    assert archive_calls == [BUCKET_ID, BUCKET_ID]
-    assert len(events) == 3
-    assert [json.loads(row["payload_json"])["state"] for row in events] == [
-        "archived", "active", "archived",
-    ]
-    assert len(decay_keys) == 2
-    assert len(set(decay_keys)) == 2
+    async def exercise_old_entry_points():
+        await engine.ensure_started()
+        await engine.start()
+        assert engine.is_running is False
+        await engine.stop()
+
+    asyncio.run(exercise_old_entry_points())
 
 
-def _commit_rows(authority, memory_id):
-    conn = authority._connect()
-    try:
-        return [dict(row) for row in conn.execute(
-            "SELECT * FROM commit_log WHERE aggregate_id=? ORDER BY rowid",
-            (memory_id,),
-        ).fetchall()]
-    finally:
-        conn.close()
+def test_explicit_resolution_and_archive_still_work(tmp_path, monkeypatch):
+    import server
 
+    _config, bucket_manager, authority, service = _stack(tmp_path)
+    _seed_managed(service, memory_id=BUCKET_ID)
+    monkeypatch.setattr(server, "bucket_mgr", bucket_manager)
+    monkeypatch.setattr(server, "memory_authority_store", authority)
+    monkeypatch.setattr(server, "memory_commit_service", service)
 
-def test_decay_rejects_owner_archive_restore_aba_at_same_body_revision(tmp_path):
-    config, bucket_manager, authority, service = _stack(tmp_path)
-    _seed_managed(service)
-    archive_calls = _count_archive_calls(bucket_manager)
+    response = asyncio.run(server.trace(BUCKET_ID, resolved=1, idempotency_key="explicit-resolve"))
 
-    class OwnerRestoreRace:
-        def __init__(self):
-            self.authority = authority
-
-        async def change_memory_state(self, **kwargs):
-            await service.change_memory_state(
-                memory_id=MEMORY_ID, state="archived", recall_policy="enabled",
-                idempotency_key="owner-aba-archive", actor="owner",
-            )
-            await service.change_memory_state(
-                memory_id=MEMORY_ID, state="active", recall_policy="enabled",
-                idempotency_key="owner-aba-restore", actor="owner",
-            )
-            return await service.change_memory_state(**kwargs)
-
-    result = asyncio.run(DecayEngine(config, bucket_manager, OwnerRestoreRace()).run_decay_cycle())
-    current = authority.get_memory(MEMORY_ID)
-    bucket = asyncio.run(bucket_manager.get(BUCKET_ID))
-    assert result["archived"] == 0
+    assert "resolved=True" in response
+    assert asyncio.run(bucket_manager.get(BUCKET_ID))["metadata"]["resolved"] is True
+    current = authority.get_memory(BUCKET_ID)
     assert current["state"] == "active"
-    assert current["active_revision"] == 1
-    assert bucket["content"] == BODY
-    assert Path(bucket["path"]).is_relative_to(Path(bucket_manager.dynamic_dir))
-    assert archive_calls == [BUCKET_ID]
-    assert [json.loads(row["payload_json"])["state"] for row in _state_rows(authority, MEMORY_ID)] == [
-        "archived", "active",
-    ]
 
-
-def test_legacy_bucket_uses_direct_archive_when_authority_has_no_row(tmp_path):
-    config, bucket_manager, _authority, service = _stack(tmp_path)
-    legacy_id = "legacy-decay-bucket"
-    asyncio.run(bucket_manager.create(
-        BODY,
-        bucket_id=legacy_id,
-        name="legacy bucket",
-        domain=["private"],
+    archived = asyncio.run(service.change_memory_state(
+        memory_id=BUCKET_ID, state="archived", recall_policy="enabled",
+        idempotency_key="explicit-archive", actor="owner", expected_revision=current["active_revision"],
     ))
-    archive_calls = _count_archive_calls(bucket_manager)
 
-    result = asyncio.run(DecayEngine(config, bucket_manager, service).run_decay_cycle())
-
-    bucket = asyncio.run(bucket_manager.get(legacy_id))
-    assert result["archived"] == 1
-    assert archive_calls == [legacy_id]
-    assert bucket["content"] == BODY
-    assert Path(bucket["path"]).is_relative_to(Path(bucket_manager.archive_dir))
-
-
-def test_enabled_authority_without_state_service_blocks_direct_archive(tmp_path):
-    config, bucket_manager, _authority, _service = _stack(tmp_path)
-    legacy_id = "cannot-classify-decay-bucket"
-    asyncio.run(bucket_manager.create(
-        BODY,
-        bucket_id=legacy_id,
-        name="secret bucket name",
-        domain=["private"],
-    ))
-    archive_calls = _count_archive_calls(bucket_manager)
-
-    result = asyncio.run(DecayEngine(config, bucket_manager).run_decay_cycle())
-
-    bucket = asyncio.run(bucket_manager.get(legacy_id))
-    assert result["archived"] == 0
-    assert archive_calls == []
-    assert Path(bucket["path"]).is_relative_to(Path(bucket_manager.dynamic_dir))
+    assert archived["state"] == "archived"
+    assert Path(asyncio.run(bucket_manager.get(BUCKET_ID))["path"]).is_relative_to(Path(bucket_manager.archive_dir))
+    assert len(_state_rows(authority, BUCKET_ID)) == 1
 
 
 def test_authority_state_cas_conflict_writes_no_state_or_outbox_event(tmp_path):

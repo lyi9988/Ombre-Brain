@@ -185,7 +185,7 @@ prompt_plan_mirror = PromptPlanMirrorStore(
     or os.path.join(config.get("buckets_dir") or ".", "prompt_plan_mirror.sqlite3")
 )
 dehydrator = Dehydrator(config, prompt_plan_mirror)   # Dehydrator / 脱水器
-decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
+decay_engine = DecayEngine(config)                   # Read-only memory scoring / 只读记忆评分
 embedding_engine = EmbeddingEngine(config)            # Embedding engine / 向量化引擎
 reranker_engine = RerankerEngine(config)              # Reranker / 召回重排序
 recall_diagnostics = RecallDiagnosticsLogger(config)  # Recall diagnostics / 召回诊断
@@ -210,7 +210,6 @@ memory_commit_service = (
     if memory_authority_store is not None
     else None
 )
-decay_engine.memory_state_service = memory_commit_service
 
 
 def _new_portrait_maintainer():
@@ -2864,6 +2863,7 @@ async def health_check(request):
             "status": "ok",
             "buckets": stats["permanent_count"] + stats["dynamic_count"],
             "decay_engine": "running" if decay_engine.is_running else "stopped",
+            "decay_cycle": decay_engine.cycle_status,
             "memory_edges": len(memory_edge_store.list_edges()),
             "entity_edges": len(entity_edge_store.list_edges()),
             "reflection": {
@@ -3601,15 +3601,6 @@ async def entity_edge_backfill(
         dry_run=dry_run,
         include_archive=include_archive,
     )
-
-
-async def _ensure_decay_engine_started_for_transport(transport_name: str) -> None:
-    if transport_name not in ("sse", "streamable-http"):
-        return
-    try:
-        await decay_engine.ensure_started()
-    except Exception as e:
-        logger.warning("Decay engine startup failed / 衰减引擎启动失败: %s", e)
 
 
 async def _commit_tool_memory(
@@ -6883,7 +6874,6 @@ async def breath(
     ):
         return BREATH_HANDOFF_RETIRED
 
-    await decay_engine.ensure_started()
     max_results = _int_between(max_results, 20, 1, 50)
     max_tokens = _int_between(max_tokens, 10000, 0, 20000)
     include_related = _bool_value(include_related, True)
@@ -8133,7 +8123,6 @@ async def hold(
     source_metadata: dict | None = None,
 ) -> str:
     """写一条长期记忆。单个事实/承诺/偏好用 hold；旧记忆的新感受用 comment_bucket；悄悄话用 whisper=True。date 可传事件日期；title 可选，传了就用给定标题，不传则自动生成。普通记忆不用填写 domain，系统会自动判断；维护自我锚点等特殊桶时可显式传 domain。显式 valence/arousal 会覆盖自动情绪。普通记忆 content 的最小写入就是正文；只有确实需要结构化时才按需使用 ### moment、### original、### reflection。需要之后轻轻提醒/照顾备忘的事项用 reminder_create，不写进长期记忆。feel=True/whisper=True 时 content 只写第一人称感受，不写分段标题。"""
-    await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
     if not content or not content.strip():
@@ -8635,7 +8624,6 @@ async def grow(
     idempotency_key: str = "",
 ) -> str:
     """把筛过的长片段拆成少量长期记忆；单条事实/承诺/偏好优先 hold，旧记忆补感受优先 comment_bucket。只有多个已筛选长期记忆点才用 grow，别塞整段流水账。保留原文称呼、昵称、互称、自称和原话，不要把临时称呼推成稳定画像事实。title 可选，短内容时传了就用你给的标题。普通记忆 content 的最小写入就是正文；只有确实需要结构化时才按需使用 ### moment、### original、### reflection。需要之后轻轻提醒/照顾备忘的事项用 reminder_create，不写进长期记忆。feel 年轮只写第一人称感受，不写分段标题。"""
-    await decay_engine.ensure_started()
 
     if not content or not content.strip():
         return "内容为空，无法整理。"
@@ -9165,7 +9153,7 @@ async def pulse(include_archive: bool = False) -> str:
         f"当前显示桶: {visible_count} 个\n"
         f"全量记忆桶: {total_count} 个\n"
         f"总存储大小: {stats['total_size_kb']:.1f} KB\n"
-        f"衰减引擎: {'运行中' if decay_engine.is_running else '已停止'}\n"
+        "衰减引擎: 已停用自动周期（保留只读评分）\n"
     )
 
     # --- List all bucket summaries / 列出所有桶摘要 ---
@@ -9233,7 +9221,6 @@ async def introspection(
     created_to: str = "",
 ) -> str:
     """读取最近普通记忆供自省；可按日期翻页。放下用 trace，产生新感受用 comment_bucket。feel content 只写第一人称感受。"""
-    await decay_engine.ensure_started()
     limit = _int_between(limit, 10, 1, 30)
     offset = _int_between(offset, 0, 0, 10000)
     date_args = {
@@ -9561,7 +9548,6 @@ async def reflect(period: str = "daily", force: bool = False) -> dict:
 
 async def portrait_maintain(force: bool = False) -> dict:
     """维护每日 portrait state。只写 state/portrait_state.json，不写 profile_fact、anchor、pinned、protected 或 Core Memory。"""
-    await decay_engine.ensure_started()
     return await portrait_engine.maintain_daily(
         bucket_mgr,
         persona_engine,
@@ -9984,7 +9970,6 @@ async def api_portrait_maintain(request):
     if not isinstance(body, dict):
         body = {}
     try:
-        await decay_engine.ensure_started()
         result = await portrait_engine.maintain_daily(
             bucket_mgr,
             persona_engine,
@@ -14653,6 +14638,7 @@ async def api_status(request):
         return JSONResponse(
             {
                 "decay_engine": "running" if decay_engine.is_running else "stopped",
+                "decay_cycle": decay_engine.cycle_status,
                 "buckets": {
                     "permanent": stats.get("permanent_count", 0),
                     "dynamic": stats.get("dynamic_count", 0),
@@ -14885,7 +14871,6 @@ if __name__ == "__main__":
         # --- Application-level keepalive: ping /health every 60s ---
         # --- 应用层保活：每 60 秒 ping 一次 /health，防止 Cloudflare Tunnel 空闲断连 ---
         async def _keepalive_loop():
-            await _ensure_decay_engine_started_for_transport(transport)
             await asyncio.sleep(10)  # Wait for server to fully start
             async with httpx.AsyncClient() as client:
                 while True:
@@ -15216,8 +15201,6 @@ if __name__ == "__main__":
             _app = mcp.streamable_http_app()
         else:
             _app = mcp.sse_app()
-        async def _start_decay_engine_on_app_startup():
-            await _ensure_decay_engine_started_for_transport(transport)
 
         async def _close_retrieval_clients_on_app_shutdown():
             for engine in (embedding_engine, reranker_engine):
@@ -15232,7 +15215,6 @@ if __name__ == "__main__":
         attach_runtime_lifespan(
             _app,
             worker=_memory_preparation_workers,
-            on_startup=_start_decay_engine_on_app_startup,
             on_shutdown=_close_retrieval_clients_on_app_shutdown,
         )
         _app.add_middleware(

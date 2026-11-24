@@ -427,15 +427,13 @@ def test_actual_hold_queues_browse_without_synchronous_model_or_whisper_reroute(
     for node in nodes:
         node.decorator_list = []
     commits = []
-    async def started():
-        return None
     async def commit(**kwargs):
         commits.append(kwargs)
         return 'private-whisper'
     def forbidden(*args, **kwargs):
         raise AssertionError('browse queue must precede model/tag/body mutation')
     namespace = {'json': json, 'memory_authority_store': f.env['authority'], 'memory_commit_service': f.env['commit'],
-        'decay_engine': NS(ensure_started=started), '_normalize_memory_sections_for_write': forbidden,
+        '_normalize_memory_sections_for_write': forbidden,
         '_commit_tool_memory': commit, '_ai_author_name': lambda: '顾衍'}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
     result = json.loads(asyncio.run(namespace['hold'](f.kwargs['content'], source_metadata=f.kwargs['descriptor'],

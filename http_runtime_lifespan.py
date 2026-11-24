@@ -9,7 +9,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def attach_runtime_lifespan(app, *, worker, on_startup, on_shutdown):
+def attach_runtime_lifespan(app, *, worker, on_shutdown, on_startup=None):
     # FastMCP owns a lifespan for its session manager. Preserve that context
     # (including its yielded state); deprecated startup handlers bypass it.
     mcp_lifespan = app.router.lifespan_context
@@ -17,7 +17,8 @@ def attach_runtime_lifespan(app, *, worker, on_startup, on_shutdown):
     @asynccontextmanager
     async def runtime_lifespan(application):
         async with mcp_lifespan(application) as state:
-            await on_startup()
+            if on_startup is not None:
+                await on_startup()
             task = asyncio.create_task(worker(), name="chat-memory-preparation")
             logger.info("Chat Memory preparation worker started")
             try:

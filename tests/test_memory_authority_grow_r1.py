@@ -70,9 +70,6 @@ class RecordingLegacyBucketManager:
 
 
 def _install_common_grow_stubs(monkeypatch):
-    async def no_start():
-        return None
-
     async def no_related(*_args, **_kwargs):
         return None
 
@@ -90,7 +87,6 @@ def _install_common_grow_stubs(monkeypatch):
             "memory_layer": "relationship",
         }
 
-    monkeypatch.setattr(server.decay_engine, "ensure_started", no_start)
     monkeypatch.setattr(server.memory_write_gate, "should_gate", lambda **_kwargs: False)
     monkeypatch.setattr(server, "_find_readonly_related_bucket", no_related)
     monkeypatch.setattr(server, "_auto_generate_write_moment_if_needed", passthrough)
