@@ -17,7 +17,7 @@ import threading
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from copy import copy, deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -544,6 +544,13 @@ DEFAULT_AXIS_LITE_TECHNICAL_DOMAIN_TERMS = (
 )
 
 
+@dataclass
+class _QueryPlannerFlight:
+    task: asyncio.Task[tuple[dict[str, Any] | None, str | None]]
+    waiters: int = 0
+    cached: bool = False
+
+
 class GatewayService:
     """
     OpenAI-compatible gateway that injects Ombre memory before forwarding
@@ -1034,7 +1041,7 @@ class GatewayService:
             min(1000, int(self.gateway_cfg.get("query_planner_cache_max_entries", 128))),
         )
         self._query_planner_cache: dict[str, tuple[float, dict[str, Any]]] = {}
-        self._query_planner_inflight: dict[str, asyncio.Task] = {}
+        self._query_planner_inflight: dict[str, _QueryPlannerFlight] = {}
         self.rerank_cache_ttl_seconds = max(
             0.0,
             min(3600.0, float(self.gateway_cfg.get("rerank_cache_ttl_seconds", 300.0))),
@@ -20552,33 +20559,27 @@ class GatewayService:
             return plan, None
         if cached:
             self._query_planner_cache.pop(cache_key, None)
-        inflight = self._query_planner_inflight.get(cache_key)
-        if inflight is not None:
-            try:
-                plan, error = await asyncio.shield(inflight)
-            except asyncio.CancelledError:
-                if asyncio.current_task().cancelling():
-                    raise
-                raise RuntimeError("shared_planner_request_cancelled") from None
-            if plan:
-                plan = deepcopy(plan)
-                plan["_cache"] = {"status": "singleflight", "key": cache_key[:16]}
-            return plan, error
+        flight = self._query_planner_inflight.get(cache_key)
+        cache_status = "singleflight" if flight is not None else "miss"
+        if flight is None:
+            flight = _QueryPlannerFlight(asyncio.create_task(
+                self._call_query_planner_uncached(
+                    query,
+                    planner_prompt,
+                    model=model,
+                    mirrored=bool(mirrored_route),
+                )
+            ))
+            self._query_planner_inflight[cache_key] = flight
 
-        task = asyncio.create_task(
-            self._call_query_planner_uncached(
-                query,
-                planner_prompt,
-                model=model,
-                mirrored=bool(mirrored_route),
-            )
-        )
-        self._query_planner_inflight[cache_key] = task
+        # Each recall keeps its own deadline; the provider belongs to all waiters.
+        flight.waiters += 1
         try:
-            plan, error = await asyncio.shield(task)
+            plan, error = await asyncio.shield(flight.task)
             if (
                 plan
                 and not error
+                and not flight.cached
                 and self.query_planner_cache_ttl_seconds > 0
                 and self.query_planner_cache_max_entries > 0
             ):
@@ -20586,19 +20587,27 @@ class GatewayService:
                     time.monotonic() + self.query_planner_cache_ttl_seconds,
                     deepcopy(plan),
                 )
+                flight.cached = True
                 while len(self._query_planner_cache) > self.query_planner_cache_max_entries:
                     self._query_planner_cache.pop(next(iter(self._query_planner_cache)))
             if plan:
                 plan = deepcopy(plan)
-                plan["_cache"] = {"status": "miss", "key": cache_key[:16]}
+                plan["_cache"] = {"status": cache_status, "key": cache_key[:16]}
             return plan, error
         except asyncio.CancelledError:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            raise
+            if asyncio.current_task().cancelling():
+                raise
+            raise RuntimeError("shared_planner_request_cancelled") from None
         finally:
-            if self._query_planner_inflight.get(cache_key) is task:
+            flight.waiters -= 1
+            if not flight.waiters:
                 self._query_planner_inflight.pop(cache_key, None)
+                if not flight.task.done():
+                    flight.task.cancel()
+                    await asyncio.gather(flight.task, return_exceptions=True)
+                elif not flight.task.cancelled():
+                    # The last waiter can be cancelled just as the provider fails.
+                    flight.task.exception()
 
     async def _call_query_planner_uncached(
         self,

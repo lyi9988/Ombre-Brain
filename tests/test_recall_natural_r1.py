@@ -2123,7 +2123,7 @@ def test_recall_cache_waiter_cancellation_does_not_cancel_shared_provider(cache_
     assert calls == [True]
 
 
-@pytest.mark.parametrize("cache_kind", ["semantic", "rerank", "planner"])
+@pytest.mark.parametrize("cache_kind", ["semantic", "rerank"])
 def test_recall_cache_waiter_gets_provider_failure_when_owner_cancels(cache_kind):
     _service, invoke, started, _release, child_cancelled, calls, inflight = (
         _blocking_recall_cache_case(cache_kind)
@@ -2145,6 +2145,64 @@ def test_recall_cache_waiter_gets_provider_failure_when_owner_cancels(cache_kind
 
     asyncio.run(run())
     assert calls == [True]
+
+
+def test_query_planner_first_waiter_cancellation_preserves_shared_work_and_cache():
+    _service, invoke, started, release, child_cancelled, calls, inflight = (
+        _blocking_recall_cache_case("planner")
+    )
+
+    async def run():
+        first = asyncio.create_task(invoke())
+        await _wait_for_cache_child_start(started, first)
+        second = asyncio.create_task(invoke())
+        await asyncio.sleep(0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        release.set()
+        plan, error = await asyncio.wait_for(second, timeout=1)
+        assert error is None
+        assert plan["queries"] == [{"query": "synthetic expansion"}]
+        assert plan["_cache"]["status"] == "singleflight"
+        assert not child_cancelled.is_set()
+        assert inflight == {}
+        plan["queries"][0]["query"] = "changed by caller"
+        cached, error = await invoke()
+        assert error is None
+        assert cached["queries"] == [{"query": "synthetic expansion"}]
+        assert cached["_cache"]["status"] == "hit"
+
+    asyncio.run(run())
+    assert calls == [True]
+
+
+def test_query_planner_last_waiter_cancellation_cleans_up_and_allows_a_fresh_call():
+    _service, invoke, started, release, child_cancelled, calls, inflight = (
+        _blocking_recall_cache_case("planner")
+    )
+
+    async def run():
+        first = asyncio.create_task(invoke())
+        await _wait_for_cache_child_start(started, first)
+        second = asyncio.create_task(invoke())
+        await asyncio.sleep(0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert not child_cancelled.is_set()
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+        assert child_cancelled.is_set()
+        assert inflight == {}
+        release.set()
+        plan, error = await asyncio.wait_for(invoke(), timeout=1)
+        assert error is None and plan["queries"]
+        assert plan["_cache"]["status"] == "miss"
+
+    asyncio.run(run())
+    assert calls == [True, True]
 
 
 def test_configured_memory_recall_off_measures_zero_fact_injection_and_suppresses_legacy_sources():
