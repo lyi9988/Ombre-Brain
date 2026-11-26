@@ -2702,8 +2702,13 @@ def _parse_anchor_proposals(
     return proposals, rejected
 
 
+def _legacy_memory_enrichment_enabled() -> bool:
+    reflection_cfg = config.get("reflection")
+    return not isinstance(reflection_cfg, dict) or bool(reflection_cfg.get("enrich_backfill_enabled", True))
+
+
 def _queue_memory_enrichment(bucket_id: str, *, force: bool = False) -> None:
-    if not bucket_id:
+    if not bucket_id or not _legacy_memory_enrichment_enabled():
         return
     try:
         loop = asyncio.get_running_loop()
@@ -2713,8 +2718,12 @@ def _queue_memory_enrichment(bucket_id: str, *, force: bool = False) -> None:
 
 
 async def _enrich_memory_async(bucket_id: str, *, force: bool = False) -> None:
+    if not _legacy_memory_enrichment_enabled():
+        return
     try:
         bucket = await bucket_mgr.get(bucket_id)
+        if not _legacy_memory_enrichment_enabled():
+            return
         if is_self_anchor_bucket(bucket):
             logger.debug("Skip self-anchor enrichment / 跳过自我入口关系补全: %s", bucket_id)
             return
@@ -2894,42 +2903,13 @@ async def breath_hook(request):
     return PlainTextResponse(BREATH_HANDOFF_RETIRED, status_code=410)
 
 
-# =============================================================
-# /introspection-hook endpoint: Dedicated hook for waking self-reflection
-# 清醒自省专用挂载点。/dream-hook 暂时保留兼容旧接入。
-# =============================================================
+# Retired unauthenticated memory hooks; retain only a terminal response.
 @mcp.custom_route("/introspection-hook", methods=["GET"])
 @mcp.custom_route("/dream-hook", methods=["GET"])
 async def dream_hook(request):
     from starlette.responses import PlainTextResponse
-    try:
-        all_buckets = await bucket_mgr.list_all(include_archive=False)
-        candidates = [
-            b for b in all_buckets
-            if b["metadata"].get("type") not in ("permanent", "feel")
-            and not b["metadata"].get("pinned", False)
-            and not b["metadata"].get("protected", False)
-        ]
-        candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-        recent = candidates[:10]
 
-        if not recent:
-            return PlainTextResponse("")
-
-        parts = []
-        for b in recent:
-            meta = b["metadata"]
-            resolved_tag = "[已解决]" if meta.get("resolved", False) else "[未解决]"
-            parts.append(
-                f"{meta.get('name', b['id'])} {resolved_tag} "
-                f"V{meta.get('valence', 0.5):.1f}/A{meta.get('arousal', 0.3):.1f}\n"
-                f"{_bucket_text_for_embedding(b)[:200]}"
-            )
-
-        return PlainTextResponse("[Ombre Brain - Introspection]\n" + "\n---\n".join(parts))
-    except Exception as e:
-        logger.warning(f"Introspection hook failed: {e}")
-        return PlainTextResponse("")
+    return PlainTextResponse("Retired legacy memory hook.", status_code=410)
 
 
 # =============================================================
@@ -3270,6 +3250,8 @@ async def _backfill_memory_enrichment(
     edge_store_arg=None,
     embedding_engine_arg=None,
 ) -> dict:
+    if not _legacy_memory_enrichment_enabled():
+        return {"processed": 0, "ids": [], "errors": []}
     mgr = bucket_mgr_arg or bucket_mgr
     engine = reflection_engine_arg or reflection_engine
     edge_store = edge_store_arg or memory_edge_store
@@ -3295,6 +3277,8 @@ async def _backfill_memory_enrichment(
     processed: list[str] = []
     errors: list[str] = []
     for bucket in candidates[:limit]:
+        if not _legacy_memory_enrichment_enabled():
+            break
         bucket_id = bucket.get("id")
         if not bucket_id:
             continue
