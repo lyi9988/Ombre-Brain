@@ -2703,8 +2703,7 @@ def _parse_anchor_proposals(
 
 
 def _legacy_memory_enrichment_enabled() -> bool:
-    reflection_cfg = config.get("reflection")
-    return not isinstance(reflection_cfg, dict) or bool(reflection_cfg.get("enrich_backfill_enabled", True))
+    return False  # Protected recovery cannot restart the retired writer.
 
 
 def _queue_memory_enrichment(bucket_id: str, *, force: bool = False) -> None:
